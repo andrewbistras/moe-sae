@@ -62,7 +62,9 @@ class ShardWriter:
         self.pool = pool
         self._buf: dict[str, list[torch.Tensor]] = {k: [] for k in _FIELD_SPECS}
         self._buffered = 0
-        self._shard_idx = 0
+        # Resume-safe: continue numbering after any shards already on disk
+        # (fresh directory → 0). total_written counts THIS session only.
+        self._shard_idx = len(list(self.dir.glob("shard_*.safetensors")))
         self.total_written = 0
 
     def add(
@@ -99,6 +101,20 @@ class ShardWriter:
         self.total_written += size
         self._buf = rest
         self._buffered -= size
+
+    def flush_partial(self) -> None:
+        """Write the current buffer as a (possibly small) shard now.
+
+        Used at resume checkpoints: on-disk shards must exactly reflect the
+        progress record, so a killed run can continue without duplicating or
+        losing tokens. Readers accept variable shard sizes.
+        """
+        if self._buffered > 0:
+            self._write_shard(self._buffered)
+
+    @property
+    def shard_count(self) -> int:
+        return self._shard_idx
 
     def close(self, drop_remainder: bool = False) -> int:
         """Flush the final partial shard (unless drop_remainder). Returns total."""

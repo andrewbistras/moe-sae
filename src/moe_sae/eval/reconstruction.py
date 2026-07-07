@@ -18,6 +18,18 @@ Protocol pins the exact surface the evaluation needs:
   itself and returns [N, 1, d].
 - `decoder_cols(bank, latent) -> [M, d]` unit-norm decoder columns D_{e,j}
   (needed by the §17 subtraction intervention).
+- `f_dict` is the per-dictionary-bank width: f for router-tied conditions,
+  the full global width (6f for B, 64f for F) for the single global bank.
+  The dictionary therefore holds num_banks·f_dict latents — sizing anything
+  by num_banks·f undercounts global conditions, whose per-bank-equivalent f
+  is smaller than the actual dictionary.
+
+Decisions (recorded):
+- The FeatureDump producer writes meta.json {condition, f, f_dict, num_banks,
+  split, theta_star} into the dump directory (finding: downstream
+  `analysis.mass.load_dump` needs condition/f resolvable from the dump
+  itself). `evaluate_reconstruction` is the layer that knows all six fields,
+  so it owns the write.
 
 Deadness note: the "dead-feature %" reported here is *eval-set deadness* —
 latents that never fired under θ*-inference on this split. It is distinct from
@@ -63,7 +75,8 @@ class ThresholdedEncoding:
 @runtime_checkable
 class ThresholdedSAE(Protocol):
     condition: str  # "A".."F"
-    f: int  # per-bank dictionary width
+    f: int  # per-bank(-equivalent) dictionary width
+    f_dict: int  # width per dictionary bank: f router-tied, 6f/64f global
     num_banks: int  # 64 for router-tied conditions, 1 for global (B/F)
 
     def encode_thresholded(
@@ -162,7 +175,10 @@ def evaluate_reconstruction(
     root = Path(capture_root)
     assert split in SPLIT_RANGES, split
     is_global = condition.num_banks == 1
-    n_latents_total = condition.num_banks * condition.f
+    # Total dictionary size: f_dict is the width per dictionary bank (f for
+    # router-tied, 6f/64f for the single global bank) — num_banks·f would
+    # undercount global conditions (B/F) whose latent ids run up to f_dict.
+    n_latents_total = condition.num_banks * condition.f_dict
 
     # ---- pass 1: split mean of c_route (float64) ----
     route_sum = torch.zeros(0, dtype=torch.float64)
@@ -184,6 +200,21 @@ def evaluate_reconstruction(
     dump_dir = Path(out_dump_dir) if out_dump_dir is not None else None
     if dump_dir is not None:
         dump_dir.mkdir(parents=True, exist_ok=True)
+        # FeatureDump meta (consumed by analysis.mass.load_dump): condition
+        # and widths must be resolvable from the dump directory itself.
+        (dump_dir / "meta.json").write_text(
+            json.dumps(
+                {
+                    "condition": condition.condition,
+                    "f": condition.f,
+                    "f_dict": condition.f_dict,
+                    "num_banks": condition.num_banks,
+                    "split": split,
+                    "theta_star": float(theta_star),
+                },
+                indent=2,
+            )
+        )
 
     num_local = den_local = 0.0
     num_agg = den_agg = 0.0
@@ -230,7 +261,7 @@ def evaluate_reconstruction(
                 num_e.index_add_(0, flat_e, err.reshape(-1))
                 den_e.index_add_(0, flat_e, base.reshape(-1))
 
-            flat_ids = enc.act_bank * condition.f + enc.act_latent
+            flat_ids = enc.act_bank * condition.f_dict + enc.act_latent
             fire_counts += torch.bincount(flat_ids, minlength=n_latents_total)
 
             l0 = torch.bincount(enc.act_token, minlength=n).to(torch.int32)

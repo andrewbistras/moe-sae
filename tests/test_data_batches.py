@@ -144,6 +144,85 @@ def test_unaligned_half_size(capture_root):
     assert counts == {1000 + s: SHARD for s in range(8)}
 
 
+def build_mixed_pool(root, pool, n_shards, ids):
+    """Rows cycle through `ids` (int32 domain-offset style), so every shard
+    mixes train/dev/eval buckets; c is filled with the example_id per row."""
+    torch.manual_seed(ids[0])
+    w = ShardWriter(root, pool, shard_size=SHARD)
+    for s in range(n_shards):
+        eid = torch.tensor(
+            [ids[(s * SHARD + r) % len(ids)] for r in range(SHARD)], dtype=torch.int32
+        )
+        w.add(
+            c=eid.to(torch.float32).view(-1, 1, 1).expand(SHARD, 6, D).contiguous(),
+            experts=torch.randint(0, 64, (SHARD, 6)),
+            gates=torch.rand(SHARD, 6),
+            example_id=eid,
+            domain=torch.full((SHARD,), s % 4, dtype=torch.uint8),
+        )
+    assert w.close() == n_shards * SHARD
+
+
+@pytest.fixture()
+def mixed_root(tmp_path):
+    # raw int32 domain-offset ids; %100 gives buckets 0, 1, 85 (dev), 92 (eval)
+    vis_ids = [250000000, 250000001, 250000085, 250000092]
+    txt_ids = [300000000, 300000001, 300000185, 300000292]
+    build_mixed_pool(tmp_path, "visual", n_shards=8, ids=vis_ids)
+    build_mixed_pool(tmp_path, "text", n_shards=2, ids=txt_ids)
+    return tmp_path
+
+
+def test_split_filter_excludes_dev_and_eval_buckets(mixed_root):
+    # Regression (blocker): training stream must never see example_id%100 >= 80.
+    composer = make_composer(mixed_root)
+    batches = list(islice(iter(composer), 12))  # > 1 epoch of each pool
+    for b in batches:
+        assert (b.example_id.to(torch.int64) % 100 < 80).all(), (
+            "dev/eval buckets leaked into the training stream"
+        )
+    # half of every shard's rows are dev/eval: exclusions must be tracked
+    assert composer.excluded_counts["visual"] > 0
+    assert composer.excluded_counts["text"] > 0
+
+
+def test_split_filter_keeps_halves_and_determinism(mixed_root):
+    a = list(islice(iter(make_composer(mixed_root, seed=7)), 8))
+    b = list(islice(iter(make_composer(mixed_root, seed=7)), 8))
+    for x, y in zip(a, b):
+        for f in ("c", "experts", "gates", "token_type", "example_id", "domain"):
+            assert torch.equal(getattr(x, f), getattr(y, f)), f
+    for batch in a:
+        assert int((batch.token_type == 1).sum()) == 16
+        assert int((batch.token_type == 0).sum()) == 16
+        # row integrity survives filtering: c still matches example_id
+        expected = (
+            batch.example_id.to(torch.bfloat16).view(-1, 1, 1).expand_as(batch.c)
+        )
+        assert torch.equal(batch.c, expected)
+
+
+def test_split_filter_epoch_is_permutation_of_train_rows(mixed_root):
+    # 8 visual shards x 8 kept rows = 64 = 4 batches x 16 visual rows: one epoch
+    batches = list(islice(iter(make_composer(mixed_root)), 4))
+    vis_ids = torch.cat([b.example_id[b.token_type == 1] for b in batches])
+    counts = {int(e): int((vis_ids == e).sum()) for e in vis_ids.unique()}
+    assert counts == {250000000: 32, 250000001: 32}, (
+        "each kept visual token must appear exactly once per epoch"
+    )
+
+
+def test_split_none_disables_filter(mixed_root):
+    composer = BatchComposer(
+        mixed_root, batch_tokens=32, seed=7, buffer_shards=2,
+        batch_cls=TrainBatch, split=None,
+    )
+    batches = list(islice(iter(composer), 8))  # full visual epoch (old behavior)
+    ids = torch.cat([b.example_id for b in batches]).to(torch.int64) % 100
+    assert (ids >= 80).any(), "split=None must keep dev/eval rows"
+    assert composer.excluded_counts == {"visual": 0, "text": 0}
+
+
 def test_missing_pool_raises(tmp_path):
     build_pool(tmp_path, "visual", n_shards=1, id_base=0)
     with pytest.raises(FileNotFoundError):

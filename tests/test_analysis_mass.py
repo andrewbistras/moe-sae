@@ -157,7 +157,22 @@ def _write_shards(root, condition, f, pt, ac, n_tokens, n_shards):
         if energy is not None:
             shard["energy"] = torch.from_numpy(energy[lo:hi])
         save_file(shard, str(root / f"shard_{i:05d}.safetensors"))
-    (root / "meta.json").write_text(json.dumps({"condition": condition, "f": f}))
+    (root / "meta.json").write_text(json.dumps(make_meta(condition, f)))
+
+
+def make_meta(condition, f, split="train"):
+    """Producer meta.json format (run_eval): condition/f/f_dict/num_banks/
+    split/theta_star, with f_dict the TOTAL dictionary width."""
+    banked = condition in ("A", "C", "D", "E")
+    f_dict = N_BANKS * f if banked or condition == "F" else TOP_K * f
+    return {
+        "condition": condition,
+        "f": f,
+        "f_dict": f_dict,
+        "num_banks": N_BANKS if banked else 1,
+        "split": split,
+        "theta_star": 0.1,
+    }
 
 
 def write_stats(dir_path, starved=(), count=10_000_000):
@@ -281,11 +296,68 @@ def test_multi_shard_equals_single_shard(tmp_path):
 
 
 def test_load_dump_requires_condition(tmp_path):
+    """Metaless dumps: loading aborts naming the missing field, and the
+    explicit condition=/f= overrides (run_analysis --condition/--f) work."""
     root = write_synth_dump(tmp_path / "d")
     (root / "meta.json").unlink()
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="condition"):
         load_dump(root)
-    assert load_dump(root, condition="A", f=16).condition == "A"
+    dump = load_dump(root, condition="A", f=16)
+    assert dump.condition == "A" and dump.f == 16
+    assert dump.f_dict is None and dump.split is None and dump.theta_star is None
+
+
+def test_load_dump_parses_producer_meta_fields(tmp_path):
+    dump = load_dump(write_synth_dump(tmp_path / "d", n_examples=5))
+    assert dump.condition == "A" and dump.f == 16
+    assert dump.f_dict == N_BANKS * 16  # total dictionary width
+    assert dump.num_banks == N_BANKS
+    assert dump.split == "train"
+    assert dump.theta_star == pytest.approx(0.1)
+
+
+def test_load_dump_normalizes_per_dict_bank_f_dict(tmp_path):
+    """Producers may write sae.conditions-style f_dict (== f for banked
+    conditions); FeatureDump.f_dict is normalized to the TOTAL width."""
+    root = write_synth_dump(tmp_path / "d", n_examples=5)
+    meta = make_meta("A", 16)
+    meta["f_dict"] = 16  # per-dict-bank width
+    (root / "meta.json").write_text(json.dumps(meta))
+    assert load_dump(root).f_dict == N_BANKS * 16
+    meta["f_dict"] = 100  # neither f nor 64*f: inconsistent
+    (root / "meta.json").write_text(json.dumps(meta))
+    with pytest.raises(ValueError, match="f_dict"):
+        load_dump(root)
+
+
+def test_load_dump_act_bank_roundtrip_condition_c(tmp_path):
+    """Condition C carries the per-example bank permutation in act_bank; the
+    loader must expose it and mass attribution must use it, not the host
+    expert at (token, slot)."""
+    root = tmp_path / "c"
+    root.mkdir(parents=True)
+    shard = {
+        "experts": torch.tensor([[0, 1, 2, 3, 4, 5], [10, 11, 12, 13, 14, 15]], dtype=torch.uint8),
+        "gates": torch.full((2, 6), 0.1),
+        "token_type": torch.tensor([1, 0], dtype=torch.uint8),
+        "example_id": torch.tensor([0, 1], dtype=torch.int32),
+        "domain": torch.zeros(2, dtype=torch.uint8),
+        "l0": torch.tensor([1, 1], dtype=torch.int32),
+        "act_token": torch.tensor([0, 1], dtype=torch.int64),
+        "act_slot": torch.tensor([0, 3], dtype=torch.uint8),  # hosts 0 and 13
+        "act_bank": torch.tensor([42, 42], dtype=torch.uint8),  # permuted banks
+        "act_latent": torch.tensor([7, 7], dtype=torch.int32),
+        "act_value": torch.tensor([2.0, 3.0]),
+    }
+    save_file(shard, str(root / "shard_00000.safetensors"))
+    (root / "meta.json").write_text(json.dumps(make_meta("C", 16)))
+    dump = load_dump(root)
+    np.testing.assert_array_equal(dump.act_bank, [42, 42])
+    np.testing.assert_array_equal(dump.act_banks(), [42, 42])
+    m = token_bank_masses(dump)
+    assert m.m_act[0, 42] == pytest.approx(2.0)
+    assert m.m_act[1, 42] == pytest.approx(3.0)
+    assert m.m_act[0, 0] == 0.0 and m.m_act[1, 13] == 0.0  # not the hosts
 
 
 # --------------------------------------------------------------------------- #
@@ -359,7 +431,7 @@ OUTPUT_FILES = ("mass.json", "enrichment.json", "stability.json", "probes.json",
 
 
 def test_run_analysis_cli_banked(tmp_path):
-    dump = write_synth_dump(tmp_path / "dumps" / "runA" / "train", n_examples=110)
+    dump = write_synth_dump(tmp_path / "dumps" / "runA" / "dev", n_examples=110)
     stats = write_stats(tmp_path / "stats")
     out = tmp_path / "reports"
     _load_script().main(
@@ -367,6 +439,7 @@ def test_run_analysis_cli_banked(tmp_path):
             "--dump", str(dump), "--stats", str(stats), "--out", str(out),
             "--load-floor", "500000", "--n-shuffles", "40", "--n-boot", "40",
             "--compare-dump", str(dump), "--seed-dumps", str(dump),
+            "--train-dump", str(dump),
         ]
     )
     for name in OUTPUT_FILES:
@@ -380,16 +453,64 @@ def test_run_analysis_cli_banked(tmp_path):
     assert set(VIS_BANKS) <= set(stab["top_enriched"]["all"])
     assert any(k.startswith("seed:") for k in stab["top_enriched"])
     prob = json.loads((out / "probes.json").read_text())
-    assert prob["probes"]["feature_identity"]["heldout"]["accuracy"] > 0.9
+    assert prob["probes"]["feature_identity"]["dev"]["accuracy"] > 0.9
+    # eval split untouched by default (spec §17/§20)
+    assert prob["include_eval_split"] is False
+    assert "skipped" in prob["probes"]["feature_identity"]["eval"]
 
 
-def test_run_analysis_cli_global(tmp_path):
-    dump = write_synth_global_dump(tmp_path / "dumps" / "runB" / "train", n_examples=110)
+def test_run_analysis_cli_probes_skipped_without_train_dump(tmp_path, capsys):
+    dump = write_synth_dump(tmp_path / "dumps" / "runA" / "dev", n_examples=110)
     stats = write_stats(tmp_path / "stats")
     out = tmp_path / "reports"
     _load_script().main(
         ["--dump", str(dump), "--stats", str(stats), "--out", str(out),
          "--n-shuffles", "10", "--n-boot", "10"]
+    )
+    for name in OUTPUT_FILES:
+        assert (out / name).exists(), name
+    prob = json.loads((out / "probes.json").read_text())
+    assert "skipped" in prob and "--train-dump" in prob["skipped"]
+    assert "probes skipped" in capsys.readouterr().out
+    assert "Skipped" in (out / "summary.md").read_text()
+
+
+def test_run_analysis_cli_include_eval_split(tmp_path):
+    dump = write_synth_dump(tmp_path / "dumps" / "runA" / "dev", n_examples=110)
+    stats = write_stats(tmp_path / "stats")
+    out = tmp_path / "reports"
+    _load_script().main(
+        ["--dump", str(dump), "--stats", str(stats), "--out", str(out),
+         "--n-shuffles", "10", "--n-boot", "10",
+         "--train-dump", str(dump), "--include-eval-split"]
+    )
+    prob = json.loads((out / "probes.json").read_text())
+    assert prob["include_eval_split"] is True
+    assert prob["probes"]["feature_identity"]["eval"]["accuracy"] > 0.9
+
+
+def test_run_analysis_cli_metaless_overrides(tmp_path):
+    dump = write_synth_dump(tmp_path / "dumps" / "runA" / "dev", n_examples=110)
+    (dump / "meta.json").unlink()
+    stats = write_stats(tmp_path / "stats")
+    out = tmp_path / "reports"
+    _load_script().main(
+        ["--dump", str(dump), "--stats", str(stats), "--out", str(out),
+         "--n-shuffles", "10", "--n-boot", "10",
+         "--train-dump", str(dump), "--condition", "A", "--f", "16"]
+    )
+    prob = json.loads((out / "probes.json").read_text())
+    assert prob["condition"] == "A"
+    assert prob["probes"]["feature_identity"]["n_features"] == N_BANKS * 16
+
+
+def test_run_analysis_cli_global(tmp_path):
+    dump = write_synth_global_dump(tmp_path / "dumps" / "runB" / "dev", n_examples=110)
+    stats = write_stats(tmp_path / "stats")
+    out = tmp_path / "reports"
+    _load_script().main(
+        ["--dump", str(dump), "--stats", str(stats), "--out", str(out),
+         "--n-shuffles", "10", "--n-boot", "10", "--train-dump", str(dump)]
     )
     for name in OUTPUT_FILES:
         assert (out / name).exists(), name
@@ -399,4 +520,4 @@ def test_run_analysis_cli_global(tmp_path):
     assert "note" in stab  # §14–§16.3 undefined for global conditions
     prob = json.loads((out / "probes.json").read_text())
     assert "skipped" in prob["probes"]["sae_bank_mass"]
-    assert prob["probes"]["feature_identity"]["heldout"]["accuracy"] > 0.9
+    assert prob["probes"]["feature_identity"]["dev"]["accuracy"] > 0.9

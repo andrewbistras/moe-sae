@@ -1,12 +1,15 @@
 """SAECondition (spec §12): all six conditions on tiny dims — exact-K
 selection, per-condition selection semantics, torch-seed-independent C
-permutations, aux-loss wiring, θ*-inference, checkpoint round trip."""
+permutations, aux-loss wiring, θ*-inference, checkpoint round trip, and the
+run-directory loader `load_condition_from_run`."""
+
+import json
 
 import numpy as np
 import pytest
 import torch
 
-from moe_sae.sae import TrainBatch
+from moe_sae.sae import TrainBatch, load_condition_from_run
 from moe_sae.sae.batchtopk import global_batch_topk, largest_remainder_budgets
 from moe_sae.sae.conditions import SAECondition, build_condition
 from moe_sae.train.config import CONDITION_C_SALT, CONDITIONS, RunConfig, global_width
@@ -262,6 +265,64 @@ def test_checkpoint_roundtrip(tmp_path):
     for k in ("act_token", "act_slot", "act_bank", "act_latent", "act_value",
               "l0", "recon_slots", "mu_slots"):
         assert torch.equal(getattr(a, k), getattr(b, k)), k
+
+
+def test_load_condition_from_run_final_and_theta_json(tmp_path):
+    """Regression: scripts called a nonexistent module-level
+    conditions.load_checkpoint(run_dir, device=...); the run-level loader must
+    exist, prefer final/, and treat theta_star.json as canonical over the
+    checkpoint's stored EMA value."""
+    cond = build("A")
+    cond.theta_ema.update(0.5)  # checkpoint EMA differs from the json below
+    run_dir = tmp_path / "run"
+    cond.save_checkpoint(
+        run_dir / "final" / "checkpoint.safetensors", cond.theta_ema, cond.dead_tracker, step=7
+    )
+    (run_dir / "final" / "theta_star.json").write_text(json.dumps({"theta_star": 0.25}))
+
+    cond2, theta_star, extras = load_condition_from_run(run_dir, device="cpu")
+    assert theta_star == 0.25  # json is canonical, beats the EMA's 0.5
+    assert extras["step"] == 7
+    assert torch.equal(cond2.sae.W_enc.detach(), cond.sae.W_enc.detach())
+
+    # bare-float theta_star.json is also accepted
+    (run_dir / "final" / "theta_star.json").write_text("0.125")
+    _, theta_star, _ = load_condition_from_run(run_dir)
+    assert theta_star == 0.125
+
+
+def test_load_condition_from_run_highest_step_and_theta_fallback(tmp_path):
+    cond = build("A")
+    run_dir = tmp_path / "run"
+    cond.theta_ema.update(0.3)
+    cond.save_checkpoint(
+        run_dir / "checkpoints" / "900.safetensors", cond.theta_ema, cond.dead_tracker, step=900
+    )
+    with torch.no_grad():
+        cond.sae.W_enc.add_(1.0)  # distinguish the later checkpoint
+    cond.theta_ema.update(0.9)
+    cond.save_checkpoint(
+        run_dir / "checkpoints" / "1000.safetensors", cond.theta_ema, cond.dead_tracker, step=1000
+    )
+    cond2, theta_star, extras = load_condition_from_run(run_dir)
+    assert extras["step"] == 1000  # numeric order ("900" > "1000" lexically)
+    assert torch.equal(cond2.sae.W_enc.detach(), cond.sae.W_enc.detach())
+    # no final/theta_star.json → fall back to the checkpoint's EMA value
+    assert theta_star == pytest.approx(cond.theta_ema.value)
+
+
+def test_load_condition_from_run_errors(tmp_path):
+    with pytest.raises(FileNotFoundError, match="no checkpoint"):
+        load_condition_from_run(tmp_path / "empty_run")
+
+    # checkpoint present but θ never initialized and no theta_star.json
+    cond = build("B")
+    run_dir = tmp_path / "run"
+    cond.save_checkpoint(
+        run_dir / "final" / "checkpoint.safetensors", cond.theta_ema, cond.dead_tracker, step=0
+    )
+    with pytest.raises(ValueError, match="theta_star"):
+        load_condition_from_run(run_dir)
 
 
 def test_checkpoint_none_theta(tmp_path):

@@ -19,11 +19,31 @@ evaluation data. The identical pipeline is run on condition C as the negative
 control (changelog #10) — the FeatureDump's `act_bank` field carries the true
 bank identity so the subtraction uses bank-correct decoder columns even when
 banks are permuted (condition C).
+
+Decisions:
+- Spec §17 fifth matching criterion (removed-vector norm
+  ‖Σ_{(e,j)∈J_t} z·D_{e,j}‖₂): exact pre-hoc token-level norm matching is
+  impossible — the norm depends on which set members co-fire at each token and
+  on cross-latent decoder-column geometry, both token-dependent. It is
+  implemented as the per-latent coefficient-mass proxy (exact per latent under
+  unit decoder columns) at construction time, plus POST-HOC measurement:
+  `removed_norm_report` computes per-token removed-vector norms for J and each
+  control over a provided sample of encoded tokens (via the same
+  `decoder_cols` access `run_intervention` uses) and flags any control set
+  whose mean removed norm deviates from J's by more than `norm_tolerance`
+  (default 20%, configurable). `matched_control_sets` embeds this under
+  `removed_norms` in its match-quality report when given `decoder_cols` +
+  `encoded_samples`.
+- `select_enriched_latents` takes its §16.3 load floor from an explicit
+  `bank_counts` argument (the TRAINING loads, runs/<run>/final/bank_loads.npy,
+  numpy [64] int64); when omitted it falls back to `stats.bank_counts`
+  (stats-pass loads) with a logged warning.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -45,6 +65,13 @@ LOAD_FLOOR_DISCOVERY = 500_000
 # Matching tolerances in log10 units (documented free parameters of the
 # §17 matched-control construction; achieved quality is always recorded).
 DEFAULT_TOLERANCES = {"freq": 0.3, "mass": 0.3, "load": 0.3}
+
+# Post-hoc removed-vector-norm check (spec §17 fifth criterion, see module
+# Decisions): flag a control set whose mean per-token removed norm deviates
+# from J's by more than this relative tolerance.
+DEFAULT_NORM_TOLERANCE = 0.2
+
+logger = logging.getLogger(__name__)
 
 
 # --------------------------------------------------------------------------- #
@@ -128,6 +155,7 @@ def select_enriched_latents(
     load_floor: int = LOAD_FLOOR_DISCOVERY,
     min_visual_fires: int = 1,
     eps: float = 1e-9,
+    bank_counts=None,
 ) -> list[tuple[int, int]]:
     """Deterministic frozen ablation set J from the DEV-split FeatureDump.
 
@@ -139,16 +167,29 @@ def select_enriched_latents(
        visual firing-rate enrichment (rate_vis+ε)/(rate_text+ε) is at or above
        the given `quantile` of that distribution.
 
-    `stats` is a `moe_sae.train.stats_pass.ActivationStats` (duck-typed:
-    needs `.p_gate_visual` [64] and `.bank_counts` [64]).
-    Returns a sorted list of (bank, latent) pairs.
+    `bank_counts` (numpy [64] int64) is the load-floor source: the TRAINING
+    loads (runs/<run>/final/bank_loads.npy). When None, falls back to
+    `stats.bank_counts` (stats-pass loads) with a logged warning (see module
+    Decisions). `stats` is a `moe_sae.train.stats_pass.ActivationStats`
+    (duck-typed: needs `.p_gate_visual` [64]; `.bank_counts` [64] only for the
+    fallback). Returns a sorted list of (bank, latent) pairs.
     """
+    if bank_counts is None:
+        logger.warning(
+            "select_enriched_latents: no bank_counts given — falling back to "
+            "stats.bank_counts (stats-pass loads, NOT training loads) for the "
+            "§16.3 load floor"
+        )
+        bank_counts = stats.bank_counts
+    bank_counts = torch.as_tensor(bank_counts, dtype=torch.int64)
+    assert bank_counts.shape == (64,), bank_counts.shape
+
     ls = latent_stats_from_dump(dev_dump_dir, f)
     q_vis = ls["bank_mass_visual"] / ls["bank_mass_visual"].sum().clamp_min(1e-300)
     r_vis = torch.log(
         (q_vis + eps) / (stats.p_gate_visual.to(torch.float64) + eps)
     )
-    eligible = stats.bank_counts >= load_floor
+    eligible = bank_counts >= load_floor
     assert int(eligible.sum()) >= top_n_experts, (
         f"only {int(eligible.sum())} banks meet the load floor {load_floor}"
     )
@@ -181,6 +222,10 @@ def matched_control_sets(
     n_controls: int = 10,
     seed: int = 0,
     tolerances: dict | None = None,
+    decoder_cols: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
+    encoded_samples: Iterable[ThresholdedEncoding] | None = None,
+    d: int | None = None,
+    norm_tolerance: float = DEFAULT_NORM_TOLERANCE,
 ) -> tuple[list[list[tuple[int, int]]], dict]:
     """Control ablation sets matched to J (spec §17): same #latents, and — via
     greedy per-latent nearest matching in log10 space — matched total
@@ -188,8 +233,13 @@ def matched_control_sets(
 
     Removed-vector norm: with unit-norm decoder columns, each latent's removed
     contribution has norm exactly z, so total coefficient mass is the
-    per-latent removed-norm proxy (cross-latent cancellation in Σ z·D is a
-    token-level effect and is not matchable set-wise; documented caveat).
+    per-latent removed-norm proxy at construction time; the token-level norm
+    (spec §17's fifth criterion, not matchable pre hoc — see module Decisions)
+    is measured post hoc when `decoder_cols`, `encoded_samples` (a sample of
+    `ThresholdedEncoding`s), and `d` are given: `removed_norm_report` output
+    is embedded under `removed_norms` in the returned match-quality report,
+    flagging sets whose mean removed norm deviates from J's by more than
+    `norm_tolerance`.
 
     Per latent in J (deterministic sorted order) a control latent is drawn
     uniformly (seeded) from fired latents outside J and unused within the set
@@ -264,7 +314,68 @@ def matched_control_sets(
         "removed_norm_proxy": "total coefficient mass (unit-norm decoder columns)",
         "sets": set_reports,
     }
+    if decoder_cols is not None and encoded_samples is not None:
+        assert d is not None, "d (model dim) required for removed-norm measurement"
+        report["removed_norms"] = removed_norm_report(
+            J, controls, encoded_samples, f, decoder_cols, d, norm_tolerance
+        )
     return controls, report
+
+
+def removed_norm_report(
+    J: list[tuple[int, int]],
+    controls: list[list[tuple[int, int]]],
+    encoded_samples: Iterable[ThresholdedEncoding],
+    f: int,
+    decoder_cols: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    d: int,
+    norm_tolerance: float = DEFAULT_NORM_TOLERANCE,
+) -> dict:
+    """Post-hoc spec §17 fifth-criterion measurement (see module Decisions).
+
+    Over a sample of encoded tokens, computes the per-token removed-vector
+    norm ‖Σ_{(e,j)∈J_t} z·D_{e,j}‖₂ (at positions with nonempty J_t) for J and
+    for each control set, and reports the distributions (n_positions, mean,
+    median, p90) plus each control's mean ratio vs J. A control whose mean
+    deviates from J's by more than `norm_tolerance` relative (or that cannot
+    be compared: no ablated positions) gets `flag_removed_norm` True.
+    """
+    named = [("J", J)] + [(f"control_{i:02d}", c) for i, c in enumerate(controls)]
+    norms: dict[str, list[torch.Tensor]] = {name: [] for name, _ in named}
+    for enc in encoded_samples:
+        if enc.act_token.numel() == 0:
+            continue
+        n_tok = int(enc.act_token.max()) + 1
+        for name, latents in named:
+            deltas, positions = compute_ablation_deltas(
+                enc, latents, f, decoder_cols, n_tok, d
+            )
+            if positions.any():
+                norms[name].append(deltas[positions].norm(dim=1))
+
+    def _dist(chunks: list[torch.Tensor]) -> dict:
+        if not chunks:
+            return {"n_positions": 0, "mean": None, "median": None, "p90": None}
+        v = torch.cat(chunks).to(torch.float64)
+        return {
+            "n_positions": int(v.numel()),
+            "mean": float(v.mean()),
+            "median": float(v.median()),
+            "p90": float(torch.quantile(v, 0.9)),
+        }
+
+    j_dist = _dist(norms["J"])
+    sets = []
+    for i in range(len(controls)):
+        dist = _dist(norms[f"control_{i:02d}"])
+        comparable = dist["mean"] is not None and (j_dist["mean"] or 0) > 0
+        ratio = dist["mean"] / j_dist["mean"] if comparable else None
+        dist["mean_ratio_vs_J"] = ratio
+        dist["flag_removed_norm"] = bool(
+            ratio is None or abs(ratio - 1.0) > norm_tolerance
+        )
+        sets.append(dist)
+    return {"norm_tolerance": norm_tolerance, "J": j_dist, "sets": sets}
 
 
 # --------------------------------------------------------------------------- #

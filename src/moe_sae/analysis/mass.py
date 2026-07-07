@@ -23,6 +23,16 @@ is therefore read from the dump's optional per-token per-slot `energy` field
 ([N, 6] float32, ‖D_e z_{t,e}‖² at slot order), written by
 `moe_sae.eval.reconstruction.dump_features`. Dumps without the field yield
 m_energy = None and the energy robustness check is skipped.
+
+Decisions:
+- meta.json fields `condition`, `f`, `f_dict`, `num_banks`, `split`,
+  `theta_star` are parsed when present; `condition` and `f` remain
+  caller-overridable for metaless dumps (run_analysis --condition/--f).
+- `FeatureDump.f_dict` is normalized to the TOTAL dictionary width F_total
+  (64·f banked, 6f/64f global). Producers that write the per-dict-bank width
+  (sae.conditions semantics: f_dict == f for banked conditions) are detected
+  via `f` and normalized at load; a banked f_dict matching neither f nor 64·f
+  is rejected as inconsistent meta.
 """
 
 from __future__ import annotations
@@ -70,6 +80,11 @@ class FeatureDump:
     energy: np.ndarray | None  # [N, 6] float64 or None
     act_bank: np.ndarray | None = None  # [M] int64 — assigned bank (≠ experts
     # slot lookup for condition C, whose banks are per-example permutations)
+    f_dict: int | None = None  # TOTAL dictionary width F_total (from meta.json,
+    # normalized — see module Decisions); None if unknown
+    split: str | None = None  # producer split tag from meta.json (train/dev/eval)
+    num_banks: int | None = None  # dictionary bank count from meta.json (64 or 1)
+    theta_star: float | None = None  # frozen θ* from meta.json
 
     def act_banks(self) -> np.ndarray:
         """Bank of each activation: the dump's act_bank field when present
@@ -107,6 +122,8 @@ def load_dump(
     `condition`/`f` override the dump's meta.json; the condition must be
     resolvable from one of the two or loading aborts (mass semantics depend
     on it — a wrong default would silently produce garbage q vectors).
+    meta.json's `f_dict`/`num_banks`/`split`/`theta_star` are parsed when
+    present (see module Decisions for the f_dict width normalization).
     """
     root = Path(path)
     meta = _read_meta(root)
@@ -114,9 +131,28 @@ def load_dump(
     if condition not in BANKED_CONDITIONS + GLOBAL_CONDITIONS:
         raise ValueError(
             f"cannot determine SAE condition for dump at {root}: got {condition!r}; "
-            "provide meta.json with a 'condition' field or pass condition= explicitly"
+            "meta.json is missing (or lacks a 'condition' field) — write it, or pass "
+            "condition= explicitly (--condition on scripts/run_analysis.py)"
         )
     f = f if f is not None else meta.get("f")
+    f = int(f) if f is not None else None
+    f_dict = meta.get("f_dict")
+    if f_dict is not None:
+        f_dict = int(f_dict)
+        if condition in BANKED_CONDITIONS:
+            total = NUM_ROUTED_EXPERTS * f if f is not None else None
+            if f is None:
+                # only the total is unambiguous without f; assume it and derive f
+                f = f_dict // NUM_ROUTED_EXPERTS
+            elif f_dict == f and f_dict != total:
+                f_dict = total  # per-dict-bank width (sae.conditions) → total
+            elif f_dict != total:
+                raise ValueError(
+                    f"meta.json at {root} is inconsistent: 'f_dict'={f_dict} is "
+                    f"neither 'f'={f} (per-dict-bank width) nor 64·f={total} "
+                    "(total width) for a banked condition — fix meta.json or "
+                    "pass f= explicitly (--f on scripts/run_analysis.py)"
+                )
 
     paths = sorted(root.glob("shard_*.safetensors"))
     if not paths:
@@ -158,7 +194,7 @@ def load_dump(
 
     return FeatureDump(
         condition=condition,
-        f=int(f) if f is not None else None,
+        f=f,
         experts=cat(per_token["experts"], np.int64),
         gates=cat(per_token["gates"], np.float32),
         token_type=cat(per_token["token_type"], np.uint8),
@@ -171,6 +207,10 @@ def load_dump(
         act_value=cat(acts["act_value"], np.float64),
         energy=cat(energy, np.float64) if has_energy and energy else None,
         act_bank=cat(act_bank, np.int64) if has_act_bank and act_bank else None,
+        f_dict=f_dict,
+        split=meta.get("split"),
+        num_banks=int(meta["num_banks"]) if meta.get("num_banks") is not None else None,
+        theta_star=float(meta["theta_star"]) if meta.get("theta_star") is not None else None,
     )
 
 

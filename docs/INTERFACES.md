@@ -256,4 +256,6 @@ language-stack token positions.
 
 `example_id % 100`: 0–79 train, 80–89 development (enriched-set definition,
 §17), 90–99 evaluation (untouched until intervention run). Example-level, never
-position-level (spec §16.4).
+position-level (spec §16.4). SAE training (`BatchComposer`) and the statistics
+pass (`compute_stats`) consume ONLY the train buckets 0–79 by default
+(`split='train'`; `split=None` disables filtering for debugging only).

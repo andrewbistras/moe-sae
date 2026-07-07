@@ -1,6 +1,8 @@
 """Spec §16.4 incremental-modality-information probes: frozen example-level
-splits, exact feature construction, planted-structure probe performance, and
-global-condition handling."""
+splits, exact feature construction (incl. condition-C bank permutation and
+f_dict widths), the train-dump/score-dump flow with the eval split untouched
+by default, planted-structure probe performance, and global-condition
+handling."""
 
 import json
 from pathlib import Path
@@ -35,16 +37,18 @@ TXT_BANKS = (10, 11)
 
 def write_synth_dump(
     root, condition="A", f=16, n_examples=120, tokens_per_side=6, seed=0,
-    signal=5.0, noise=0.05,
+    signal=5.0, noise=0.05, ex_ids=None,
 ):
-    """Planted banked dump (visual -> banks 1,2,3; text -> banks 10,11)."""
+    """Planted banked dump (visual -> banks 1,2,3; text -> banks 10,11).
+    `ex_ids` restricts example ids (default range(n_examples)) — used to
+    build single-split dumps matching the run_eval per-split layout."""
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(seed)
     pt = {k: [] for k in ("experts", "gates", "token_type", "example_id", "domain", "l0")}
     ac = {k: [] for k in ("act_token", "act_slot", "act_latent", "act_value")}
     t = 0
-    for ex in range(n_examples):
+    for ex in ex_ids if ex_ids is not None else range(n_examples):
         for tt in (1, 0):
             banks = VIS_BANKS if tt else TXT_BANKS
             for _ in range(tokens_per_side):
@@ -120,7 +124,21 @@ def _save(root, condition, f, pt, ac):
         "act_value": torch.from_numpy(np.asarray(ac["act_value"], np.float32)),
     }
     save_file(shard, str(root / "shard_00000.safetensors"))
-    (root / "meta.json").write_text(json.dumps({"condition": condition, "f": f}))
+    # Producer meta format (run_eval): condition/f/f_dict/num_banks/split/theta_star.
+    banked = condition in ("A", "C", "D", "E")
+    f_dict = N_BANKS * f if banked or condition == "F" else TOP_K * f
+    (root / "meta.json").write_text(
+        json.dumps(
+            {
+                "condition": condition,
+                "f": f,
+                "f_dict": f_dict,
+                "num_banks": N_BANKS if banked else 1,
+                "split": "train",
+                "theta_star": 0.1,
+            }
+        )
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -203,6 +221,61 @@ def test_identity_features_exact_global():
     assert dense.sum() == 3.0
 
 
+def test_identity_features_condition_c_uses_act_bank():
+    """FINDING regression: condition C's bank is a per-example permutation
+    carried in act_bank — two tokens from different examples firing the SAME
+    (bank, latent) must share one identity column, even though their host
+    experts (experts[token, slot]) differ."""
+    f = 16
+    dump = FeatureDump(
+        condition="C",
+        f=f,
+        experts=np.array([[0, 1, 2, 3, 4, 5], [10, 11, 12, 13, 14, 15]], np.int64),
+        gates=np.full((2, 6), 0.1, np.float32),
+        token_type=np.array([1, 1], np.uint8),
+        example_id=np.array([0, 1], np.int64),
+        domain=np.zeros(2, np.uint8),
+        l0=np.array([1, 1], np.int64),
+        act_token=np.array([0, 1], np.int64),
+        act_slot=np.array([0, 3], np.int64),  # host experts 0 and 13 — differ
+        act_latent=np.array([7, 7], np.int64),
+        act_value=np.array([1.0, 1.0], np.float64),
+        energy=None,
+        act_bank=np.array([42, 42], np.int64),  # planted permutation: same bank
+    )
+    dense = np.asarray(identity_features(dump).todense())
+    col = 42 * f + 7
+    assert dense[0, col] == 1.0 and dense[1, col] == 1.0  # same column
+    assert dense.sum() == 2.0
+    # the host-expert-derived columns must NOT be set
+    assert dense[0, 0 * f + 7] == 0.0
+    assert dense[1, 13 * f + 7] == 0.0
+
+
+def test_identity_features_banked_falls_back_to_host_expert():
+    dump = make_tiny_dump()  # act_bank is None -> experts[token, slot]
+    assert dump.act_bank is None
+    dense = np.asarray(identity_features(dump).todense())
+    assert dense[0, 0 * 16 + 3] == 1.0 and dense[1, 11 * 16 + 7] == 1.0
+
+
+def test_identity_features_global_uses_f_dict():
+    dump = make_tiny_dump(condition="B")
+    dump.f = None
+    dump.f_dict = 6 * 16  # total dictionary width from meta.json
+    x = identity_features(dump)
+    assert x.shape == (2, 6 * 16)
+
+
+def test_identity_features_banked_derives_f_from_f_dict():
+    dump = make_tiny_dump()
+    dump.f = None
+    dump.f_dict = 64 * 16  # total width -> per-bank f = 16
+    dense = np.asarray(identity_features(dump).todense())
+    assert dense.shape == (2, 64 * 16)
+    assert dense[1, 11 * 16 + 7] == 1.0
+
+
 def test_total_features_per_condition():
     assert total_features("A", 4096) == 64 * 4096
     assert total_features("C", 1024) == 64 * 1024
@@ -233,23 +306,25 @@ ALL_PROBES = (
 def test_probes_beat_chance_on_planted(tmp_path):
     dump = load_dump(write_synth_dump(tmp_path / "d"))
     masses = token_bank_masses(dump)
-    rep = run_probes(dump, masses, c=1.0, seed=0)
+    rep = run_probes(dump, masses, dump, masses, c=1.0, seed=0)
 
     assert rep["condition"] == "A"
-    for split in ("train", "dev", "eval"):
+    assert rep["include_eval_split"] is False
+    for split in ("train", "dev"):
         assert rep["splits"][split]["n_tokens"] > 0
         assert rep["splits"][split]["frac_visual"] == pytest.approx(0.5, abs=0.05)
-    # example-level counts: ids 0..119 -> 100 train, 10 dev, 10 eval examples
+    # example-level counts: ids 0..119 -> 100 train, 10 dev examples
     assert rep["splits"]["train"]["n_examples"] == 100
     assert rep["splits"]["dev"]["n_examples"] == 10
-    assert rep["splits"]["eval"]["n_examples"] == 10
+    # eval split untouched pre-intervention: no balance report, no scores
+    assert "eval" not in rep["splits"]
 
     for name in ALL_PROBES:
         res = rep["probes"][name]
         assert "skipped" not in res, name
-        for part in ("dev", "eval", "heldout"):
-            assert res[part]["accuracy"] > 0.95, (name, part)
-            assert res[part]["auc"] > 0.99, (name, part)
+        assert res["dev"]["accuracy"] > 0.95, name
+        assert res["dev"]["auc"] > 0.99, name
+        assert "skipped" in res["eval"], name
     # L1 identity probe: sparse, nonzero coefficients reported
     ident = rep["probes"]["feature_identity"]
     assert ident["penalty"] == "l1"
@@ -258,23 +333,67 @@ def test_probes_beat_chance_on_planted(tmp_path):
     assert rep["probes"]["gates_plus_identity"]["n_features"] == 64 + 64 * 16
 
 
+def test_probes_separate_train_and_dev_dumps(tmp_path):
+    """FINDING regression: run_eval produces single-split dumps — probes must
+    fit on a TRAIN-split dump and score on a separate DEV-split dump."""
+    train = load_dump(write_synth_dump(tmp_path / "train", ex_ids=range(80)))
+    dev_ids = [b + o for o in (0, 100, 200) for b in range(80, 90)]
+    dev = load_dump(write_synth_dump(tmp_path / "dev", ex_ids=dev_ids, seed=1))
+    rep = run_probes(train, token_bank_masses(train), dev, token_bank_masses(dev))
+    assert rep["splits"]["train"]["n_examples"] == 80
+    assert rep["splits"]["dev"]["n_examples"] == 30
+    for name in ALL_PROBES:
+        assert rep["probes"][name]["dev"]["accuracy"] > 0.95, name
+    # swapped dumps fail loudly: the dev dump has no train-split tokens
+    with pytest.raises(ValueError, match="train-split"):
+        run_probes(dev, token_bank_masses(dev), train, token_bank_masses(train))
+
+
+def test_probes_eval_split_requires_explicit_opt_in(tmp_path):
+    """FINDING regression: eval-split scoring (spec §17/§20 post-intervention
+    only) is off by default and enabled only via include_eval_split."""
+    dump = load_dump(write_synth_dump(tmp_path / "d"))
+    masses = token_bank_masses(dump)
+    rep = run_probes(dump, masses, dump, masses, include_eval_split=True)
+    assert rep["include_eval_split"] is True
+    assert rep["splits"]["eval"]["n_examples"] == 10
+    for name in ALL_PROBES:
+        res = rep["probes"][name]
+        assert "skipped" not in res["eval"], name
+        assert res["eval"]["accuracy"] > 0.95, name
+
+
+def test_probes_reject_dev_dump_without_dev_tokens(tmp_path):
+    train = load_dump(write_synth_dump(tmp_path / "train", ex_ids=range(80)))
+    m = token_bank_masses(train)
+    with pytest.raises(ValueError, match="dev-split"):
+        run_probes(train, m, train, m)
+
+
+def test_probes_reject_condition_mismatch(tmp_path):
+    a = load_dump(write_synth_dump(tmp_path / "a"))
+    b = load_dump(write_synth_global_dump(tmp_path / "b", condition="B"))
+    with pytest.raises(ValueError, match="condition"):
+        run_probes(a, token_bank_masses(a), b, None)
+
+
 def test_probes_deterministic(tmp_path):
     dump = load_dump(write_synth_dump(tmp_path / "d", n_examples=110))
     masses = token_bank_masses(dump)
-    a = run_probes(dump, masses, seed=3)
-    b = run_probes(dump, masses, seed=3)
+    a = run_probes(dump, masses, dump, masses, seed=3)
+    b = run_probes(dump, masses, dump, masses, seed=3)
     assert a == b
 
 
 def test_probes_global_condition_skips_bank_mass(tmp_path):
     dump = load_dump(write_synth_global_dump(tmp_path / "g", condition="B"))
     assert token_bank_masses(dump) is None
-    rep = run_probes(dump, None, seed=0)
+    rep = run_probes(dump, None, dump, None, seed=0)
     assert "skipped" in rep["probes"]["sae_bank_mass"]
     assert "skipped" in rep["probes"]["gates_plus_bank_mass"]
     # probes 1 and 3 apply to all conditions and separate the planted structure
-    assert rep["probes"]["router_gates"]["heldout"]["accuracy"] > 0.95
-    assert rep["probes"]["feature_identity"]["heldout"]["accuracy"] > 0.95
+    assert rep["probes"]["router_gates"]["dev"]["accuracy"] > 0.95
+    assert rep["probes"]["feature_identity"]["dev"]["accuracy"] > 0.95
     assert rep["probes"]["feature_identity"]["n_features"] == 6 * 16
 
 
@@ -282,4 +401,4 @@ def test_probes_raise_on_single_class_train():
     dump = make_tiny_dump()
     dump.example_id = np.array([85, 86], np.int64)  # no train examples
     with pytest.raises(ValueError):
-        run_probes(dump, token_bank_masses(dump))
+        run_probes(dump, token_bank_masses(dump), dump, token_bank_masses(dump))

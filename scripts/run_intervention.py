@@ -12,20 +12,64 @@ Usage:
         --out reports/intervention_<name>/ \
         [--stats stats/<capture-name>] \
         [--negative-control-run runs/<C-name>]
+
+Decisions (recorded):
+- §16.3 load floor source: the run's OWN training loads
+  (runs/<name>/final/bank_loads.npy, written by the training loop) are what
+  reach the floor comparison in `select_enriched_latents`; the stats-pass
+  counts are only a logged-warning fallback when that artifact is missing.
+  `select_J_with_training_loads` tolerates either intervention API (an
+  explicit `bank_counts` kwarg, or the stats-carried counts).
+- Matched-control load matching keeps the stats-pass counts (the floor is the
+  only comparison the finding pins to training loads).
 """
 
 from __future__ import annotations
 
 import argparse
+import dataclasses
+import inspect
 import json
 from pathlib import Path
+from types import SimpleNamespace
+
+import numpy as np
+import torch
 
 INTERVENTION_DOMAINS = ("coco", "textvqa", "chartqa", "ai2d", "text_control")
 
 
-def load_theta_star(run_dir: Path) -> float:
-    raw = json.loads((run_dir / "final" / "theta_star.json").read_text())
-    return float(raw["theta_star"]) if isinstance(raw, dict) else float(raw)
+def load_training_bank_counts(run_dir: Path, stats) -> torch.Tensor:
+    """§16.3 load-floor counts: the run's training loads
+    (runs/<name>/final/bank_loads.npy), falling back to the stats-pass routed
+    counts with a logged warning when the artifact is missing."""
+    path = Path(run_dir) / "final" / "bank_loads.npy"
+    if path.exists():
+        return torch.from_numpy(np.load(path)).to(torch.int64)
+    print(f"[warn] {path} not found; using stats-pass bank_counts for the §16.3 load floor")
+    return stats.bank_counts.to(torch.int64)
+
+
+def select_J_with_training_loads(
+    dev_dump, stats, bank_counts: torch.Tensor, *, f: int, top_n_experts: int,
+    quantile: float, load_floor: int,
+):
+    """Call `select_enriched_latents` so that `bank_counts` (the training
+    loads) is what reaches the load-floor comparison, whichever API the
+    intervention module exposes (explicit `bank_counts` parameter, or counts
+    carried on the stats object)."""
+    from moe_sae.eval.intervention import select_enriched_latents
+
+    kwargs = dict(
+        f=f, top_n_experts=top_n_experts, quantile=quantile, load_floor=load_floor
+    )
+    if "bank_counts" in inspect.signature(select_enriched_latents).parameters:
+        return select_enriched_latents(dev_dump, stats, bank_counts=bank_counts, **kwargs)
+    if dataclasses.is_dataclass(stats):
+        stats = dataclasses.replace(stats, bank_counts=bank_counts)
+    else:
+        stats = SimpleNamespace(**{**vars(stats), "bank_counts": bank_counts})
+    return select_enriched_latents(dev_dump, stats, **kwargs)
 
 
 def run_pipeline(run_dir: Path, dev_dump: Path, stats, out_dir: Path, args, device: str) -> None:
@@ -36,19 +80,20 @@ def run_pipeline(run_dir: Path, dev_dump: Path, stats, out_dir: Path, args, devi
         matched_control_sets,
         run_intervention,
         save_ablation_set,
-        select_enriched_latents,
     )
     from moe_sae.model_loading import load_model
-    from moe_sae.sae import conditions
+    from moe_sae.sae import load_condition_from_run
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    theta_star = load_theta_star(run_dir)
-    condition = conditions.load_checkpoint(run_dir, device=device)
+    condition, theta_star, _extras = load_condition_from_run(run_dir, device=device)
 
-    # Step 9: enriched-set definition on the DEV split; frozen before eval data.
-    J = select_enriched_latents(
+    # Step 9: enriched-set definition on the DEV split; frozen before eval
+    # data. The §16.3 load floor is applied to the run's training loads.
+    bank_counts = load_training_bank_counts(run_dir, stats)
+    J = select_J_with_training_loads(
         dev_dump,
         stats,
+        bank_counts,
         f=condition.f,
         top_n_experts=args.top_n_experts,
         quantile=args.quantile,

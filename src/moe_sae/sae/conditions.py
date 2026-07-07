@@ -32,6 +32,11 @@ Decisions (recorded):
   permitted (contract does not exclude it); aux selection never resets
   deadness.
 - l0_visual / l0_text are 0.0 when the batch contains no token of that type.
+- `load_condition_from_run(run_dir, device)` is the run-directory loader used
+  by the eval/intervention scripts: it prefers final/checkpoint.safetensors,
+  falls back to the highest-step checkpoints/{step}.safetensors, and resolves
+  θ* from final/theta_star.json (canonical) before the checkpoint's stored EMA
+  value. Additive helper — training/inference logic is untouched.
 """
 
 from __future__ import annotations
@@ -552,6 +557,54 @@ class SAECondition(nn.Module):
             "dead_tracker": cond.dead_tracker,
         }
         return cond, theta_star, extras
+
+
+def load_condition_from_run(
+    run_dir: str | Path, device: str | torch.device = "cpu"
+) -> tuple[SAECondition, float, dict]:
+    """Load a trained condition from a run directory (contract:
+    docs/INTERFACES.md §"Run artifact layout").
+
+    Checkpoint resolution: prefer run_dir/final/checkpoint.safetensors, else
+    the highest-step run_dir/checkpoints/{step}.safetensors (numeric order).
+    θ* resolution: canonical source is run_dir/final/theta_star.json
+    ({'theta_star': x} or a bare float), falling back to the checkpoint's
+    stored θ EMA value; errors if neither exists.
+
+    Returns (condition-on-device, theta_star, extras) with extras as produced
+    by `SAECondition.load_checkpoint`.
+    """
+    run_dir = Path(run_dir)
+    ckpt = run_dir / "final" / "checkpoint.safetensors"
+    if not ckpt.exists():
+        candidates: list[tuple[int, Path]] = []
+        for p in (run_dir / "checkpoints").glob("*.safetensors"):
+            try:
+                candidates.append((int(p.stem), p))
+            except ValueError:
+                continue  # not a {step}.safetensors file
+        if not candidates:
+            raise FileNotFoundError(
+                f"no checkpoint under {run_dir}: expected "
+                "final/checkpoint.safetensors or checkpoints/{step}.safetensors"
+            )
+        ckpt = max(candidates)[1]
+
+    condition, ckpt_theta, extras = SAECondition.load_checkpoint(ckpt)
+    condition = condition.to(torch.device(device))
+
+    theta_path = run_dir / "final" / "theta_star.json"
+    if theta_path.exists():
+        raw = json.loads(theta_path.read_text())
+        theta_star = float(raw["theta_star"]) if isinstance(raw, dict) else float(raw)
+    elif ckpt_theta is not None:
+        theta_star = float(ckpt_theta)
+    else:
+        raise ValueError(
+            f"cannot resolve theta_star for {run_dir}: no final/theta_star.json "
+            f"and checkpoint {ckpt} carries no θ EMA value"
+        )
+    return condition, theta_star, extras
 
 
 def build_condition(

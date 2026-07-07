@@ -13,8 +13,8 @@ Regularized linear classifiers predict visual-vs-text token type from:
 
 Splits (frozen contract, docs/INTERFACES.md §Splits): example_id % 100 —
 0–79 train, 80–89 dev, 90–99 eval. Probes are fit on train-split tokens and
-reported on dev and eval tokens (and their union, "heldout"); held-out at the
-*example* level, never at the position level (spec §16.4).
+scored on dev-split tokens; held-out at the *example* level, never at the
+position level (spec §16.4).
 
 Classifier choices (frozen here): sklearn LogisticRegression.
 - Dense probes (1, 2, 1+2): penalty='l2', solver='lbfgs'. The spec asks only
@@ -25,6 +25,24 @@ Classifier choices (frozen here): sklearn LogisticRegression.
   deterministic and fast for binary problems on sparse inputs of this size).
 - C is configurable (default 1.0), identical across probes within one run,
   reported in the output. Seeds fixed; class balance reported per split.
+
+Decisions:
+- Two-dump flow: `run_eval` produces single-split FeatureDumps, so run_probes
+  takes a TRAIN-split dump (+ masses) to fit on and a separate score dump
+  (+ masses) whose DEV-split tokens are scored. Passing the same object for
+  both is valid for mixed-split dumps (e.g. synthetic fixtures); split
+  membership is always re-derived from example_id, never trusted from meta.
+- The frozen EVAL split (example_id % 100 in 90–99) is scored only when
+  include_eval_split=True (run_analysis --include-eval-split), a
+  POST-INTERVENTION-ONLY switch: spec §17/§20 require evaluation data
+  untouched until the intervention has run. By default the per-probe "eval"
+  entry is a skipped marker and no eval-split class balance is reported. The
+  former "heldout" (dev∪eval) aggregate is removed for the same reason; dev
+  is the pre-intervention reporting split.
+- Bank attribution for the identity probe uses FeatureDump.act_banks()
+  (act_bank field when present, exact for condition C's per-example bank
+  permutation; experts[token, slot] fallback). F_total comes from meta
+  `f_dict` when present, else is derived from the per-bank width `f`.
 """
 
 from __future__ import annotations
@@ -44,6 +62,11 @@ from moe_sae.model_loading import NUM_ROUTED_EXPERTS
 from moe_sae.train.config import global_width
 
 SPLIT_TRAIN, SPLIT_DEV, SPLIT_EVAL = 0, 1, 2
+
+EVAL_SPLIT_NOTE = (
+    "eval split (example_id % 100 in 90–99) untouched pre-intervention "
+    "(spec §17/§20); rerun with --include-eval-split after the intervention"
+)
 
 
 def example_split(example_id: np.ndarray) -> np.ndarray:
@@ -77,17 +100,35 @@ def gate_features(dump: FeatureDump) -> np.ndarray:
 def identity_features(dump: FeatureDump) -> sparse.csr_matrix:
     """[N, F_total] binary CSR — which latents fired under θ*-inference.
 
-    Global latent index: bank·f + latent for banked conditions (bank =
-    experts[act_token, act_slot]); the raw latent index for global conditions.
+    Global latent index: bank·f + latent for banked conditions, with bank
+    from FeatureDump.act_banks() (permutation-aware for condition C); the
+    raw latent index for global conditions. F_total is meta `f_dict` when
+    present, else derived from the per-bank width `f`.
     """
-    if dump.f is None:
-        raise ValueError("dump meta must provide per-bank width 'f' for the identity probe")
     n = dump.n_tokens
-    f_total = total_features(dump.condition, dump.f)
     if dump.is_banked:
-        banks = dump.experts[dump.act_token, dump.act_slot]
-        cols = banks * dump.f + dump.act_latent
+        f = dump.f
+        if f is None and dump.f_dict is not None:
+            f = dump.f_dict // NUM_ROUTED_EXPERTS
+        if f is None:
+            raise ValueError(
+                "identity probe needs the per-bank width: dump meta.json provides "
+                "neither 'f' nor 'f_dict' — write them, or pass f= to load_dump "
+                "(--f on scripts/run_analysis.py)"
+            )
+        f_total = dump.f_dict if dump.f_dict is not None else NUM_ROUTED_EXPERTS * f
+        cols = dump.act_banks() * f + dump.act_latent
     else:
+        if dump.f_dict is not None:
+            f_total = dump.f_dict
+        elif dump.f is not None:
+            f_total = global_width(dump.condition, dump.f)
+        else:
+            raise ValueError(
+                "identity probe needs the dictionary width: dump meta.json provides "
+                "neither 'f_dict' nor 'f' — write them, or pass f= to load_dump "
+                "(--f on scripts/run_analysis.py)"
+            )
         cols = dump.act_latent
     x = sparse.csr_matrix(
         (np.ones(len(cols), dtype=np.float32), (dump.act_token, cols)),
@@ -112,39 +153,75 @@ def _evaluate(clf: LogisticRegression, x, y: np.ndarray) -> dict | None:
 
 
 def run_probes(
-    dump: FeatureDump,
-    masses: BankMasses | None,
+    train_dump: FeatureDump,
+    train_masses: BankMasses | None,
+    score_dump: FeatureDump,
+    score_masses: BankMasses | None,
     c: float = 1.0,
     seed: int = 0,
     max_iter: int = 2000,
+    include_eval_split: bool = False,
 ) -> dict:
-    """Fit and score the §16.4 probes. `masses` is None for global conditions;
-    the bank-mass probes are then reported as skipped."""
-    y = (dump.token_type == TOKEN_TYPE_VISUAL).astype(np.int64)
-    split = example_split(dump.example_id)
-    train = split == SPLIT_TRAIN
-    dev = split == SPLIT_DEV
-    ev = split == SPLIT_EVAL
-    heldout = dev | ev
-    if not train.any() or np.unique(y[train]).size < 2:
-        raise ValueError("train split is empty or single-class; cannot fit probes")
+    """Fit the §16.4 probes on `train_dump`'s TRAIN-split tokens and score them
+    on `score_dump`'s DEV-split tokens. `*_masses` are None for global
+    conditions; the bank-mass probes are then reported as skipped. EVAL-split
+    scoring is off unless include_eval_split=True (post-intervention only —
+    see module Decisions)."""
+    if train_dump.condition != score_dump.condition:
+        raise ValueError(
+            f"probe train/score dumps disagree on condition: "
+            f"{train_dump.condition!r} vs {score_dump.condition!r}"
+        )
+    y_tr = (train_dump.token_type == TOKEN_TYPE_VISUAL).astype(np.int64)
+    y_sc = (score_dump.token_type == TOKEN_TYPE_VISUAL).astype(np.int64)
+    train = example_split(train_dump.example_id) == SPLIT_TRAIN
+    sc_split = example_split(score_dump.example_id)
+    dev = sc_split == SPLIT_DEV
+    ev = sc_split == SPLIT_EVAL
+    if not train.any() or np.unique(y_tr[train]).size < 2:
+        raise ValueError(
+            "train dump has no train-split tokens (example_id % 100 < 80) or a "
+            "single class; cannot fit probes — pass a TRAIN-split FeatureDump "
+            "(--train-dump on scripts/run_analysis.py)"
+        )
+    if not dev.any():
+        raise ValueError(
+            "score dump has no dev-split tokens (example_id % 100 in 80–89); "
+            "probes are scored on the dev split — pass a DEV-split FeatureDump "
+            "(--dump on scripts/run_analysis.py)"
+        )
 
-    x_gate = gate_features(dump)
-    x_id = identity_features(dump)
-    probes: dict[str, tuple[object, str]] = {"router_gates": (x_gate, "l2")}
-    if masses is not None:
-        x_mass = masses.m_act.astype(np.float32)
-        probes["sae_bank_mass"] = (x_mass, "l2")
-    probes["feature_identity"] = (x_id, "l1")
-    if masses is not None:
-        probes["gates_plus_bank_mass"] = (np.hstack([x_gate, x_mass]), "l2")
+    x_gate_tr, x_gate_sc = gate_features(train_dump), gate_features(score_dump)
+    x_id_tr, x_id_sc = identity_features(train_dump), identity_features(score_dump)
+    if x_id_tr.shape[1] != x_id_sc.shape[1]:
+        raise ValueError(
+            f"identity feature spaces differ: train dump F_total={x_id_tr.shape[1]}, "
+            f"score dump F_total={x_id_sc.shape[1]} — check the dumps' meta.json "
+            "'f'/'f_dict' fields (or the --f override)"
+        )
+    have_mass = train_masses is not None and score_masses is not None
+    probes: dict[str, tuple[object, object, str]] = {
+        "router_gates": (x_gate_tr, x_gate_sc, "l2")
+    }
+    if have_mass:
+        xm_tr = train_masses.m_act.astype(np.float32)
+        xm_sc = score_masses.m_act.astype(np.float32)
+        probes["sae_bank_mass"] = (xm_tr, xm_sc, "l2")
+    probes["feature_identity"] = (x_id_tr, x_id_sc, "l1")
+    if have_mass:
+        probes["gates_plus_bank_mass"] = (
+            np.hstack([x_gate_tr, xm_tr]),
+            np.hstack([x_gate_sc, xm_sc]),
+            "l2",
+        )
     probes["gates_plus_identity"] = (
-        sparse.hstack([sparse.csr_matrix(x_gate), x_id], format="csr"),
+        sparse.hstack([sparse.csr_matrix(x_gate_tr), x_id_tr], format="csr"),
+        sparse.hstack([sparse.csr_matrix(x_gate_sc), x_id_sc], format="csr"),
         "l1",
     )
 
     results: dict[str, dict | None] = {}
-    for name, (x, penalty) in probes.items():
+    for name, (x_tr, x_sc, penalty) in probes.items():
         # sklearn >= 1.8 deprecates penalty= in favor of l1_ratio (1.0 == pure
         # L1, 0.0 == pure L2); verified equivalent to the old penalty kwarg.
         if penalty == "l1":
@@ -153,38 +230,44 @@ def run_probes(
             )
         else:
             clf = LogisticRegression(l1_ratio=0.0, solver="lbfgs", C=c, max_iter=max_iter)
-        clf.fit(x[train], y[train])
+        clf.fit(x_tr[train], y_tr[train])
         entry = {
             "penalty": penalty,
-            "n_features": int(x.shape[1]),
-            "dev": _evaluate(clf, x[dev], y[dev]),
-            "eval": _evaluate(clf, x[ev], y[ev]),
-            "heldout": _evaluate(clf, x[heldout], y[heldout]),
+            "n_features": int(x_tr.shape[1]),
+            "dev": _evaluate(clf, x_sc[dev], y_sc[dev]),
+            "eval": (
+                _evaluate(clf, x_sc[ev], y_sc[ev])
+                if include_eval_split
+                else {"skipped": EVAL_SPLIT_NOTE}
+            ),
         }
         if penalty == "l1":
             entry["n_nonzero_coef"] = int(np.count_nonzero(clf.coef_))
         results[name] = entry
-    if masses is None:
+    if not have_mass:
         note = "global condition: no bank structure (spec §14)"
         results["sae_bank_mass"] = {"skipped": note}
         results["gates_plus_bank_mass"] = {"skipped": note}
 
-    def balance(mask: np.ndarray) -> dict:
+    def balance(dump: FeatureDump, y: np.ndarray, mask: np.ndarray) -> dict:
         return {
             "n_tokens": int(mask.sum()),
             "n_examples": int(np.unique(dump.example_id[mask]).size),
             "frac_visual": float(y[mask].mean()) if mask.any() else None,
         }
 
+    splits = {
+        "train": balance(train_dump, y_tr, train),
+        "dev": balance(score_dump, y_sc, dev),
+    }
+    if include_eval_split:
+        splits["eval"] = balance(score_dump, y_sc, ev)
+
     return {
-        "condition": dump.condition,
+        "condition": train_dump.condition,
         "C": c,
         "seed": seed,
-        "splits": {
-            "train": balance(train),
-            "dev": balance(dev),
-            "eval": balance(ev),
-            "heldout": balance(heldout),
-        },
+        "include_eval_split": include_eval_split,
+        "splits": splits,
         "probes": results,
     }

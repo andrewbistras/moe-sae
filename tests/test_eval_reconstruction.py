@@ -1,11 +1,21 @@
 """Reconstruction evaluation (spec §13): metrics against a naive per-token
 reference, FeatureDump contents against the contract, split filtering, global
-conditions, and the A-vs-C sanity gate (spec §20 step 5)."""
+conditions, real tiny SAECondition end-to-end runs (regression: dictionary
+sizing must use f_dict, not the per-bank-equivalent f), dump meta.json, script
+wiring (run_eval / run_intervention), and the A-vs-C sanity gate (spec §20
+step 5)."""
 
+import importlib.util
 import json
+import subprocess
+import sys
+from pathlib import Path
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
+from safetensors.torch import save_file
 
 from moe_sae.capture.writer import ShardWriter, iter_shards
 from moe_sae.eval.reconstruction import (
@@ -15,6 +25,8 @@ from moe_sae.eval.reconstruction import (
     split_mask,
 )
 from moe_sae.eval.sanity_gate import compare_sanity
+
+REPO = Path(__file__).resolve().parent.parent
 
 BANKS = 8
 F = 8
@@ -32,6 +44,7 @@ class FakeRoutedSAE:
     def __init__(self, num_banks=BANKS, f=F, d=D, seed=0):
         g = torch.Generator().manual_seed(seed)
         self.num_banks, self.f, self.d = num_banks, f, d
+        self.f_dict = f  # router-tied: per-dictionary-bank width == f
         self.W = torch.randn(num_banks, f, d, generator=g)
         self.b = torch.randn(num_banks, f, generator=g) * 0.1
         Dm = torch.randn(num_banks, d, f, generator=g)
@@ -72,15 +85,21 @@ class FakeRoutedSAE:
 
 
 class FakeGlobalSAE:
-    """Tiny global SAE (condition B/F shape): encodes c_route, num_banks=1."""
+    """Tiny global SAE (condition B shape): encodes c_route, num_banks=1.
+
+    Honest widths: `f` is the per-bank-equivalent width (as on SAECondition)
+    while the actual dictionary is `f_dict = 6f` — latent ids run up to
+    f_dict, so anything sized by num_banks·f under-allocates (the original
+    finding; the old fake set f = full width, masking the bug)."""
 
     condition = "B"
 
-    def __init__(self, f=16, d=D, seed=1):
+    def __init__(self, f=4, d=D, seed=1):
         g = torch.Generator().manual_seed(seed)
         self.num_banks, self.f, self.d = 1, f, d
-        self.W = torch.randn(f, d, generator=g)
-        Dm = torch.randn(d, f, generator=g)
+        self.f_dict = 6 * f  # condition B: compute-matched global width
+        self.W = torch.randn(self.f_dict, d, generator=g)
+        Dm = torch.randn(d, self.f_dict, generator=g)
         self.D = Dm / Dm.norm(dim=0, keepdim=True)
         self.mu = torch.randn(d, generator=g) * 0.5
 
@@ -164,7 +183,7 @@ def naive_metrics(root, split, sae, theta):
         l0_sum[pool] += enc.act_token.shape[0]
         n_pool[pool] += 1
         for b, l in zip(enc.act_bank.tolist(), enc.act_latent.tolist()):
-            fired.add(b * sae.f + l)
+            fired.add(b * sae.f_dict + l)
 
     covered = [e for e in range(64) if den_e[e] > 0]
     return {
@@ -177,7 +196,9 @@ def naive_metrics(root, split, sae, theta):
         "aggregate_nmse": num_a / den_a,
         "mean_l0": (l0_sum["visual"] + l0_sum["text"]) / n_total,
         "mean_l0_visual": l0_sum["visual"] / max(n_pool["visual"], 1),
-        "dead_pct": 100.0 * (sae.num_banks * sae.f - len(fired)) / (sae.num_banks * sae.f),
+        "dead_pct": 100.0
+        * (sae.num_banks * sae.f_dict - len(fired))
+        / (sae.num_banks * sae.f_dict),
         "n_total": n_total,
         "n_visual": n_pool["visual"],
     }
@@ -284,12 +305,227 @@ def test_global_condition(tmp_path):
     assert metrics["local_macro_nmse"] is None
     assert metrics["local_micro_nmse"] == pytest.approx(ref["local_micro_nmse"], rel=1e-6)
     assert metrics["aggregate_nmse"] == pytest.approx(ref["aggregate_nmse"], rel=1e-6)
-    assert metrics["n_latents_total"] == sae.f
+    # regression: the dictionary is f_dict (6f) wide, not the per-bank f
+    assert metrics["n_latents_total"] == sae.f_dict
+    assert metrics["dead_feature_pct"] == pytest.approx(ref["dead_pct"])
 
+    saw_wide_latent = False
     for dump in iter_dump_shards(tmp_path / "dump"):
         assert (dump["act_slot"] == 0).all()
         # global conditions: slot 0 carries ‖D z‖²; slots 1..5 are zero
         assert (dump["energy"][:, 1:] == 0).all()
+        if dump["act_latent"].numel():
+            assert int(dump["act_latent"].max()) < sae.f_dict
+            saw_wide_latent |= int(dump["act_latent"].max()) >= sae.f
+    # the fixture must actually exercise latent ids beyond the per-bank f,
+    # otherwise this test cannot catch num_banks·f sizing again
+    assert saw_wide_latent
+
+
+# --------------------------------------------------------------------------- #
+# Real tiny SAEConditions end to end (regression: num_banks·f sizing crashed   #
+# global conditions whose dictionary is f_dict = 6f/64f wide)                  #
+# --------------------------------------------------------------------------- #
+
+
+def tiny_real_condition(condition, f=4, k_bar=6, seed=1):
+    """A real SAECondition over the tiny capture dims (BANKS banks, d=D)."""
+    from moe_sae.sae import build_condition
+    from moe_sae.train.config import RunConfig
+
+    g = torch.Generator().manual_seed(seed)
+    mu_e = torch.randn(BANKS, D, generator=g) * 0.1
+    mu_route = torch.randn(D, generator=g) * 0.1
+    cfg = RunConfig(
+        run_name=f"tiny_{condition}",
+        condition=condition,
+        seed=seed,
+        f=f,
+        k_bar=k_bar,
+        total_tokens=0,
+        capture_root="unused",
+        stats_path="unused",
+        pipeline=True,
+        compute_dtype="float32",
+    )
+    return build_condition(condition, cfg, mu_e, mu_route, seed)
+
+
+@pytest.mark.parametrize("condition", ["A", "B", "F"])
+def test_real_tiny_condition_end_to_end(tmp_path, condition):
+    """Reviewer repro: condition B with f=4 has f_dict=24; sizing the
+    dictionary as num_banks·f made the fire-count bincount crash. Runs a real
+    build_condition SAE through evaluate_reconstruction on a tiny capture."""
+    build_capture(tmp_path / "cap")
+    cond = tiny_real_condition(condition)
+    theta = 0.5
+    metrics = evaluate_reconstruction(
+        cond, theta, tmp_path / "cap", "dev", tmp_path / "dump"
+    )
+    assert metrics["n_latents_total"] == cond.num_banks * cond.f_dict
+
+    ref = naive_metrics(tmp_path / "cap", "dev", cond, theta)
+    assert metrics["local_micro_nmse"] == pytest.approx(ref["local_micro_nmse"], rel=1e-5)
+    assert metrics["aggregate_nmse"] == pytest.approx(ref["aggregate_nmse"], rel=1e-5)
+    assert metrics["dead_feature_pct"] == pytest.approx(ref["dead_pct"])
+    fh = metrics["firing_freq_hist"]
+    assert sum(fh["counts"]) == metrics["n_latents_total"] - fh["never_fired"]
+
+    max_latent = -1
+    for dump in iter_dump_shards(tmp_path / "dump"):
+        if dump["act_latent"].numel():
+            max_latent = max(max_latent, int(dump["act_latent"].max()))
+    assert max_latent < cond.f_dict
+    if condition in ("B", "F"):
+        # the fixture must fire latents beyond the per-bank-equivalent f,
+        # otherwise it could not catch num_banks·f sizing again
+        assert max_latent >= cond.f
+
+
+def test_dump_meta_json_and_load_dump_roundtrip(tmp_path):
+    """FeatureDump producers write meta.json so analysis.load_dump can resolve
+    condition/f without explicit overrides (regression: never written)."""
+    from moe_sae.analysis.mass import load_dump
+
+    build_capture(tmp_path / "cap")
+    sae = FakeGlobalSAE()
+    evaluate_reconstruction(sae, 0.5, tmp_path / "cap", "dev", tmp_path / "dump")
+
+    meta = json.loads((tmp_path / "dump" / "meta.json").read_text())
+    assert meta == {
+        "condition": "B",
+        "f": sae.f,
+        "f_dict": sae.f_dict,
+        "num_banks": 1,
+        "split": "dev",
+        "theta_star": 0.5,
+    }
+    dump = load_dump(tmp_path / "dump")  # no condition= override needed now
+    assert dump.condition == "B"
+    assert dump.f == sae.f
+
+
+# --------------------------------------------------------------------------- #
+# Script wiring (scripts/run_eval.py, scripts/run_intervention.py)             #
+# --------------------------------------------------------------------------- #
+
+
+def _import_script(name):
+    spec = importlib.util.spec_from_file_location(name, REPO / "scripts" / f"{name}.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_run_eval_script_end_to_end(tmp_path):
+    """Regression: run_eval called a nonexistent conditions.load_checkpoint;
+    also pins --split train (§16.4 probes fit on train) and dump meta.json."""
+    build_capture(tmp_path / "cap")
+    cond = tiny_real_condition("A")
+    run_dir = tmp_path / "run"
+    cond.save_checkpoint(
+        run_dir / "final" / "checkpoint.safetensors", cond.theta_ema, cond.dead_tracker, step=3
+    )
+    (run_dir / "final" / "theta_star.json").write_text(json.dumps({"theta_star": 0.5}))
+
+    res = subprocess.run(
+        [
+            sys.executable,
+            str(REPO / "scripts" / "run_eval.py"),
+            "--run", str(run_dir),
+            "--capture", str(tmp_path / "cap"),
+            "--split", "train",
+            "--dump", str(tmp_path / "dump"),
+            "--device", "cpu",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=REPO,
+    )
+    assert res.returncode == 0, res.stderr
+    meta = json.loads((tmp_path / "dump" / "meta.json").read_text())
+    assert meta["condition"] == "A" and meta["split"] == "train"
+    assert meta["theta_star"] == 0.5
+    metrics = json.loads((run_dir / "eval_train" / "metrics.json").read_text())
+    assert metrics["split"] == "train"
+    assert metrics["n_latents_total"] == cond.num_banks * cond.f_dict
+
+
+def _write_intervention_dump(dump_dir):
+    """Minimal FeatureDump: banks 2 and 3 carry visual-enriched latents."""
+    dump_dir.mkdir(parents=True, exist_ok=True)
+    acts, token_type = [], []
+    n = 40
+    for t in range(n):
+        if t < 20:  # visual tokens
+            token_type.append(1)
+            acts.append((t, 0, 2, 1, 3.0))
+            acts.append((t, 1, 3, 2, 2.0))
+        else:  # text tokens
+            token_type.append(0)
+            acts.append((t, 0, 0, 3, 3.0))
+    tok, slot, bank, lat, val = zip(*acts)
+    save_file(
+        {
+            "act_token": torch.tensor(tok, dtype=torch.int64),
+            "act_slot": torch.tensor(slot, dtype=torch.uint8),
+            "act_bank": torch.tensor(bank, dtype=torch.uint8),
+            "act_latent": torch.tensor(lat, dtype=torch.int32),
+            "act_value": torch.tensor(val, dtype=torch.float32),
+            "token_type": torch.tensor(token_type, dtype=torch.uint8),
+            "experts": torch.zeros(n, 6, dtype=torch.uint8),
+            "gates": torch.zeros(n, 6, dtype=torch.float32),
+            "example_id": torch.arange(n, dtype=torch.int32),
+            "domain": torch.zeros(n, dtype=torch.uint8),
+            "l0": torch.zeros(n, dtype=torch.int32),
+            "energy": torch.zeros(n, 6, dtype=torch.float32),
+        },
+        str(dump_dir / "shard_00000.safetensors"),
+    )
+
+
+def test_intervention_load_floor_uses_training_loads(tmp_path):
+    """Regression: the §16.3 floor must see runs/<run>/final/bank_loads.npy
+    (training loads), not the stats-pass counts, when the artifact exists."""
+    ri = _import_script("run_intervention")
+    _write_intervention_dump(tmp_path / "dump")
+    stats = SimpleNamespace(
+        p_gate_visual=torch.full((64,), 1.0 / 64.0),
+        bank_counts=torch.full((64,), 10**6, dtype=torch.int64),  # all pass
+    )
+    run_dir = tmp_path / "run"
+    (run_dir / "final").mkdir(parents=True)
+    loads = np.full(64, 10**6, dtype=np.int64)
+    loads[3] = 0  # bank 3 starved in TRAINING, healthy in the stats pass
+    np.save(run_dir / "final" / "bank_loads.npy", loads)
+
+    counts = ri.load_training_bank_counts(run_dir, stats)
+    assert int(counts[3]) == 0 and int(counts[2]) == 10**6
+
+    kwargs = dict(f=4, top_n_experts=2, quantile=0.5, load_floor=500_000)
+    J = ri.select_J_with_training_loads(tmp_path / "dump", stats, counts, **kwargs)
+    assert (2, 1) in J
+    assert all(b != 3 for b, _ in J)  # floor came from bank_loads.npy
+
+    # sanity: with the training loads all healthy, bank 3 is selected — the
+    # array we pass is really what reaches the floor comparison
+    healthy = torch.full((64,), 10**6, dtype=torch.int64)
+    J2 = ri.select_J_with_training_loads(tmp_path / "dump", stats, healthy, **kwargs)
+    assert (3, 2) in J2
+
+    # the adapter must not mutate the caller's stats object
+    assert int(stats.bank_counts[3]) == 10**6
+
+
+def test_intervention_bank_counts_fallback_warns(tmp_path, capsys):
+    ri = _import_script("run_intervention")
+    stats = SimpleNamespace(
+        p_gate_visual=torch.full((64,), 1.0 / 64.0),
+        bank_counts=torch.arange(64, dtype=torch.int64),
+    )
+    counts = ri.load_training_bank_counts(tmp_path / "missing_run", stats)
+    assert torch.equal(counts, stats.bank_counts)
+    assert "bank_loads.npy" in capsys.readouterr().out
 
 
 def test_sanity_gate(tmp_path):

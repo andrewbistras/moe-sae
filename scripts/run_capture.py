@@ -40,6 +40,12 @@ def main() -> None:
     p.add_argument("--max-seq-len", type=int, default=2048)
     p.add_argument("--shard-size", type=int, default=16384)
     p.add_argument(
+        "--resume",
+        action="store_true",
+        help="continue an interrupted capture at --out from its progress.json "
+        "(identical parameters required; a completed capture is a no-op)",
+    )
+    p.add_argument(
         "--export-validation-inputs",
         metavar="DIR",
         default=None,
@@ -81,16 +87,22 @@ def main() -> None:
             {d: domain_stream(d, split=args.split) for d in domains}, seed=args.seed
         )
 
+    # The raw stream (not islice) goes to the driver: on --resume it
+    # fast-forwards by the recorded consumed count, and n_examples_target
+    # bounds CONSUMED examples so resumed runs stop at the same stream
+    # position a single uninterrupted run would.
     capture_examples(
         model=model,
         processor=processor,
-        examples_iter=itertools.islice(examples, args.examples),
+        examples_iter=examples,
         out_root=args.out,
         visual_cap_per_example=args.visual_cap,
         seed=args.seed,
         max_seq_len=args.max_seq_len,
         text_control=args.text_control,
         shard_size=args.shard_size,
+        n_examples_target=args.examples,
+        resume=args.resume,
     )
     _hard_exit()
 
@@ -106,4 +118,17 @@ def _hard_exit() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except BaseException:
+        # A crash must not fall through to normal interpreter exit: abandoned
+        # HF streaming iterators leave pyarrow IO threads whose ThreadPool
+        # shutdown deadlocks in exit() (observed: process hung in
+        # __cxa_finalize after an exception). Print and hard-exit instead.
+        import traceback
+
+        traceback.print_exc()
+        logging.shutdown()
+        os._exit(1)

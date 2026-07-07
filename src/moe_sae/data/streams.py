@@ -194,6 +194,12 @@ def domain_stream(
         if buckets is not None and raw_index % 10 not in buckets:
             continue
         image, prompt_text, answer_text = spec.map_record(rec)
+        # The vendored processor pads with a 3-tuple background color and
+        # normalizes 3 channels; grayscale/palette/RGBA images (present in
+        # COCO/TextVQA train splits) crash ImageOps.pad. RGB is the contract.
+        # (getattr guard: tests inject non-PIL sentinel objects as images.)
+        if image is not None and getattr(image, "mode", "RGB") != "RGB":
+            image = image.convert("RGB")
         yield Example(
             example_id=base + out_index,
             domain=domain,

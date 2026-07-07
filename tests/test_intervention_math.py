@@ -16,6 +16,7 @@ from moe_sae.eval.intervention import (
     latent_stats_from_dump,
     load_ablation_set,
     matched_control_sets,
+    removed_norm_report,
     run_intervention,
     save_ablation_set,
     select_enriched_latents,
@@ -354,8 +355,8 @@ def test_latent_stats_from_dump(tmp_path):
     assert float(ls["bank_mass_text"][0]) == pytest.approx(4.0)
 
 
-def test_select_enriched_latents(tmp_path):
-    # banks 2 and 3 carry visual mass; bank 0 is text-dominated.
+def _enrichment_acts():
+    """Banks 2 and 3 carry visual mass; bank 0 is text-dominated."""
     acts = []
     token_type = []
     n = 40
@@ -371,6 +372,11 @@ def test_select_enriched_latents(tmp_path):
             acts.append((t, 0, 0, 3, 3.0))  # text-only latent (bank 0)
             acts.append((t, 1, 2, 0, 0.1))  # bank-2 latent firing mostly on text
             acts.append((t, 2, 2, 3, 1.0))  # bank-2 latent firing ONLY on text
+    return acts, token_type, n
+
+
+def test_select_enriched_latents(tmp_path):
+    acts, token_type, n = _enrichment_acts()
     write_dump_shard(tmp_path, 0, acts, n, token_type)
 
     J = select_enriched_latents(
@@ -393,6 +399,33 @@ def test_select_enriched_latents(tmp_path):
         load_floor=500_000,
     )
     assert all(b != 3 for b, _ in J2)
+
+
+def test_select_enriched_latents_bank_counts_source(tmp_path, caplog):
+    # Regression: the §16.3 load floor must come from an explicit bank_counts
+    # (TRAINING loads) when given, not from the stats pass.
+    import numpy as np
+
+    acts, token_type, n = _enrichment_acts()
+    write_dump_shard(tmp_path, 0, acts, n, token_type)
+
+    counts = np.full(64, 10**6, dtype=np.int64)
+    counts[3] = 0  # training loads exclude bank 3
+    stats = make_stats()  # stats-pass loads would admit EVERY bank
+    J = select_enriched_latents(
+        tmp_path, stats, f=4, top_n_experts=2, quantile=0.5,
+        load_floor=500_000, bank_counts=counts,
+    )
+    assert J and all(b != 3 for b, _ in J)
+
+    # fallback path: no bank_counts → stats.bank_counts, with a logged warning
+    with caplog.at_level("WARNING", logger="moe_sae.eval.intervention"):
+        J2 = select_enriched_latents(
+            tmp_path, stats, f=4, top_n_experts=2, quantile=0.5,
+            load_floor=500_000,
+        )
+    assert any("bank_counts" in r.message for r in caplog.records)
+    assert any(b == 3 for b, _ in J2)  # bank 3 eligible again under stats loads
 
 
 def test_save_load_ablation_set(tmp_path):
@@ -431,3 +464,126 @@ def test_matched_control_sets(tmp_path):
         J, tmp_path, make_stats(), f=32, n_controls=4, seed=11
     )
     assert controls == controls2
+
+
+# --------------------------------------------------------------------------- #
+# Post-hoc removed-vector-norm measurement (spec §17 fifth criterion)          #
+# --------------------------------------------------------------------------- #
+
+
+def _fire_all_encoding(pairs, n_tok, d):
+    """Every (bank, latent) in `pairs` fires at every token with value 1.0."""
+    rows = [(t, s, b, l) for t in range(n_tok) for s, (b, l) in enumerate(pairs)]
+    tok, slot, bank, lat = zip(*rows)
+    return ThresholdedEncoding(
+        act_token=torch.tensor(tok, dtype=torch.int64),
+        act_slot=torch.tensor(slot, dtype=torch.int64),
+        act_bank=torch.tensor(bank, dtype=torch.int64),
+        act_latent=torch.tensor(lat, dtype=torch.int64),
+        act_value=torch.ones(len(rows), dtype=torch.float32),
+        recon_slots=torch.zeros(n_tok, len(pairs), d),
+        mu_slots=torch.zeros(n_tok, len(pairs), d),
+    )
+
+
+def test_removed_norm_report_equal_mass_different_norms():
+    # Regression: two latent sets with EQUAL total coefficient mass (the
+    # per-latent proxy) but different per-token removed-vector norms —
+    # aligned vs orthogonal decoder columns. The report must expose the
+    # difference and flag the mismatched set.
+    d, f = 4, 8
+    e1 = torch.zeros(d)
+    e1[0] = 1.0
+    e2 = torch.zeros(d)
+    e2[1] = 1.0
+    D = torch.zeros(3, d, f)
+    D[0, :, 0] = e1  # bank 0: two ALIGNED unit columns (like an enriched bank)
+    D[0, :, 1] = e1
+    D[1, :, 0] = e1  # bank 1: two ORTHOGONAL unit columns
+    D[1, :, 1] = e2
+    D[2, :, 0] = e2  # bank 2: aligned — a genuinely norm-matched control
+    D[2, :, 1] = e2
+
+    def dcols(bank, latent):
+        return D[bank.to(torch.int64), :, latent.to(torch.int64)]
+
+    J = [(0, 0), (0, 1)]  # per-token removed vector 2·e1 → norm 2
+    ctrl_orth = [(1, 0), (1, 1)]  # same mass (2.0), removed norm √2
+    ctrl_good = [(2, 0), (2, 1)]  # same mass, same norm 2
+    enc = _fire_all_encoding(J + ctrl_orth + ctrl_good, n_tok=3, d=d)
+
+    report = removed_norm_report(J, [ctrl_orth, ctrl_good], [enc], f, dcols, d)
+    assert report["J"]["n_positions"] == 3
+    assert report["J"]["mean"] == pytest.approx(2.0)
+    assert report["J"]["median"] == pytest.approx(2.0)
+    assert report["J"]["p90"] == pytest.approx(2.0)
+
+    orth = report["sets"][0]
+    assert orth["mean"] == pytest.approx(2**0.5)
+    assert orth["mean_ratio_vs_J"] == pytest.approx(2**0.5 / 2.0)
+    assert orth["flag_removed_norm"] is True  # ~29% below J > 20% tolerance
+
+    good = report["sets"][1]
+    assert good["mean_ratio_vs_J"] == pytest.approx(1.0)
+    assert good["flag_removed_norm"] is False
+
+    # a wider tolerance unflags the orthogonal set
+    loose = removed_norm_report(
+        J, [ctrl_orth], [enc], f, dcols, d, norm_tolerance=0.5
+    )
+    assert loose["sets"][0]["flag_removed_norm"] is False
+
+    # a control that never fires cannot be compared → flagged, 0 positions
+    never = removed_norm_report(J, [[(1, 5)]], [enc], f, dcols, d)
+    assert never["sets"][0]["n_positions"] == 0
+    assert never["sets"][0]["mean"] is None
+    assert never["sets"][0]["flag_removed_norm"] is True
+
+
+def test_matched_control_sets_embeds_removed_norms(tmp_path):
+    # Same dump fixture as test_matched_control_sets: equal per-latent mass,
+    # so construction-time matching is perfect — but J's decoder columns are
+    # aligned while the control bank's are orthogonal, so the measured
+    # per-token removed norms differ (3 vs √3) and every set is flagged.
+    acts = []
+    token_type = [1] * 10 + [0] * 10
+    for t in range(10):
+        for l in range(3):
+            acts.append((t, 0, 2, l, 1.0))
+        for l in range(30):
+            acts.append((t, 1, 1, l, 1.0))
+    write_dump_shard(tmp_path, 0, acts, 20, token_type)
+
+    d, f = 32, 32
+    D = torch.zeros(3, d, f)
+    for l in range(3):
+        D[2, 0, l] = 1.0  # J bank: all columns aligned to e0
+    for l in range(30):
+        D[1, 1 + l, l] = 1.0  # control bank: mutually orthogonal columns
+
+    def dcols(bank, latent):
+        return D[bank.to(torch.int64), :, latent.to(torch.int64)]
+
+    J = [(2, 0), (2, 1), (2, 2)]
+    pairs = J + [(1, l) for l in range(30)]
+    enc = _fire_all_encoding(pairs, n_tok=2, d=d)
+
+    controls, report = matched_control_sets(
+        J, tmp_path, make_stats(), f=f, n_controls=3, seed=11,
+        decoder_cols=dcols, encoded_samples=[enc], d=d,
+    )
+    # per-latent proxy matching still reports parity...
+    assert all(sr["total_mass_ratio"] == pytest.approx(1.0) for sr in report["sets"])
+    # ...but the post-hoc token-level measurement exposes the norm mismatch
+    rn = report["removed_norms"]
+    assert rn["norm_tolerance"] == 0.2
+    assert rn["J"]["mean"] == pytest.approx(3.0)
+    assert len(rn["sets"]) == 3
+    for s in rn["sets"]:
+        assert s["mean"] == pytest.approx(3**0.5)
+        assert s["mean_ratio_vs_J"] == pytest.approx(3**0.5 / 3.0)
+        assert s["flag_removed_norm"] is True
+
+    # without decoder access the report simply omits the measurement
+    _, report2 = matched_control_sets(J, tmp_path, make_stats(), f=f, n_controls=2)
+    assert "removed_norms" not in report2

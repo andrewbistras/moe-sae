@@ -19,17 +19,17 @@ from pathlib import Path
 FIDELITY_DOMAINS = ("coco", "textvqa", "chartqa", "ai2d", "text_control")
 
 
-def load_theta_star(run_dir: Path) -> float:
-    """runs/<name>/final/theta_star.json — {'theta_star': x} or a bare float."""
-    raw = json.loads((run_dir / "final" / "theta_star.json").read_text())
-    return float(raw["theta_star"]) if isinstance(raw, dict) else float(raw)
-
-
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--run", required=True, help="run directory (runs/<run_name>)")
     ap.add_argument("--capture", required=True, help="capture root (captures/<name>)")
-    ap.add_argument("--split", required=True, choices=("dev", "eval"))
+    ap.add_argument(
+        "--split",
+        required=True,
+        choices=("train", "dev", "eval"),
+        help="capture split; 'train' produces the dump the §16.4 probes FIT on "
+        "(the reconstruction metrics are then in-sample for that split)",
+    )
     ap.add_argument("--dump", required=True, help="FeatureDump output dir (dumps/<run>/<split>)")
     ap.add_argument("--out", default=None, help="metrics dir inside the run (default eval_<split>)")
     ap.add_argument("--fidelity", default=None, help="comma list of modes: matched,full")
@@ -45,11 +45,10 @@ def main() -> None:
     from moe_sae.eval.fidelity import run_fidelity
     from moe_sae.eval.reconstruction import evaluate_reconstruction
     from moe_sae.model_loading import pick_device
-    from moe_sae.sae import conditions
+    from moe_sae.sae import load_condition_from_run
 
     device = str(pick_device(args.device))
-    theta_star = load_theta_star(run_dir)
-    condition = conditions.load_checkpoint(run_dir, device=device)
+    condition, theta_star, _extras = load_condition_from_run(run_dir, device=device)
 
     metrics = evaluate_reconstruction(
         condition, theta_star, args.capture, args.split, args.dump, device=device

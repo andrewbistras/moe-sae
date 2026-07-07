@@ -1,14 +1,25 @@
 #!/usr/bin/env python
-"""Run the spec §14–§16 analyses over a FeatureDump and write JSON + summary.
+"""Run the spec §14–§16 analyses over FeatureDumps and write JSON + summary.
 
 Usage:
     uv run python scripts/run_analysis.py \
-        --dump dumps/<run>/<split> --stats stats/<name> \
+        --dump dumps/<run>/dev --stats stats/<name> \
         --out reports/analysis_<run>/ [--load-floor 500000] \
-        [--compare-dump dumps/<C-run>/<split>] \
-        [--seed-dumps dumps/<A-seed2>/<split> dumps/<A-seed3>/<split>] \
-        [--condition A] [--seed 0] [--n-shuffles 1000] [--n-boot 1000] \
-        [--probe-c 1.0]
+        [--train-dump dumps/<run>/train] \
+        [--compare-dump dumps/<C-run>/dev] \
+        [--seed-dumps dumps/<A-seed2>/dev dumps/<A-seed3>/dev] \
+        [--condition A] [--f 4096] [--seed 0] [--n-shuffles 1000] \
+        [--n-boot 1000] [--probe-c 1.0] [--include-eval-split]
+
+--dump is the dev/primary dump: §14–§16.3 run on it, and the §16.4 probes are
+scored on its dev-split tokens. The probes are FIT on --train-dump (a
+TRAIN-split dump from the same run); without --train-dump the probes are
+skipped with a logged notice. --include-eval-split additionally scores probes
+on the frozen eval split (example_id % 100 in 90–99) — POST-INTERVENTION ONLY:
+spec §17/§20 require evaluation data untouched until the intervention runs.
+--condition/--f override missing meta.json fields (applied to --dump,
+--train-dump and --seed-dumps, which share the run's condition; --compare-dump
+is condition C and must carry its own meta.json).
 
 Outputs: mass.json, enrichment.json, stability.json, probes.json, summary.md.
 For global conditions (B/F) the bank-structured analyses (§14–§16.3) are
@@ -95,33 +106,52 @@ def _write_summary(out: Path, args, dump, mass_report, enr, stab, prob) -> None:
             lines.append(f"\nMean pairwise Jaccard: {_fmt(mean_j)}")
     else:
         lines += ["## §14–§16.3", "", GLOBAL_NOTE, ""]
-    lines += ["", "## §16.4 incremental modality information (heldout = dev+eval)", "", "| probe | accuracy | ROC-AUC | nnz coef |", "|---|---|---|---|"]
-    for name, res in prob["probes"].items():
-        if res is None or "skipped" in res:
-            lines.append(f"| {name} | skipped | — | — |")
-            continue
-        h = res["heldout"]
-        nnz = res.get("n_nonzero_coef", "—")
-        lines.append(f"| {name} | {_fmt(h['accuracy'])} | {_fmt(h['auc'])} | {nnz} |")
-    tb = prob["splits"]["train"]
-    hb = prob["splits"]["heldout"]
-    lines.append(
-        f"\nClass balance (frac visual): train {_fmt(tb['frac_visual'])} "
-        f"({tb['n_tokens']} tokens), heldout {_fmt(hb['frac_visual'])} "
-        f"({hb['n_tokens']} tokens)."
-    )
+    if "skipped" in prob:
+        lines += ["", "## §16.4 incremental modality information", "", f"Skipped: {prob['skipped']}"]
+    else:
+        lines += ["", "## §16.4 incremental modality information", "", "| probe | split | accuracy | ROC-AUC | nnz coef |", "|---|---|---|---|---|"]
+        for name, res in prob["probes"].items():
+            if res is None or "skipped" in res:
+                lines.append(f"| {name} | — | skipped | — | — |")
+                continue
+            nnz = res.get("n_nonzero_coef", "—")
+            for part in ("dev", "eval"):
+                r = res[part]
+                if r is None or "skipped" in r:
+                    continue
+                lines.append(
+                    f"| {name} | {part} | {_fmt(r['accuracy'])} | {_fmt(r['auc'])} | {nnz} |"
+                )
+        if not prob["include_eval_split"]:
+            lines.append("\nEval split not scored (pre-intervention; spec §17/§20).")
+        tb = prob["splits"]["train"]
+        db = prob["splits"]["dev"]
+        lines.append(
+            f"\nClass balance (frac visual): train {_fmt(tb['frac_visual'])} "
+            f"({tb['n_tokens']} tokens), dev {_fmt(db['frac_visual'])} "
+            f"({db['n_tokens']} tokens)."
+        )
     (out / "summary.md").write_text("\n".join(lines) + "\n")
 
 
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--dump", required=True, help="dumps/<run>/<split> directory")
+    ap.add_argument("--dump", required=True, help="dev/primary dump: dumps/<run>/dev")
     ap.add_argument("--stats", required=True, help="stats artifact (dir or .safetensors)")
     ap.add_argument("--out", required=True, help="report output directory")
     ap.add_argument("--load-floor", type=int, default=500_000)
+    ap.add_argument(
+        "--train-dump", default=None,
+        help="TRAIN-split dump the §16.4 probes are fit on; probes are skipped when absent",
+    )
+    ap.add_argument(
+        "--include-eval-split", action="store_true",
+        help="also score probes on the frozen eval split — POST-INTERVENTION ONLY (spec §17/§20)",
+    )
     ap.add_argument("--compare-dump", default=None, help="condition-C dump for §16.1")
     ap.add_argument("--seed-dumps", nargs="*", default=[], help="replicate-seed dumps for §16.3")
-    ap.add_argument("--condition", default=None, help="override dump meta condition")
+    ap.add_argument("--condition", default=None, help="override dump meta condition (metaless dumps)")
+    ap.add_argument("--f", type=int, default=None, help="override dump meta per-bank width f (metaless dumps)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--n-shuffles", type=int, default=1000)
     ap.add_argument("--n-boot", type=int, default=1000)
@@ -130,7 +160,7 @@ def main(argv: list[str] | None = None) -> None:
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    dump = load_dump(args.dump, condition=args.condition)
+    dump = load_dump(args.dump, condition=args.condition, f=args.f)
     stats = load_stats(args.stats)
     masses = token_bank_masses(dump)
     mods = modality_masks(dump)
@@ -170,7 +200,7 @@ def main(argv: list[str] | None = None) -> None:
 
         seed_q = {}
         for sd in args.seed_dumps:
-            sdump = load_dump(sd)
+            sdump = load_dump(sd, condition=args.condition, f=args.f)
             smasses = token_bank_masses(sdump)
             if smasses is None:
                 continue
@@ -196,8 +226,24 @@ def main(argv: list[str] | None = None) -> None:
         json.dumps(stab if stab is not None else {"condition": dump.condition, "note": GLOBAL_NOTE}, indent=2)
     )
 
-    # ---- §16.4 probes (all conditions) ----
-    prob = run_probes(dump, masses, c=args.probe_c, seed=args.seed)
+    # ---- §16.4 probes (all conditions; fit on --train-dump, scored on --dump) ----
+    if args.train_dump:
+        tdump = load_dump(args.train_dump, condition=args.condition, f=args.f)
+        prob = run_probes(
+            tdump,
+            token_bank_masses(tdump),
+            dump,
+            masses,
+            c=args.probe_c,
+            seed=args.seed,
+            include_eval_split=args.include_eval_split,
+        )
+    else:
+        prob = {
+            "skipped": "--train-dump not provided; §16.4 probes fit on a "
+            "TRAIN-split FeatureDump (dumps/<run>/train)"
+        }
+        print(f"probes skipped: {prob['skipped']}")
     (out / "probes.json").write_text(json.dumps(prob, indent=2))
 
     _write_summary(out, args, dump, mass_report, enr, stab, prob)

@@ -33,6 +33,7 @@ from moe_sae.sae.conditions import (  # noqa: E402
     StepOutput,
     ThresholdedEncoding,
     build_condition,
+    load_condition_from_run,
 )
 from moe_sae.sae.dead import DeadTracker  # noqa: E402
 from moe_sae.sae.optim import SpecAdam  # noqa: E402
@@ -48,4 +49,5 @@ __all__ = [
     "StepOutput",
     "ThresholdedEncoding",
     "build_condition",
+    "load_condition_from_run",
 ]

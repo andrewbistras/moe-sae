@@ -117,6 +117,89 @@ def test_domain_counts(tmp_path):
     assert stats.domain_counts["text"] == {"coco": 2, "textvqa": 2, "chartqa": 2, "ai2d": 1}
 
 
+def build_mixed_capture(root, seed=3):
+    """Both pools contain train, dev, and eval buckets (raw int32 domain-offset
+    ids: %100 in {0..79}, {80..89}, {90..99})."""
+    g = torch.Generator().manual_seed(seed)
+    ids = {
+        "visual": [250000000, 250000001, 250000085, 250000092],
+        "text": [300000002, 300000003, 300000188, 300000297],
+    }
+    rows = {}
+    for pool, n in (("visual", 12), ("text", 8)):
+        w = ShardWriter(root, pool, shard_size=4)
+        experts = torch.stack([torch.randperm(E, generator=g)[:K] for _ in range(n)])
+        c = torch.randn(n, K, D, generator=g)
+        gates = torch.rand(n, K, generator=g)
+        eid = torch.tensor([ids[pool][t % 4] for t in range(n)], dtype=torch.int32)
+        domain = (torch.arange(n) % 4).to(torch.uint8)
+        w.add(c, experts, gates, eid, domain)
+        w.close()
+        rows[pool] = eid
+    return rows
+
+
+def test_split_filter_matches_train_only_reference(tmp_path):
+    # Regression (blocker): μ_e / baselines must be train-bucket statistics.
+    build_mixed_capture(tmp_path / "mixed")
+    # reference capture holding ONLY the train-bucket rows
+    g = torch.Generator().manual_seed(3)
+    ids = {
+        "visual": [250000000, 250000001, 250000085, 250000092],
+        "text": [300000002, 300000003, 300000188, 300000297],
+    }
+    for pool, n in (("visual", 12), ("text", 8)):
+        w = ShardWriter(tmp_path / "trainonly", pool, shard_size=4)
+        experts = torch.stack([torch.randperm(E, generator=g)[:K] for _ in range(n)])
+        c = torch.randn(n, K, D, generator=g)
+        gates = torch.rand(n, K, generator=g)
+        eid = torch.tensor([ids[pool][t % 4] for t in range(n)], dtype=torch.int32)
+        keep = (eid.to(torch.int64) % 100) < 80
+        domain = (torch.arange(n) % 4).to(torch.uint8)
+        w.add(c[keep], experts[keep], gates[keep], eid[keep], domain[keep])
+        w.close()
+
+    stats = compute_stats(tmp_path / "mixed", num_experts=E, hidden_size=D)
+    ref = compute_stats(
+        tmp_path / "trainonly", num_experts=E, hidden_size=D, split=None
+    )
+    assert torch.allclose(stats.mu_e, ref.mu_e)
+    assert torch.allclose(stats.mu_route, ref.mu_route)
+    assert torch.equal(stats.bank_counts, ref.bank_counts)
+    assert torch.allclose(stats.p_route_visual, ref.p_route_visual)
+    assert torch.allclose(stats.p_gate_text, ref.p_gate_text)
+    # kept/excluded accounting: 12 visual rows -> 6 train / 6 dev+eval, etc.
+    assert stats.tokens_visual == 6 and stats.excluded_visual == 6
+    assert stats.tokens_text == 4 and stats.excluded_text == 4
+    assert stats.split == "train"
+
+
+def test_split_none_keeps_all_rows(tmp_path):
+    build_mixed_capture(tmp_path)
+    stats = compute_stats(tmp_path, num_experts=E, hidden_size=D, split=None)
+    ref = naive_reference(tmp_path)  # naive loop has no filter
+    assert torch.allclose(stats.mu_e.to(torch.float64), ref["mu_e"], atol=1e-6)
+    assert stats.tokens_visual == 12 and stats.tokens_text == 8
+    assert stats.excluded_visual == 0 and stats.excluded_text == 0
+    assert stats.split is None
+
+
+def test_split_counts_in_summary_json(tmp_path):
+    import json
+
+    build_mixed_capture(tmp_path / "cap")
+    stats = compute_stats(tmp_path / "cap", num_experts=E, hidden_size=D)
+    save_stats(stats, tmp_path / "stats")
+    summary = json.loads((tmp_path / "stats" / "stats.json").read_text())
+    assert summary["split"] == "train"
+    assert summary["tokens"]["visual"] == 6
+    assert summary["tokens"]["excluded_visual"] == 6
+    assert summary["tokens"]["excluded_text"] == 4
+    loaded = load_stats(tmp_path / "stats")
+    assert loaded.split == "train"
+    assert loaded.excluded_visual == 6 and loaded.excluded_text == 4
+
+
 def test_save_load_roundtrip(tmp_path):
     build_capture(tmp_path / "cap")
     stats = compute_stats(tmp_path / "cap", num_experts=E, hidden_size=D)

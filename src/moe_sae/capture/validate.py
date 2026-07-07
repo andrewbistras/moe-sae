@@ -23,6 +23,13 @@ Two phases, run sequentially in one process with explicit memory release:
 
 Validation inputs: `examples_{i:04d}.pt` dicts produced by
 `moe_sae.data.evalsets.export_validation_inputs` (docs/INTERFACES.md).
+
+Decisions:
+- Token budget: the §3 gate is requested over `n_tokens` tokens; a PASS on
+  fewer accumulated tokens (inputs dir too small) is NOT a PASS. In that case
+  the overall `gate` is reported as "INSUFFICIENT_TOKENS" (never "PASS"), with
+  requested vs actual counts in `token_budget`. A FAIL on insufficient tokens
+  stays "FAIL" (more severe); the budget shortfall is still recorded.
 """
 
 from __future__ import annotations
@@ -143,6 +150,23 @@ def gate_verdict(
     if n == 0:
         out["note"] = "no tokens validated — cannot pass an empty gate"
     return out
+
+
+def token_budget_verdict(gate: str, requested: int, actual: int) -> tuple[str, dict]:
+    """Spec §3 token-budget check: a PASS may not stand on fewer accumulated
+    tokens than requested. Returns (gate', budget_report). A "PASS" with
+    actual < requested is demoted to "INSUFFICIENT_TOKENS"; a "FAIL" stays
+    "FAIL" (more severe) with the shortfall still recorded."""
+    budget = {
+        "requested": int(requested),
+        "actual": int(actual),
+        "sufficient": bool(actual >= requested),
+    }
+    if not budget["sufficient"]:
+        budget["note"] = "validated fewer tokens than requested — gate cannot PASS"
+        if gate == "PASS":
+            gate = "INSUFFICIENT_TOKENS"
+    return gate, budget
 
 
 def summarize_rel(rel: np.ndarray) -> dict:
@@ -438,10 +462,13 @@ def run_validation(
 ) -> dict:
     """Run both phases and write the report JSON. Returns the report dict.
 
-    Gate semantics (decision, see docs): overall `gate` is "PASS" iff BOTH the
-    spec §3 FP32 criterion (every token rel < 1e-5) AND the production-path
-    cross-check (every token ≤ 1e-5) hold — a failing cross-check means the
-    shard-writing capture path is invalid, which must block training.
+    Gate semantics (decision, see docs): overall `gate` is "PASS" iff ALL of
+    the spec §3 FP32 criterion (every token rel < 1e-5), the production-path
+    cross-check (every token ≤ 1e-5), AND the token budget (accumulated tokens
+    ≥ `n_tokens`) hold — a failing cross-check means the shard-writing capture
+    path is invalid, and a budget shortfall means the gate never saw the
+    requested sample; either must block training. A budget shortfall alone is
+    reported as gate "INSUFFICIENT_TOKENS" (see module Decisions).
     """
     dev = pick_device(device)
     files = _input_files(inputs_dir)
@@ -499,6 +526,10 @@ def run_validation(
     }
     report["gate"] = (
         "PASS" if fp32_verdict["status"] == "PASS" and crosscheck_pass else "FAIL"
+    )
+    # Spec §3 token budget: PASS must not stand on fewer tokens than requested.
+    report["gate"], report["token_budget"] = token_budget_verdict(
+        report["gate"], n_tokens, int(rel.size)
     )
     per_domain = _per_domain(domains, rel, nz, "fp32")
 

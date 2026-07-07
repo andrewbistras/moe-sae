@@ -1,0 +1,26 @@
+[runner] attempt 1 2026-07-06 22:56:00 
+2026-07-06 22:56:01,407 moe_sae.model_loading INFO Loading deepseek-ai/deepseek-vl2-tiny in torch.bfloat16 on mps ...
+/Users/abistras/Desktop/moe-sae/.venv/lib/python3.11/site-packages/huggingface_hub/file_download.py:949: FutureWarning: `resume_download` is deprecated and will be removed in version 1.0.0. Downloads always resume when possible. If you want to force a new download, use `force_download=True`.
+  warnings.warn(
+2026-07-06 22:56:10,442 moe_sae.model_loading INFO Frozen architecture verified: 12 layers, dense layer 0, MoE layer 5 with 64 routed + 2 shared experts, top-6 routing, d=1280.
+Special tokens have been added in the vocabulary, make sure the associated word embeddings are fine-tuned or trained.
+Add pad token = ['<｜▁pad▁｜>'] to the tokenizer
+<｜▁pad▁｜>:2
+Add image token = ['<image>'] to the tokenizer
+<image>:128815
+Add grounding-related tokens = ['<|ref|>', '<|/ref|>', '<|det|>', '<|/det|>', '<|grounding|>'] to the tokenizer with input_ids
+<|ref|>:128816
+<|/ref|>:128817
+<|det|>:128818
+<|/det|>:128819
+<|grounding|>:128820
+Add chat tokens = ['<|User|>', '<|Assistant|>'] to the tokenizer with input_ids
+<|User|>:128821
+<|Assistant|>:128822
+
+2026-07-06 22:56:11,408 __main__ INFO model loaded: FrozenModelInfo(model_id='deepseek-ai/deepseek-vl2-tiny', hidden_size=1280, num_language_layers=12, num_routed_experts=64, num_shared_experts=2, top_k_routed=6, target_layer_zero_indexed=5, dtype='torch.bfloat16', device='mps')
+huggingface/tokenizers: The current process just got forked, after parallelism has already been used. Disabling parallelism to avoid deadlocks...
+To disable this warning, you can either:
+	- Avoid using `tokenizers` before the fork if possible
+	- Explicitly set the environment variable TOKENIZERS_PARALLELISM=(true | false)
+You're using a LlamaTokenizerFast tokenizer. Please note that with a fast tokenizer, using the `__call__` method is faster than using a method to encode the text followed by a call to the `pad` method to get a padded encoding.

@@ -15,6 +15,14 @@ Computes, in one streaming pass with float64 accumulators:
 
 Outputs `stats.safetensors` (tensors, float32/int64) plus a human-readable
 `stats.json` summary. Banks never routed to have μ_e = 0 and count 0.
+
+Decisions:
+- Split filtering (docs/INTERFACES.md §Splits): μ_e and the router baselines
+  are training-distribution statistics (spec §5 "initial statistics pass"), so
+  `compute_stats` consumes ONLY the train buckets (`example_id % 100` in 0–79)
+  by default (`split='train'`; `split=None` disables filtering). stats.json
+  reports kept and excluded token counts per pool plus the split used. The
+  modulo applies to the raw int32 domain-offset example_id.
 """
 
 from __future__ import annotations
@@ -27,6 +35,7 @@ import torch
 from safetensors.torch import load_file, save_file
 
 from moe_sae.capture.writer import DOMAIN_NAMES, POOLS, iter_shards
+from moe_sae.data.batches import SPLIT_RANGES, split_mask
 from moe_sae.model_loading import HIDDEN_SIZE, NUM_ROUTED_EXPERTS, TOP_K_ROUTED
 
 STATS_FILE = "stats.safetensors"
@@ -49,6 +58,9 @@ class ActivationStats:
     tokens_visual: int
     tokens_text: int
     domain_counts: dict  # {pool: {domain_name: n_tokens}}
+    split: str | None = "train"  # split the pass was restricted to (None = all)
+    excluded_visual: int = 0  # tokens dropped by the split filter per pool
+    excluded_text: int = 0
 
     @property
     def tokens_total(self) -> int:
@@ -61,8 +73,14 @@ def compute_stats(
     num_experts: int = NUM_ROUTED_EXPERTS,
     hidden_size: int = HIDDEN_SIZE,
     top_k: int = TOP_K_ROUTED,
+    split: str | None = "train",
 ) -> ActivationStats:
-    """Single streaming pass over both pools; all accumulators float64/int64."""
+    """Single streaming pass over both pools; all accumulators float64/int64.
+
+    Only `split` rows (default: train buckets, example_id % 100 in 0–79) are
+    accumulated; `split=None` disables the filter (debugging only).
+    """
+    assert split is None or split in SPLIT_RANGES, split
     root = Path(capture_root)
     d = hidden_size
 
@@ -71,10 +89,17 @@ def compute_stats(
     counts = {p: torch.zeros(num_experts, dtype=torch.int64) for p in POOLS}
     gate_sums = {p: torch.zeros(num_experts, dtype=torch.float64) for p in POOLS}
     n_tokens = {p: 0 for p in POOLS}
+    n_excluded = {p: 0 for p in POOLS}
     domain_counts: dict[str, dict[str, int]] = {p: {} for p in POOLS}
 
     for pool in POOLS:
         for shard in iter_shards(root, pool):
+            if split is not None:
+                keep = split_mask(shard["example_id"], split)
+                n_excluded[pool] += int((~keep).sum())
+                shard = {k: v[keep] for k, v in shard.items()}
+                if not bool(keep.any()):
+                    continue
             c = shard["c"].to(torch.float64)  # [N, 6, d]
             experts = shard["experts"].to(torch.int64)  # [N, 6]
             gates = shard["gates"].to(torch.float64)  # [N, 6]
@@ -125,6 +150,9 @@ def compute_stats(
         tokens_visual=n_tokens["visual"],
         tokens_text=n_tokens["text"],
         domain_counts=domain_counts,
+        split=split,
+        excluded_visual=n_excluded["visual"],
+        excluded_text=n_excluded["text"],
     )
 
 
@@ -146,10 +174,13 @@ def save_stats(stats: ActivationStats, out_dir: str | Path) -> Path:
 
     counts = stats.bank_counts
     summary = {
+        "split": stats.split,
         "tokens": {
             "visual": stats.tokens_visual,
             "text": stats.tokens_text,
             "total": stats.tokens_total,
+            "excluded_visual": stats.excluded_visual,
+            "excluded_text": stats.excluded_text,
         },
         "domain_counts": stats.domain_counts,
         "bank_counts": counts.tolist(),
@@ -190,4 +221,7 @@ def load_stats(stats_dir: str | Path) -> ActivationStats:
         tokens_visual=summary["tokens"]["visual"],
         tokens_text=summary["tokens"]["text"],
         domain_counts=summary["domain_counts"],
+        split=summary.get("split", "train"),
+        excluded_visual=summary["tokens"].get("excluded_visual", 0),
+        excluded_text=summary["tokens"].get("excluded_text", 0),
     )
