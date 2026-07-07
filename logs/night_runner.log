@@ -16,3 +16,17 @@
 [night 2026-07-07 07:33:21] stats: done already (stats/pipeline_1m/stats.safetensors)
 [night 2026-07-07 07:33:21] train A: wiping incomplete runs/pipeline_1m_A
 [night 2026-07-07 07:33:21] train A: attempt 1
+[night 2026-07-07 07:43:02] train A: OK
+[night 2026-07-07 07:43:02] train B: attempt 1
+[night 2026-07-07 07:44:51] train B: OK
+[night 2026-07-07 07:44:51] train C: attempt 1
+[night 2026-07-07 07:52:53] train C: OK
+[night 2026-07-07 07:52:53] eval A: attempt 1
+[night 2026-07-07 07:53:50] eval A: OK
+[night 2026-07-07 07:53:50] eval B: attempt 1
+[night 2026-07-07 07:54:01] eval B: OK
+[night 2026-07-07 07:54:01] eval C: attempt 1
+[night 2026-07-07 07:55:01] eval C: OK
+[night 2026-07-07 07:55:01] sanity-gate: attempt 1
+[night 2026-07-07 07:55:05] sanity-gate: OK
+[night 2026-07-07 07:55:05] pipeline chain complete — see reports/sanity_gate_pipeline.json

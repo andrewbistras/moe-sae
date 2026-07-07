@@ -85,3 +85,21 @@ torch.AcceleratorError: index 25165824 is out of bounds for dimension 0 with siz
 [night 2026-07-07 07:33:21] stats: done already (stats/pipeline_1m/stats.safetensors)
 [night 2026-07-07 07:33:21] train A: wiping incomplete runs/pipeline_1m_A
 [night 2026-07-07 07:33:21] train A: attempt 1
+[night 2026-07-07 07:43:02] train A: OK
+[night 2026-07-07 07:43:02] train B: attempt 1
+[night 2026-07-07 07:44:51] train B: OK
+[night 2026-07-07 07:44:51] train C: attempt 1
+[night 2026-07-07 07:52:53] train C: OK
+[night 2026-07-07 07:52:53] eval A: attempt 1
+[dev] local micro NMSE=0.24220689917141902, aggregate NMSE=0.21080950719983438, mean L0=45.80, dead=36.68%
+[night 2026-07-07 07:53:50] eval A: OK
+[night 2026-07-07 07:53:50] eval B: attempt 1
+[dev] local micro NMSE=0.36429136778931437, aggregate NMSE=0.36431442252762036, mean L0=34.96, dead=0.00%
+[night 2026-07-07 07:54:01] eval B: OK
+[night 2026-07-07 07:54:01] eval C: attempt 1
+[dev] local micro NMSE=0.4504168276272597, aggregate NMSE=0.5492492282032767, mean L0=46.40, dead=0.07%
+[night 2026-07-07 07:55:01] eval C: OK
+[night 2026-07-07 07:55:01] sanity-gate: attempt 1
+sanity gate: PASS 0.5377394544678428
+[night 2026-07-07 07:55:05] sanity-gate: OK
+[night 2026-07-07 07:55:05] pipeline chain complete — see reports/sanity_gate_pipeline.json
