@@ -1,0 +1,28 @@
+# Auto-consistent with moe_sae.train.config.RunConfig (frozen spec v0.1.1).
+# Frozen values (batch_tokens, lr schedule, Adam, aux, dead window, theta EMA)
+# are echoed here for the run artifact; RunConfig.validate() rejects edits.
+run_name: discovery_F_seed1
+condition: F
+seed: 1
+f: 4096
+k_bar: 64
+total_tokens: 50000000
+capture_root: captures/discovery_50m
+stats_path: stats/discovery_50m/stats.safetensors
+out_root: runs
+pipeline: false
+batch_tokens: 4096
+lr: 0.0003
+lr_min: 3.0e-05
+warmup_steps: 1000
+adam_beta1: 0.9
+adam_beta2: 0.999
+grad_clip: 1.0
+aux_alpha: 0.03125
+aux_token_budget: 512
+dead_window: 250000
+theta_ema_decay: 0.999
+device: auto
+log_every: 10
+ckpt_every_steps: 2000
+compute_dtype: bfloat16

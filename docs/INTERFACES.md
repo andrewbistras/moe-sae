@@ -193,12 +193,35 @@ Sparse activation fields (M = nonzero activations in shard):
 | key | shape | dtype | meaning |
 |---|---|---|---|
 | `act_token` | [M] | int64 | token row index within this shard |
-| `act_slot`  | [M] | uint8 | slot 0..5 (bank = experts[token, slot]); 0 for global conditions |
+| `act_slot`  | [M] | uint8 | slot 0..5; 0 for global conditions |
+| `act_bank`  | [M] | uint8 | assigned dictionary bank — equals experts[token, slot] for A/D/E, the *permuted* bank for C, 0 for B/F |
 | `act_latent`| [M] | int32 | latent index j within the bank / global dictionary |
 | `act_value` | [M] | float32 | z value (post θ* threshold) |
 
 Per-token parallel fields (N tokens): `experts` [N,6] u8, `gates` [N,6] f32,
-`token_type` [N] u8, `example_id` [N] i32, `domain` [N] u8, `l0` [N] i32.
+`token_type` [N] u8, `example_id` [N] i32, `domain` [N] u8, `l0` [N] i32,
+`energy` [N,6] f32 (per-slot ‖D_e z_te‖², slot 0 for global conditions — the
+§14 m_energy source; analysis skips the energy robustness check when absent).
+Consumers prefer `act_bank` for bank attribution and fall back to
+experts[token, slot] (exact for condition A only).
+
+## Frozen-θ* inference API (integration decision)
+
+`SAECondition.encode_thresholded(c [N,6,d], experts [N,6], example_id [N],
+theta_star) -> ThresholdedEncoding` (exported from `moe_sae.sae`): sparse
+act_token/act_slot/act_bank/act_latent/act_value + l0 [N] + recon_slots
+[N,S,d] (ĉ = μ + Dz) + mu_slots [N,S,d]; S=6 router-tied, S=1 global (B/F).
+`example_id` is REQUIRED — condition C's bank assignment is a per-example
+permutation even at inference. Conditions also expose `num_banks` (64
+router-tied / 1 global) and `decoder_cols(bank [M], latent [M]) -> [M, d]`.
+
+## Stats artifact (`train/stats_pass.py` → stats.safetensors)
+
+Keys: `mu_e` [64,1280] f32, `mu_route` [1280] f32, `bank_counts`,
+`bank_counts_visual`, `bank_counts_text` [64] i64, `p_route_visual`,
+`p_route_text`, `p_gate_visual`, `p_gate_text` [64] f32. The image modality is
+named **"visual"** in stored artifacts (matching capture pool names); analysis
+code maps its "image" naming onto the `_visual` keys when loading.
 
 ## Eval example provider (`moe_sae.data.evalsets`)
 
