@@ -635,3 +635,23 @@ You're using a LlamaTokenizerFast tokenizer. Please note that with a fast tokeni
 2026-07-07 06:40:31,676 moe_sae.capture.driver INFO 2400 consumed (2357 captured, 0 failed) | tokens {'visual': 1182487, 'text': 50600} | 0.4 ex/s
 2026-07-07 06:42:16,257 moe_sae.capture.driver WARNING skipping example 300000611 (ai2d): 2067 tokens > max_seq_len=2048
 2026-07-07 06:42:31,021 moe_sae.capture.driver INFO 2450 consumed (2406 captured, 0 failed) | tokens {'visual': 1206665, 'text': 51642} | 0.4 ex/s
+2026-07-07 06:43:14,523 moe_sae.capture.driver WARNING skipping example 300000616 (ai2d): 2061 tokens > max_seq_len=2048
+2026-07-07 06:43:19,979 moe_sae.capture.driver WARNING skipping example 300000617 (ai2d): 2059 tokens > max_seq_len=2048
+2026-07-07 06:44:35,042 moe_sae.capture.driver INFO 2500 consumed (2454 captured, 0 failed) | tokens {'visual': 1230513, 'text': 52563} | 0.4 ex/s
+2026-07-07 06:46:45,184 moe_sae.capture.driver INFO 2550 consumed (2504 captured, 0 failed) | tokens {'visual': 1255021, 'text': 53605} | 0.4 ex/s
+2026-07-07 06:47:43,889 moe_sae.capture.driver WARNING skipping example 300000642 (ai2d): 2070 tokens > max_seq_len=2048
+2026-07-07 06:47:47,590 moe_sae.capture.driver WARNING skipping example 300000643 (ai2d): 2062 tokens > max_seq_len=2048
+2026-07-07 06:48:00,389 moe_sae.capture.driver WARNING skipping example 300000644 (ai2d): 2053 tokens > max_seq_len=2048
+2026-07-07 06:48:56,024 moe_sae.capture.driver INFO 2600 consumed (2551 captured, 0 failed) | tokens {'visual': 1278721, 'text': 54534} | 0.4 ex/s
+2026-07-07 06:51:11,187 moe_sae.capture.driver INFO 2650 consumed (2601 captured, 0 failed) | tokens {'visual': 1303957, 'text': 55667} | 0.4 ex/s
+2026-07-07 06:53:09,884 moe_sae.capture.driver INFO 2700 consumed (2651 captured, 0 failed) | tokens {'visual': 1328647, 'text': 56710} | 0.4 ex/s
+2026-07-07 06:55:10,435 moe_sae.capture.driver INFO 2750 consumed (2701 captured, 0 failed) | tokens {'visual': 1354065, 'text': 57844} | 0.4 ex/s
+2026-07-07 06:56:06,566 moe_sae.capture.driver WARNING skipping example 300000693 (ai2d): 2062 tokens > max_seq_len=2048
+2026-07-07 06:56:11,003 moe_sae.capture.driver WARNING skipping example 300000694 (ai2d): 2055 tokens > max_seq_len=2048
+2026-07-07 06:57:07,974 moe_sae.capture.driver INFO 2800 consumed (2749 captured, 0 failed) | tokens {'visual': 1378004, 'text': 58844} | 0.4 ex/s
+2026-07-07 06:58:45,816 moe_sae.capture.driver WARNING skipping example 300000708 (ai2d): 2058 tokens > max_seq_len=2048
+2026-07-07 06:58:54,775 moe_sae.capture.driver WARNING skipping example 300000709 (ai2d): 2055 tokens > max_seq_len=2048
+2026-07-07 06:59:00,103 moe_sae.capture.driver WARNING skipping example 300000710 (ai2d): 2059 tokens > max_seq_len=2048
+2026-07-07 06:59:08,372 moe_sae.capture.driver WARNING skipping example 300000711 (ai2d): 2056 tokens > max_seq_len=2048
+2026-07-07 06:59:12,653 moe_sae.capture.driver INFO 2850 consumed (2795 captured, 0 failed) | tokens {'visual': 1401101, 'text': 59708} | 0.4 ex/s
+2026-07-07 07:01:35,402 moe_sae.capture.driver INFO 2900 consumed (2845 captured, 0 failed) | tokens {'visual': 1426519, 'text': 60900} | 0.4 ex/s
