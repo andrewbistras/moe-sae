@@ -24,3 +24,65 @@ To disable this warning, you can either:
 	- Avoid using `tokenizers` before the fork if possible
 	- Explicitly set the environment variable TOKENIZERS_PARALLELISM=(true | false)
 You're using a LlamaTokenizerFast tokenizer. Please note that with a fast tokenizer, using the `__call__` method is faster than using a method to encode the text followed by a call to the `pad` method to get a padded encoding.
+2026-07-06 22:58:58,961 moe_sae.capture.driver INFO 50 consumed (50 captured, 0 failed) | tokens {'visual': 25054, 'text': 1081} | 0.3 ex/s
+2026-07-06 23:01:07,586 moe_sae.capture.driver INFO 100 consumed (100 captured, 0 failed) | tokens {'visual': 49926, 'text': 2173} | 0.3 ex/s
+[runner] attempt 1 exited rc=137
+[runner] attempt 2 2026-07-06 23:01:55 --resume
+2026-07-06 23:01:57,626 moe_sae.model_loading INFO Loading deepseek-ai/deepseek-vl2-tiny in torch.bfloat16 on mps ...
+/Users/abistras/Desktop/moe-sae/.venv/lib/python3.11/site-packages/huggingface_hub/file_download.py:949: FutureWarning: `resume_download` is deprecated and will be removed in version 1.0.0. Downloads always resume when possible. If you want to force a new download, use `force_download=True`.
+  warnings.warn(
+2026-07-06 23:02:11,890 moe_sae.model_loading INFO Frozen architecture verified: 12 layers, dense layer 0, MoE layer 5 with 64 routed + 2 shared experts, top-6 routing, d=1280.
+Special tokens have been added in the vocabulary, make sure the associated word embeddings are fine-tuned or trained.
+Add pad token = ['<｜▁pad▁｜>'] to the tokenizer
+<｜▁pad▁｜>:2
+Add image token = ['<image>'] to the tokenizer
+<image>:128815
+Add grounding-related tokens = ['<|ref|>', '<|/ref|>', '<|det|>', '<|/det|>', '<|grounding|>'] to the tokenizer with input_ids
+<|ref|>:128816
+<|/ref|>:128817
+<|det|>:128818
+<|/det|>:128819
+<|grounding|>:128820
+Add chat tokens = ['<|User|>', '<|Assistant|>'] to the tokenizer with input_ids
+<|User|>:128821
+<|Assistant|>:128822
+
+2026-07-06 23:02:13,194 __main__ INFO model loaded: FrozenModelInfo(model_id='deepseek-ai/deepseek-vl2-tiny', hidden_size=1280, num_language_layers=12, num_routed_experts=64, num_shared_experts=2, top_k_routed=6, target_layer_zero_indexed=5, dtype='torch.bfloat16', device='mps')
+huggingface/tokenizers: The current process just got forked, after parallelism has already been used. Disabling parallelism to avoid deadlocks...
+To disable this warning, you can either:
+	- Avoid using `tokenizers` before the fork if possible
+	- Explicitly set the environment variable TOKENIZERS_PARALLELISM=(true | false)
+2026-07-06 23:02:44,750 moe_sae.capture.driver INFO resume: fast-forwarded 100 examples in 31.5s
+You're using a LlamaTokenizerFast tokenizer. Please note that with a fast tokenizer, using the `__call__` method is faster than using a method to encode the text followed by a call to the `pad` method to get a padded encoding.
+/Users/abistras/.local/share/uv/python/cpython-3.11.15-macos-aarch64-none/lib/python3.11/multiprocessing/resource_tracker.py:254: UserWarning: resource_tracker: There appear to be 1 leaked semaphore objects to clean up at shutdown
+  warnings.warn('resource_tracker: There appear to be %d '
+/Users/abistras/.local/share/uv/python/cpython-3.11.15-macos-aarch64-none/lib/python3.11/multiprocessing/resource_tracker.py:254: UserWarning: resource_tracker: There appear to be 1 leaked semaphore objects to clean up at shutdown
+  warnings.warn('resource_tracker: There appear to be %d '
+[runner] attempt 1 2026-07-06 23:03:30 --resume
+2026-07-06 23:03:32,213 moe_sae.model_loading INFO Loading deepseek-ai/deepseek-vl2-tiny in torch.bfloat16 on mps ...
+/Users/abistras/Desktop/moe-sae/.venv/lib/python3.11/site-packages/huggingface_hub/file_download.py:949: FutureWarning: `resume_download` is deprecated and will be removed in version 1.0.0. Downloads always resume when possible. If you want to force a new download, use `force_download=True`.
+  warnings.warn(
+2026-07-06 23:03:40,650 moe_sae.model_loading INFO Frozen architecture verified: 12 layers, dense layer 0, MoE layer 5 with 64 routed + 2 shared experts, top-6 routing, d=1280.
+Special tokens have been added in the vocabulary, make sure the associated word embeddings are fine-tuned or trained.
+Add pad token = ['<｜▁pad▁｜>'] to the tokenizer
+<｜▁pad▁｜>:2
+Add image token = ['<image>'] to the tokenizer
+<image>:128815
+Add grounding-related tokens = ['<|ref|>', '<|/ref|>', '<|det|>', '<|/det|>', '<|grounding|>'] to the tokenizer with input_ids
+<|ref|>:128816
+<|/ref|>:128817
+<|det|>:128818
+<|/det|>:128819
+<|grounding|>:128820
+Add chat tokens = ['<|User|>', '<|Assistant|>'] to the tokenizer with input_ids
+<|User|>:128821
+<|Assistant|>:128822
+
+2026-07-06 23:03:41,535 __main__ INFO model loaded: FrozenModelInfo(model_id='deepseek-ai/deepseek-vl2-tiny', hidden_size=1280, num_language_layers=12, num_routed_experts=64, num_shared_experts=2, top_k_routed=6, target_layer_zero_indexed=5, dtype='torch.bfloat16', device='mps')
+2026-07-06 23:03:41,546 moe_sae.capture.driver WARNING resume: deleting un-checkpointed shard captures/pipeline_1m/visual/shard_00004.safetensors
+huggingface/tokenizers: The current process just got forked, after parallelism has already been used. Disabling parallelism to avoid deadlocks...
+To disable this warning, you can either:
+	- Avoid using `tokenizers` before the fork if possible
+	- Explicitly set the environment variable TOKENIZERS_PARALLELISM=(true | false)
+2026-07-06 23:04:16,234 moe_sae.capture.driver INFO resume: fast-forwarded 100 examples in 34.7s
+You're using a LlamaTokenizerFast tokenizer. Please note that with a fast tokenizer, using the `__call__` method is faster than using a method to encode the text followed by a call to the `pad` method to get a padded encoding.

@@ -40,6 +40,9 @@ while ! is_complete; do
   fi
   RESUME=""
   [ -f "$OUT/progress.json" ] && RESUME="--resume"
+  # Sweep any orphaned worker for this capture root: killing the uv/caffeinate
+  # wrapper can orphan the python child, and two workers on one root collide.
+  pkill -9 -f "run_capture.py --out $OUT" 2>/dev/null && sleep 3
   echo "[runner] attempt $attempt $(date '+%F %T') $RESUME" >> "$LOG"
   PYTHONUNBUFFERED=1 caffeinate -i uv run --no-sync python scripts/run_capture.py \
     --out "$OUT" --examples "$EXAMPLES" --visual-cap "$VISUAL_CAP" \

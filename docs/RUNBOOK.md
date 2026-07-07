@@ -256,3 +256,28 @@ Decide on layer replication, width, model scale, SparseCore, and whether the
   engineering contract; if a script grows flags, `--help` wins on spelling but
   the *order of operations and the two hard gates* in this runbook are fixed
   by spec §20.
+
+## Resilient local execution (interrupt/sleep-safe)
+
+Long local stages run detached and self-heal; safe to close the terminal or
+put the laptop to sleep (work pauses and resumes on wake; `caffeinate -i`
+prevents idle sleep while running):
+
+```bash
+# capture (§20 step 2 data): checkpoints progress.json every 100 examples;
+# auto-restarts with --resume; ≤~5 min of work ever redone; kill-safe
+nohup scripts/run_pipeline_capture.sh >> logs/capture_runner.log 2>&1 &
+
+# everything after capture: stats → train A/B/C → eval dumps → §20.5 gate;
+# waits for capture to complete; every step idempotent — rerun anytime
+nohup scripts/run_pipeline_night.sh >> logs/night_runner.log 2>&1 &
+```
+
+Progress: `tail -f logs/capture_pipeline.log logs/pipeline_night.log`, or
+`python3 -m json.tool captures/pipeline_1m/progress.json`.
+
+Verified failure modes: SIGKILL of the worker (runner restarts `--resume`,
+stray un-checkpointed shards deleted), orphaned worker after wrapper death
+(pre-attempt sweep kills it), per-example data failures (logged + skipped;
+>5% failure rate aborts loudly), interpreter-exit pyarrow deadlock (hard
+exit paths).
