@@ -301,3 +301,27 @@ def test_determinism_same_seed(tmp_path):
             ln.pop("wall_time")  # the only legitimately nondeterministic field
         runs.append(lines)
     assert runs[0] == runs[1]
+
+
+def test_adaptive_capacity_growth():
+    """Overflow grows capacity (never drops tokens) and the step still
+    matches torch. All 24·6 slots pile onto two banks — far beyond a
+    capacity-8 start (the example-correlated hot-bank scenario)."""
+    torch_cond = build("A")
+    jax_cond = build("A")
+    batch = make_batch()
+    hot = torch.zeros_like(batch.experts)
+    hot[:, 3:] = 1  # banks 0 and 1 only
+    batch = TrainBatch(
+        c=batch.c, experts=hot, gates=batch.gates,
+        token_type=batch.token_type, example_id=batch.example_id,
+        domain=batch.domain,
+    )
+
+    out_t = torch_cond.training_step(batch, step=0)
+    run = JaxRun(jax_cond, capacity=8, device=jax.devices("cpu")[0])
+    out_j, _ = run.training_step(batch, lr=0.0)
+    assert run.capacity >= 72  # grew to fit 24·3=72 slots per bank
+    assert out_j["k_selected"] == out_t.k_selected == K_BAR * B
+    np.testing.assert_allclose(out_j["l_local"], out_t.l_local, rtol=1e-5)
+    np.testing.assert_allclose(out_j["theta_b"], out_t.theta_b, rtol=1e-5)

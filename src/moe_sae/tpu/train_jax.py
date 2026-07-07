@@ -18,6 +18,7 @@ Condition D's per-bank selection runs host-side through the torch engine
 from __future__ import annotations
 
 import json
+import logging
 import time
 from functools import partial
 from pathlib import Path
@@ -31,6 +32,8 @@ from moe_sae.sae import TrainBatch
 from moe_sae.sae.batchtopk import largest_remainder_budgets, per_bank_topk
 from moe_sae.sae.conditions import SAECondition
 from moe_sae.tpu import sae_jax as sj
+
+logger = logging.getLogger(__name__)
 
 _JNP_DTYPE = {torch.float32: jnp.float32, torch.bfloat16: jnp.bfloat16}
 
@@ -181,6 +184,28 @@ class JaxRun:
         self.capacity = max(cap, 128)
         return self.capacity
 
+    def _plan_with_adaptive_capacity(self, bank_ids_np, n_banks):
+        """Grouping plan that grows capacity on overflow instead of failing.
+
+        Real router loads are example-correlated (all tokens of an image pile
+        onto its experts together), so per-batch maxima far exceed iid
+        estimates — observed 909 slots on a bank whose aggregate share
+        predicts ~500 ± 22. Growth re-jits the step once per resize (rare;
+        capacity only ratchets up) and never drops a token (spec §6)."""
+        while True:
+            try:
+                return sj.grouping_plan(bank_ids_np, n_banks, self.capacity)
+            except RuntimeError:
+                observed = int(np.bincount(bank_ids_np.reshape(-1), minlength=n_banks).max())
+                new_cap = int(np.ceil(observed * 1.25 / 128.0) * 128)
+                assert new_cap > self.capacity, (observed, self.capacity)
+                logger.warning(
+                    "grouped-GEMM capacity %d → %d (max bank load %d); re-jitting",
+                    self.capacity, new_cap, observed,
+                )
+                self.capacity = new_cap
+                self._grad_fn = None  # rebuilt with the new static capacity
+
     def _build_grad_fn(self, kind: str):
         c = self.cond
         if self.is_global:
@@ -218,7 +243,7 @@ class JaxRun:
             bank_ids = c._bank_ids(experts, batch.example_id)  # torch (C-aware)
             B, S = bank_ids.shape
             self._capacity_for(B * S)
-            plan = sj.grouping_plan(bank_ids.numpy(), c.n_banks, self.capacity)
+            plan = self._plan_with_adaptive_capacity(bank_ids.numpy(), c.n_banks)
             cj = jnp.asarray(batch.c.float().numpy(), self.dtype)
             args = (
                 jnp.asarray(plan.bank_flat), jnp.asarray(plan.order),
