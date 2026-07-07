@@ -1,5 +1,13 @@
 # Implementation contract — frozen spec v0.1.1
 
+> **v0.1.2 note:** the operational decisions recorded here that carry scientific
+> weight (aux-loss normalization, condition-C construction, splits, θ_b
+> conventions, optimizer constants, deadness boundaries, backend-substitution
+> policy, capture/eval masks) are now FROZEN in
+> `spec/frozen_spec_v0.1.2_addendum.md` (A1–A10), which supersedes this file
+> for those items. This file remains the engineering reference for formats
+> and APIs.
+
 This document binds every module to shared formats and frozen constants. It is
 an *engineering* contract; the science is frozen in `spec/frozen_spec_v0.1.1.md`.
 If this document and the spec disagree, **the spec wins** and this file has a bug.
