@@ -281,3 +281,37 @@ stray un-checkpointed shards deleted), orphaned worker after wrapper death
 (pre-attempt sweep kills it), per-example data failures (logged + skipped;
 >5% failure rate aborts loudly), interpreter-exit pyarrow deadlock (hard
 exit paths).
+
+## TPU v4-32 execution plan (discovery §20 step 4)
+
+**Region**: TPU v4 lives in GCP `us-central2-b`. The GCS bucket MUST be in
+`us-central2` — in-region reads are free; cross-region/cloud egress on the
+~770 GB shard set is the one large avoidable I/O cost (~$70/TB, repeatedly).
+
+**Division of labor** (keeps the §3-gate-validated capture path untouched):
+- Capture stays PyTorch on a rented GPU (scripts/cloud/capture_discovery.sh,
+  ~8 h ≈ $10–25 spot on A100, shards rsync straight to the bucket).
+- SAE training runs in JAX on the slice (src/moe_sae/tpu/, checkpoint format
+  identical to torch — the whole eval/analysis stack works unchanged).
+- Data order: the JAX trainer reuses the torch BatchComposer (CPU) so batch
+  sequences are bit-identical across backends.
+
+**Why the whole suite is ~30 min on a v4-32**: SAE compute is tiny (~19
+PFLOP·s for an A-run, 10.7× for F). The binding resource is activation
+streaming (~90 GB/s for one run at 50% MFU) — solved by two design moves:
+1. *One stream, many consumers*: spec §10 requires matched data order across
+   conditions, so all 14 runs consume the identical batch sequence — fetch
+   once, broadcast; per-stream need drops to ~6 GB/s.
+2. *Host-RAM cache*: 770 GB < ~1.6 TB of host RAM across the 4 TPU-VMs; after
+   one free in-region GCS pass, every read is memory-speed and the A-runs are
+   compute-bound (≥50% MFU). Grouped-GEMM capacity padding costs ~2× on A's
+   encode (Cap=768 vs mean load 384) — still ~5× cheaper than F.
+
+**Order of operations**: 00_provision.sh → 01_setup_hosts.sh →
+02_smoke_ladder.sh (rungs 1–2 run free locally first; rung 4–5 replicate the
+pipeline run and the A-vs-C sanity gate cross-backend before any discovery
+spend) → capture_discovery.sh on the GPU box → 03_discovery_suite.sh.
+
+**Cost picture**: GPU capture $10–25 + storage ~$15/mo + in-region reads $0 +
+~1 h of v4-32 (free under TRC). MFU >50% target applies to the A-shape
+training steps; F-runs are the wall-clock stragglers by construction.

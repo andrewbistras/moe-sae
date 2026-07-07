@@ -575,3 +575,63 @@ huggingface/tokenizers: The current process just got forked, after parallelism h
 To disable this warning, you can either:
 	- Avoid using `tokenizers` before the fork if possible
 	- Explicitly set the environment variable TOKENIZERS_PARALLELISM=(true | false)
+2026-07-07 05:49:06,978 moe_sae.capture.driver INFO resume: fast-forwarded 1200 examples in 38.8s
+You're using a LlamaTokenizerFast tokenizer. Please note that with a fast tokenizer, using the `__call__` method is faster than using a method to encode the text followed by a call to the `pad` method to get a padded encoding.
+2026-07-07 05:51:57,929 moe_sae.capture.driver INFO 1250 consumed (1239 captured, 0 failed) | tokens {'visual': 623448, 'text': 27414} | 0.3 ex/s
+2026-07-07 05:54:08,135 moe_sae.capture.driver INFO 1300 consumed (1289 captured, 0 failed) | tokens {'visual': 648684, 'text': 28466} | 0.3 ex/s
+2026-07-07 05:54:51,683 moe_sae.capture.driver WARNING skipping example 300000329 (ai2d): 2057 tokens > max_seq_len=2048
+2026-07-07 05:54:59,230 moe_sae.capture.driver WARNING skipping example 300000330 (ai2d): 2058 tokens > max_seq_len=2048
+2026-07-07 05:55:02,871 moe_sae.capture.driver WARNING skipping example 300000331 (ai2d): 2063 tokens > max_seq_len=2048
+2026-07-07 05:55:09,337 moe_sae.capture.driver WARNING skipping example 300000332 (ai2d): 2053 tokens > max_seq_len=2048
+2026-07-07 05:55:56,131 moe_sae.capture.driver INFO 1350 consumed (1335 captured, 0 failed) | tokens {'visual': 670962, 'text': 29421} | 0.4 ex/s
+2026-07-07 05:58:23,817 moe_sae.capture.driver INFO 1400 consumed (1385 captured, 0 failed) | tokens {'visual': 695925, 'text': 30482} | 0.4 ex/s
+2026-07-07 06:00:48,745 moe_sae.capture.driver INFO 1450 consumed (1435 captured, 0 failed) | tokens {'visual': 721070, 'text': 31541} | 0.4 ex/s
+2026-07-07 06:02:59,632 moe_sae.capture.driver INFO 1500 consumed (1485 captured, 0 failed) | tokens {'visual': 746033, 'text': 32603} | 0.4 ex/s
+2026-07-07 06:04:58,078 moe_sae.capture.driver INFO 1550 consumed (1535 captured, 0 failed) | tokens {'visual': 770086, 'text': 33666} | 0.4 ex/s
+2026-07-07 06:06:54,343 moe_sae.capture.driver INFO 1600 consumed (1585 captured, 0 failed) | tokens {'visual': 794503, 'text': 34719} | 0.4 ex/s
+2026-07-07 06:08:51,182 moe_sae.capture.driver INFO 1650 consumed (1635 captured, 0 failed) | tokens {'visual': 819193, 'text': 35721} | 0.4 ex/s
+2026-07-07 06:10:57,119 moe_sae.capture.driver INFO 1700 consumed (1685 captured, 0 failed) | tokens {'visual': 844429, 'text': 36805} | 0.4 ex/s
+2026-07-07 06:11:47,958 moe_sae.capture.driver WARNING skipping example 300000430 (ai2d): 2055 tokens > max_seq_len=2048
+2026-07-07 06:11:57,586 moe_sae.capture.driver WARNING skipping example 300000431 (ai2d): 2062 tokens > max_seq_len=2048
+2026-07-07 06:12:55,431 moe_sae.capture.driver INFO 1750 consumed (1733 captured, 0 failed) | tokens {'visual': 868459, 'text': 37775} | 0.4 ex/s
+2026-07-07 06:15:07,765 moe_sae.capture.driver INFO 1800 consumed (1783 captured, 0 failed) | tokens {'visual': 893240, 'text': 38825} | 0.4 ex/s
+2026-07-07 06:17:21,001 moe_sae.capture.driver INFO 1850 consumed (1833 captured, 0 failed) | tokens {'visual': 918294, 'text': 39902} | 0.4 ex/s
+2026-07-07 06:19:49,097 moe_sae.capture.driver INFO 1900 consumed (1883 captured, 0 failed) | tokens {'visual': 943712, 'text': 41072} | 0.4 ex/s
+2026-07-07 06:22:17,811 moe_sae.capture.driver INFO 1950 consumed (1933 captured, 0 failed) | tokens {'visual': 969130, 'text': 42181} | 0.4 ex/s
+2026-07-07 06:24:38,262 moe_sae.capture.driver INFO 2000 consumed (1983 captured, 0 failed) | tokens {'visual': 994730, 'text': 43310} | 0.4 ex/s
+2026-07-07 06:27:04,255 moe_sae.capture.driver WARNING skipping example 300000512 (ai2d): 2051 tokens > max_seq_len=2048
+2026-07-07 06:27:04,256 moe_sae.capture.driver INFO 2050 consumed (2032 captured, 0 failed) | tokens {'visual': 1019636, 'text': 44436} | 0.4 ex/s
+2026-07-07 06:29:02,510 moe_sae.capture.driver INFO 2100 consumed (2082 captured, 0 failed) | tokens {'visual': 1044781, 'text': 45422} | 0.4 ex/s
+2026-07-07 06:30:21,079 moe_sae.capture.driver WARNING skipping example 300000533 (ai2d): 2056 tokens > max_seq_len=2048
+2026-07-07 06:30:27,458 moe_sae.capture.driver WARNING skipping example 300000534 (ai2d): 2054 tokens > max_seq_len=2048
+2026-07-07 06:30:57,773 moe_sae.capture.driver WARNING skipping example 300000537 (ai2d): 2069 tokens > max_seq_len=2048
+2026-07-07 06:30:57,774 moe_sae.capture.driver INFO 2150 consumed (2129 captured, 0 failed) | tokens {'visual': 1068481, 'text': 46343} | 0.4 ex/s
+2026-07-07 06:31:02,239 moe_sae.capture.driver WARNING skipping example 300000538 (ai2d): 2056 tokens > max_seq_len=2048
+2026-07-07 06:31:10,764 moe_sae.capture.driver WARNING skipping example 300000539 (ai2d): 2054 tokens > max_seq_len=2048
+2026-07-07 06:31:17,733 moe_sae.capture.driver WARNING skipping example 300000540 (ai2d): 2053 tokens > max_seq_len=2048
+2026-07-07 06:32:52,647 moe_sae.capture.driver INFO 2200 consumed (2176 captured, 0 failed) | tokens {'visual': 1092272, 'text': 47267} | 0.4 ex/s
+2026-07-07 06:34:49,699 moe_sae.capture.driver INFO 2250 consumed (2226 captured, 0 failed) | tokens {'visual': 1116871, 'text': 48279} | 0.4 ex/s
+2026-07-07 06:36:14,273 moe_sae.capture.driver WARNING skipping example 300000571 (ai2d): 2060 tokens > max_seq_len=2048
+2026-07-07 06:36:26,805 moe_sae.capture.driver WARNING skipping example 300000572 (ai2d): 2058 tokens > max_seq_len=2048
+2026-07-07 06:36:47,082 moe_sae.capture.driver INFO 2300 consumed (2274 captured, 0 failed) | tokens {'visual': 1140901, 'text': 49167} | 0.4 ex/s
+2026-07-07 06:36:59,818 moe_sae.capture.driver WARNING skipping example 300000576 (ai2d): 2060 tokens > max_seq_len=2048
+2026-07-07 06:37:12,724 moe_sae.capture.driver WARNING skipping example 300000577 (ai2d): 2067 tokens > max_seq_len=2048
+2026-07-07 06:37:17,021 moe_sae.capture.driver WARNING skipping example 300000578 (ai2d): 2060 tokens > max_seq_len=2048
+2026-07-07 06:37:25,971 moe_sae.capture.driver WARNING skipping example 300000579 (ai2d): 2062 tokens > max_seq_len=2048
+2026-07-07 06:37:37,537 moe_sae.capture.driver WARNING skipping example 300000580 (ai2d): 2058 tokens > max_seq_len=2048
+2026-07-07 06:37:37,563 moe_sae.capture.driver WARNING skipping example 300000581 (ai2d): 2060 tokens > max_seq_len=2048
+2026-07-07 06:37:55,984 moe_sae.capture.driver WARNING skipping example 300000582 (ai2d): 2064 tokens > max_seq_len=2048
+2026-07-07 06:37:56,009 moe_sae.capture.driver WARNING skipping example 300000583 (ai2d): 2061 tokens > max_seq_len=2048
+2026-07-07 06:38:17,234 moe_sae.capture.driver WARNING skipping example 300000585 (ai2d): 2076 tokens > max_seq_len=2048
+2026-07-07 06:38:22,076 moe_sae.capture.driver WARNING skipping example 300000586 (ai2d): 2069 tokens > max_seq_len=2048
+2026-07-07 06:38:35,201 moe_sae.capture.driver INFO 2350 consumed (2314 captured, 0 failed) | tokens {'visual': 1160653, 'text': 49792} | 0.4 ex/s
+2026-07-07 06:38:37,897 moe_sae.capture.driver WARNING skipping example 300000587 (ai2d): 2057 tokens > max_seq_len=2048
+2026-07-07 06:38:37,928 moe_sae.capture.driver WARNING skipping example 300000588 (ai2d): 2062 tokens > max_seq_len=2048
+2026-07-07 06:38:53,942 moe_sae.capture.driver WARNING skipping example 300000589 (ai2d): 2059 tokens > max_seq_len=2048
+2026-07-07 06:38:55,656 moe_sae.capture.driver WARNING skipping example 300000590 (ai2d): 2058 tokens > max_seq_len=2048
+2026-07-07 06:39:03,668 moe_sae.capture.driver WARNING skipping example 300000591 (ai2d): 2058 tokens > max_seq_len=2048
+2026-07-07 06:39:16,555 moe_sae.capture.driver WARNING skipping example 300000592 (ai2d): 2058 tokens > max_seq_len=2048
+2026-07-07 06:39:25,661 moe_sae.capture.driver WARNING skipping example 300000593 (ai2d): 2070 tokens > max_seq_len=2048
+2026-07-07 06:40:31,676 moe_sae.capture.driver INFO 2400 consumed (2357 captured, 0 failed) | tokens {'visual': 1182487, 'text': 50600} | 0.4 ex/s
+2026-07-07 06:42:16,257 moe_sae.capture.driver WARNING skipping example 300000611 (ai2d): 2067 tokens > max_seq_len=2048
+2026-07-07 06:42:31,021 moe_sae.capture.driver INFO 2450 consumed (2406 captured, 0 failed) | tokens {'visual': 1206665, 'text': 51642} | 0.4 ex/s
