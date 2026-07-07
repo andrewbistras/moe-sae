@@ -86,3 +86,492 @@ To disable this warning, you can either:
 	- Explicitly set the environment variable TOKENIZERS_PARALLELISM=(true | false)
 2026-07-06 23:04:16,234 moe_sae.capture.driver INFO resume: fast-forwarded 100 examples in 34.7s
 You're using a LlamaTokenizerFast tokenizer. Please note that with a fast tokenizer, using the `__call__` method is faster than using a method to encode the text followed by a call to the `pad` method to get a padded encoding.
+2026-07-06 23:06:29,991 moe_sae.capture.driver INFO 150 consumed (150 captured, 0 failed) | tokens {'visual': 74525, 'text': 3294} | 0.4 ex/s
+2026-07-06 23:07:12,225 moe_sae.capture.driver WARNING skipping example 300000041 (ai2d): 2063 tokens > max_seq_len=2048
+2026-07-06 23:07:29,594 moe_sae.capture.driver WARNING skipping example 300000042 (ai2d): 2062 tokens > max_seq_len=2048
+2026-07-06 23:07:34,359 moe_sae.capture.driver WARNING skipping example 300000043 (ai2d): 2060 tokens > max_seq_len=2048
+2026-07-06 23:07:46,926 moe_sae.capture.driver WARNING skipping example 300000044 (ai2d): 2061 tokens > max_seq_len=2048
+2026-07-06 23:07:52,830 moe_sae.capture.driver WARNING skipping example 300000045 (ai2d): 2054 tokens > max_seq_len=2048
+2026-07-06 23:08:01,915 moe_sae.capture.driver WARNING skipping example 300000046 (ai2d): 2055 tokens > max_seq_len=2048
+2026-07-06 23:08:40,103 moe_sae.capture.driver INFO 200 consumed (194 captured, 0 failed) | tokens {'visual': 96507, 'text': 4137} | 0.4 ex/s
+2026-07-06 23:11:17,601 moe_sae.capture.driver INFO 250 consumed (244 captured, 0 failed) | tokens {'visual': 121561, 'text': 5244} | 0.4 ex/s
+2026-07-06 23:13:39,803 moe_sae.capture.driver INFO 300 consumed (294 captured, 0 failed) | tokens {'visual': 146797, 'text': 6388} | 0.4 ex/s
+2026-07-06 23:15:46,794 moe_sae.capture.driver INFO 350 consumed (344 captured, 0 failed) | tokens {'visual': 171760, 'text': 7553} | 0.4 ex/s
+2026-07-06 23:18:29,888 moe_sae.capture.driver INFO 400 consumed (394 captured, 0 failed) | tokens {'visual': 197360, 'text': 8767} | 0.4 ex/s
+2026-07-06 23:20:56,623 moe_sae.capture.driver INFO 450 consumed (444 captured, 0 failed) | tokens {'visual': 222960, 'text': 9787} | 0.3 ex/s
+2026-07-06 23:23:12,372 moe_sae.capture.driver INFO 500 consumed (494 captured, 0 failed) | tokens {'visual': 247832, 'text': 10931} | 0.4 ex/s
+2026-07-06 23:25:23,638 moe_sae.capture.driver INFO 550 consumed (544 captured, 0 failed) | tokens {'visual': 272886, 'text': 12027} | 0.4 ex/s
+2026-07-06 23:27:18,849 moe_sae.capture.driver INFO 600 consumed (594 captured, 0 failed) | tokens {'visual': 297758, 'text': 13097} | 0.4 ex/s
+2026-07-06 23:27:45,429 moe_sae.capture.driver WARNING skipping example 300000152 (ai2d): 2056 tokens > max_seq_len=2048
+2026-07-06 23:27:54,549 moe_sae.capture.driver WARNING skipping example 300000153 (ai2d): 2065 tokens > max_seq_len=2048
+2026-07-06 23:28:02,629 moe_sae.capture.driver WARNING skipping example 300000154 (ai2d): 2067 tokens > max_seq_len=2048
+2026-07-06 23:28:12,810 moe_sae.capture.driver WARNING skipping example 300000155 (ai2d): 2063 tokens > max_seq_len=2048
+2026-07-06 23:28:22,029 moe_sae.capture.driver WARNING skipping example 300000156 (ai2d): 2058 tokens > max_seq_len=2048
+2026-07-06 23:29:24,772 moe_sae.capture.driver INFO 650 consumed (639 captured, 0 failed) | tokens {'visual': 320707, 'text': 13903} | 0.4 ex/s
+2026-07-06 23:31:33,625 moe_sae.capture.driver INFO 700 consumed (689 captured, 0 failed) | tokens {'visual': 345397, 'text': 15003} | 0.4 ex/s
+2026-07-06 23:33:35,985 moe_sae.capture.driver INFO 750 consumed (739 captured, 0 failed) | tokens {'visual': 370997, 'text': 16090} | 0.4 ex/s
+2026-07-06 23:35:53,623 moe_sae.capture.driver INFO 800 consumed (789 captured, 0 failed) | tokens {'visual': 396597, 'text': 17263} | 0.4 ex/s
+2026-07-06 23:38:02,717 moe_sae.capture.driver INFO 850 consumed (839 captured, 0 failed) | tokens {'visual': 421378, 'text': 18352} | 0.4 ex/s
+2026-07-06 23:40:21,429 moe_sae.capture.driver INFO 900 consumed (889 captured, 0 failed) | tokens {'visual': 446978, 'text': 19530} | 0.4 ex/s
+2026-07-06 23:42:31,077 moe_sae.capture.driver INFO 950 consumed (939 captured, 0 failed) | tokens {'visual': 472305, 'text': 20567} | 0.4 ex/s
+2026-07-06 23:44:41,710 moe_sae.capture.driver INFO 1000 consumed (989 captured, 0 failed) | tokens {'visual': 497541, 'text': 21701} | 0.4 ex/s
+2026-07-06 23:46:48,553 moe_sae.capture.driver INFO 1050 consumed (1039 captured, 0 failed) | tokens {'visual': 522595, 'text': 22805} | 0.4 ex/s
+/Users/abistras/.local/share/uv/python/cpython-3.11.15-macos-aarch64-none/lib/python3.11/multiprocessing/resource_tracker.py:254: UserWarning: resource_tracker: There appear to be 1 leaked semaphore objects to clean up at shutdown
+  warnings.warn('resource_tracker: There appear to be %d '
+[runner] attempt 1 2026-07-06 23:49:43 --resume
+2026-07-06 23:49:45,552 moe_sae.model_loading INFO Loading deepseek-ai/deepseek-vl2-tiny in torch.bfloat16 on mps ...
+/Users/abistras/Desktop/moe-sae/.venv/lib/python3.11/site-packages/huggingface_hub/file_download.py:949: FutureWarning: `resume_download` is deprecated and will be removed in version 1.0.0. Downloads always resume when possible. If you want to force a new download, use `force_download=True`.
+  warnings.warn(
+2026-07-06 23:49:54,064 moe_sae.model_loading INFO Frozen architecture verified: 12 layers, dense layer 0, MoE layer 5 with 64 routed + 2 shared experts, top-6 routing, d=1280.
+Special tokens have been added in the vocabulary, make sure the associated word embeddings are fine-tuned or trained.
+Add pad token = ['<｜▁pad▁｜>'] to the tokenizer
+<｜▁pad▁｜>:2
+Add image token = ['<image>'] to the tokenizer
+<image>:128815
+Add grounding-related tokens = ['<|ref|>', '<|/ref|>', '<|det|>', '<|/det|>', '<|grounding|>'] to the tokenizer with input_ids
+<|ref|>:128816
+<|/ref|>:128817
+<|det|>:128818
+<|/det|>:128819
+<|grounding|>:128820
+Add chat tokens = ['<|User|>', '<|Assistant|>'] to the tokenizer with input_ids
+<|User|>:128821
+<|Assistant|>:128822
+
+2026-07-06 23:49:55,069 __main__ INFO model loaded: FrozenModelInfo(model_id='deepseek-ai/deepseek-vl2-tiny', hidden_size=1280, num_language_layers=12, num_routed_experts=64, num_shared_experts=2, top_k_routed=6, target_layer_zero_indexed=5, dtype='torch.bfloat16', device='mps')
+2026-07-06 23:49:55,077 moe_sae.capture.driver WARNING resume: deleting un-checkpointed shard captures/pipeline_1m/visual/shard_00038.safetensors
+2026-07-06 23:49:55,077 moe_sae.capture.driver WARNING resume: deleting un-checkpointed shard captures/pipeline_1m/visual/shard_00039.safetensors
+huggingface/tokenizers: The current process just got forked, after parallelism has already been used. Disabling parallelism to avoid deadlocks...
+To disable this warning, you can either:
+	- Avoid using `tokenizers` before the fork if possible
+	- Explicitly set the environment variable TOKENIZERS_PARALLELISM=(true | false)
+2026-07-06 23:50:52,902 moe_sae.capture.driver INFO resume: fast-forwarded 1000 examples in 57.8s
+You're using a LlamaTokenizerFast tokenizer. Please note that with a fast tokenizer, using the `__call__` method is faster than using a method to encode the text followed by a call to the `pad` method to get a padded encoding.
+2026-07-06 23:53:31,600 moe_sae.capture.driver INFO 1050 consumed (1039 captured, 0 failed) | tokens {'visual': 522595, 'text': 22805} | 0.3 ex/s
+2026-07-06 23:55:53,570 moe_sae.capture.driver INFO 1100 consumed (1089 captured, 0 failed) | tokens {'visual': 547649, 'text': 23930} | 0.3 ex/s
+2026-07-06 23:58:28,814 moe_sae.capture.driver INFO 1150 consumed (1139 captured, 0 failed) | tokens {'visual': 573067, 'text': 25121} | 0.3 ex/s
+2026-07-07 00:01:16,594 moe_sae.capture.driver INFO 1200 consumed (1189 captured, 0 failed) | tokens {'visual': 598121, 'text': 26300} | 0.3 ex/s
+2026-07-07 00:04:32,920 moe_sae.capture.driver INFO 1250 consumed (1239 captured, 0 failed) | tokens {'visual': 623448, 'text': 27414} | 0.3 ex/s
+[runner] attempt 1 exited rc=143
+/Users/abistras/.local/share/uv/python/cpython-3.11.15-macos-aarch64-none/lib/python3.11/multiprocessing/resource_tracker.py:254: UserWarning: resource_tracker: There appear to be 1 leaked semaphore objects to clean up at shutdown
+  warnings.warn('resource_tracker: There appear to be %d '
+[runner] attempt 2 2026-07-07 00:05:40 --resume
+Fatal Python error: init_sys_streams: can't initialize sys standard streams
+Python runtime state: core initialized
+OSError: [Errno 9] Bad file descriptor
+
+Current thread 0x00000001f13158c0 (most recent call first):
+  <no Python frame>
+[runner] attempt 2 exited rc=1
+[runner] attempt 3 2026-07-07 00:05:50 --resume
+Fatal Python error: init_sys_streams: can't initialize sys standard streams
+Python runtime state: core initialized
+OSError: [Errno 9] Bad file descriptor
+
+Current thread 0x00000001f13158c0 (most recent call first):
+  <no Python frame>
+[runner] attempt 3 exited rc=1
+[runner] attempt 4 2026-07-07 00:06:00 --resume
+Fatal Python error: init_sys_streams: can't initialize sys standard streams
+Python runtime state: core initialized
+OSError: [Errno 9] Bad file descriptor
+
+Current thread 0x00000001f13158c0 (most recent call first):
+  <no Python frame>
+[runner] attempt 4 exited rc=1
+[runner] attempt 5 2026-07-07 00:06:10 --resume
+Fatal Python error: init_sys_streams: can't initialize sys standard streams
+Python runtime state: core initialized
+OSError: [Errno 9] Bad file descriptor
+
+Current thread 0x00000001f13158c0 (most recent call first):
+  <no Python frame>
+[runner] attempt 5 exited rc=1
+[runner] attempt 6 2026-07-07 00:06:20 --resume
+Fatal Python error: init_sys_streams: can't initialize sys standard streams
+Python runtime state: core initialized
+OSError: [Errno 9] Bad file descriptor
+
+Current thread 0x00000001f13158c0 (most recent call first):
+  <no Python frame>
+[runner] attempt 6 exited rc=1
+[runner] attempt 7 2026-07-07 00:06:30 --resume
+Fatal Python error: init_sys_streams: can't initialize sys standard streams
+Python runtime state: core initialized
+OSError: [Errno 9] Bad file descriptor
+
+Current thread 0x00000001f13158c0 (most recent call first):
+  <no Python frame>
+[runner] attempt 7 exited rc=1
+[runner] attempt 8 2026-07-07 00:06:40 --resume
+Fatal Python error: init_sys_streams: can't initialize sys standard streams
+Python runtime state: core initialized
+OSError: [Errno 9] Bad file descriptor
+
+Current thread 0x00000001f13158c0 (most recent call first):
+  <no Python frame>
+[runner] attempt 8 exited rc=1
+[runner] attempt 9 2026-07-07 00:06:51 --resume
+Fatal Python error: init_sys_streams: can't initialize sys standard streams
+Python runtime state: core initialized
+OSError: [Errno 9] Bad file descriptor
+
+Current thread 0x00000001f13158c0 (most recent call first):
+  <no Python frame>
+[runner] attempt 9 exited rc=1
+[runner] attempt 10 2026-07-07 00:07:01 --resume
+Fatal Python error: init_sys_streams: can't initialize sys standard streams
+Python runtime state: core initialized
+OSError: [Errno 9] Bad file descriptor
+
+Current thread 0x00000001f13158c0 (most recent call first):
+  <no Python frame>
+[runner] attempt 10 exited rc=1
+[runner] attempt 11 2026-07-07 00:07:11 --resume
+Fatal Python error: init_sys_streams: can't initialize sys standard streams
+Python runtime state: core initialized
+OSError: [Errno 9] Bad file descriptor
+
+Current thread 0x00000001f13158c0 (most recent call first):
+  <no Python frame>
+[runner] attempt 11 exited rc=1
+[runner] attempt 12 2026-07-07 00:07:21 --resume
+Fatal Python error: init_sys_streams: can't initialize sys standard streams
+Python runtime state: core initialized
+OSError: [Errno 9] Bad file descriptor
+
+Current thread 0x00000001f13158c0 (most recent call first):
+  <no Python frame>
+[runner] attempt 12 exited rc=1
+[runner] attempt 13 2026-07-07 00:07:31 --resume
+Fatal Python error: init_sys_streams: can't initialize sys standard streams
+Python runtime state: core initialized
+OSError: [Errno 9] Bad file descriptor
+
+Current thread 0x00000001f13158c0 (most recent call first):
+  <no Python frame>
+[runner] attempt 13 exited rc=1
+[runner] attempt 14 2026-07-07 00:07:41 --resume
+Fatal Python error: init_sys_streams: can't initialize sys standard streams
+Python runtime state: core initialized
+OSError: [Errno 9] Bad file descriptor
+
+Current thread 0x00000001f13158c0 (most recent call first):
+  <no Python frame>
+[runner] attempt 14 exited rc=1
+[runner] attempt 15 2026-07-07 00:07:51 --resume
+Fatal Python error: init_sys_streams: can't initialize sys standard streams
+Python runtime state: core initialized
+OSError: [Errno 9] Bad file descriptor
+
+Current thread 0x00000001f13158c0 (most recent call first):
+  <no Python frame>
+[runner] attempt 15 exited rc=1
+[runner] attempt 16 2026-07-07 00:08:01 --resume
+Fatal Python error: init_sys_streams: can't initialize sys standard streams
+Python runtime state: core initialized
+OSError: [Errno 9] Bad file descriptor
+
+Current thread 0x00000001f13158c0 (most recent call first):
+  <no Python frame>
+[runner] attempt 16 exited rc=1
+[runner] attempt 17 2026-07-07 00:08:11 --resume
+Fatal Python error: init_sys_streams: can't initialize sys standard streams
+Python runtime state: core initialized
+OSError: [Errno 9] Bad file descriptor
+
+Current thread 0x00000001f13158c0 (most recent call first):
+  <no Python frame>
+[runner] attempt 17 exited rc=1
+[runner] attempt 18 2026-07-07 00:08:22 --resume
+Fatal Python error: init_sys_streams: can't initialize sys standard streams
+Python runtime state: core initialized
+OSError: [Errno 9] Bad file descriptor
+
+Current thread 0x00000001f13158c0 (most recent call first):
+  <no Python frame>
+[runner] attempt 18 exited rc=1
+[runner] attempt 19 2026-07-07 00:08:32 --resume
+Fatal Python error: init_sys_streams: can't initialize sys standard streams
+Python runtime state: core initialized
+OSError: [Errno 9] Bad file descriptor
+
+Current thread 0x00000001f13158c0 (most recent call first):
+  <no Python frame>
+[runner] attempt 19 exited rc=1
+[runner] attempt 20 2026-07-07 00:08:42 --resume
+Fatal Python error: init_sys_streams: can't initialize sys standard streams
+Python runtime state: core initialized
+OSError: [Errno 9] Bad file descriptor
+
+Current thread 0x00000001f13158c0 (most recent call first):
+  <no Python frame>
+[runner] attempt 20 exited rc=1
+[runner] attempt 21 2026-07-07 00:08:52 --resume
+Fatal Python error: init_sys_streams: can't initialize sys standard streams
+Python runtime state: core initialized
+OSError: [Errno 9] Bad file descriptor
+
+Current thread 0x00000001f13158c0 (most recent call first):
+  <no Python frame>
+[runner] attempt 21 exited rc=1
+[runner] attempt 22 2026-07-07 00:09:02 --resume
+Fatal Python error: init_sys_streams: can't initialize sys standard streams
+Python runtime state: core initialized
+OSError: [Errno 9] Bad file descriptor
+
+Current thread 0x00000001f13158c0 (most recent call first):
+  <no Python frame>
+[runner] attempt 22 exited rc=1
+[runner] attempt 23 2026-07-07 00:09:12 --resume
+Fatal Python error: init_sys_streams: can't initialize sys standard streams
+Python runtime state: core initialized
+OSError: [Errno 9] Bad file descriptor
+
+Current thread 0x00000001f13158c0 (most recent call first):
+  <no Python frame>
+[runner] attempt 23 exited rc=1
+[runner] attempt 24 2026-07-07 00:09:22 --resume
+Fatal Python error: init_sys_streams: can't initialize sys standard streams
+Python runtime state: core initialized
+OSError: [Errno 9] Bad file descriptor
+
+Current thread 0x00000001f13158c0 (most recent call first):
+  <no Python frame>
+[runner] attempt 24 exited rc=1
+[runner] attempt 25 2026-07-07 00:09:32 --resume
+Fatal Python error: init_sys_streams: can't initialize sys standard streams
+Python runtime state: core initialized
+OSError: [Errno 9] Bad file descriptor
+
+Current thread 0x00000001f13158c0 (most recent call first):
+  <no Python frame>
+[runner] attempt 25 exited rc=1
+[runner] attempt 26 2026-07-07 00:09:42 --resume
+Fatal Python error: init_sys_streams: can't initialize sys standard streams
+Python runtime state: core initialized
+OSError: [Errno 9] Bad file descriptor
+
+Current thread 0x00000001f13158c0 (most recent call first):
+  <no Python frame>
+[runner] attempt 26 exited rc=1
+[runner] attempt 27 2026-07-07 00:09:53 --resume
+Fatal Python error: init_sys_streams: can't initialize sys standard streams
+Python runtime state: core initialized
+OSError: [Errno 9] Bad file descriptor
+
+Current thread 0x00000001f13158c0 (most recent call first):
+  <no Python frame>
+[runner] attempt 27 exited rc=1
+[runner] attempt 28 2026-07-07 00:10:03 --resume
+Fatal Python error: init_sys_streams: can't initialize sys standard streams
+Python runtime state: core initialized
+OSError: [Errno 9] Bad file descriptor
+
+Current thread 0x00000001f13158c0 (most recent call first):
+  <no Python frame>
+[runner] attempt 28 exited rc=1
+[runner] attempt 29 2026-07-07 00:10:13 --resume
+Fatal Python error: init_sys_streams: can't initialize sys standard streams
+Python runtime state: core initialized
+OSError: [Errno 9] Bad file descriptor
+
+Current thread 0x00000001f13158c0 (most recent call first):
+  <no Python frame>
+[runner] attempt 29 exited rc=1
+[runner] attempt 30 2026-07-07 00:10:23 --resume
+Fatal Python error: init_sys_streams: can't initialize sys standard streams
+Python runtime state: core initialized
+OSError: [Errno 9] Bad file descriptor
+
+Current thread 0x00000001f13158c0 (most recent call first):
+  <no Python frame>
+[runner] attempt 30 exited rc=1
+[runner] attempt 31 2026-07-07 00:10:33 --resume
+Fatal Python error: init_sys_streams: can't initialize sys standard streams
+Python runtime state: core initialized
+OSError: [Errno 9] Bad file descriptor
+
+Current thread 0x00000001f13158c0 (most recent call first):
+  <no Python frame>
+[runner] attempt 31 exited rc=1
+[runner] attempt 32 2026-07-07 00:10:43 --resume
+Fatal Python error: init_sys_streams: can't initialize sys standard streams
+Python runtime state: core initialized
+OSError: [Errno 9] Bad file descriptor
+
+Current thread 0x00000001f13158c0 (most recent call first):
+  <no Python frame>
+[runner] attempt 32 exited rc=1
+[runner] attempt 33 2026-07-07 00:10:53 --resume
+Fatal Python error: init_sys_streams: can't initialize sys standard streams
+Python runtime state: core initialized
+OSError: [Errno 9] Bad file descriptor
+
+Current thread 0x00000001f13158c0 (most recent call first):
+  <no Python frame>
+[runner] attempt 33 exited rc=1
+[runner] attempt 34 2026-07-07 00:11:03 --resume
+Fatal Python error: init_sys_streams: can't initialize sys standard streams
+Python runtime state: core initialized
+OSError: [Errno 9] Bad file descriptor
+
+Current thread 0x00000001f13158c0 (most recent call first):
+  <no Python frame>
+[runner] attempt 34 exited rc=1
+[runner] attempt 35 2026-07-07 00:11:13 --resume
+Fatal Python error: init_sys_streams: can't initialize sys standard streams
+Python runtime state: core initialized
+OSError: [Errno 9] Bad file descriptor
+
+Current thread 0x00000001f13158c0 (most recent call first):
+  <no Python frame>
+[runner] attempt 35 exited rc=1
+[runner] attempt 36 2026-07-07 00:11:24 --resume
+Fatal Python error: init_sys_streams: can't initialize sys standard streams
+Python runtime state: core initialized
+OSError: [Errno 9] Bad file descriptor
+
+Current thread 0x00000001f13158c0 (most recent call first):
+  <no Python frame>
+[runner] attempt 36 exited rc=1
+[runner] attempt 37 2026-07-07 00:11:34 --resume
+Fatal Python error: init_sys_streams: can't initialize sys standard streams
+Python runtime state: core initialized
+OSError: [Errno 9] Bad file descriptor
+
+Current thread 0x00000001f13158c0 (most recent call first):
+  <no Python frame>
+[runner] attempt 37 exited rc=1
+[runner] attempt 38 2026-07-07 00:11:44 --resume
+Fatal Python error: init_sys_streams: can't initialize sys standard streams
+Python runtime state: core initialized
+OSError: [Errno 9] Bad file descriptor
+
+Current thread 0x00000001f13158c0 (most recent call first):
+  <no Python frame>
+[runner] attempt 38 exited rc=1
+[runner] attempt 39 2026-07-07 00:11:54 --resume
+Fatal Python error: init_sys_streams: can't initialize sys standard streams
+Python runtime state: core initialized
+OSError: [Errno 9] Bad file descriptor
+
+Current thread 0x00000001f13158c0 (most recent call first):
+  <no Python frame>
+[runner] attempt 39 exited rc=1
+[runner] attempt 40 2026-07-07 00:12:04 --resume
+Fatal Python error: init_sys_streams: can't initialize sys standard streams
+Python runtime state: core initialized
+OSError: [Errno 9] Bad file descriptor
+
+Current thread 0x00000001f13158c0 (most recent call first):
+  <no Python frame>
+[runner] attempt 40 exited rc=1
+[runner] attempt 41 2026-07-07 00:12:14 --resume
+Fatal Python error: init_sys_streams: can't initialize sys standard streams
+Python runtime state: core initialized
+OSError: [Errno 9] Bad file descriptor
+
+Current thread 0x00000001f13158c0 (most recent call first):
+  <no Python frame>
+[runner] attempt 41 exited rc=1
+[runner] attempt 42 2026-07-07 00:12:24 --resume
+Fatal Python error: init_sys_streams: can't initialize sys standard streams
+Python runtime state: core initialized
+OSError: [Errno 9] Bad file descriptor
+
+Current thread 0x00000001f13158c0 (most recent call first):
+  <no Python frame>
+[runner] attempt 42 exited rc=1
+[runner] attempt 43 2026-07-07 00:12:34 --resume
+Fatal Python error: init_sys_streams: can't initialize sys standard streams
+Python runtime state: core initialized
+OSError: [Errno 9] Bad file descriptor
+
+Current thread 0x00000001f13158c0 (most recent call first):
+  <no Python frame>
+[runner] attempt 43 exited rc=1
+[runner] attempt 44 2026-07-07 00:12:44 --resume
+Fatal Python error: init_sys_streams: can't initialize sys standard streams
+Python runtime state: core initialized
+OSError: [Errno 9] Bad file descriptor
+
+Current thread 0x00000001f13158c0 (most recent call first):
+  <no Python frame>
+[runner] attempt 44 exited rc=1
+[runner] attempt 45 2026-07-07 00:12:55 --resume
+Fatal Python error: init_sys_streams: can't initialize sys standard streams
+Python runtime state: core initialized
+OSError: [Errno 9] Bad file descriptor
+
+Current thread 0x00000001f13158c0 (most recent call first):
+  <no Python frame>
+[runner] attempt 45 exited rc=1
+[runner] attempt 46 2026-07-07 00:13:05 --resume
+Fatal Python error: init_sys_streams: can't initialize sys standard streams
+Python runtime state: core initialized
+OSError: [Errno 9] Bad file descriptor
+
+Current thread 0x00000001f13158c0 (most recent call first):
+  <no Python frame>
+[runner] attempt 46 exited rc=1
+[runner] attempt 47 2026-07-07 00:13:15 --resume
+Fatal Python error: init_sys_streams: can't initialize sys standard streams
+Python runtime state: core initialized
+OSError: [Errno 9] Bad file descriptor
+
+Current thread 0x00000001f13158c0 (most recent call first):
+  <no Python frame>
+[runner] attempt 47 exited rc=1
+[runner] attempt 48 2026-07-07 00:13:25 --resume
+Fatal Python error: init_sys_streams: can't initialize sys standard streams
+Python runtime state: core initialized
+OSError: [Errno 9] Bad file descriptor
+
+Current thread 0x00000001f13158c0 (most recent call first):
+  <no Python frame>
+[runner] attempt 48 exited rc=1
+[runner] attempt 49 2026-07-07 00:13:35 --resume
+Fatal Python error: init_sys_streams: can't initialize sys standard streams
+Python runtime state: core initialized
+OSError: [Errno 9] Bad file descriptor
+
+Current thread 0x00000001f13158c0 (most recent call first):
+  <no Python frame>
+[runner] attempt 49 exited rc=1
+[runner] attempt 50 2026-07-07 00:13:45 --resume
+Fatal Python error: init_sys_streams: can't initialize sys standard streams
+Python runtime state: core initialized
+OSError: [Errno 9] Bad file descriptor
+
+Current thread 0x00000001f13158c0 (most recent call first):
+  <no Python frame>
+[runner] attempt 50 exited rc=1
+[runner] 50 attempts without completion — giving up
+[runner] attempt 1 2026-07-07 05:48:12 --resume
+2026-07-07 05:48:14,872 moe_sae.model_loading INFO Loading deepseek-ai/deepseek-vl2-tiny in torch.bfloat16 on mps ...
+/Users/abistras/Desktop/moe-sae/.venv/lib/python3.11/site-packages/huggingface_hub/file_download.py:949: FutureWarning: `resume_download` is deprecated and will be removed in version 1.0.0. Downloads always resume when possible. If you want to force a new download, use `force_download=True`.
+  warnings.warn(
+2026-07-07 05:48:27,300 moe_sae.model_loading INFO Frozen architecture verified: 12 layers, dense layer 0, MoE layer 5 with 64 routed + 2 shared experts, top-6 routing, d=1280.
+Special tokens have been added in the vocabulary, make sure the associated word embeddings are fine-tuned or trained.
+Add pad token = ['<｜▁pad▁｜>'] to the tokenizer
+<｜▁pad▁｜>:2
+Add image token = ['<image>'] to the tokenizer
+<image>:128815
+Add grounding-related tokens = ['<|ref|>', '<|/ref|>', '<|det|>', '<|/det|>', '<|grounding|>'] to the tokenizer with input_ids
+<|ref|>:128816
+<|/ref|>:128817
+<|det|>:128818
+<|/det|>:128819
+<|grounding|>:128820
+Add chat tokens = ['<|User|>', '<|Assistant|>'] to the tokenizer with input_ids
+<|User|>:128821
+<|Assistant|>:128822
+
+2026-07-07 05:48:28,222 __main__ INFO model loaded: FrozenModelInfo(model_id='deepseek-ai/deepseek-vl2-tiny', hidden_size=1280, num_language_layers=12, num_routed_experts=64, num_shared_experts=2, top_k_routed=6, target_layer_zero_indexed=5, dtype='torch.bfloat16', device='mps')
+2026-07-07 05:48:28,224 moe_sae.capture.driver WARNING resume: deleting un-checkpointed shard captures/pipeline_1m/visual/shard_00046.safetensors
+2026-07-07 05:48:28,224 moe_sae.capture.driver WARNING resume: deleting un-checkpointed shard captures/pipeline_1m/visual/shard_00047.safetensors
+huggingface/tokenizers: The current process just got forked, after parallelism has already been used. Disabling parallelism to avoid deadlocks...
+To disable this warning, you can either:
+	- Avoid using `tokenizers` before the fork if possible
+	- Explicitly set the environment variable TOKENIZERS_PARALLELISM=(true | false)

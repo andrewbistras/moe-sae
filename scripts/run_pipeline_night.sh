@@ -21,12 +21,14 @@ say() { echo "[night $(date '+%F %T')] $*" | tee -a "$LOG"; }
 run_step() {  # run_step <name> <artifact-that-marks-done> <cmd...>
   local name="$1" artifact="$2"; shift 2
   if [ -e "$artifact" ]; then say "$name: done already ($artifact)"; return 0; fi
-  for try in 1 2; do
+  for try in 1 2 3; do
     say "$name: attempt $try"
-    PYTHONUNBUFFERED=1 caffeinate -i "$@" >> "$LOG" 2>&1
+    # stdin from /dev/null: this chain outlives the launching terminal, and a
+    # child inheriting a dead pty fd 0 dies at python startup (init_sys_streams).
+    PYTHONUNBUFFERED=1 caffeinate -is "$@" < /dev/null >> "$LOG" 2>&1
     if [ -e "$artifact" ]; then say "$name: OK"; return 0; fi
     say "$name: attempt $try failed (rc=$?, artifact missing)"
-    sleep 10
+    sleep 30
   done
   say "$name: FAILED twice — stopping the chain"; exit 1
 }

@@ -1,1 +1,2 @@
 scripts/run_pipeline_capture.sh: line 51: 61988 Killed: 9               PYTHONUNBUFFERED=1 caffeinate -i uv run --no-sync python scripts/run_capture.py --out "$OUT" --examples "$EXAMPLES" --visual-cap "$VISUAL_CAP" --seed "$SEED" --device "$DEVICE" $RESUME >> "$LOG" 2>&1
+[runner] 50 attempts without completion — giving up

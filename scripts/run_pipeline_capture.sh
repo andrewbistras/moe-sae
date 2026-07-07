@@ -31,11 +31,27 @@ sys.exit(0 if p.exists() and json.loads(p.read_text()).get("complete") else 1)
 EOF
 }
 
+consumed() {
+  python3 -c "import json;print(json.load(open('$OUT/progress.json'))['stream_consumed'])" \
+    < /dev/null 2>/dev/null || echo 0
+}
+
+# Attempts count only CONSECUTIVE no-progress failures: any advance in
+# progress.json resets the counter, so a long healthy run interrupted many
+# times (sleep/wake cycles) never exhausts the budget, while a genuine crash
+# storm stops after MAX_ATTEMPTS with exponential backoff (10s → 300s cap).
 attempt=0
+backoff=10
+last_consumed=$(consumed)
 while ! is_complete; do
+  now_consumed=$(consumed)
+  if [ "$now_consumed" -gt "$last_consumed" ]; then
+    attempt=0; backoff=10
+  fi
+  last_consumed=$now_consumed
   attempt=$((attempt + 1))
   if [ "$attempt" -gt "$MAX_ATTEMPTS" ]; then
-    echo "[runner] $MAX_ATTEMPTS attempts without completion — giving up" | tee -a "$LOG"
+    echo "[runner] $MAX_ATTEMPTS consecutive no-progress attempts — giving up" | tee -a "$LOG"
     exit 1
   fi
   RESUME=""
@@ -44,12 +60,16 @@ while ! is_complete; do
   # wrapper can orphan the python child, and two workers on one root collide.
   pkill -9 -f "run_capture.py --out $OUT" 2>/dev/null && sleep 3
   echo "[runner] attempt $attempt $(date '+%F %T') $RESUME" >> "$LOG"
-  PYTHONUNBUFFERED=1 caffeinate -i uv run --no-sync python scripts/run_capture.py \
+  # stdin MUST come from /dev/null: the runner may outlive the terminal that
+  # launched it, and a worker inheriting a dead pty fd 0 dies at interpreter
+  # startup (init_sys_streams / EBADF — observed 2026-07-07 00:13).
+  PYTHONUNBUFFERED=1 caffeinate -is uv run --no-sync python scripts/run_capture.py \
     --out "$OUT" --examples "$EXAMPLES" --visual-cap "$VISUAL_CAP" \
-    --seed "$SEED" --device "$DEVICE" $RESUME >> "$LOG" 2>&1
+    --seed "$SEED" --device "$DEVICE" $RESUME < /dev/null >> "$LOG" 2>&1
   rc=$?
   echo "[runner] attempt $attempt exited rc=$rc" >> "$LOG"
   [ $rc -eq 0 ] && continue  # loop re-checks completion
-  sleep 10
+  sleep "$backoff"
+  backoff=$((backoff * 2)); [ "$backoff" -gt 300 ] && backoff=300
 done
 echo "[runner] capture complete: $OUT $(date '+%F %T')" | tee -a "$LOG"
