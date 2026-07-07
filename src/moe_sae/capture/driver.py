@@ -264,12 +264,16 @@ def capture_examples(
     n_examples_target: int | None = None,
     resume: bool = False,
     checkpoint_every: int = 100,
+    start_offset: int = 0,
 ) -> CaptureMeta:
     """Run capture over `examples_iter`, writing pools + meta.json to out_root.
 
     `n_examples_target` counts CONSUMED stream examples (so a resumed run
-    stops at the same stream position a single run would). Interrupt-safe:
-    see module docstring (Resilience).
+    stops at the same stream position a single run would). `start_offset`
+    skips that many stream examples before this capture's range begins —
+    parallel workers carve the deterministic stream into disjoint slices
+    (worker w: start_offset = w·per_worker, n_examples_target = per_worker).
+    Interrupt-safe: see module docstring (Resilience).
     """
     out_root = Path(out_root)
     out_root.mkdir(parents=True, exist_ok=True)
@@ -280,6 +284,7 @@ def capture_examples(
         "max_seq_len": max_seq_len,
         "text_control": text_control,
         "shard_size": shard_size,
+        "start_offset": start_offset,
     }
     progress = _resume_state(out_root, resume, run_config)
     if progress.complete:
@@ -287,7 +292,7 @@ def capture_examples(
         return CaptureMeta.load(out_root)
 
     examples_iter = iter(examples_iter)
-    _fast_forward(examples_iter, progress.stream_consumed)
+    _fast_forward(examples_iter, start_offset + progress.stream_consumed)
 
     language = model.language.model  # DeepseekV2Model
     target_layer = language.layers[TARGET_LAYER_ZERO_INDEXED]

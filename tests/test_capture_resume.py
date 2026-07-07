@@ -99,3 +99,63 @@ def test_flush_partial_shards_are_readable(tmp_path):
     w.close()
     sizes = [s["domain"].shape[0] for s in iter_shards(tmp_path, "text")]
     assert sizes == [7, 5]
+
+
+def test_start_offset_in_resume_config(tmp_path):
+    """Worker slicing: start_offset is part of the resume-validated config."""
+    cfg = dict(CONFIG, start_offset=1000)
+    CaptureProgress(config=cfg).save(tmp_path)
+    with pytest.raises(RuntimeError, match="mismatch"):
+        _resume_state(tmp_path, resume=True, run_config=dict(CONFIG, start_offset=0))
+    ok = _resume_state(tmp_path, resume=True, run_config=cfg)
+    assert ok.config["start_offset"] == 1000
+
+
+def test_merge_captures(tmp_path):
+    import subprocess
+    import sys
+
+    from moe_sae.capture.writer import CaptureMeta, iter_shards
+
+    for w, (n_vis, n_txt) in enumerate([(40, 10), (25, 15)]):
+        root = tmp_path / f"w{w}"
+        for pool, n in (("visual", n_vis), ("text", n_txt)):
+            wr = ShardWriter(root, pool, shard_size=16)
+            wr.add(
+                c=torch.full((n, 6, 4), float(w), dtype=torch.bfloat16),
+                experts=torch.zeros(n, 6, dtype=torch.uint8),
+                gates=torch.zeros(n, 6),
+                example_id=torch.arange(n, dtype=torch.int32) + w * 1000,
+                domain=torch.zeros(n, dtype=torch.uint8),
+            )
+            wr.close()
+        prog = CaptureProgress(
+            stream_consumed=50, captured=48, config=dict(CONFIG, start_offset=w * 50)
+        )
+        prog.tokens = {"visual": n_vis, "text": n_txt}
+        prog.shards = {
+            "visual": len(list((root / "visual").glob("*.safetensors"))),
+            "text": len(list((root / "text").glob("*.safetensors"))),
+        }
+        prog.complete = True
+        prog.save(root)
+        CaptureMeta(
+            name=f"w{w}", model_id="m", spec_version="v0.1.1",
+            target_layer_zero_indexed=5,
+            tokens=prog.tokens, examples=48, config=prog.config,
+        ).save(root)
+
+    out = tmp_path / "merged"
+    r = subprocess.run(
+        [sys.executable, "scripts/merge_captures.py", str(tmp_path / "w0"),
+         str(tmp_path / "w1"), "--out", str(out)],
+        capture_output=True, text=True,
+        env={**__import__("os").environ, "PYTHONPATH": "src"},
+    )
+    assert r.returncode == 0, r.stderr[-1500:]
+    prog = CaptureProgress.load(out)
+    assert prog.complete and prog.captured == 96
+    assert prog.tokens == {"visual": 65, "text": 25}
+    vis_ids = torch.cat([s["example_id"] for s in iter_shards(out, "visual")])
+    assert vis_ids.shape[0] == 65
+    assert len(set(vis_ids.tolist())) == 65  # no duplicates across workers

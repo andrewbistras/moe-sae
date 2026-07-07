@@ -126,3 +126,26 @@ def test_theta_ema_init_update_and_state():
     assert ema2.value == ema.value and ema2.decay == ema.decay
     ema2.update(0.0)
     assert abs(ema2.value - 0.999 * ema.value) < 1e-12
+
+
+import pytest as _pytest
+
+
+@_pytest.mark.skipif(
+    not __import__("torch").backends.mps.is_available(), reason="MPS unavailable"
+)
+def test_global_batch_topk_mps_at_pipeline_scale():
+    """Regression: MPS topk kernel raises index-out-of-bounds at the
+    pipeline-scale candidate count (25,165,824 = 4096·6·1024); the CPU
+    fallback must keep the selection correct on MPS tensors."""
+    import torch
+
+    n, k = 4096 * 6 * 1024, 32 * 4096
+    g = torch.Generator().manual_seed(0)
+    scores_cpu = torch.relu(torch.randn(n, generator=g))
+    mask_cpu, theta_cpu = global_batch_topk(scores_cpu, k)
+
+    mask_mps, theta_mps = global_batch_topk(scores_cpu.to("mps"), k)
+    assert mask_mps.device.type == "mps"
+    assert theta_mps == theta_cpu
+    assert torch.equal(mask_mps.cpu(), mask_cpu)

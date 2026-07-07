@@ -40,6 +40,13 @@ def main() -> None:
     p.add_argument("--max-seq-len", type=int, default=2048)
     p.add_argument("--shard-size", type=int, default=16384)
     p.add_argument(
+        "--start",
+        type=int,
+        default=0,
+        help="skip this many stream examples before capturing (parallel "
+        "workers: worker w uses --start w*PER --examples PER into its own --out)",
+    )
+    p.add_argument(
         "--resume",
         action="store_true",
         help="continue an interrupted capture at --out from its progress.json "
@@ -103,6 +110,7 @@ def main() -> None:
         shard_size=args.shard_size,
         n_examples_target=args.examples,
         resume=args.resume,
+        start_offset=args.start,
     )
     _hard_exit()
 

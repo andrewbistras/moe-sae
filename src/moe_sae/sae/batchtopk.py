@@ -28,9 +28,20 @@ def global_batch_topk(scores: torch.Tensor, k_total: int) -> tuple[torch.Tensor,
 
     scores: [n] (any float dtype; upcast to fp32). Returns (mask [n] bool,
     θ_b = value of the k_total-th largest score).
+
+    Backend note: MPS's topk kernel raises an internal index-out-of-bounds on
+    large inputs (observed at n = 25,165,824 — the pipeline-scale candidate
+    set, 2026-07-07). The selection is computed on CPU for MPS tensors: same
+    fp32 math, ~100 ms at pipeline scale; CUDA/CPU paths are unchanged.
     """
     s = scores.float()
     assert s.ndim == 1 and 0 < k_total <= s.numel(), (s.shape, k_total)
+    if s.device.type == "mps":
+        s_sel = s.cpu()
+        vals, idx = torch.topk(s_sel, k_total, sorted=True)
+        mask = torch.zeros_like(s_sel, dtype=torch.bool)
+        mask[idx] = True
+        return mask.to(scores.device), float(vals[-1].item())
     vals, idx = torch.topk(s, k_total, sorted=True)
     mask = torch.zeros_like(s, dtype=torch.bool)
     mask[idx] = True

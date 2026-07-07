@@ -655,3 +655,32 @@ You're using a LlamaTokenizerFast tokenizer. Please note that with a fast tokeni
 2026-07-07 06:59:08,372 moe_sae.capture.driver WARNING skipping example 300000711 (ai2d): 2056 tokens > max_seq_len=2048
 2026-07-07 06:59:12,653 moe_sae.capture.driver INFO 2850 consumed (2795 captured, 0 failed) | tokens {'visual': 1401101, 'text': 59708} | 0.4 ex/s
 2026-07-07 07:01:35,402 moe_sae.capture.driver INFO 2900 consumed (2845 captured, 0 failed) | tokens {'visual': 1426519, 'text': 60900} | 0.4 ex/s
+2026-07-07 07:04:03,755 moe_sae.capture.driver INFO 2950 consumed (2895 captured, 0 failed) | tokens {'visual': 1451937, 'text': 62125} | 0.4 ex/s
+2026-07-07 07:04:04,981 moe_sae.capture.driver WARNING skipping example 300000737 (ai2d): 2057 tokens > max_seq_len=2048
+2026-07-07 07:04:48,779 moe_sae.capture.driver WARNING skipping example 300000742 (ai2d): 2085 tokens > max_seq_len=2048
+2026-07-07 07:04:59,446 moe_sae.capture.driver WARNING skipping example 300000743 (ai2d): 2064 tokens > max_seq_len=2048
+2026-07-07 07:05:09,013 moe_sae.capture.driver WARNING skipping example 300000744 (ai2d): 2071 tokens > max_seq_len=2048
+2026-07-07 07:05:16,085 moe_sae.capture.driver WARNING skipping example 300000745 (ai2d): 2070 tokens > max_seq_len=2048
+2026-07-07 07:05:24,722 moe_sae.capture.driver WARNING skipping example 300000746 (ai2d): 2052 tokens > max_seq_len=2048
+2026-07-07 07:05:26,439 moe_sae.capture.driver WARNING skipping example 300000747 (ai2d): 2067 tokens > max_seq_len=2048
+2026-07-07 07:05:51,807 moe_sae.capture.driver INFO 3000 consumed (2938 captured, 0 failed) | tokens {'visual': 1473862, 'text': 62909} | 0.4 ex/s
+2026-07-07 07:07:48,520 moe_sae.capture.driver INFO 3050 consumed (2988 captured, 0 failed) | tokens {'visual': 1498370, 'text': 64080} | 0.4 ex/s
+2026-07-07 07:10:18,247 moe_sae.capture.driver INFO 3100 consumed (3038 captured, 0 failed) | tokens {'visual': 1523515, 'text': 65179} | 0.4 ex/s
+2026-07-07 07:12:21,489 moe_sae.capture.driver INFO 3150 consumed (3088 captured, 0 failed) | tokens {'visual': 1548114, 'text': 66181} | 0.4 ex/s
+2026-07-07 07:14:14,996 moe_sae.capture.driver INFO 3200 consumed (3138 captured, 0 failed) | tokens {'visual': 1572440, 'text': 67273} | 0.4 ex/s
+2026-07-07 07:14:20,439 moe_sae.capture.driver WARNING skipping example 300000800 (ai2d): 2057 tokens > max_seq_len=2048
+2026-07-07 07:14:21,651 moe_sae.capture.driver WARNING skipping example 300000801 (ai2d): 2056 tokens > max_seq_len=2048
+2026-07-07 07:14:28,062 moe_sae.capture.driver WARNING skipping example 300000802 (ai2d): 2056 tokens > max_seq_len=2048
+2026-07-07 07:15:07,586 moe_sae.capture.driver WARNING skipping example 300000806 (ai2d): 2059 tokens > max_seq_len=2048
+2026-07-07 07:15:20,849 moe_sae.capture.driver WARNING skipping example 300000807 (ai2d): 2057 tokens > max_seq_len=2048
+2026-07-07 07:16:07,542 moe_sae.capture.driver INFO 3250 consumed (3183 captured, 0 failed) | tokens {'visual': 1594297, 'text': 68157} | 0.4 ex/s
+2026-07-07 07:18:03,076 moe_sae.capture.driver INFO 3300 consumed (3233 captured, 0 failed) | tokens {'visual': 1619169, 'text': 69251} | 0.4 ex/s
+2026-07-07 07:20:12,820 moe_sae.capture.driver INFO 3350 consumed (3283 captured, 0 failed) | tokens {'visual': 1643768, 'text': 70338} | 0.4 ex/s
+2026-07-07 07:22:23,986 moe_sae.capture.driver INFO 3400 consumed (3333 captured, 0 failed) | tokens {'visual': 1668185, 'text': 71503} | 0.4 ex/s
+2026-07-07 07:24:44,713 moe_sae.capture.driver INFO 3450 consumed (3383 captured, 0 failed) | tokens {'visual': 1692966, 'text': 72622} | 0.4 ex/s
+2026-07-07 07:26:45,917 moe_sae.capture.driver INFO 3500 consumed (3433 captured, 0 failed) | tokens {'visual': 1717019, 'text': 73641} | 0.4 ex/s
+2026-07-07 07:26:45,932 moe_sae.capture.driver INFO capture done: 3433 captured / 3500 consumed (67 too long, 0 failed), tokens={'visual': 1717019, 'text': 73641} → captures/pipeline_1m
+/Users/abistras/.local/share/uv/python/cpython-3.11.15-macos-aarch64-none/lib/python3.11/multiprocessing/resource_tracker.py:254: UserWarning: resource_tracker: There appear to be 1 leaked semaphore objects to clean up at shutdown
+  warnings.warn('resource_tracker: There appear to be %d '
+[runner] attempt 1 exited rc=0
+[runner] capture complete: captures/pipeline_1m 2026-07-07 07:26:46

@@ -1,3 +1,18 @@
 [night 2026-07-06 23:05:41] waiting for capture completion at captures/pipeline_1m
 [night 2026-07-06 23:49:43] waiting for capture completion at captures/pipeline_1m
 [night 2026-07-07 05:48:11] waiting for capture completion at captures/pipeline_1m
+[night 2026-07-07 07:27:19] capture complete
+[night 2026-07-07 07:27:19] stats: attempt 1
+[night 2026-07-07 07:27:52] stats: OK
+[night 2026-07-07 07:27:52] train A: attempt 1
+[night 2026-07-07 07:27:59] train A: attempt 1 failed (rc=0, artifact missing)
+[night 2026-07-07 07:28:29] train A: attempt 2
+[night 2026-07-07 07:28:33] train A: attempt 2 failed (rc=0, artifact missing)
+[night 2026-07-07 07:29:03] train A: attempt 3
+[night 2026-07-07 07:29:07] train A: attempt 3 failed (rc=0, artifact missing)
+[night 2026-07-07 07:29:37] train A: FAILED twice — stopping the chain
+[night 2026-07-07 07:33:21] waiting for capture completion at captures/pipeline_1m
+[night 2026-07-07 07:33:21] capture complete
+[night 2026-07-07 07:33:21] stats: done already (stats/pipeline_1m/stats.safetensors)
+[night 2026-07-07 07:33:21] train A: wiping incomplete runs/pipeline_1m_A
+[night 2026-07-07 07:33:21] train A: attempt 1

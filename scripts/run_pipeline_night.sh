@@ -26,8 +26,9 @@ run_step() {  # run_step <name> <artifact-that-marks-done> <cmd...>
     # stdin from /dev/null: this chain outlives the launching terminal, and a
     # child inheriting a dead pty fd 0 dies at python startup (init_sys_streams).
     PYTHONUNBUFFERED=1 caffeinate -is "$@" < /dev/null >> "$LOG" 2>&1
+    rc=$?
     if [ -e "$artifact" ]; then say "$name: OK"; return 0; fi
-    say "$name: attempt $try failed (rc=$?, artifact missing)"
+    say "$name: attempt $try failed (rc=$rc, artifact missing)"
     sleep 30
   done
   say "$name: FAILED twice — stopping the chain"; exit 1
