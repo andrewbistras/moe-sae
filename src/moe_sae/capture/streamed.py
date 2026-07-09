@@ -46,13 +46,28 @@ _SINGLE_FILE = "model.safetensors"
 
 
 def _resolve_checkpoint_dir(model_id_or_path: str | Path) -> Path:
-    """Local directory holding the checkpoint; never downloads (offline gate)."""
+    """Local directory holding the checkpoint WEIGHTS.
+
+    Prefers the local cache; downloads the safetensors snapshot when the
+    weights are absent (fresh environments — e.g. a new Colab VM — have the
+    tokenizer cached long before the gate runs; observed 2026-07-09)."""
     p = Path(model_id_or_path)
     if p.is_dir():
         return p
     from huggingface_hub import snapshot_download
 
-    return Path(snapshot_download(str(model_id_or_path), local_files_only=True))
+    try:
+        root = Path(snapshot_download(str(model_id_or_path), local_files_only=True))
+        if (root / _INDEX_FILE).exists() or (root / _SINGLE_FILE).exists():
+            return root
+    except Exception:
+        pass
+    return Path(
+        snapshot_download(
+            str(model_id_or_path),
+            allow_patterns=["*.safetensors", "*.safetensors.index.json", "config.json"],
+        )
+    )
 
 
 class CheckpointStreamer:
