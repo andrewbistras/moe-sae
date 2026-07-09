@@ -2,7 +2,7 @@
 name = "moe-sae"
 version = "0.1.1"
 description = "Router-Tied BatchTopK Sparse Autoencoders for Multimodal Mixture-of-Experts Models (frozen spec v0.1.1)"
-requires-python = ">=3.11,<3.12"
+requires-python = ">=3.11,<3.13"
 dependencies = [
     "accelerate>=1.14.0",
     "datasets>=5.0.0",
