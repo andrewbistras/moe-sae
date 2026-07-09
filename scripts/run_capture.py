@@ -47,6 +47,13 @@ def main() -> None:
         "workers: worker w uses --start w*PER --examples PER into its own --out)",
     )
     p.add_argument(
+        "--buckets",
+        default=None,
+        help="capture only examples with example_id %% 100 in lo-hi (e.g. "
+        "'80-99' for the retained dev/eval capture; saves the skipped "
+        "examples' model forwards entirely)",
+    )
+    p.add_argument(
         "--resume",
         action="store_true",
         help="continue an interrupted capture at --out from its progress.json "
@@ -93,6 +100,17 @@ def main() -> None:
         examples = interleave_domains(
             {d: domain_stream(d, split=args.split) for d in domains}, seed=args.seed
         )
+
+    if args.buckets:
+        lo, hi = (int(x) for x in args.buckets.split("-"))
+        base = examples
+
+        def _bucket_filtered(src=base, lo=lo, hi=hi):
+            for ex in src:
+                if lo <= ex.example_id % 100 <= hi:
+                    yield ex
+
+        examples = _bucket_filtered()
 
     # The raw stream (not islice) goes to the driver: on --resume it
     # fast-forwards by the recorded consumed count, and n_examples_target

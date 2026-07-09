@@ -315,3 +315,16 @@ spend) → capture_discovery.sh on the GPU box → 03_discovery_suite.sh.
 **Cost picture**: GPU capture $10–25 + storage ~$15/mo + in-region reads $0 +
 ~1 h of v4-32 (free under TRC). MFU >50% target applies to the A-shape
 training steps; F-runs are the wall-clock stragglers by construction.
+
+## Bucketless A100 lane (current discovery plan, 2026-07-08)
+
+No GCS/Drive. `notebooks/colab_discovery.ipynb` (rewritten) runs five phases
+on one A100-40: prefix stats (2k train examples → μ_e/baselines) → retained
+dev/eval capture (buckets 80–99, ~48 GB local, resumable) → **streaming
+co-training** (`scripts/run_stream_discovery.py`: rotating ~50 GB windows;
+all 14 runs replay each window with one condition GPU-resident at a time;
+matched data order is bitwise; capture paid once; seeds vary init only —
+user decision 2026-07-08) → eval + binding §20.5 gate → artifact tarball
+(~25 GB) downloaded to the laptop. Correctness: windowed+swapped ==
+loop.train bit-equal (tests/test_streaming.py). Accepted risk: phase 3 is
+not resumable; a dead session reruns it (~5–7 h, ~70 CU).
