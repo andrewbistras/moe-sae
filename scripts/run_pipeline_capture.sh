@@ -19,7 +19,8 @@ EXAMPLES="${EXAMPLES:-3500}"
 VISUAL_CAP="${VISUAL_CAP:-512}"
 SEED="${SEED:-7}"
 DEVICE="${DEVICE:-mps}"
-LOG="logs/capture_pipeline.log"
+START="${START:-0}"  # stream slice offset (parallel workers; run_capture --start)
+LOG="${LOG:-logs/capture_pipeline.log}"
 MAX_ATTEMPTS=50
 
 is_complete() {
@@ -63,9 +64,11 @@ while ! is_complete; do
   # stdin MUST come from /dev/null: the runner may outlive the terminal that
   # launched it, and a worker inheriting a dead pty fd 0 dies at interpreter
   # startup (init_sys_streams / EBADF — observed 2026-07-07 00:13).
-  PYTHONUNBUFFERED=1 caffeinate -is uv run --no-sync python scripts/run_capture.py \
+  # caffeinate exists only on macOS; on Linux hosts run bare.
+  KEEPAWAKE=""; command -v caffeinate >/dev/null && KEEPAWAKE="caffeinate -is"
+  PYTHONUNBUFFERED=1 $KEEPAWAKE uv run --no-sync python scripts/run_capture.py \
     --out "$OUT" --examples "$EXAMPLES" --visual-cap "$VISUAL_CAP" \
-    --seed "$SEED" --device "$DEVICE" $RESUME < /dev/null >> "$LOG" 2>&1
+    --seed "$SEED" --device "$DEVICE" --start "$START" $RESUME < /dev/null >> "$LOG" 2>&1
   rc=$?
   echo "[runner] attempt $attempt exited rc=$rc" >> "$LOG"
   [ $rc -eq 0 ] && continue  # loop re-checks completion

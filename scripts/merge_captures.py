@@ -21,7 +21,10 @@ from moe_sae.capture.driver import PROGRESS_FILE, CaptureProgress
 from moe_sae.capture.writer import POOLS, CaptureMeta, shard_paths
 
 
-def merge(worker_roots: list[Path], out_root: Path) -> CaptureMeta:
+def merge(worker_roots: list[Path], out_root: Path, mode: str = "hardlink") -> CaptureMeta:
+    """mode: hardlink (same filesystem; copy fallback) | symlink (cross-mount
+    stitching — the bucketless multi-host data plane, where worker slices live
+    on different hosts' RAM-disks reached via NFS mounts) | copy."""
     workers = []
     for root in worker_roots:
         prog = CaptureProgress.load(root)
@@ -40,10 +43,15 @@ def merge(worker_roots: list[Path], out_root: Path) -> CaptureMeta:
             for src in shard_paths(root, pool):
                 dst = dst_dir / f"shard_{shard_idx[pool]:05d}.safetensors"
                 assert not dst.exists(), dst
-                try:
-                    os.link(src, dst)  # hardlink: instant, no extra disk
-                except OSError:
+                if mode == "symlink":
+                    dst.symlink_to(src.resolve())
+                elif mode == "copy":
                     dst.write_bytes(src.read_bytes())
+                else:
+                    try:
+                        os.link(src, dst)  # hardlink: instant, no extra disk
+                    except OSError:
+                        dst.write_bytes(src.read_bytes())
                 shard_idx[pool] += 1
             tokens[pool] += prog.tokens.get(pool, 0)
         merged_prog.stream_consumed += prog.stream_consumed
@@ -82,8 +90,9 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("workers", nargs="+", help="complete worker capture roots, in stream order")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--mode", default="hardlink", choices=["hardlink", "symlink", "copy"])
     args = ap.parse_args()
-    meta = merge([Path(w) for w in args.workers], Path(args.out))
+    meta = merge([Path(w) for w in args.workers], Path(args.out), mode=args.mode)
     print(json.dumps({"examples": meta.examples, "tokens": meta.tokens}, indent=2))
 
 
