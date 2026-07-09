@@ -121,6 +121,7 @@ def stream_discovery(
     model=None,  # optional: moved to CPU during replay to free GPU headroom
     ckpt_every_windows: int = 4,
     min_visual_buffer: int = 65536,  # frozen shuffle-buffer depth (contract)
+    pipelined: bool = False,  # A100-80: compose window w+1 during replay of w
 ) -> None:
     n_steps = configs[0].n_steps
     assert all(c.n_steps == n_steps for c in configs), "runs must share n_steps"
@@ -139,22 +140,50 @@ def stream_discovery(
         swapper.swap_out(s.name, s.cond, s.opt)
 
     n_windows = (n_steps + window_batches - 1) // window_batches
-    logger.info("streaming %d runs × %d steps in %d windows of %d",
-                len(slots), n_steps, n_windows, window_batches)
+    logger.info("streaming %d runs × %d steps in %d windows of %d (pipelined=%s)",
+                len(slots), n_steps, n_windows, window_batches, pipelined)
 
-    for w in range(n_windows):
+    def compose_window(w: int) -> None:
         k = min(window_batches, n_steps - w * window_batches)
         if not store.exists(w):
-            if model is not None:
-                model.to(device)
             batches = [composer.next_batch() for _ in range(k)]
             store.write(w, batches)
             logger.info("window %d/%d composed (%d batches, %d examples consumed)",
                         w + 1, n_windows, k, composer.examples_consumed)
+
+    producer_state = {"exc": None}
+    if pipelined:
+        import threading
+
+        events = [threading.Event() for _ in range(n_windows)]
+
+        def producer():
+            try:
+                for w in range(n_windows):
+                    compose_window(w)
+                    events[w].set()
+            except BaseException as e:  # surfaced by the consumer below
+                producer_state["exc"] = e
+                for ev in events:
+                    ev.set()
+
         if model is not None:
-            model.to("cpu")
-            if device == "cuda":
-                torch.cuda.empty_cache()
+            model.to(device)  # stays resident: capture overlaps replay (80 GB)
+        threading.Thread(target=producer, daemon=True).start()
+
+    for w in range(n_windows):
+        if pipelined:
+            events[w].wait()
+            if producer_state["exc"] is not None:
+                raise producer_state["exc"]
+        else:
+            if model is not None:
+                model.to(device)
+            compose_window(w)
+            if model is not None:
+                model.to("cpu")
+                if device == "cuda":
+                    torch.cuda.empty_cache()
 
         batches = store.read(w)
         for s in slots:

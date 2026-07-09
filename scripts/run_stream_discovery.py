@@ -30,6 +30,8 @@ def main() -> None:
     p.add_argument("--seed", type=int, default=7, help="capture stream seed (frozen)")
     p.add_argument("--visual-cap", type=int, default=512)
     p.add_argument("--work-dir", default="stream_work")
+    p.add_argument("--pipeline", action="store_true",
+                   help="A100-80: overlap capture with replay (model resident)")
     args = p.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
@@ -117,6 +119,7 @@ def main() -> None:
         device=args.device,
         work_dir=args.work_dir,
         model=model,
+        pipelined=args.pipeline,
     )
 
 

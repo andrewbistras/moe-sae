@@ -143,8 +143,10 @@ def test_state_swapper_durability(tmp_path):
         assert torch.equal(st["exp_avg_sq"], ref[i][1])
 
 
-def test_windowed_equals_sequential(tmp_path):
-    """THE invariant: stream_discovery == loop.train per condition, bit-equal."""
+@pytest.mark.parametrize("pipelined", [False, True])
+def test_windowed_equals_sequential(tmp_path, pipelined):
+    """THE invariant: stream_discovery == loop.train per condition, bit-equal
+    — in both serial and pipelined (producer-thread) modes."""
     mu_e, mu_route = make_means()
     n_batches = 6
     specs = [("A", 1), ("B", 2), ("C", 3)]
@@ -178,6 +180,7 @@ def test_windowed_equals_sequential(tmp_path):
         work_dir=tmp_path / "work",
         ckpt_every_windows=100,
         min_visual_buffer=30,  # must match the reference composer above
+        pipelined=pipelined,
     )
 
     for cond_name, seed in specs:
