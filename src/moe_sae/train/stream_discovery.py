@@ -119,7 +119,8 @@ def stream_discovery(
     device: str = "cuda",
     work_dir: str | Path = "stream_work",
     model=None,  # optional: moved to CPU during replay to free GPU headroom
-    ckpt_every_windows: int = 4,
+    ckpt_every_windows: int = 10**9,  # mid-run ckpts OFF by default: the
+    # stream is not resumable, so they buy nothing and cost ~17 GB/round
     min_visual_buffer: int = 65536,  # frozen shuffle-buffer depth (contract)
     pipelined: bool = False,  # A100-80: compose window w+1 during replay of w
 ) -> None:
