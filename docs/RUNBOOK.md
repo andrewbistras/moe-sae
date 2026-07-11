@@ -328,3 +328,17 @@ user decision 2026-07-08) → eval + binding §20.5 gate → artifact tarball
 (~25 GB) downloaded to the laptop. Correctness: windowed+swapped ==
 loop.train bit-equal (tests/test_streaming.py). Accepted risk: phase 3 is
 not resumable; a dead session reruns it (~5–7 h, ~70 CU).
+
+## Lane history: Colab windowed-streaming (attempted, retired)
+
+Between 2026-07-08 and 07-10 a third lane was built and debugged: 50M-token
+discovery entirely on one Colab VM — no GCS, no Drive — streaming activations
+through a rotating 2×31 GB on-disk capture window pipelined with training
+(design preserved at git tag `colab-streaming-campaign`). It fought Colab's
+disk (ENOSPC at the original sizing) and session model through five fix
+rounds and never completed a discovery run; no artifacts were produced. It is
+retired in favor of: **TPU v4-32 training (primary) + slice-host-CPU or spot
+A100 capture into the us-central2 bucket**, with the GCS Colab notebook as
+backup. Lesson recorded: capture-and-train-in-place on session-limited,
+disk-limited VMs couples the two most failure-prone phases; the
+capture-once-to-durable-storage design decouples them.

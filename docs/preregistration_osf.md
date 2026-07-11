@@ -46,6 +46,14 @@ The four permitted outcome readings are frozen verbatim in spec §18 ("strong po
 
 **No discovery-scale data exists.** Discovery capture and training begin only after this registration is posted. Completed to date, in accordance with spec §20 steps 1–3:
 
+0. **Infrastructure campaign without data (2026-07-08 → 07-10), disclosed for
+   completeness:** a Colab-based "windowed streaming" discovery harness was
+   built and debugged (five engineering commits; design preserved at git tag
+   `colab-streaming-campaign`) but **no discovery capture or training run ever
+   completed and no discovery-scale artifacts exist** (verified: no artifacts
+   locally, in the linked Drive, or in any project bucket). No analysis code
+   ran on any discovery-scale data. The frozen protocol was not altered by or
+   during this campaign.
 1. **Hook validation (spec §3 hard gate): PASS.** FP32 reference forward, 100,933 tokens: max per-token relative error 0.0; production-path cross-check 0.0; BF16 production report max 1.99×10⁻³ / median 1.66×10⁻³ with no systematic structure (all |ρ| < 0.03).
 2. **Pipeline-validation run (spec §10: 1M tokens, f=1024, k̄=32, one seed — pre-declared "plumbing only; no scientific conclusions").** Observed, disclosed verbatim:
    - Step-5 gate *rehearsal* (addendum A10): held-out local micro NMSE A = 0.242 vs C = 0.450 (ratio 0.538; rule ≤ 0.9). PASS.
