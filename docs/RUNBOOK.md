@@ -342,3 +342,12 @@ A100 capture into the us-central2 bucket**, with the GCS Colab notebook as
 backup. Lesson recorded: capture-and-train-in-place on session-limited,
 disk-limited VMs couples the two most failure-prone phases; the
 capture-once-to-durable-storage design decouples them.
+
+## Lane assignment note: condition D runs on the GPU
+
+D's per-bank variable budgets are host-side under the JAX static-shape port
+(~400 MB/step PCIe → hours). The torch/CUDA path selects on-device natively:
+train D on the A100 (~15 min) in parallel with the TPU suite. Same shards,
+same composer seed → matched data order (§10) holds; A7 + parity legitimize
+the mixed backend. TPU-only fallback (no GPU available): accept ~2-3 h with
+pinned f32 transfers, or host-CPU torch for D.
