@@ -3,7 +3,7 @@
 **Registration type:** OSF Prereg (adapted template). **Draft v1 — not yet posted.**
 **Author:** Andrew Bistras. *(Implementation and drafting assistance: Claude (Anthropic); all frozen scientific choices predate implementation.)*
 **Date of registration:** [POST DATE]
-**Frozen protocol:** spec v0.1.2 = `spec/frozen_spec_v0.1.1.md` + `spec/frozen_spec_v0.1.2_addendum.md`, at repository tag `[TAG]`, commit `[COMMIT HASH]`. The registered analysis code is the same commit (258 automated tests passing at tag time).
+**Frozen protocol:** spec v0.1.2 = `spec/frozen_spec_v0.1.1.md` + `spec/frozen_spec_v0.1.2_addendum.md`, at repository tag `[TAG]`, commit `[COMMIT HASH]`. The registered analysis code is the same commit (311 automated tests passing at tag time).
 
 ---
 
