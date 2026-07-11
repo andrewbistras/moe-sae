@@ -13,12 +13,20 @@ batch sequences across backends by construction.
 
 Condition D's per-bank selection runs host-side through the torch engine
 (decision recorded in sae_jax.py).
+
+Resume / anomaly-halt / ops-metrics semantics are shared with the torch loop
+(helpers imported from moe_sae.train.loop; see its module docstring and
+Decisions). JAX-specific resume state persisted in the {step}.aux.npz
+sidecar: the SpecAdamJax FP32 moments + step count, and the (possibly
+ratcheted) grouped-GEMM capacity so a resumed run re-jits with the identical
+static capacity (-1 encodes "not yet chosen"/global).
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 from functools import partial
 from pathlib import Path
@@ -32,6 +40,21 @@ from moe_sae.sae import TrainBatch
 from moe_sae.sae.batchtopk import largest_remainder_budgets, per_bank_topk
 from moe_sae.sae.conditions import SAECondition
 from moe_sae.tpu import sae_jax as sj
+from moe_sae.train.loop import (
+    OPS_METRICS_NAME,
+    aux_path_for,
+    halt_anomaly,
+    load_aux,
+    lr_at_step,
+    open_sinks,
+    resolve_resume,
+    restore_condition,
+    run_logbook_path,
+    save_aux,
+    truncate_metrics_jsonl,
+)
+from moe_sae.util.manifest import logbook_append
+from moe_sae.util.metrics import GoodputTracker, MFUMeter, flops_per_step_estimate
 
 logger = logging.getLogger(__name__)
 
@@ -323,41 +346,149 @@ class JaxRun:
 # --------------------------------------------------------------------------- #
 
 
-def train_jax(cfg, cond: SAECondition, batch_iter, out_dir, capacity=None, device=None):
-    from moe_sae.train.loop import lr_at_step  # single source for the schedule
+_ADAM_PARAM_KEYS = ("W_enc", "b_enc", "D")
 
+
+def _jax_aux_arrays(run: JaxRun) -> dict:
+    """SpecAdamJax FP32 moments + step count + static capacity, npz-ready."""
+    arrays: dict = {
+        "adam_t": np.int64(run.opt.state["t"]),
+        "capacity": np.int64(-1 if run.capacity is None else run.capacity),
+    }
+    for name in _ADAM_PARAM_KEYS:
+        arrays[f"adam_m_{name}"] = np.asarray(run.opt.state["m"][name], np.float32)
+        arrays[f"adam_v_{name}"] = np.asarray(run.opt.state["v"][name], np.float32)
+    return arrays
+
+
+def _load_jax_adam_state(run: JaxRun, aux) -> None:
+    run.opt.state["t"] = int(aux["adam_t"])
+    for name in _ADAM_PARAM_KEYS:
+        run.opt.state["m"][name] = jnp.asarray(aux[f"adam_m_{name}"], jnp.float32)
+        run.opt.state["v"][name] = jnp.asarray(aux[f"adam_v_{name}"], jnp.float32)
+
+
+def train_jax(
+    cfg,
+    cond: SAECondition,
+    batch_iter,
+    out_dir,
+    capacity=None,
+    device=None,
+    *,
+    resume: bool = False,
+    peak_flops: float | None = None,
+):
     out_dir = Path(out_dir)
+    start_step, ckpt_path, complete = resolve_resume(out_dir, resume)
+    if complete:
+        logbook_append(
+            "resume_noop",
+            {"out_dir": str(out_dir), "note": "final checkpoint exists; run complete"},
+            path=run_logbook_path(out_dir),
+        )
+        return
     (out_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
     (out_dir / "final").mkdir(parents=True, exist_ok=True)
     cfg.to_yaml(out_dir / "config.yaml")
 
-    run = JaxRun(cond, capacity=capacity, device=device)
     bank_loads = torch.zeros(64, dtype=torch.int64)
     theta_trajectory: list[float] = []
-    metrics_path = out_dir / "metrics.jsonl"
+    gp = GoodputTracker()
+    aux = None
+    if ckpt_path is not None:
+        # Restore the torch condition FIRST: JaxRun uploads its params.
+        k = restore_condition(cond, ckpt_path)
+        assert k == start_step, (k, start_step)
+        aux = load_aux(ckpt_path)
+        bank_loads = torch.from_numpy(aux["bank_loads"].copy())
+        theta_trajectory = [float(x) for x in aux["theta_trajectory"]]
+        if capacity is None and int(aux["capacity"]) > 0:
+            capacity = int(aux["capacity"])  # identical static jit capacity
+
+    run = JaxRun(cond, capacity=capacity, device=device)
+    if aux is not None:
+        _load_jax_adam_state(run, aux)
+        with gp.data_wait():
+            # Composer fast-forward: the ONLY stream interaction on resume.
+            for _ in range(start_step):
+                next(batch_iter)
+        logbook_append(
+            "resume",
+            {"step": start_step, "checkpoint": str(ckpt_path)},
+            path=run_logbook_path(out_dir),
+        )
+    if resume:
+        truncate_metrics_jsonl(out_dir / "metrics.jsonl", start_step)
+        truncate_metrics_jsonl(out_dir / OPS_METRICS_NAME, start_step)
+
+    meter = None
+    if peak_flops is not None:
+        cap_arg = run.capacity if cfg.condition in ("A", "C", "D", "E") else None
+        meter = MFUMeter(
+            flops_per_step_estimate(
+                cfg.condition, cfg.batch_tokens, cfg.f, cond.d, cfg.k_bar,
+                capacity=cap_arg,
+            ),
+            peak_flops,
+        )
+    sink, ops_sink = open_sinks(out_dir)
     t_start = time.time()
+    spike = getattr(cfg, "spike_threshold", None)  # ops-only knob, default off
 
     n_steps = cfg.n_steps
-    for step in range(n_steps):
-        batch = next(batch_iter)
-        lr = lr_at_step(step, cfg)
-        out, host_route_counts = run.training_step(batch, lr)
-        theta_trajectory.append(out["theta_b"])
-        bank_loads += host_route_counts
+    try:
+        for step in range(start_step, n_steps):
+            t_iter = time.perf_counter()
+            with gp.data_wait():
+                batch = next(batch_iter)
+            with gp.compute():
+                lr = lr_at_step(step, cfg)
+                out, host_route_counts = run.training_step(batch, lr)
+                grad_norm = out.pop("grad_norm")
+                if not math.isfinite(out["loss"]) or not math.isfinite(grad_norm):
+                    reason = (
+                        "non-finite loss" if not math.isfinite(out["loss"])
+                        else "non-finite grad_norm"
+                    )
+                    halt_anomaly(
+                        out_dir, step, reason,
+                        {"loss": out["loss"], "grad_norm": grad_norm},
+                        lambda p: run.save_checkpoint(p, step),
+                    )
+                if spike is not None and grad_norm > spike:
+                    halt_anomaly(
+                        out_dir, step, f"grad_norm spike > {spike}",
+                        {"loss": out["loss"], "grad_norm": grad_norm},
+                        lambda p: run.save_checkpoint(p, step),
+                    )
+                theta_trajectory.append(out["theta_b"])
+                bank_loads += host_route_counts
 
-        if step % cfg.log_every == 0 or step == n_steps - 1:
-            line = {
-                "step": step, "lr": lr, "grad_norm": out.pop("grad_norm"),
-                "theta_ema": cond.theta_ema.value,
-                "wall_time": time.time() - t_start, **out,
-            }
-            with metrics_path.open("a") as fh:
-                fh.write(json.dumps(line) + "\n")
-        else:
-            out.pop("grad_norm")
+            dt = max(time.perf_counter() - t_iter, 1e-9)
+            ops_stats = meter.update(dt) if meter is not None else {"steps_per_sec": 1.0 / dt}
+            if step % cfg.log_every == 0 or step == n_steps - 1:
+                sink.log(
+                    step,
+                    {
+                        "lr": lr, "grad_norm": grad_norm,
+                        "theta_ema": cond.theta_ema.value,
+                        "wall_time": time.time() - t_start, **out,
+                    },
+                )
+                ops_sink.log(step, {**ops_stats, **gp.report()})
 
-        if (step + 1) % cfg.ckpt_every_steps == 0 and (step + 1) < n_steps:
-            run.save_checkpoint(out_dir / "checkpoints" / f"{step + 1}.safetensors", step + 1)
+            if (step + 1) % cfg.ckpt_every_steps == 0 and (step + 1) < n_steps:
+                with gp.checkpoint():
+                    ckpt = out_dir / "checkpoints" / f"{step + 1}.safetensors"
+                    run.save_checkpoint(ckpt, step + 1)
+                    save_aux(
+                        aux_path_for(ckpt), bank_loads, theta_trajectory,
+                        _jax_aux_arrays(run),
+                    )
+    finally:
+        sink.close()
+        ops_sink.close()
 
     (out_dir / "final" / "theta_star.json").write_text(
         json.dumps(

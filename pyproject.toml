@@ -35,4 +35,5 @@ package = true
 [dependency-groups]
 dev = [
     "pytest>=8.0",
+    "tensorboard",
 ]

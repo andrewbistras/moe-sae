@@ -1,4 +1,4 @@
-"""Training loop (spec §10–§11): schedule, step, logging, artifacts.
+"""Training loop (spec §10–§11): schedule, step, logging, artifacts, resume.
 
 Per step: `condition.training_step` → `loss.backward()` → `SpecAdam.step(lr)`
 → θ-EMA update → DeadTracker update. LR schedule: linear warmup over
@@ -8,6 +8,53 @@ Per step: `condition.training_step` → `loss.backward()` → `SpecAdam.step(lr)
 Artifacts (contract §Run artifact layout): config.yaml echo, metrics.jsonl,
 theta_trajectory.npy, checkpoints/{step}.safetensors, and final/
 {theta_star.json, bank_loads.npy, dead_final.npy, checkpoint.safetensors}.
+
+Ops additions (docs/OPS.md; all frozen-math-neutral — no training-step
+number changes, no batch reordering):
+
+- **Bitwise resume** (`resume=True`): restore the latest
+  checkpoints/{k}.safetensors (params, θ-EMA, DeadTracker) plus its
+  {k}.aux.npz sidecar (FP32 Adam moments + step count, cumulative
+  bank_loads, θ trajectory — OPS §4: anything excluded from the checkpoint
+  is a resume bug), then fast-forward the deterministic BatchComposer by k
+  batches. The fast-forward is the ONLY stream interaction, so the resumed
+  trajectory is bit-identical to an uninterrupted run.
+- **metrics.jsonl truncation**: on resume, lines with step >= k are dropped
+  before appending — a resumed run never duplicates a step.
+- **Anomaly guard**: non-finite loss/grad_norm (or grad_norm above the
+  optional ops-only `cfg.spike_threshold`) → emergency checkpoint +
+  run-local logbook entry + RuntimeError. HALT, never skip: dropping or
+  retrying a batch would desynchronize the frozen matched data order
+  (spec §10; OPS §2 spike playbook).
+- **MetricsSink / ops sidecar**: the canonical metrics.jsonl is written by
+  MetricsSink in jsonl_only mode (byte-identical to the registered format);
+  MFU + goodput numbers go to a separate ops_metrics.jsonl (+ TensorBoard
+  under tb/ when available) so the registered artifact never changes.
+
+Decisions (recorded):
+- Adam moments/step count live in {step}.aux.npz NEXT TO the .safetensors,
+  not inside it: the checkpoint format is read by load_condition_from_run
+  across the eval/analysis stack and stays untouched; the sidecar is
+  additive ops state required by the OPS §4 bitwise-resume rule.
+- resume=True on a completed run (final/checkpoint.safetensors exists) is a
+  logged no-op, mirroring the capture driver ("a completed capture is a
+  no-op"); durable state present WITHOUT resume is a RuntimeError, also
+  mirroring capture.
+- Anomaly checkpoints are named anomaly_{step}.safetensors so the numeric
+  latest-checkpoint scan (and load_condition_from_run) never selects them.
+  Loss is checked BEFORE backward, so a NaN-loss emergency checkpoint holds
+  clean pre-update parameters; a NaN that first appears in the gradients is
+  only detectable after `opt.step` (SpecAdam is frozen and cannot be
+  intercepted mid-step), so that emergency checkpoint is forensic and the
+  halt message directs auditors to the last periodic checkpoint.
+- Anomaly/resume events go to a run-local logbook (out_dir/logs/LOGBOOK.md)
+  so the record travels with the run artifacts.
+- wall_time restarts at the resume moment; it is the one legitimately
+  nondeterministic metrics field and is excluded from the bitwise contract
+  (the OPS §4 drill compares metrics.jsonl minus wall_time).
+- `spike_threshold` is read via getattr (default None = off): it is an
+  ops-only knob, deliberately not a RunConfig field — the frozen config
+  schema and its YAML echo stay exactly as registered.
 
 `train` deliberately does NOT call `cfg.validate()`: validation of frozen
 constants belongs to the entry-point script (scripts/run_train.py); tests
@@ -20,7 +67,7 @@ import json
 import math
 import time
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
 
 import numpy as np
 import torch
@@ -29,6 +76,16 @@ from moe_sae.sae import TrainBatch
 from moe_sae.sae.conditions import SAECondition
 from moe_sae.sae.optim import SpecAdam
 from moe_sae.train.config import RunConfig
+from moe_sae.util.manifest import logbook_append
+from moe_sae.util.metrics import (
+    GoodputTracker,
+    MetricsSink,
+    MFUMeter,
+    flops_per_step_estimate,
+)
+
+OPS_METRICS_NAME = "ops_metrics.jsonl"
+RUN_LOGBOOK = ("logs", "LOGBOOK.md")
 
 
 def lr_at_step(step: int, cfg: RunConfig) -> float:
@@ -41,13 +98,218 @@ def lr_at_step(step: int, cfg: RunConfig) -> float:
     return cfg.lr_min + 0.5 * (cfg.lr - cfg.lr_min) * (1.0 + math.cos(math.pi * progress))
 
 
+# --------------------------------------------------------------------------- #
+# Resume plumbing (shared with moe_sae.tpu.train_jax)                          #
+# --------------------------------------------------------------------------- #
+
+
+def run_logbook_path(out_dir: str | Path) -> Path:
+    """Run-local logbook (see module Decisions)."""
+    return Path(out_dir).joinpath(*RUN_LOGBOOK)
+
+
+def latest_checkpoint(ckpt_dir: str | Path) -> tuple[int, Path] | None:
+    """Highest-step numeric checkpoints/{step}.safetensors, or None.
+    Non-numeric stems (e.g. anomaly_{step}.safetensors) are ignored."""
+    candidates: list[tuple[int, Path]] = []
+    ckpt_dir = Path(ckpt_dir)
+    if ckpt_dir.is_dir():
+        for p in ckpt_dir.glob("*.safetensors"):
+            try:
+                candidates.append((int(p.stem), p))
+            except ValueError:
+                continue
+    return max(candidates) if candidates else None
+
+
+def aux_path_for(ckpt_path: str | Path) -> Path:
+    """{step}.aux.npz sidecar next to a checkpoints/{step}.safetensors."""
+    ckpt_path = Path(ckpt_path)
+    return ckpt_path.with_name(f"{ckpt_path.stem}.aux.npz")
+
+
+def resolve_resume(out_dir: str | Path, resume: bool) -> tuple[int, Path | None, bool]:
+    """Resume decision for a run directory → (start_step, ckpt_path, complete).
+
+    Mirrors the capture-driver semantics (moe_sae.capture.driver):
+    durable state without resume=True is a hard error; resume on a completed
+    run is a no-op (complete=True); resume with no durable checkpoint starts
+    fresh from step 0.
+    """
+    out_dir = Path(out_dir)
+    final_ckpt = out_dir / "final" / "checkpoint.safetensors"
+    latest = latest_checkpoint(out_dir / "checkpoints")
+    has_state = (
+        final_ckpt.exists() or latest is not None or (out_dir / "metrics.jsonl").exists()
+    )
+    if not resume:
+        if has_state:
+            raise RuntimeError(
+                f"{out_dir} already contains run state; pass resume=True "
+                "(--resume) to continue it, or choose a fresh out_dir."
+            )
+        return 0, None, False
+    if final_ckpt.exists():
+        return 0, None, True  # completed run: resume is a no-op
+    if latest is None:
+        return 0, None, False  # nothing durable yet: fresh start
+    return latest[0], latest[1], False
+
+
+def restore_condition(condition: SAECondition, ckpt_path: str | Path) -> int:
+    """Restore params + θ-EMA + DeadTracker from a checkpoint into an
+    already-built condition (in place, so callers keep their reference and
+    device placement). Returns the checkpoint's step."""
+    restored, _, extras = SAECondition.load_checkpoint(ckpt_path)
+    assert restored.condition == condition.condition, (
+        restored.condition,
+        condition.condition,
+    )
+    assert (restored.f, restored.k_bar) == (condition.f, condition.k_bar)
+    with torch.no_grad():
+        for name in ("W_enc", "b_enc", "D", "mu"):
+            dst = getattr(condition.sae, name)
+            src = getattr(restored.sae, name)
+            assert dst.shape == src.shape, (name, dst.shape, src.shape)
+            dst.copy_(src.to(dst.device))
+    condition.theta_ema.load_state_dict(restored.theta_ema.state_dict())
+    condition.dead_tracker.load_state_dict(restored.dead_tracker.state_dict())
+    return extras["step"]
+
+
+def truncate_metrics_jsonl(path: str | Path, start_step: int) -> int:
+    """Drop jsonl lines with step >= start_step (and any torn final line from
+    a mid-write kill), preserving the surviving lines byte-for-byte. Returns
+    the number of dropped lines."""
+    p = Path(path)
+    if not p.exists():
+        return 0
+    kept: list[str] = []
+    dropped = 0
+    for raw in p.read_text().splitlines(keepends=True):
+        try:
+            step = json.loads(raw)["step"]
+        except (json.JSONDecodeError, KeyError, TypeError):
+            dropped += 1  # torn write from the kill; the step will be re-run
+            continue
+        if step < start_step:
+            kept.append(raw)
+        else:
+            dropped += 1
+    p.write_text("".join(kept))
+    return dropped
+
+
+def save_aux(
+    path: str | Path,
+    bank_loads: torch.Tensor,
+    theta_trajectory: list[float],
+    extra_arrays: dict,
+) -> None:
+    """Write the {step}.aux.npz resume sidecar (see module Decisions)."""
+    np.savez(
+        str(path),
+        bank_loads=bank_loads.detach().cpu().numpy(),
+        theta_trajectory=np.asarray(theta_trajectory, dtype=np.float64),
+        **extra_arrays,
+    )
+
+
+def load_aux(ckpt_path: str | Path) -> "np.lib.npyio.NpzFile":
+    """Load the aux sidecar for a checkpoint; loud error if absent (a
+    checkpoint without its optimizer state cannot resume bitwise, OPS §4)."""
+    p = aux_path_for(ckpt_path)
+    if not p.exists():
+        raise RuntimeError(
+            f"checkpoint {ckpt_path} has no aux sidecar {p.name}: cannot "
+            "resume bitwise without Adam moments/step count (docs/OPS.md §4)."
+        )
+    return np.load(p)
+
+
+def _adam_state_arrays(opt: SpecAdam) -> dict:
+    """FP32 Adam moments + step count as npz-ready arrays. Iterates
+    `opt._params()` — the deterministic group order SpecAdam itself uses."""
+    arrays: dict = {"adam_t": np.int64(opt.t)}
+    for i, (p, _) in enumerate(opt._params()):
+        st = opt.state[id(p)]
+        arrays[f"adam_m_{i}"] = st["exp_avg"].detach().cpu().numpy()
+        arrays[f"adam_v_{i}"] = st["exp_avg_sq"].detach().cpu().numpy()
+    return arrays
+
+
+def _load_adam_state(opt: SpecAdam, aux) -> None:
+    opt.t = int(aux["adam_t"])
+    with torch.no_grad():
+        for i, (p, _) in enumerate(opt._params()):
+            st = opt.state[id(p)]
+            st["exp_avg"].copy_(torch.from_numpy(aux[f"adam_m_{i}"].copy()))
+            st["exp_avg_sq"].copy_(torch.from_numpy(aux[f"adam_v_{i}"].copy()))
+
+
+# --------------------------------------------------------------------------- #
+# Anomaly guard (OPS §2: HALT, never skip)                                     #
+# --------------------------------------------------------------------------- #
+
+
+def halt_anomaly(
+    out_dir: str | Path,
+    step: int,
+    reason: str,
+    detail: dict,
+    save_ckpt: Callable[[Path], None],
+) -> None:
+    """Emergency checkpoint + logbook entry + RuntimeError. Skipping or
+    retrying the batch is never permitted (spec §10 matched data order)."""
+    out_dir = Path(out_dir)
+    ckpt = out_dir / "checkpoints" / f"anomaly_{step}.safetensors"
+    save_ckpt(ckpt)
+    logbook_append(
+        "anomaly",
+        {"reason": reason, "step": step, "checkpoint": str(ckpt), **detail},
+        path=run_logbook_path(out_dir),
+    )
+    raise RuntimeError(
+        f"anomaly halt at step {step}: {reason} {detail}. Emergency checkpoint "
+        f"at {ckpt}. HALT-never-skip (docs/OPS.md §2) — audit, then resume "
+        "with --resume from the last periodic checkpoint."
+    )
+
+
+def open_sinks(out_dir: str | Path) -> tuple[MetricsSink, MetricsSink]:
+    """(canonical, ops) sinks: canonical is jsonl_only (byte-identical
+    registered metrics.jsonl); ops points at ops_metrics.jsonl and mirrors to
+    TensorBoard under out_dir/tb when available."""
+    out_dir = Path(out_dir)
+    canonical = MetricsSink(out_dir, jsonl_only=True)
+    ops = MetricsSink(out_dir, enable_tensorboard=True)
+    ops.metrics_path = out_dir / OPS_METRICS_NAME  # sidecar, not the registered file
+    return canonical, ops
+
+
+# --------------------------------------------------------------------------- #
+# The loop                                                                     #
+# --------------------------------------------------------------------------- #
+
+
 def train(
     cfg: RunConfig,
     condition: SAECondition,
     batch_iter: Iterator[TrainBatch],
     out_dir: str | Path,
+    *,
+    resume: bool = False,
+    peak_flops: float | None = None,
 ) -> None:
     out_dir = Path(out_dir)
+    start_step, ckpt_path, complete = resolve_resume(out_dir, resume)
+    if complete:
+        logbook_append(
+            "resume_noop",
+            {"out_dir": str(out_dir), "note": "final checkpoint exists; run complete"},
+            path=run_logbook_path(out_dir),
+        )
+        return
     (out_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
     (out_dir / "final").mkdir(parents=True, exist_ok=True)
     cfg.to_yaml(out_dir / "config.yaml")
@@ -64,45 +326,107 @@ def train(
 
     bank_loads = None  # cumulative host-expert routed tokens, [64] int64
     theta_trajectory: list[float] = []
-    metrics_path = out_dir / "metrics.jsonl"
+    gp = GoodputTracker()
+
+    if ckpt_path is not None:
+        k = restore_condition(condition, ckpt_path)
+        assert k == start_step, (k, start_step)
+        aux = load_aux(ckpt_path)
+        _load_adam_state(opt, aux)
+        bank_loads = torch.from_numpy(aux["bank_loads"].copy())
+        theta_trajectory = [float(x) for x in aux["theta_trajectory"]]
+        with gp.data_wait():
+            # Composer fast-forward: the ONLY stream interaction on resume —
+            # consuming k batches reproduces the exact stream position.
+            for _ in range(start_step):
+                next(batch_iter)
+        logbook_append(
+            "resume",
+            {"step": start_step, "checkpoint": str(ckpt_path)},
+            path=run_logbook_path(out_dir),
+        )
+    if resume:
+        truncate_metrics_jsonl(out_dir / "metrics.jsonl", start_step)
+        truncate_metrics_jsonl(out_dir / OPS_METRICS_NAME, start_step)
+
+    meter = None
+    if peak_flops is not None:
+        meter = MFUMeter(
+            flops_per_step_estimate(
+                cfg.condition, cfg.batch_tokens, cfg.f, condition.d, cfg.k_bar
+            ),
+            peak_flops,
+        )
+    sink, ops_sink = open_sinks(out_dir)
     t_start = time.time()
+    spike = getattr(cfg, "spike_threshold", None)  # ops-only knob, default off
 
     n_steps = cfg.n_steps
-    for step in range(n_steps):
-        batch = next(batch_iter)
-        out = condition.training_step(batch, step)
-        out.loss.backward()
-        lr = lr_at_step(step, cfg)
-        grad_norm = opt.step(lr)
-        opt.zero_grad()
+    try:
+        for step in range(start_step, n_steps):
+            t_iter = time.perf_counter()
+            with gp.data_wait():
+                batch = next(batch_iter)
+            with gp.compute():
+                out = condition.training_step(batch, step)
+                loss_val = float(out.loss.item())
+                if not math.isfinite(loss_val):
+                    halt_anomaly(
+                        out_dir, step, "non-finite loss", {"loss": loss_val},
+                        lambda p: condition.save_checkpoint(p, theta_ema, dead_tracker, step),
+                    )
+                out.loss.backward()
+                lr = lr_at_step(step, cfg)
+                grad_norm = opt.step(lr)
+                opt.zero_grad()
+                if not math.isfinite(grad_norm) or (
+                    spike is not None and grad_norm > spike
+                ):
+                    reason = (
+                        "non-finite grad_norm"
+                        if not math.isfinite(grad_norm)
+                        else f"grad_norm spike > {spike}"
+                    )
+                    halt_anomaly(
+                        out_dir, step, reason,
+                        {"grad_norm": grad_norm, "loss": loss_val},
+                        lambda p: condition.save_checkpoint(p, theta_ema, dead_tracker, step),
+                    )
 
-        theta_ema.update(out.theta_b)
-        dead_tracker.update(out.dict_route_counts, out.fired_mask)
-        theta_trajectory.append(out.theta_b)
-        if bank_loads is None:
-            bank_loads = out.bank_route_counts.clone().to(torch.int64)
-        else:
-            bank_loads += out.bank_route_counts.to(torch.int64)
+                theta_ema.update(out.theta_b)
+                dead_tracker.update(out.dict_route_counts, out.fired_mask)
+                theta_trajectory.append(out.theta_b)
+                if bank_loads is None:
+                    bank_loads = out.bank_route_counts.clone().to(torch.int64)
+                else:
+                    bank_loads += out.bank_route_counts.to(torch.int64)
 
-        if step % cfg.log_every == 0 or step == n_steps - 1:
-            line = {
-                "step": step,
-                "lr": lr,
-                "grad_norm": grad_norm,
-                "theta_ema": theta_ema.value,
-                "wall_time": time.time() - t_start,
-                **out.scalars(),
-            }
-            with metrics_path.open("a") as fh:
-                fh.write(json.dumps(line) + "\n")
+            dt = max(time.perf_counter() - t_iter, 1e-9)
+            ops_stats = meter.update(dt) if meter is not None else {"steps_per_sec": 1.0 / dt}
+            if step % cfg.log_every == 0 or step == n_steps - 1:
+                sink.log(
+                    step,
+                    {
+                        "lr": lr,
+                        "grad_norm": grad_norm,
+                        "theta_ema": theta_ema.value,
+                        "wall_time": time.time() - t_start,
+                        **out.scalars(),
+                    },
+                )
+                ops_sink.log(step, {**ops_stats, **gp.report()})
 
-        if (step + 1) % cfg.ckpt_every_steps == 0 and (step + 1) < n_steps:
-            condition.save_checkpoint(
-                out_dir / "checkpoints" / f"{step + 1}.safetensors",
-                theta_ema,
-                dead_tracker,
-                step + 1,
-            )
+            if (step + 1) % cfg.ckpt_every_steps == 0 and (step + 1) < n_steps:
+                with gp.checkpoint():
+                    ckpt = out_dir / "checkpoints" / f"{step + 1}.safetensors"
+                    condition.save_checkpoint(ckpt, theta_ema, dead_tracker, step + 1)
+                    save_aux(
+                        aux_path_for(ckpt), bank_loads, theta_trajectory,
+                        _adam_state_arrays(opt),
+                    )
+    finally:
+        sink.close()
+        ops_sink.close()
 
     # θ* frozen at end of training (spec §6, changelog #6).
     (out_dir / "final" / "theta_star.json").write_text(
