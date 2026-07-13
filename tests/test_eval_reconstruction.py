@@ -157,9 +157,13 @@ def naive_metrics(root, split, sae, theta):
             for t in keep.nonzero(as_tuple=True)[0].tolist():
                 rows.append((pool, shard["c"][t], shard["experts"][t].to(torch.int64)))
     n_total = len(rows)
-    route_mean = torch.stack(
-        [c.to(torch.float64).sum(dim=0) for _, c, _ in rows]
-    ).mean(dim=0)
+    # A11: balanced (0.5/0.5 pool-weighted) route mean over populated pools.
+    pool_means = []
+    for pool in ("visual", "text"):
+        routes = [c.to(torch.float64).sum(dim=0) for p, c, _ in rows if p == pool]
+        if routes:
+            pool_means.append(torch.stack(routes).mean(dim=0))
+    route_mean = sum(pool_means) / len(pool_means)
 
     num_l = den_l = num_a = den_a = 0.0
     num_e = torch.zeros(64, dtype=torch.float64)

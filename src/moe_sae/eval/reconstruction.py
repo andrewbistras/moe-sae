@@ -164,7 +164,9 @@ def evaluate_reconstruction(
     """Spec §13 reconstruction metrics + FeatureDump shards over one split.
 
     Two streaming passes: pass 1 computes the split's routed-aggregate mean
-    (denominator of the aggregate NMSE / explained variance, spec §8); pass 2
+    (denominator of the aggregate NMSE / explained variance, spec §8) under
+    the A11 modality-balanced measure — per-pool means weighted 0.5/0.5
+    (a split with a single populated pool uses that pool's mean); pass 2
     encodes under θ*, accumulates all metrics in float64, and writes one
     FeatureDump shard per capture shard that has ≥1 row in the split.
 
@@ -181,8 +183,9 @@ def evaluate_reconstruction(
     # undercount global conditions (B/F) whose latent ids run up to f_dict.
     n_latents_total = condition.num_banks * condition.f_dict
 
-    # ---- pass 1: split mean of c_route (float64) ----
-    route_sum = torch.zeros(0, dtype=torch.float64)
+    # ---- pass 1: split mean of c_route (float64), A11 balanced measure ----
+    route_sums: dict[str, torch.Tensor] = {}
+    n_pool_pass1 = {p: 0 for p in POOLS}
     n_total = 0
     for pool in POOLS:
         for shard in iter_shards(root, pool):
@@ -190,12 +193,16 @@ def evaluate_reconstruction(
             if not keep.any():
                 continue
             c = shard["c"][keep].to(torch.float64)
-            if route_sum.numel() == 0:
-                route_sum = torch.zeros(c.shape[-1], dtype=torch.float64)
-            route_sum += c.sum(dim=1).sum(dim=0)
+            if pool not in route_sums:
+                route_sums[pool] = torch.zeros(c.shape[-1], dtype=torch.float64)
+            route_sums[pool] += c.sum(dim=1).sum(dim=0)
+            n_pool_pass1[pool] += int(keep.sum())
             n_total += int(keep.sum())
     assert n_total > 0, f"split '{split}' has no tokens under {root}"
-    route_mean = route_sum / n_total
+    # A11: weight the pools 0.5/0.5 (single-populated-pool splits fall back
+    # to that pool's mean).
+    pool_means = [route_sums[p] / n_pool_pass1[p] for p in POOLS if n_pool_pass1[p] > 0]
+    route_mean = sum(pool_means) / len(pool_means)
 
     # ---- pass 2: encode, accumulate, dump ----
     dump_dir = Path(out_dump_dir) if out_dump_dir is not None else None
@@ -336,7 +343,8 @@ def evaluate_reconstruction(
         "notes": (
             "dead_feature_pct is eval-set deadness (never fired under θ*-inference "
             "on this split), distinct from the spec §8 training deadness window; "
-            "aggregate denominator uses this split's own c_route mean, local "
+            "aggregate denominator uses this split's own c_route mean under the "
+            "A11 modality-balanced (0.5/0.5 pool-weighted) measure, local "
             "denominators use the condition's frozen μ (spec §5)."
         ),
     }

@@ -1,11 +1,17 @@
-"""Statistics pass over capture shards (spec §20 step 2).
+"""Statistics pass over capture shards (spec §20 step 2; v0.1.2 A11 measure).
 
 Computes, in one streaming pass with float64 accumulators:
 
-- per-expert means μ_e = E[c_te | e ∈ S_t] over both pools (spec §5 centering,
-  frozen once computed — the trainer must load them from here, never re-estimate);
-- routed-aggregate mean μ_route = E_t[Σ_slots c_te] (denominator of the
-  aggregate diagnostic loss, spec §8);
+- per-expert means μ_e = E[c_te | e ∈ S_t] under the **modality-balanced
+  (50/50) measure restricted to the train split** (A11, Reviewer F): per-pool
+  sums are accumulated separately and combined as 0.5·mean_visual +
+  0.5·mean_text per bank. A bank routed in only ONE modality uses that
+  modality's mean alone (documented decision: the balanced measure is
+  undefined on an empty pool, and the available-modality mean is the measure's
+  restriction to the bank's support). Frozen once computed — the trainer must
+  load μ_e from here, never re-estimate;
+- routed-aggregate mean μ_route = 0.5·E_visual[c_route] + 0.5·E_text[c_route]
+  (same A11 measure; denominator mean of the aggregate diagnostic, spec §8);
 - per-bank routed-token counts (total and per pool) — the §16.3 load-floor
   inputs;
 - router baselines per modality (spec §15): routing frequency
@@ -14,7 +20,8 @@ Computes, in one streaming pass with float64 accumulators:
 - per-domain token counts per pool.
 
 Outputs `stats.safetensors` (tensors, float32/int64) plus a human-readable
-`stats.json` summary. Banks never routed to have μ_e = 0 and count 0.
+`stats.json` summary recording `measure="balanced_train_split"` (A11). Banks
+never routed to have μ_e = 0 and count 0.
 
 Decisions:
 - Split filtering (A3, moe_sae.data.splits): μ_e and the router baselines
@@ -62,6 +69,9 @@ class ActivationStats:
     split: str | None = "train"  # split the pass was restricted to (None = all)
     excluded_visual: int = 0  # tokens dropped by the split filter per pool
     excluded_text: int = 0
+    # A11: the measure μ_e / μ_route were computed under (50/50 modality
+    # balance restricted to `split`).
+    measure: str = "balanced_train_split"
 
     @property
     def tokens_total(self) -> int:
@@ -85,8 +95,8 @@ def compute_stats(
     root = Path(capture_root)
     d = hidden_size
 
-    mu_sum = torch.zeros(num_experts, d, dtype=torch.float64)
-    route_sum = torch.zeros(d, dtype=torch.float64)
+    mu_sums = {p: torch.zeros(num_experts, d, dtype=torch.float64) for p in POOLS}
+    route_sums = {p: torch.zeros(d, dtype=torch.float64) for p in POOLS}
     counts = {p: torch.zeros(num_experts, dtype=torch.int64) for p in POOLS}
     gate_sums = {p: torch.zeros(num_experts, dtype=torch.float64) for p in POOLS}
     n_tokens = {p: 0 for p in POOLS}
@@ -108,10 +118,10 @@ def compute_stats(
             assert k == top_k, f"expected {top_k} slots, got {k}"
 
             flat_e = experts.reshape(-1)
-            mu_sum.index_add_(0, flat_e, c.reshape(-1, d))
+            mu_sums[pool].index_add_(0, flat_e, c.reshape(-1, d))
             counts[pool] += torch.bincount(flat_e, minlength=num_experts)
             gate_sums[pool].index_add_(0, flat_e, gates.reshape(-1))
-            route_sum += c.sum(dim=1).sum(dim=0)
+            route_sums[pool] += c.sum(dim=1).sum(dim=0)
             n_tokens[pool] += n
 
             for dom, cnt in zip(*torch.unique(shard["domain"], return_counts=True)):
@@ -122,13 +132,33 @@ def compute_stats(
     assert total_tokens > 0, f"no captured tokens under {root}"
     bank_counts = counts["visual"] + counts["text"]
 
-    # μ_e = Σ c_te / count_e, guarding never-routed banks (μ_e := 0).
+    # A11 (v0.1.2, Reviewer F): μ_e under the modality-balanced (50/50)
+    # measure — 0.5·mean_visual(e) + 0.5·mean_text(e) per bank. Banks routed
+    # in only one modality use the available modality's mean (the balanced
+    # measure restricted to the bank's support); never-routed banks are 0.
+    def pool_mean(pool: str) -> torch.Tensor:
+        return torch.where(
+            counts[pool].unsqueeze(1) > 0,
+            mu_sums[pool] / counts[pool].clamp_min(1).unsqueeze(1).to(torch.float64),
+            torch.zeros(num_experts, d, dtype=torch.float64),
+        )
+
+    mean_v, mean_t = pool_mean("visual"), pool_mean("text")
+    has_v = (counts["visual"] > 0).unsqueeze(1)
+    has_t = (counts["text"] > 0).unsqueeze(1)
     mu_e = torch.where(
-        bank_counts.unsqueeze(1) > 0,
-        mu_sum / bank_counts.clamp_min(1).unsqueeze(1).to(torch.float64),
-        torch.zeros_like(mu_sum),
+        has_v & has_t,
+        0.5 * mean_v + 0.5 * mean_t,
+        mean_v + mean_t,  # exactly one (or neither → 0) is nonzero here
     )
-    mu_route = route_sum / total_tokens
+
+    # A11: μ_route = 0.5·E_visual[c_route] + 0.5·E_text[c_route]; a split with
+    # a single populated pool falls back to that pool's mean.
+    route_means = {
+        p: (route_sums[p] / n_tokens[p]) if n_tokens[p] > 0 else None for p in POOLS
+    }
+    populated = [m for m in route_means.values() if m is not None]
+    mu_route = sum(populated) / len(populated)
 
     def p_route(pool: str) -> torch.Tensor:
         denom = max(top_k * n_tokens[pool], 1)
@@ -154,6 +184,7 @@ def compute_stats(
         split=split,
         excluded_visual=n_excluded["visual"],
         excluded_text=n_excluded["text"],
+        measure=f"balanced_{split}_split" if split is not None else "balanced_unfiltered",
     )
 
 
@@ -176,6 +207,7 @@ def save_stats(stats: ActivationStats, out_dir: str | Path) -> Path:
     counts = stats.bank_counts
     summary = {
         "split": stats.split,
+        "measure": stats.measure,  # A11: balanced 50/50 modality measure
         "tokens": {
             "visual": stats.tokens_visual,
             "text": stats.tokens_text,
@@ -225,4 +257,5 @@ def load_stats(stats_dir: str | Path) -> ActivationStats:
         split=summary.get("split", "train"),
         excluded_visual=summary["tokens"].get("excluded_visual", 0),
         excluded_text=summary["tokens"].get("excluded_text", 0),
+        measure=summary.get("measure", "balanced_train_split"),
     )

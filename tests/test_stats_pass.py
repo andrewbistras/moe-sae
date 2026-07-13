@@ -40,31 +40,42 @@ def build_capture(root, n_visual=11, n_text=7, seed=0):
 
 
 def naive_reference(root):
-    """Plain-loop float64 reference over the *stored* (bf16-rounded) shards."""
-    mu_sum = torch.zeros(E, D, dtype=torch.float64)
+    """Plain-loop float64 reference over the *stored* (bf16-rounded) shards,
+    under the A11 modality-balanced (50/50) measure: per-pool means are
+    combined 0.5/0.5; single-modality banks use the available modality's
+    mean."""
+    mu_sum = {p: torch.zeros(E, D, dtype=torch.float64) for p in ("visual", "text")}
     counts = {p: torch.zeros(E, dtype=torch.int64) for p in ("visual", "text")}
     gate_sum = {p: torch.zeros(E, dtype=torch.float64) for p in ("visual", "text")}
-    route_sum = torch.zeros(D, dtype=torch.float64)
+    route_sum = {p: torch.zeros(D, dtype=torch.float64) for p in ("visual", "text")}
     n_tok = {"visual": 0, "text": 0}
     for pool in ("visual", "text"):
         for shard in iter_shards(root, pool):
             c = shard["c"].to(torch.float64)
             for t in range(c.shape[0]):
                 n_tok[pool] += 1
-                route_sum += c[t].sum(dim=0)
+                route_sum[pool] += c[t].sum(dim=0)
                 for s in range(K):
                     e = int(shard["experts"][t, s])
-                    mu_sum[e] += c[t, s]
+                    mu_sum[pool][e] += c[t, s]
                     counts[pool][e] += 1
                     gate_sum[pool][e] += float(shard["gates"][t, s])
     total = counts["visual"] + counts["text"]
     mu_e = torch.zeros(E, D, dtype=torch.float64)
     for e in range(E):
-        if total[e] > 0:
-            mu_e[e] = mu_sum[e] / int(total[e])
+        means = [
+            mu_sum[p][e] / int(counts[p][e])
+            for p in ("visual", "text")
+            if counts[p][e] > 0
+        ]
+        if means:
+            mu_e[e] = sum(means) / len(means)
+    route_means = [
+        route_sum[p] / n_tok[p] for p in ("visual", "text") if n_tok[p] > 0
+    ]
     return {
         "mu_e": mu_e,
-        "mu_route": route_sum / sum(n_tok.values()),
+        "mu_route": sum(route_means) / len(route_means),
         "counts": counts,
         "total": total,
         "p_route": {p: counts[p].to(torch.float64) / (K * n_tok[p]) for p in counts},
@@ -122,6 +133,40 @@ def test_never_routed_bank_is_zero(tmp_path):
     assert torch.equal(stats.mu_e[6], torch.zeros(D))
     assert float(stats.p_route_visual[7]) == 0.0
     assert float(stats.p_gate_visual[7]) == 0.0
+
+
+def test_balanced_measure_exact_hand_computed(tmp_path):
+    """A11: exact hand-computed balanced means. Visual: two tokens with c ≡ 1
+    and c ≡ 5 (per-slot); text: one token with c ≡ 2. Balanced bank mean for
+    a bank seen in both pools = 0.5·3 + 0.5·2 = 2.5, NOT the raw-capture
+    (1+5+2)/3 ≈ 2.667; single-modality banks use their own pool's mean."""
+    ids = ids_in_split(0, "train", 3)
+    wv = ShardWriter(tmp_path, "visual", shard_size=8)
+    experts_v = torch.tensor([[0, 1, 2, 3, 4, 6], [0, 1, 2, 3, 4, 5]], dtype=torch.uint8)
+    c_v = torch.stack([torch.full((K, D), 1.0), torch.full((K, D), 5.0)])
+    wv.add(c_v, experts_v, torch.full((2, K), 0.1),
+           torch.tensor(ids[:2], dtype=torch.int32), torch.zeros(2, dtype=torch.uint8))
+    wv.close()
+    wt = ShardWriter(tmp_path, "text", shard_size=8)
+    experts_t = torch.tensor([[0, 1, 2, 3, 4, 5]], dtype=torch.uint8)
+    wt.add(torch.full((1, K, D), 2.0), experts_t, torch.full((1, K), 0.1),
+           torch.tensor(ids[2:], dtype=torch.int32), torch.zeros(1, dtype=torch.uint8))
+    wt.close()
+
+    stats = compute_stats(tmp_path, num_experts=E, hidden_size=D)
+    assert stats.measure == "balanced_train_split"
+    # banks 0-4: both pools -> 0.5·((1+5)/2) + 0.5·2 = 2.5
+    for e in range(5):
+        assert torch.allclose(stats.mu_e[e], torch.full((D,), 2.5)), e
+    # bank 5: visual mean 5 (one token), text mean 2 -> 3.5
+    assert torch.allclose(stats.mu_e[5], torch.full((D,), 3.5))
+    # bank 6: visual-only -> that modality's mean (1.0)
+    assert torch.allclose(stats.mu_e[6], torch.full((D,), 1.0))
+    # bank 7: never routed -> 0
+    assert torch.equal(stats.mu_e[7], torch.zeros(D))
+    # μ_route: visual token routes sum to 6·1=6 and 6·5=30 (mean 18); text 12
+    # -> balanced 0.5·18 + 0.5·12 = 15 (raw-capture mean would be 16)
+    assert torch.allclose(stats.mu_route, torch.full((D,), 15.0))
 
 
 def test_domain_counts(tmp_path):
@@ -219,6 +264,7 @@ def test_split_counts_in_summary_json(tmp_path):
     save_stats(stats, tmp_path / "stats")
     summary = json.loads((tmp_path / "stats" / "stats.json").read_text())
     assert summary["split"] == "train"
+    assert summary["measure"] == "balanced_train_split"  # A11 record
     assert summary["tokens"]["visual"] == 6
     assert summary["tokens"]["excluded_visual"] == 6
     assert summary["tokens"]["excluded_text"] == 4
