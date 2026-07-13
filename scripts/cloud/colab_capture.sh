@@ -48,6 +48,10 @@ mkdir -p logs reports
 # for ~180 MB shards and keep objects md5-verifiable.
 gcloud config set storage/parallel_composite_upload_enabled False 2>/dev/null || true
 
+# HF CDN connections drop mid-parquet-block under load (ChunkedEncodingError
+# through fsspec); give hub reads a longer timeout on top of its own backoff.
+export HF_HUB_DOWNLOAD_TIMEOUT=60
+
 # A7 substrate guard: shards from an ungated GPU class are inadmissible.
 nvidia-smi --query-gpu=name --format=csv,noheader | grep -q "A100" \
   || { say "not an A100 runtime (A7: gate + capture must share a substrate) — refusing"; exit 1; }
@@ -143,13 +147,28 @@ run_slice() {
       gcloud storage rm -r "$BUCKET/$out" >/dev/null 2>&1 || true
     fi
   fi
-  say "slice $k: capturing $PER examples from --start $((k * PER)) $RESUME"
-  PYTHONUNBUFFERED=1 python scripts/run_capture.py \
-    --out "$out" --start $((k * PER)) --examples "$PER" \
-    --visual-cap "$VISUAL_CAP" --seed "$SEED" --device cuda $RESUME \
-    < /dev/null >> "logs/capture_w$k.log" 2>&1
-  complete_json "$out/progress.json" \
-    || { say "slice $k: worker exited incomplete (logs/capture_w$k.log) — rerun to resume"; return 1; }
+  # Progress-aware retry (same doctrine as run_pipeline_capture.sh): HF-stream
+  # failures land in the iterator, OUTSIDE per-example isolation, and kill the
+  # worker — transient CDN weather, so retry with backoff as long as each
+  # attempt advances the checkpoint; give up only when attempts stop paying.
+  local attempts=0 last_captured=-1 captured
+  while :; do
+    say "slice $k: capturing $PER examples from --start $((k * PER)) $RESUME"
+    PYTHONUNBUFFERED=1 python scripts/run_capture.py \
+      --out "$out" --start $((k * PER)) --examples "$PER" \
+      --visual-cap "$VISUAL_CAP" --seed "$SEED" --device cuda $RESUME \
+      < /dev/null >> "logs/capture_w$k.log" 2>&1 || true
+    complete_json "$out/progress.json" && break
+    captured=$(python3 -c "import json;print(json.load(open('$out/progress.json')).get('captured',0))" 2>/dev/null || echo 0)
+    if [ "$captured" -gt "$last_captured" ]; then attempts=0; last_captured=$captured; else attempts=$((attempts + 1)); fi
+    if [ "$attempts" -ge 5 ]; then
+      say "slice $k: no progress over 5 attempts (logs/capture_w$k.log) — systematic, giving up"
+      return 1
+    fi
+    say "slice $k: worker died at $captured/$PER — retry $attempts/5 in $((30 * attempts + 15))s"
+    sleep $((30 * attempts + 15))
+    [ -f "$out/progress.json" ] && RESUME="--resume"
+  done
   say "slice $k: pushing to bucket"
   # --delete-unmatched: drop bucket-side strays from interrupted pushes so the
   # bucket copy exactly mirrors the completed slice before we verify + wipe
