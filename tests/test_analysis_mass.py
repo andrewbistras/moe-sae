@@ -436,8 +436,10 @@ def test_run_analysis_cli_banked(tmp_path):
     out = tmp_path / "reports"
     _load_script().main(
         [
+            # no --load-floor: exercises the A13 split-proportional default
+            # (the planted vis/txt banks clear 10% of uniform expectation)
             "--dump", str(dump), "--stats", str(stats), "--out", str(out),
-            "--load-floor", "500000", "--n-shuffles", "40", "--n-boot", "40",
+            "--n-shuffles", "40", "--n-boot", "40",
             "--compare-dump", str(dump), "--seed-dumps", str(dump),
             "--train-dump", str(dump),
         ]

@@ -4,7 +4,7 @@
 Usage:
     uv run python scripts/run_analysis.py \
         --dump dumps/<run>/dev --stats stats/<name> \
-        --out reports/analysis_<run>/ [--load-floor 500000] \
+        --out reports/analysis_<run>/ [--load-floor <absolute override>] \
         [--train-dump dumps/<run>/train] \
         [--compare-dump dumps/<C-run>/dev] \
         [--seed-dumps dumps/<A-seed2>/dev dumps/<A-seed3>/dev] \
@@ -36,6 +36,7 @@ from pathlib import Path
 import numpy as np
 
 from moe_sae.analysis.enrichment import enrichment_analysis, load_stats
+from moe_sae.eval.intervention import split_proportional_floor
 from moe_sae.analysis.mass import (
     load_dump,
     modality_masks,
@@ -60,14 +61,16 @@ def _fmt(x, digits: int = 4) -> str:
     return f"{x:.{digits}f}"
 
 
-def _write_summary(out: Path, args, dump, mass_report, enr, stab, prob) -> None:
+def _write_summary(out: Path, args, dump, mass_report, enr, stab, prob, load_floor=None) -> None:
     lines = [
         f"# Analysis summary — {args.dump}",
         "",
         f"- condition: **{dump.condition}**, tokens: {dump.n_tokens} "
         f"({mass_report['n_tokens_image']} image / {mass_report['n_tokens_text']} text), "
         f"examples: {mass_report['n_examples']}",
-        f"- stats: `{args.stats}`, load floor: {args.load_floor}, seed: {args.seed}",
+        f"- stats: `{args.stats}`, load floor: {load_floor} "
+        f"({'absolute override' if args.load_floor is not None else 'A13 split-proportional'}), "
+        f"seed: {args.seed}",
         "",
     ]
     if stab is not None:
@@ -139,7 +142,12 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--dump", required=True, help="dev/primary dump: dumps/<run>/dev")
     ap.add_argument("--stats", required=True, help="stats artifact (dir or .safetensors)")
     ap.add_argument("--out", required=True, help="report output directory")
-    ap.add_argument("--load-floor", type=int, default=500_000)
+    ap.add_argument(
+        "--load-floor", type=float, default=None,
+        help="ABSOLUTE load-floor override; default (A13) is split-proportional: "
+        "10%% of the dump split's uniform-load expectation (split_tokens*6)/64, "
+        "applied to the dump's own per-split host-routing counts",
+    )
     ap.add_argument(
         "--train-dump", default=None,
         help="TRAIN-split dump the §16.4 probes are fit on; probes are skipped when absent",
@@ -165,6 +173,18 @@ def main(argv: list[str] | None = None) -> None:
     masses = token_bank_masses(dump)
     mods = modality_masks(dump)
 
+    # A13: split-proportional load floor over the dump's own per-split
+    # host-routing counts (absolute --load-floor overrides the floor value).
+    split_bank_counts = np.bincount(dump.experts.reshape(-1), minlength=64)
+    if args.load_floor is not None:
+        load_floor = float(args.load_floor)
+    else:
+        load_floor = split_proportional_floor(dump.n_tokens)
+    print(
+        f"load floor: {load_floor:.1f} "
+        f"({'absolute override' if args.load_floor is not None else 'A13 split-proportional'})"
+    )
+
     # ---- §14 masses ----
     mass_report: dict = {
         "condition": dump.condition,
@@ -189,7 +209,10 @@ def main(argv: list[str] | None = None) -> None:
     enr = None
     stab = None
     if masses is not None:
-        enr = enrichment_analysis(q_by_modality(masses, dump, "act"), stats, args.load_floor)
+        enr = enrichment_analysis(
+            q_by_modality(masses, dump, "act"), stats, load_floor,
+            bank_counts=split_bank_counts,
+        )
 
         compare_ex = None
         if args.compare_dump:
@@ -212,12 +235,13 @@ def main(argv: list[str] | None = None) -> None:
             dump,
             masses,
             stats,
-            load_floor=args.load_floor,
+            load_floor=load_floor,
             seed=args.seed,
             n_shuffles=args.n_shuffles,
             n_boot=args.n_boot,
             compare_example_masses=compare_ex,
             seed_q_image=seed_q or None,
+            bank_counts=split_bank_counts,
         )
     (out / "enrichment.json").write_text(
         json.dumps(enr if enr is not None else {"condition": dump.condition, "note": GLOBAL_NOTE}, indent=2)
@@ -246,7 +270,7 @@ def main(argv: list[str] | None = None) -> None:
         print(f"probes skipped: {prob['skipped']}")
     (out / "probes.json").write_text(json.dumps(prob, indent=2))
 
-    _write_summary(out, args, dump, mass_report, enr, stab, prob)
+    _write_summary(out, args, dump, mass_report, enr, stab, prob, load_floor=load_floor)
     print(f"analysis written to {out}")
 
 

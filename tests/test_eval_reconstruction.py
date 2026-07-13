@@ -464,8 +464,11 @@ def test_run_eval_script_end_to_end(tmp_path):
     assert metrics["n_latents_total"] == cond.num_banks * cond.f_dict
 
 
-def _write_intervention_dump(dump_dir):
-    """Minimal FeatureDump: banks 2 and 3 carry visual-enriched latents."""
+def _write_intervention_dump(dump_dir, starve_bank_3=True):
+    """Minimal FeatureDump: banks 2 and 3 carry visual-enriched latents. The
+    host routing (`experts`, the A13 floor source) routes every token to
+    banks {2, 0} — bank 3 receives ZERO routed tokens in this split unless
+    `starve_bank_3=False` (then rows are [2, 3, 2, 0, 0, 0])."""
     dump_dir.mkdir(parents=True, exist_ok=True)
     acts, token_type = [], []
     n = 40
@@ -478,6 +481,7 @@ def _write_intervention_dump(dump_dir):
             token_type.append(0)
             acts.append((t, 0, 0, 3, 3.0))
     tok, slot, bank, lat, val = zip(*acts)
+    row = [2, 2, 2, 0, 0, 0] if starve_bank_3 else [2, 3, 2, 0, 0, 0]
     save_file(
         {
             "act_token": torch.tensor(tok, dtype=torch.int64),
@@ -486,7 +490,7 @@ def _write_intervention_dump(dump_dir):
             "act_latent": torch.tensor(lat, dtype=torch.int32),
             "act_value": torch.tensor(val, dtype=torch.float32),
             "token_type": torch.tensor(token_type, dtype=torch.uint8),
-            "experts": torch.zeros(n, 6, dtype=torch.uint8),
+            "experts": torch.tensor([row] * n, dtype=torch.uint8),
             "gates": torch.zeros(n, 6, dtype=torch.float32),
             "example_id": torch.arange(n, dtype=torch.int32),
             "domain": torch.zeros(n, dtype=torch.uint8),
@@ -497,48 +501,41 @@ def _write_intervention_dump(dump_dir):
     )
 
 
-def test_intervention_load_floor_uses_training_loads(tmp_path):
-    """Regression: the §16.3 floor must see runs/<run>/final/bank_loads.npy
-    (training loads), not the stats-pass counts, when the artifact exists."""
-    ri = _import_script("run_intervention")
-    _write_intervention_dump(tmp_path / "dump")
+def test_intervention_load_floor_split_proportional(tmp_path):
+    """A13 regression (supersedes the training-loads floor): the §16.3 floor
+    is 10% of the split-uniform expectation, computed from the analysis
+    dump's OWN host routing — a bank starved in the split is excluded even
+    when training loads and the stats pass are healthy."""
+    from moe_sae.eval.intervention import (
+        dump_split_bank_counts,
+        select_enriched_latents,
+        split_proportional_floor,
+    )
+
+    _write_intervention_dump(tmp_path / "dump")  # bank 3 starved in the split
     stats = SimpleNamespace(
         p_gate_visual=torch.full((64,), 1.0 / 64.0),
-        bank_counts=torch.full((64,), 10**6, dtype=torch.int64),  # all pass
+        bank_counts=torch.full((64,), 10**6, dtype=torch.int64),  # all healthy
     )
-    run_dir = tmp_path / "run"
-    (run_dir / "final").mkdir(parents=True)
-    loads = np.full(64, 10**6, dtype=np.int64)
-    loads[3] = 0  # bank 3 starved in TRAINING, healthy in the stats pass
-    np.save(run_dir / "final" / "bank_loads.npy", loads)
+    counts, n_tok = dump_split_bank_counts(tmp_path / "dump")
+    assert n_tok == 40 and int(counts[3]) == 0 and int(counts[2]) == 3 * 40
+    assert split_proportional_floor(n_tok) == 0.10 * (40 * 6) / 64
 
-    counts = ri.load_training_bank_counts(run_dir, stats)
-    assert int(counts[3]) == 0 and int(counts[2]) == 10**6
-
-    kwargs = dict(f=4, top_n_experts=2, quantile=0.5, load_floor=500_000)
-    J = ri.select_J_with_training_loads(tmp_path / "dump", stats, counts, **kwargs)
+    kwargs = dict(f=4, top_n_experts=2, quantile=0.5)
+    J = select_enriched_latents(tmp_path / "dump", stats, **kwargs)
     assert (2, 1) in J
-    assert all(b != 3 for b, _ in J)  # floor came from bank_loads.npy
+    assert all(b != 3 for b, _ in J)  # starved in the split → below A13 floor
 
-    # sanity: with the training loads all healthy, bank 3 is selected — the
-    # array we pass is really what reaches the floor comparison
-    healthy = torch.full((64,), 10**6, dtype=torch.int64)
-    J2 = ri.select_J_with_training_loads(tmp_path / "dump", stats, healthy, **kwargs)
+    # with bank 3 routed in the split, it clears the proportional floor
+    _write_intervention_dump(tmp_path / "dump2", starve_bank_3=False)
+    J2 = select_enriched_latents(tmp_path / "dump2", stats, **kwargs)
     assert (3, 2) in J2
 
-    # the adapter must not mutate the caller's stats object
-    assert int(stats.bank_counts[3]) == 10**6
-
-
-def test_intervention_bank_counts_fallback_warns(tmp_path, capsys):
-    ri = _import_script("run_intervention")
-    stats = SimpleNamespace(
-        p_gate_visual=torch.full((64,), 1.0 / 64.0),
-        bank_counts=torch.arange(64, dtype=torch.int64),
+    # the absolute override flag path still works (A13 keeps it)
+    J3 = select_enriched_latents(
+        tmp_path / "dump", stats, load_floor=0.0, **kwargs
     )
-    counts = ri.load_training_bank_counts(tmp_path / "missing_run", stats)
-    assert torch.equal(counts, stats.bank_counts)
-    assert "bank_loads.npy" in capsys.readouterr().out
+    assert (3, 2) in J3
 
 
 def test_sanity_gate(tmp_path):

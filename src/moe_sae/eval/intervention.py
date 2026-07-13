@@ -34,10 +34,17 @@ Decisions:
   (default 20%, configurable). `matched_control_sets` embeds this under
   `removed_norms` in its match-quality report when given `decoder_cols` +
   `encoded_samples`.
-- `select_enriched_latents` takes its §16.3 load floor from an explicit
-  `bank_counts` argument (the TRAINING loads, runs/<run>/final/bank_loads.npy,
-  numpy [64] int64); when omitted it falls back to `stats.bank_counts`
-  (stats-pass loads) with a logged warning.
+- §16.3 load floor (A13, v0.1.2 addendum — supersedes the v0.1.1 absolute
+  500k floor and the earlier training-loads source): a bank enters enrichment
+  rankings iff its routed token count IN THE SPLIT UNDER ANALYSIS is at least
+  10% of the split's uniform-load expectation E_uniform = (split_tokens×6)/64.
+  Both the counts (from the dump's host-expert routing, `dump.experts`) and
+  the default floor are computed from the analysis dump itself
+  (`dump_split_bank_counts` / `split_proportional_floor`); an absolute
+  `load_floor` override remains available (scripts keep an --load-floor
+  flag). Per-bank counts are still reported for all 64 banks. Matched-control
+  LOAD matching keeps the stats-pass counts (the floor is the only
+  comparison A13 re-sources).
 """
 
 from __future__ import annotations
@@ -64,8 +71,10 @@ from moe_sae.eval.reconstruction import (
     theta_star_json,
 )
 
-# Load floor for enrichment rankings (spec §16.3, frozen for discovery scale).
-LOAD_FLOOR_DISCOVERY = 500_000
+# A13 (v0.1.2): the load floor is split-proportional — 10% of the split's
+# uniform-load expectation E_uniform = (split_tokens × TOP_K) / N_BANKS.
+# (The v0.1.1 absolute 500k floor is superseded; see module Decisions.)
+FLOOR_FRACTION = 0.10
 
 # Matching tolerances in log10 units (documented free parameters of the
 # §17 matched-control construction; achieved quality is always recorded).
@@ -151,13 +160,34 @@ def latent_stats_from_dump(dump_dir: str | Path, f: int) -> dict:
 # --------------------------------------------------------------------------- #
 
 
+def dump_split_bank_counts(dump_dir: str | Path) -> tuple[torch.Tensor, int]:
+    """A13 floor inputs: per-bank routed token counts in the split under
+    analysis, from the dump's host-expert routing (`experts` field), plus the
+    split's token count. Returns ([64] int64 counts, n_split_tokens)."""
+    counts = torch.zeros(64, dtype=torch.int64)
+    n_tokens = 0
+    for shard in iter_dump_shards(dump_dir):
+        experts = shard["experts"].to(torch.int64)
+        counts += torch.bincount(experts.reshape(-1), minlength=64)
+        n_tokens += experts.shape[0]
+    return counts, n_tokens
+
+
+def split_proportional_floor(
+    n_split_tokens: int, top_k: int = 6, n_banks: int = 64
+) -> float:
+    """A13 frozen floor: 10% of the split's uniform-load expectation
+    E_uniform = (split_tokens × top_k) / n_banks."""
+    return FLOOR_FRACTION * (n_split_tokens * top_k) / n_banks
+
+
 def select_enriched_latents(
     dev_dump_dir: str | Path,
     stats,
     f: int,
     top_n_experts: int = 6,
     quantile: float = 0.9,
-    load_floor: int = LOAD_FLOOR_DISCOVERY,
+    load_floor: float | None = None,
     min_visual_fires: int = 1,
     eps: float = 1e-9,
     bank_counts=None,
@@ -172,22 +202,30 @@ def select_enriched_latents(
        visual firing-rate enrichment (rate_vis+ε)/(rate_text+ε) is at or above
        the given `quantile` of that distribution.
 
-    `bank_counts` (numpy [64] int64) is the load-floor source: the TRAINING
-    loads (runs/<run>/final/bank_loads.npy). When None, falls back to
-    `stats.bank_counts` (stats-pass loads) with a logged warning (see module
-    Decisions). `stats` is a `moe_sae.train.stats_pass.ActivationStats`
-    (duck-typed: needs `.p_gate_visual` [64]; `.bank_counts` [64] only for the
-    fallback). Returns a sorted list of (bank, latent) pairs.
+    Load floor (A13): a bank qualifies iff its routed token count IN THE
+    SPLIT UNDER ANALYSIS ≥ 0.10 × (split_tokens×6)/64. `bank_counts` defaults
+    to the dump's own host-expert routing (`dump_split_bank_counts`);
+    `load_floor=None` (default) computes the split-proportional floor, while
+    an explicit value is an absolute override (kept for audits/tests).
+    `stats` is a `moe_sae.train.stats_pass.ActivationStats` (duck-typed:
+    needs `.p_gate_visual` [64]). Returns a sorted list of (bank, latent)
+    pairs.
     """
     if bank_counts is None:
-        logger.warning(
-            "select_enriched_latents: no bank_counts given — falling back to "
-            "stats.bank_counts (stats-pass loads, NOT training loads) for the "
-            "§16.3 load floor"
-        )
-        bank_counts = stats.bank_counts
+        bank_counts, n_split_tokens = dump_split_bank_counts(dev_dump_dir)
+    else:
+        bank_counts = torch.as_tensor(bank_counts, dtype=torch.int64)
+        # each token contributes exactly TOP_K routed slots by construction
+        n_split_tokens = int(bank_counts.sum().item()) // 6
     bank_counts = torch.as_tensor(bank_counts, dtype=torch.int64)
     assert bank_counts.shape == (64,), bank_counts.shape
+    if load_floor is None:
+        load_floor = split_proportional_floor(n_split_tokens)
+        logger.info(
+            "select_enriched_latents: A13 split-proportional load floor = %.1f "
+            "(10%% of uniform expectation over %d split tokens)",
+            load_floor, n_split_tokens,
+        )
 
     ls = latent_stats_from_dump(dev_dump_dir, f)
     q_vis = ls["bank_mass_visual"] / ls["bank_mass_visual"].sum().clamp_min(1e-300)

@@ -14,11 +14,17 @@ Baselines come from the router-statistics artifact (`stats.safetensors`):
 | `p_route_text`  | [64]  | routing frequency per bank, text tokens          |
 | `p_gate_image`  | [64]  | gate-mass fraction per bank, image tokens        |
 | `p_gate_text`   | [64]  | gate-mass fraction per bank, text tokens         |
-| `bank_counts`   | [64]  | routed *training* tokens per bank (load floor)   |
+| `bank_counts`   | [64]  | routed *training* tokens per bank                 |
 
-Load floor (spec §16.3, frozen): banks with fewer than 500,000 routed training
-tokens (10,000 for the pipeline run) are excluded from enrichment rankings and
-stability statistics; per-bank counts are reported for all 64 banks regardless.
+Load floor (A13, v0.1.2 addendum — supersedes the v0.1.1 absolute floor):
+a bank enters enrichment rankings and stability statistics only if its routed
+token count IN THE SPLIT UNDER ANALYSIS is ≥ 10% of that split's uniform-load
+expectation E_uniform = (split_tokens × 6)/64. The per-split counts come from
+the analysis dump's host-expert routing (`bank_counts` argument of
+`enrichment_analysis`; computed by `moe_sae.eval.intervention.
+dump_split_bank_counts`); the floor value itself comes from
+`split_proportional_floor`, with an absolute override retained on the
+scripts. Per-bank counts are reported for all 64 banks regardless.
 """
 
 from __future__ import annotations
@@ -76,7 +82,7 @@ def enrichment(q: np.ndarray, p: np.ndarray, eps: float = EPSILON) -> np.ndarray
     return np.log(q + eps) - np.log(p + eps)
 
 
-def load_floor_mask(bank_counts: np.ndarray, load_floor: int) -> np.ndarray:
+def load_floor_mask(bank_counts: np.ndarray, load_floor: float) -> np.ndarray:
     """True for banks at or above the floor ("fewer than" excluded, spec §16.3)."""
     return np.asarray(bank_counts) >= load_floor
 
@@ -84,13 +90,21 @@ def load_floor_mask(bank_counts: np.ndarray, load_floor: int) -> np.ndarray:
 def enrichment_analysis(
     q_by_mod: dict[str, np.ndarray | None],
     stats: RouterStats,
-    load_floor: int,
+    load_floor: float,
     eps: float = EPSILON,
+    bank_counts: np.ndarray | None = None,
 ) -> dict:
     """JSON-ready §15 report: R_M(e) vs gate mass (primary) and vs routing
     frequency, with sub-floor banks reported as null (excluded from rankings)
-    while per-bank counts are always reported for all 64 banks."""
-    mask = load_floor_mask(stats.bank_counts, load_floor)
+    while per-bank counts are always reported for all 64 banks.
+
+    `bank_counts` (A13): the per-split routed counts of the dump under
+    analysis — the floor source. Falls back to `stats.bank_counts` for
+    callers that predate A13 (absolute-floor audits)."""
+    counts = np.asarray(
+        bank_counts if bank_counts is not None else stats.bank_counts
+    )
+    mask = load_floor_mask(counts, load_floor)
 
     def masked(values: np.ndarray) -> list[float | None]:
         return [float(v) if ok else None for v, ok in zip(values, mask)]
@@ -98,8 +112,12 @@ def enrichment_analysis(
     report: dict = {
         "epsilon": eps,
         "log_base": "e",
-        "load_floor": int(load_floor),
-        "bank_counts": [int(c) for c in stats.bank_counts],
+        "load_floor": float(load_floor),
+        "load_floor_source": (
+            "split_counts (A13 split-proportional)" if bank_counts is not None
+            else "stats.bank_counts (explicit absolute floor)"
+        ),
+        "bank_counts": [int(c) for c in counts],
         "floor_mask": [bool(b) for b in mask],
         "n_banks_above_floor": int(mask.sum()),
         "R": {},

@@ -14,62 +14,22 @@ Usage:
         [--negative-control-run runs/<C-name>]
 
 Decisions (recorded):
-- §16.3 load floor source: the run's OWN training loads
-  (runs/<name>/final/bank_loads.npy, written by the training loop) are what
-  reach the floor comparison in `select_enriched_latents`; the stats-pass
-  counts are only a logged-warning fallback when that artifact is missing.
-  `select_J_with_training_loads` tolerates either intervention API (an
-  explicit `bank_counts` kwarg, or the stats-carried counts).
+- §16.3 load floor (A13, v0.1.2 addendum — supersedes the earlier
+  training-loads source): a bank qualifies iff its routed token count IN THE
+  SPLIT UNDER ANALYSIS (per-bank counts from the dev dump's own host-expert
+  routing, `dump.experts`) is ≥ 10% of that split's uniform-load expectation
+  (split_tokens×6)/64. `--load-floor` remains as an ABSOLUTE override.
 - Matched-control load matching keeps the stats-pass counts (the floor is the
-  only comparison the finding pins to training loads).
+  only comparison A13 re-sources).
 """
 
 from __future__ import annotations
 
 import argparse
-import dataclasses
-import inspect
 import json
 from pathlib import Path
-from types import SimpleNamespace
-
-import numpy as np
-import torch
 
 INTERVENTION_DOMAINS = ("coco", "textvqa", "chartqa", "ai2d", "text_control")
-
-
-def load_training_bank_counts(run_dir: Path, stats) -> torch.Tensor:
-    """§16.3 load-floor counts: the run's training loads
-    (runs/<name>/final/bank_loads.npy), falling back to the stats-pass routed
-    counts with a logged warning when the artifact is missing."""
-    path = Path(run_dir) / "final" / "bank_loads.npy"
-    if path.exists():
-        return torch.from_numpy(np.load(path)).to(torch.int64)
-    print(f"[warn] {path} not found; using stats-pass bank_counts for the §16.3 load floor")
-    return stats.bank_counts.to(torch.int64)
-
-
-def select_J_with_training_loads(
-    dev_dump, stats, bank_counts: torch.Tensor, *, f: int, top_n_experts: int,
-    quantile: float, load_floor: int,
-):
-    """Call `select_enriched_latents` so that `bank_counts` (the training
-    loads) is what reaches the load-floor comparison, whichever API the
-    intervention module exposes (explicit `bank_counts` parameter, or counts
-    carried on the stats object)."""
-    from moe_sae.eval.intervention import select_enriched_latents
-
-    kwargs = dict(
-        f=f, top_n_experts=top_n_experts, quantile=quantile, load_floor=load_floor
-    )
-    if "bank_counts" in inspect.signature(select_enriched_latents).parameters:
-        return select_enriched_latents(dev_dump, stats, bank_counts=bank_counts, **kwargs)
-    if dataclasses.is_dataclass(stats):
-        stats = dataclasses.replace(stats, bank_counts=bank_counts)
-    else:
-        stats = SimpleNamespace(**{**vars(stats), "bank_counts": bank_counts})
-    return select_enriched_latents(dev_dump, stats, **kwargs)
 
 
 def run_pipeline(run_dir: Path, dev_dump: Path, stats, out_dir: Path, args, device: str) -> None:
@@ -80,6 +40,7 @@ def run_pipeline(run_dir: Path, dev_dump: Path, stats, out_dir: Path, args, devi
         matched_control_sets,
         run_intervention,
         save_ablation_set,
+        select_enriched_latents,
     )
     from moe_sae.model_loading import load_model
     from moe_sae.sae import load_condition_from_run
@@ -88,12 +49,11 @@ def run_pipeline(run_dir: Path, dev_dump: Path, stats, out_dir: Path, args, devi
     condition, theta_star, _extras = load_condition_from_run(run_dir, device=device)
 
     # Step 9: enriched-set definition on the DEV split; frozen before eval
-    # data. The §16.3 load floor is applied to the run's training loads.
-    bank_counts = load_training_bank_counts(run_dir, stats)
-    J = select_J_with_training_loads(
+    # data. §16.3 load floor (A13): split-proportional over the dev dump's
+    # own host-routing counts; --load-floor is an absolute override.
+    J = select_enriched_latents(
         dev_dump,
         stats,
-        bank_counts,
         f=condition.f,
         top_n_experts=args.top_n_experts,
         quantile=args.quantile,
@@ -140,7 +100,11 @@ def main() -> None:
                     help="C run's DEV dump (default dumps/<C-name>/dev)")
     ap.add_argument("--top-n-experts", type=int, default=6)
     ap.add_argument("--quantile", type=float, default=0.9)
-    ap.add_argument("--load-floor", type=int, default=500_000)
+    ap.add_argument(
+        "--load-floor", type=float, default=None,
+        help="ABSOLUTE load-floor override; default (A13) is split-proportional: "
+        "10%% of the dev split's uniform-load expectation (split_tokens*6)/64",
+    )
     ap.add_argument("--n-controls", type=int, default=10)
     ap.add_argument("--eval-examples", type=int, default=200, help="examples per domain")
     ap.add_argument("--eval-seed", type=int, default=7)

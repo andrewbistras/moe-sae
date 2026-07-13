@@ -299,8 +299,10 @@ def test_run_intervention_end_to_end():
 # --------------------------------------------------------------------------- #
 
 
-def write_dump_shard(dump_dir, idx, act, n_tokens, token_type):
-    """act: list of (token, slot, bank, latent, value)."""
+def write_dump_shard(dump_dir, idx, act, n_tokens, token_type, experts=None):
+    """act: list of (token, slot, bank, latent, value). `experts` plants the
+    per-token host routing ([n, 6]) — the A13 load-floor source; defaults to
+    all-zeros (every token routed to bank 0 only)."""
     dump_dir.mkdir(parents=True, exist_ok=True)
     tok, slot, bank, lat, val = (
         zip(*act) if act else ((), (), (), (), ())
@@ -314,7 +316,11 @@ def write_dump_shard(dump_dir, idx, act, n_tokens, token_type):
             "act_latent": torch.tensor(lat, dtype=torch.int32),
             "act_value": torch.tensor(val, dtype=torch.float32),
             "token_type": torch.tensor(token_type, dtype=torch.uint8),
-            "experts": torch.zeros(n, 6, dtype=torch.uint8),
+            "experts": (
+                experts.to(torch.uint8)
+                if experts is not None
+                else torch.zeros(n, 6, dtype=torch.uint8)
+            ),
             "gates": torch.zeros(n, 6, dtype=torch.float32),
             "example_id": torch.arange(n, dtype=torch.int32),
             "domain": torch.zeros(n, dtype=torch.uint8),
@@ -391,26 +397,27 @@ def test_select_enriched_latents(tmp_path):
         tmp_path, make_stats(), f=4, top_n_experts=2, quantile=0.5, load_floor=0
     )
 
-    # load floor: exclude bank 3 → its latents cannot be selected
+    # load floor: exclude bank 3 → its latents cannot be selected (explicit
+    # counts + absolute floor: the A13 override/audit path)
     counts = torch.full((64,), 10**6, dtype=torch.int64)
     counts[3] = 0
     J2 = select_enriched_latents(
-        tmp_path, make_stats(counts), f=4, top_n_experts=2, quantile=0.5,
-        load_floor=500_000,
+        tmp_path, make_stats(), f=4, top_n_experts=2, quantile=0.5,
+        load_floor=500_000, bank_counts=counts,
     )
     assert all(b != 3 for b, _ in J2)
 
 
-def test_select_enriched_latents_bank_counts_source(tmp_path, caplog):
-    # Regression: the §16.3 load floor must come from an explicit bank_counts
-    # (TRAINING loads) when given, not from the stats pass.
+def test_select_enriched_latents_bank_counts_override(tmp_path):
+    # An explicit bank_counts array is what reaches the floor comparison
+    # (absolute-override/audit path).
     import numpy as np
 
     acts, token_type, n = _enrichment_acts()
     write_dump_shard(tmp_path, 0, acts, n, token_type)
 
     counts = np.full(64, 10**6, dtype=np.int64)
-    counts[3] = 0  # training loads exclude bank 3
+    counts[3] = 0  # override excludes bank 3
     stats = make_stats()  # stats-pass loads would admit EVERY bank
     J = select_enriched_latents(
         tmp_path, stats, f=4, top_n_experts=2, quantile=0.5,
@@ -418,14 +425,41 @@ def test_select_enriched_latents_bank_counts_source(tmp_path, caplog):
     )
     assert J and all(b != 3 for b, _ in J)
 
-    # fallback path: no bank_counts → stats.bank_counts, with a logged warning
-    with caplog.at_level("WARNING", logger="moe_sae.eval.intervention"):
-        J2 = select_enriched_latents(
-            tmp_path, stats, f=4, top_n_experts=2, quantile=0.5,
-            load_floor=500_000,
-        )
-    assert any("bank_counts" in r.message for r in caplog.records)
-    assert any(b == 3 for b, _ in J2)  # bank 3 eligible again under stats loads
+
+def test_select_enriched_latents_split_proportional_floor(tmp_path):
+    """A13: the DEFAULT floor is 10% of the split-uniform expectation
+    (split_tokens×6)/64, applied to the dump's OWN host-routing counts — a
+    bank starved in the analysis split is excluded even when training loads
+    or the stats pass would admit it."""
+    from moe_sae.eval.intervention import (
+        dump_split_bank_counts,
+        split_proportional_floor,
+    )
+
+    acts, token_type, n = _enrichment_acts()
+    # host routing: bank 3 receives ZERO routed tokens in this split; the
+    # other slots cycle over banks {0, 1, 2, 4, 5, 6}.
+    cycle = [0, 1, 2, 4, 5, 6]
+    experts = torch.tensor(
+        [[cycle[(t + s) % 6] for s in range(6)] for t in range(n)], dtype=torch.uint8
+    )
+    write_dump_shard(tmp_path, 0, acts, n, token_type, experts=experts)
+    stats = make_stats()  # healthy stats-pass loads everywhere
+
+    counts, n_tok = dump_split_bank_counts(tmp_path)
+    assert n_tok == n and int(counts.sum()) == 6 * n
+    assert int(counts[3]) == 0 and int(counts[2]) == n
+    assert split_proportional_floor(n) == pytest.approx(0.10 * n * 6 / 64)
+
+    J = select_enriched_latents(tmp_path, stats, f=4, top_n_experts=2, quantile=0.5)
+    assert (2, 1) in J
+    assert all(b != 3 for b, _ in J), "split-starved bank must be below the A13 floor"
+
+    # absolute override (kept per A13): floor 0 admits every bank again
+    J2 = select_enriched_latents(
+        tmp_path, stats, f=4, top_n_experts=2, quantile=0.5, load_floor=0.0
+    )
+    assert (3, 2) in J2
 
 
 def test_save_load_ablation_set(tmp_path):

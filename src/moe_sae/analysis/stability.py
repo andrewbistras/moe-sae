@@ -215,7 +215,7 @@ def stability_analysis(
     dump: FeatureDump,
     masses: BankMasses,
     stats: RouterStats,
-    load_floor: int,
+    load_floor: float,
     seed: int = 0,
     n_shuffles: int = N_SHUFFLES,
     n_boot: int = N_BOOT,
@@ -223,6 +223,7 @@ def stability_analysis(
     seed_q_image: dict[str, np.ndarray] | None = None,
     top_k: int = TOP_K_ENRICHED,
     eps: float = EPSILON,
+    bank_counts: np.ndarray | None = None,
 ) -> dict:
     """Assemble the full JSON-ready §16.1–§16.3 report for a banked dump.
 
@@ -232,8 +233,14 @@ def stability_analysis(
     condition, entering the §16.3 per-seed top-k stability.
     Domain-restricted enrichment uses the global per-modality gate baseline
     from `stats` (the stats artifact carries per-modality baselines).
+    `bank_counts` (A13): the analysis dump's per-split routed counts — the
+    load-floor source; falls back to `stats.bank_counts` when omitted
+    (pre-A13 absolute-floor audits only).
     """
-    floor_mask = load_floor_mask(stats.bank_counts, load_floor)
+    floor_counts = np.asarray(
+        bank_counts if bank_counts is not None else stats.bank_counts
+    )
+    floor_mask = load_floor_mask(floor_counts, load_floor)
     baseline = stats.p_gate["image"]
     ex = per_example_masses(masses.m_act, dump)
     qi, qt = observed_q(ex)
@@ -296,7 +303,8 @@ def stability_analysis(
 
     return {
         "seed": seed,
-        "load_floor": int(load_floor),
+        "load_floor": float(load_floor),
+        "load_floor_bank_counts": [int(c) for c in floor_counts],
         "floor_mask": [bool(b) for b in floor_mask],
         "separation": {
             "jsd_observed": obs,

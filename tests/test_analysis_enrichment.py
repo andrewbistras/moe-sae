@@ -109,6 +109,22 @@ def test_enrichment_analysis_reports_all_counts_and_masks_floor():
     assert report2["R"]["image"] is None
 
 
+def test_enrichment_analysis_split_counts_override_a13():
+    """A13: when the analysis dump's per-split counts are given, THEY carry
+    the floor — a bank starved in the split is excluded even though the
+    stats-pass loads are healthy; counts are reported for all 64 banks."""
+    stats = uniform_stats()  # healthy stats-pass loads for every bank
+    split_counts = np.full(N_BANKS, 100, dtype=np.int64)
+    split_counts[2] = 0  # starved IN THE SPLIT UNDER ANALYSIS
+    q = {"image": planted_q([1, 2, 3]), "text": planted_q([10, 11])}
+    report = enrichment_analysis(q, stats, load_floor=1.0, bank_counts=split_counts)
+    assert report["bank_counts"] == [int(c) for c in split_counts]
+    assert report["floor_mask"][2] is False and report["floor_mask"][1] is True
+    assert report["R"]["image"]["vs_gate"][2] is None
+    assert report["R"]["image"]["vs_gate"][1] is not None
+    assert "split" in report["load_floor_source"]
+
+
 def test_enrichment_analysis_exact_values():
     stats = uniform_stats()
     q_img = planted_q([1, 2, 3])
