@@ -66,11 +66,18 @@ class RouterTiedBanks(nn.Module):
         assert mu_e.shape == (self.n_banks, self.d), mu_e.shape
         self.mu.copy_(mu_e.to(torch.float32))
 
-    def encode(self, c: torch.Tensor, bank_ids: torch.Tensor) -> torch.Tensor:
+    def encode(
+        self, c: torch.Tensor, bank_ids: torch.Tensor, return_raw: bool = False
+    ) -> torch.Tensor:
         """a_te = ReLU(W_enc_e (c_te − μ_e) + b_enc_e).
 
         c: [B, S, d] (any float dtype); bank_ids: [B, S] int64.
         Returns [B, S, f] in parameter dtype. One GEMM per bank present.
+
+        `return_raw=True` returns the pre-ReLU pre-activations instead (A1
+        committee pin: aux-selected dead latents contribute their RAW values,
+        so gradient reaches below-threshold latents). The MAIN path always
+        consumes the ReLU'd activations.
         """
         B, S, d = c.shape
         flat = c.reshape(B * S, d).to(self.W_enc.dtype)
@@ -80,7 +87,7 @@ class RouterTiedBanks(nn.Module):
             rows = (ids == e).nonzero(as_tuple=True)[0]
             tilde = flat[rows] - self.mu[e].to(self.W_enc.dtype)
             pre = tilde @ self.W_enc[e].T + self.b_enc[e]
-            out = out.index_put((rows,), torch.relu(pre))
+            out = out.index_put((rows,), pre if return_raw else torch.relu(pre))
         return out.reshape(B, S, self.f)
 
     def decode(self, z: torch.Tensor, bank_ids: torch.Tensor, add_mu: bool) -> torch.Tensor:
@@ -124,10 +131,14 @@ class GlobalSAE(nn.Module):
         assert mu_route.shape == (self.d,), mu_route.shape
         self.mu.copy_(mu_route.to(torch.float32))
 
-    def encode(self, c_route: torch.Tensor) -> torch.Tensor:
-        """a_t = ReLU(W_enc (c_route − μ) + b_enc).  [B, d] → [B, F]."""
+    def encode(self, c_route: torch.Tensor, return_raw: bool = False) -> torch.Tensor:
+        """a_t = ReLU(W_enc (c_route − μ) + b_enc).  [B, d] → [B, F].
+
+        `return_raw=True` returns the pre-ReLU pre-activations (A1 pin; the
+        MAIN path always consumes the ReLU'd activations)."""
         tilde = c_route.to(self.W_enc.dtype) - self.mu.to(self.W_enc.dtype)
-        return torch.relu(tilde @ self.W_enc.T + self.b_enc)
+        pre = tilde @ self.W_enc.T + self.b_enc
+        return pre if return_raw else torch.relu(pre)
 
     def decode(self, z: torch.Tensor, add_mu: bool) -> torch.Tensor:
         """ĉ_t = [μ +] D z_t.  [B, F] → [B, d]."""

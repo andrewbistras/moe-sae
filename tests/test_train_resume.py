@@ -38,11 +38,14 @@ E, F_BANK, D_MODEL, B, K_BAR = 64, 8, 16, 32, 4
 N_STEPS = 6
 KILL_AT = 4  # steps 0..3 complete; checkpoint at 3; step-3 metrics truncated
 
-# The registered metrics.jsonl key order (loop.py / train_jax.py line format).
+# The registered metrics.jsonl key order (loop.py / train_jax.py line format;
+# aux_* diagnostics appended per the v0.1.2 addendum A1 — committee-required).
 METRICS_KEYS = [
     "step", "lr", "grad_norm", "theta_ema", "wall_time",
     "loss", "l_local", "l_aggregate", "l_aux", "theta_b",
     "l0_mean", "l0_visual", "l0_text", "n_dead_now", "k_selected",
+    "aux_primary_ratio", "aux_mean_selected_per_token", "aux_frac_also_main",
+    "aux_grad_norm_ratio",
 ]
 
 
@@ -172,7 +175,12 @@ def assert_runs_exactly_equal(ref: Path, res: Path) -> None:
     assert (ref / "final" / "theta_star.json").read_text() == (
         res / "final" / "theta_star.json"
     ).read_text()
-    for rel in ("final/bank_loads.npy", "final/dead_final.npy", "theta_trajectory.npy"):
+    for rel in (
+        "final/bank_loads.npy",
+        "final/dead_final.npy",
+        "final/aux_bank_counts.npy",  # A1: cumulative aux pressure must resume
+        "theta_trajectory.npy",
+    ):
         a, b = np.load(ref / rel), np.load(res / rel)
         assert np.array_equal(a, b), f"{rel} differs"
 
@@ -310,8 +318,8 @@ def test_anomaly_nan_loss_halts_jax(tmp_path, monkeypatch):
     cfg = tiny_config("A", tmp_path, "jnan")
     real_step = JaxRun.training_step
 
-    def poisoned(self, batch, lr):
-        out, hrc = real_step(self, batch, lr)
+    def poisoned(self, batch, lr, **kwargs):
+        out, hrc = real_step(self, batch, lr, **kwargs)
         out["loss"] = float("nan")
         return out, hrc
 
@@ -343,7 +351,10 @@ def test_metrics_lines_byte_identical_to_registered_format(tmp_path):
         parsed = json.loads(line)
         assert list(parsed) == METRICS_KEYS
         assert line == json.dumps(parsed)  # byte-identical legacy json.dumps format
-        assert all(math.isfinite(parsed[k]) for k in METRICS_KEYS)
+        # aux_grad_norm_ratio is null when no latent is dead (A1)
+        assert all(
+            parsed[k] is None or math.isfinite(parsed[k]) for k in METRICS_KEYS
+        )
 
     # ops numbers live in the SEPARATE sidecar, never in metrics.jsonl
     ops = [

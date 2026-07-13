@@ -31,6 +31,14 @@ Decisions (recorded):
   latent both main-selected and aux-selected in the same batch is possible and
   permitted (contract does not exclude it); aux selection never resets
   deadness.
+- A1 (v0.1.2 committee pin, Reviewer F): aux selection ranks dead-masked RAW
+  (pre-ReLU) preacts, and aux-selected latents contribute their RAW values to
+  z_aux (negatives allowed) — gradient must reach below-threshold latents to
+  revive them. MAIN selection and z stay ReLU'd (unchanged). Required A1
+  diagnostics ride on StepOutput (aux_selected / aux_main_overlap /
+  aux_bank_counts / aux_term); the aux/main grad-norm ratio is computed by
+  the loop via a second backward of aux_term ONLY at log steps (~10% cost on
+  those steps, documented in train/loop.py).
 - l0_visual / l0_text are 0.0 when the batch contains no token of that type.
 - `load_condition_from_run(run_dir, device)` is the run-directory loader used
   by the eval/intervention scripts: it prefers final/checkpoint.safetensors,
@@ -118,6 +126,17 @@ class StepOutput:
     bank_fire_counts: torch.Tensor  # [n_dict_banks] int64 — fires per bank
     dict_route_counts: torch.Tensor  # [n_dict_banks] int64 — deadness clock
     fired_mask: torch.Tensor  # [n_dict_banks, f_dict] bool — for DeadTracker
+    # ---- A1 aux diagnostics (committee-required, Reviewer S) ----
+    aux_selected: int = 0  # total aux-selected latents this batch
+    aux_main_overlap: int = 0  # aux-selected latents also main-selected
+    aux_bank_counts: torch.Tensor | None = None  # [n_dict_banks] int64 — aux
+    # selections per dictionary bank (per-bank aux pressure; accumulated by
+    # the loop and persisted in the checkpoint aux sidecar)
+    aux_term: torch.Tensor | None = None  # α·L_aux, graph-attached — the loop
+    # runs a second backward of this term ONLY at log steps to compute the
+    # aux/main gradient-norm ratio (A1 diagnostic (ii)); None when no latent
+    # was dead (L_aux == 0 exactly, no graph)
+    batch_tokens: int = 0  # B, for the mean-aux-selected-per-token diagnostic
 
     def scalars(self) -> dict:
         """Loggable scalar fields for metrics.jsonl."""
@@ -132,6 +151,15 @@ class StepOutput:
             "l0_text": self.l0_text,
             "n_dead_now": self.n_dead_now,
             "k_selected": self.k_selected,
+            # A1 diagnostics (i), (iii), (iv); (ii) aux/main grad-norm ratio
+            # is appended by the loop at log steps (second backward there).
+            "aux_primary_ratio": (self.l_aux / self.l_local) if self.l_local > 0 else 0.0,
+            "aux_mean_selected_per_token": (
+                self.aux_selected / self.batch_tokens if self.batch_tokens else 0.0
+            ),
+            "aux_frac_also_main": (
+                self.aux_main_overlap / self.aux_selected if self.aux_selected else 0.0
+            ),
         }
 
 
@@ -291,7 +319,8 @@ class SAECondition(nn.Module):
             x = batch.c.to(dev).float().sum(dim=1).to(self.compute_dtype)  # [B, d]
             B = x.shape[0]
             bank_ids = None
-            preacts = self.sae.encode(x)  # [B, F]
+            raw = self.sae.encode(x, return_raw=True)  # [B, F] pre-ReLU
+            preacts = torch.relu(raw)  # MAIN path semantics unchanged (A1)
             scores = preacts.detach().float()
             mask, theta_b = self._select(scores, None)
             mask = mask.view(B, self.f_dict)
@@ -307,7 +336,7 @@ class SAECondition(nn.Module):
             l_agg = aggregate_nmse(x32, chat.float())
 
             dead_vis = dead.view(1, self.f_dict).expand(B, self.f_dict)
-            l_aux_t = self._aux_global(scores, preacts, dead_vis, x32, chat)
+            l_aux_t, aux_stats = self._aux_global(raw, dead_vis, x32, chat, mask)
 
             z_pos = (z.detach().float() > 0)
             fired_mask = torch.zeros(1, self.f_dict, dtype=torch.bool)
@@ -320,7 +349,8 @@ class SAECondition(nn.Module):
             c = batch.c.to(dev).to(self.compute_dtype)  # [B, 6, d]
             B, S, _ = c.shape
             bank_ids = self._bank_ids(experts, batch.example_id)
-            preacts = self.sae.encode(c, bank_ids)  # [B, 6, f]
+            raw = self.sae.encode(c, bank_ids, return_raw=True)  # [B, 6, f] pre-ReLU
+            preacts = torch.relu(raw)  # MAIN path semantics unchanged (A1)
             scores = preacts.detach().float()
             mask, theta_b = self._select(scores, bank_ids)
             z = preacts * mask.to(preacts.dtype)
@@ -334,7 +364,9 @@ class SAECondition(nn.Module):
             l_agg = aggregate_nmse(c32.sum(dim=1), chat.float().sum(dim=1))
 
             dead_vis = dead[bank_ids]  # [B, 6, f]
-            l_aux_t = self._aux_routed(scores, preacts, dead_vis, bank_ids, c32, chat)
+            l_aux_t, aux_stats = self._aux_routed(
+                raw, dead_vis, bank_ids, c32, chat, mask
+            )
 
             sel_b, sel_s, sel_j = mask.nonzero(as_tuple=True)
             sel_e = bank_ids[sel_b, sel_s].cpu()
@@ -370,6 +402,11 @@ class SAECondition(nn.Module):
             bank_fire_counts=bank_fire_counts,
             dict_route_counts=dict_route_counts,
             fired_mask=fired_mask,
+            aux_selected=aux_stats["selected"],
+            aux_main_overlap=aux_stats["main_overlap"],
+            aux_bank_counts=aux_stats["bank_counts"],
+            aux_term=(self.aux_alpha * l_aux_t) if l_aux_t.requires_grad else None,
+            batch_tokens=B,
         )
 
     # ------------------------------------------------------------------ #
@@ -377,8 +414,10 @@ class SAECondition(nn.Module):
     # ------------------------------------------------------------------ #
 
     def _aux_select(self, scores2d: torch.Tensor, dead2d: torch.Tensor) -> torch.Tensor:
-        """Per-token top min(512, #dead visible) dead candidates by preact —
-        token-level competition. scores2d/dead2d: [B, n_cand]."""
+        """Per-token top min(512, #dead visible) dead candidates by RAW
+        (pre-ReLU) preact — token-level competition; selected iff > −∞ (A1
+        committee pin), so below-threshold (negative-preact) dead latents are
+        selected and receive gradient. scores2d/dead2d: [B, n_cand]."""
         masked = scores2d.masked_fill(~dead2d, _NEG_INF)
         k_aux = min(self.aux_token_budget, masked.shape[1])
         vals, idx = torch.topk(masked, k_aux, dim=1)
@@ -386,28 +425,65 @@ class SAECondition(nn.Module):
         aux_mask.scatter_(1, idx, vals > _NEG_INF)
         return aux_mask
 
-    def _aux_routed(self, scores, preacts, dead_vis, bank_ids, c32, chat) -> torch.Tensor:
+    def _no_aux_stats(self) -> dict:
+        return {
+            "selected": 0,
+            "main_overlap": 0,
+            "bank_counts": torch.zeros(self.n_dict_banks, dtype=torch.int64),
+        }
+
+    def _aux_routed(
+        self, raw, dead_vis, bank_ids, c32, chat, main_mask
+    ) -> tuple[torch.Tensor, dict]:
+        """A1 aux loss (routed): selection ranks dead-masked RAW preacts; the
+        aux-selected latents contribute their RAW values to z_aux (negatives
+        allowed — gradient must reach below-threshold latents to revive them).
+        Returns (loss, diagnostics {selected, main_overlap, bank_counts})."""
         if not bool(dead_vis.any()):
-            return torch.zeros((), dtype=torch.float32, device=preacts.device)
-        B, S, f = scores.shape
+            return (
+                torch.zeros((), dtype=torch.float32, device=raw.device),
+                self._no_aux_stats(),
+            )
+        B, S, f = raw.shape
+        raw_scores = raw.detach().float()
         aux_mask = self._aux_select(
-            scores.reshape(B, S * f), dead_vis.reshape(B, S * f)
+            raw_scores.reshape(B, S * f), dead_vis.reshape(B, S * f)
         ).view(B, S, f)
-        z_aux = preacts * aux_mask.to(preacts.dtype)
+        z_aux = raw * aux_mask.to(raw.dtype)  # RAW values (A1 pin)
         # Detached per-expert residuals reconstructed through own banks'
         # decoders, no μ (contract) — preserves no-cross-bank-cancellation.
         r = (c32 - chat.float()).detach()
         rhat = self.sae.decode(z_aux, bank_ids, add_mu=False)
-        return aux_loss(r.reshape(-1, self.d), rhat.reshape(-1, self.d))
+        loss = aux_loss(r.reshape(-1, self.d), rhat.reshape(-1, self.d))
 
-    def _aux_global(self, scores, preacts, dead_vis, x32, chat) -> torch.Tensor:
+        sel_b, sel_s, _ = aux_mask.nonzero(as_tuple=True)
+        stats = {
+            "selected": int(aux_mask.sum().item()),
+            "main_overlap": int((aux_mask & main_mask).sum().item()),
+            "bank_counts": torch.bincount(
+                bank_ids[sel_b, sel_s].cpu(), minlength=self.n_dict_banks
+            ),
+        }
+        return loss, stats
+
+    def _aux_global(self, raw, dead_vis, x32, chat, main_mask) -> tuple[torch.Tensor, dict]:
+        """A1 aux loss (global dictionary); see `_aux_routed`."""
         if not bool(dead_vis.any()):
-            return torch.zeros((), dtype=torch.float32, device=preacts.device)
-        aux_mask = self._aux_select(scores, dead_vis)
-        z_aux = preacts * aux_mask.to(preacts.dtype)
+            return (
+                torch.zeros((), dtype=torch.float32, device=raw.device),
+                self._no_aux_stats(),
+            )
+        aux_mask = self._aux_select(raw.detach().float(), dead_vis)
+        z_aux = raw * aux_mask.to(raw.dtype)  # RAW values (A1 pin)
         r = (x32 - chat.float()).detach()
         rhat = self.sae.decode(z_aux, add_mu=False)
-        return aux_loss(r, rhat)
+        loss = aux_loss(r, rhat)
+        stats = {
+            "selected": int(aux_mask.sum().item()),
+            "main_overlap": int((aux_mask & main_mask).sum().item()),
+            "bank_counts": aux_mask.sum().to(torch.int64).cpu().reshape(1),
+        }
+        return loss, stats
 
     # ------------------------------------------------------------------ #
     # Frozen-θ* inference (spec §6)                                      #

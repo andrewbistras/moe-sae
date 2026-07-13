@@ -30,6 +30,15 @@ number changes, no batch reordering):
   MetricsSink in jsonl_only mode (byte-identical to the registered format);
   MFU + goodput numbers go to a separate ops_metrics.jsonl (+ TensorBoard
   under tb/ when available) so the registered artifact never changes.
+- **A1 aux diagnostics (v0.1.2 addendum, committee-required)**: every log
+  step records aux/primary loss ratio, mean aux-selected per token, fraction
+  of aux-selected also main-selected (from StepOutput), and the aux/main
+  gradient-norm ratio via a SECOND BACKWARD of the aux term only — run
+  exclusively at log steps and costing roughly one extra backward there
+  (~10% of a log step; `aux_grad_norm_ratio`). Cumulative per-bank
+  aux-selection counts are accumulated across the run, persisted in each
+  {step}.aux.npz sidecar (restored on resume) and finalized as
+  final/aux_bank_counts.npy.
 
 Decisions (recorded):
 - Adam moments/step count live in {step}.aux.npz NEXT TO the .safetensors,
@@ -215,6 +224,35 @@ def save_aux(
     )
 
 
+def aux_grad_norm_ratio(aux_term: torch.Tensor | None, params: list) -> float | None:
+    """A1 diagnostic (ii): aux/main gradient-norm ratio via a second backward
+    of the aux term ONLY (called by the loops at log steps; the extra backward
+    costs roughly one more backward pass, ~10% of a log step's wall time —
+    documented cost, committee-required).
+
+    Call AFTER `loss.backward()` (with the graph retained): `p.grad` then holds
+    g_total = g_main + g_aux; autograd.grad of the α-scaled aux term gives
+    g_aux, and g_main = g_total − g_aux elementwise. Returns
+    ‖g_aux‖ / ‖g_main‖ (None when the aux term carried no graph, i.e. nothing
+    was dead and L_aux == 0 exactly)."""
+    if aux_term is None or not aux_term.requires_grad:
+        return None
+    g_aux = torch.autograd.grad(aux_term, params, allow_unused=True)
+    aux_sq = torch.zeros((), dtype=torch.float32)
+    main_sq = torch.zeros((), dtype=torch.float32)
+    for p, ga in zip(params, g_aux):
+        gt = p.grad.float() if p.grad is not None else None
+        ga32 = ga.float() if ga is not None else None
+        if ga32 is not None:
+            aux_sq += ga32.pow(2).sum().cpu()
+        if gt is not None:
+            gm = gt - ga32 if ga32 is not None else gt
+            main_sq += gm.pow(2).sum().cpu()
+    main_norm = float(main_sq.sqrt().item())
+    aux_norm = float(aux_sq.sqrt().item())
+    return aux_norm / max(main_norm, 1e-30)
+
+
 def load_aux(ckpt_path: str | Path) -> "np.lib.npyio.NpzFile":
     """Load the aux sidecar for a checkpoint; loud error if absent (a
     checkpoint without its optimizer state cannot resume bitwise, OPS §4)."""
@@ -326,6 +364,9 @@ def train(
 
     bank_loads = None  # cumulative host-expert routed tokens, [64] int64
     theta_trajectory: list[float] = []
+    # A1 diagnostic (v): cumulative per-bank aux-selection counts, persisted
+    # in the checkpoint aux sidecar (and final/aux_bank_counts.npy).
+    aux_bank_counts = torch.zeros(condition.n_dict_banks, dtype=torch.int64)
     gp = GoodputTracker()
 
     if ckpt_path is not None:
@@ -335,6 +376,8 @@ def train(
         _load_adam_state(opt, aux)
         bank_loads = torch.from_numpy(aux["bank_loads"].copy())
         theta_trajectory = [float(x) for x in aux["theta_trajectory"]]
+        if "aux_bank_counts" in aux.files:
+            aux_bank_counts = torch.from_numpy(aux["aux_bank_counts"].copy())
         with gp.data_wait():
             # Composer fast-forward: the ONLY stream interaction on resume —
             # consuming k batches reproduces the exact stream position.
@@ -367,6 +410,7 @@ def train(
             t_iter = time.perf_counter()
             with gp.data_wait():
                 batch = next(batch_iter)
+            is_log_step = step % cfg.log_every == 0 or step == n_steps - 1
             with gp.compute():
                 out = condition.training_step(batch, step)
                 loss_val = float(out.loss.item())
@@ -375,7 +419,16 @@ def train(
                         out_dir, step, "non-finite loss", {"loss": loss_val},
                         lambda p: condition.save_checkpoint(p, theta_ema, dead_tracker, step),
                     )
-                out.loss.backward()
+                # A1 (ii): second backward of the aux term ONLY at log steps
+                # (see aux_grad_norm_ratio; ~10% extra cost on log steps).
+                need_ratio = is_log_step and out.aux_term is not None
+                out.loss.backward(retain_graph=need_ratio)
+                aux_grad_ratio = None
+                if is_log_step:
+                    params = [p for p, _ in opt._params()]
+                    aux_grad_ratio = aux_grad_norm_ratio(
+                        out.aux_term if need_ratio else None, params
+                    )
                 lr = lr_at_step(step, cfg)
                 grad_norm = opt.step(lr)
                 opt.zero_grad()
@@ -400,10 +453,14 @@ def train(
                     bank_loads = out.bank_route_counts.clone().to(torch.int64)
                 else:
                     bank_loads += out.bank_route_counts.to(torch.int64)
+                if out.aux_bank_counts is not None:
+                    aux_bank_counts += out.aux_bank_counts.to(torch.int64)
 
             dt = max(time.perf_counter() - t_iter, 1e-9)
             ops_stats = meter.update(dt) if meter is not None else {"steps_per_sec": 1.0 / dt}
-            if step % cfg.log_every == 0 or step == n_steps - 1:
+            if is_log_step:
+                scalars = out.scalars()
+                scalars["aux_grad_norm_ratio"] = aux_grad_ratio
                 sink.log(
                     step,
                     {
@@ -411,10 +468,21 @@ def train(
                         "grad_norm": grad_norm,
                         "theta_ema": theta_ema.value,
                         "wall_time": time.time() - t_start,
-                        **out.scalars(),
+                        **scalars,
                     },
                 )
-                ops_sink.log(step, {**ops_stats, **gp.report()})
+                ops_sink.log(
+                    step,
+                    {
+                        **ops_stats,
+                        **gp.report(),
+                        # A1 diagnostics mirrored into the ops sidecar
+                        "aux_primary_ratio": scalars["aux_primary_ratio"],
+                        "aux_grad_norm_ratio": aux_grad_ratio,
+                        "aux_mean_selected_per_token": scalars["aux_mean_selected_per_token"],
+                        "aux_frac_also_main": scalars["aux_frac_also_main"],
+                    },
+                )
 
             if (step + 1) % cfg.ckpt_every_steps == 0 and (step + 1) < n_steps:
                 with gp.checkpoint():
@@ -422,7 +490,10 @@ def train(
                     condition.save_checkpoint(ckpt, theta_ema, dead_tracker, step + 1)
                     save_aux(
                         aux_path_for(ckpt), bank_loads, theta_trajectory,
-                        _adam_state_arrays(opt),
+                        {
+                            **_adam_state_arrays(opt),
+                            "aux_bank_counts": aux_bank_counts.numpy(),
+                        },
                     )
     finally:
         sink.close()
@@ -444,6 +515,8 @@ def train(
     np.save(out_dir / "theta_trajectory.npy", np.asarray(theta_trajectory, dtype=np.float64))
     np.save(out_dir / "final" / "bank_loads.npy", bank_loads.numpy())
     np.save(out_dir / "final" / "dead_final.npy", dead_tracker.dead_mask().numpy())
+    # A1 diagnostic (v): cumulative per-bank aux pressure over the whole run.
+    np.save(out_dir / "final" / "aux_bank_counts.npy", aux_bank_counts.numpy())
     condition.save_checkpoint(
         out_dir / "final" / "checkpoint.safetensors", theta_ema, dead_tracker, n_steps
     )

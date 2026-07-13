@@ -177,6 +177,8 @@ def test_training_step_metric_parity(condition):
 
 @pytest.mark.parametrize("condition", ["A", "B"])
 def test_aux_loss_parity_with_forced_dead(condition):
+    """Aux parity under the A1 raw-preact semantics (both backends select on
+    dead-masked RAW preacts and feed RAW values into z_aux)."""
     torch_cond = build(condition)
     jax_cond = build(condition)
     batch = make_batch()
@@ -189,6 +191,55 @@ def test_aux_loss_parity_with_forced_dead(condition):
     assert out_t.l_aux > 0
     np.testing.assert_allclose(out_j["l_aux"], out_t.l_aux, rtol=1e-5)
     np.testing.assert_allclose(out_j["loss"], float(out_t.loss.detach()), rtol=1e-5)
+    # A1 diagnostics agree exactly (integer counts)
+    assert out_j["aux_mean_selected_per_token"] == pytest.approx(
+        out_t.aux_selected / B
+    )
+    assert out_j["aux_frac_also_main"] == pytest.approx(
+        out_t.aux_main_overlap / out_t.aux_selected
+    )
+    assert torch.equal(out_j["aux_bank_counts"], out_t.aux_bank_counts)
+
+
+@pytest.mark.parametrize("condition", ["A", "B"])
+def test_aux_raw_negative_preact_parity(condition):
+    """A1 raw-value semantics parity where it bites: every preact negative.
+    ReLU'd aux values would be identically zero on both sides (l_aux == 1);
+    raw values must give the SAME nonzero-gradient loss on both backends."""
+    torch_cond = build(condition)
+    jax_cond = build(condition)
+    for c in (torch_cond, jax_cond):
+        with torch.no_grad():
+            c.sae.b_enc.fill_(-50.0)
+        c.dead_tracker.tokens_seen += 2 * c.dead_tracker.window
+    batch = make_batch()
+
+    out_t = torch_cond.training_step(batch, step=0)
+    run = JaxRun(jax_cond, capacity=CAP, device=jax.devices("cpu")[0])
+    out_j, _ = run.training_step(batch, lr=0.0)
+    assert out_t.l_aux > 0 and out_t.l_aux != pytest.approx(1.0)
+    np.testing.assert_allclose(out_j["l_aux"], out_t.l_aux, rtol=1e-5)
+
+
+def test_aux_grad_ratio_parity():
+    """The JAX second-backward grad ratio matches the torch loop helper."""
+    from moe_sae.train.loop import aux_grad_norm_ratio
+
+    torch_cond = build("A")
+    jax_cond = build("A")
+    batch = make_batch()
+    for c in (torch_cond, jax_cond):
+        c.dead_tracker.tokens_seen += 2 * c.dead_tracker.window
+
+    out_t = torch_cond.training_step(batch, step=0)
+    out_t.loss.backward(retain_graph=True)
+    ratio_t = aux_grad_norm_ratio(out_t.aux_term, list(torch_cond.parameters()))
+
+    run = JaxRun(jax_cond, capacity=CAP, device=jax.devices("cpu")[0])
+    out_j, _ = run.training_step(batch, lr=0.0, compute_aux_grad_ratio=True)
+    ratio_j = out_j["aux_grad_norm_ratio"]
+    assert ratio_t is not None and ratio_j is not None
+    np.testing.assert_allclose(ratio_j, ratio_t, rtol=1e-3)
 
 
 def test_specadam_pure_parity():

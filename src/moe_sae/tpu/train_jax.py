@@ -72,10 +72,11 @@ def _routed_loss(
 ):
     B, S, _ = c.shape
     n = B * S
-    preacts = sj.encode_routed(
+    preacts_raw = sj.encode_routed(
         params["W_enc"], params["b_enc"], mu, c, bank_flat, order, dest,
-        cap=cap, n_banks=n_banks, out_f=f,
+        cap=cap, n_banks=n_banks, out_f=f, raw=True,
     )
+    preacts = jax.nn.relu(preacts_raw)  # MAIN path semantics unchanged (A1)
     scores = jax.lax.stop_gradient(preacts).astype(jnp.float32)
     if kind == "global":
         mask_flat, theta_b = sj.global_topk_mask(scores.reshape(-1), k_bar * B)
@@ -104,9 +105,11 @@ def _routed_loss(
         sj.aggregate_nmse(c32.sum(axis=1), chat.astype(jnp.float32).sum(axis=1))
     )
 
+    # A1: aux selection ranks dead-masked RAW preacts; aux values are RAW.
+    raw_scores = jax.lax.stop_gradient(preacts_raw).astype(jnp.float32)
     dead_vis = dead_ef[bank_flat].reshape(B, S * f)  # [N=B·S rows of banks]
-    aux_mask = sj.aux_select_mask(scores.reshape(B, S * f), dead_vis, aux_budget)
-    z_aux = preacts * aux_mask.reshape(B, S, f).astype(preacts.dtype)
+    aux_mask = sj.aux_select_mask(raw_scores.reshape(B, S * f), dead_vis, aux_budget)
+    z_aux = preacts_raw * aux_mask.reshape(B, S, f).astype(preacts_raw.dtype)
     r = jax.lax.stop_gradient(c32 - chat.astype(jnp.float32))
     rhat = decode(z=z_aux, add_mu=False)
     l_aux = jnp.where(
@@ -123,10 +126,18 @@ def _routed_loss(
     bank_fire = jnp.zeros(n_banks, jnp.int32).at[bank_flat].add(
         mask_rows.sum(axis=1).astype(jnp.int32)
     )
+    aux_rows = aux_mask.reshape(n, f)
+    aux_bank_counts = jnp.zeros(n_banks, jnp.int32).at[bank_flat].add(
+        aux_rows.sum(axis=1).astype(jnp.int32)
+    )
     aux = {
         "l_local": l_local, "l_aggregate": l_agg, "l_aux": l_aux,
         "theta_b": theta_b, "k_selected": mask.sum().astype(jnp.int32),
         "l0_tok": l0_tok, "fired_mask": fired, "bank_fire_counts": bank_fire,
+        # A1 diagnostics
+        "aux_selected": aux_mask.sum().astype(jnp.int32),
+        "aux_main_overlap": (aux_mask.reshape(B, S, f) & mask).sum().astype(jnp.int32),
+        "aux_bank_counts": aux_bank_counts,
     }
     return loss, aux
 
@@ -135,7 +146,8 @@ def _global_loss(
     params, x, mu, dead_f, *, kind, k_bar, f_dict, d, aux_alpha, aux_budget,
 ):
     B = x.shape[0]
-    preacts = sj.encode_global(params["W_enc"], params["b_enc"], mu, x)
+    preacts_raw = sj.encode_global(params["W_enc"], params["b_enc"], mu, x, raw=True)
+    preacts = jax.nn.relu(preacts_raw)  # MAIN path semantics unchanged (A1)
     scores = jax.lax.stop_gradient(preacts).astype(jnp.float32)
     mask_flat, theta_b = sj.global_topk_mask(scores.reshape(-1), k_bar * B)
     mask = mask_flat.reshape(B, f_dict)
@@ -148,9 +160,11 @@ def _global_loss(
     l_local = sj.local_nmse(x32, chat, mu_rows)
     l_agg = jax.lax.stop_gradient(sj.aggregate_nmse(x32, chat.astype(jnp.float32)))
 
+    # A1: aux selection ranks dead-masked RAW preacts; aux values are RAW.
+    raw_scores = jax.lax.stop_gradient(preacts_raw).astype(jnp.float32)
     dead_vis = jnp.broadcast_to(dead_f.reshape(1, f_dict), (B, f_dict))
-    aux_mask = sj.aux_select_mask(scores, dead_vis, aux_budget)
-    z_aux = preacts * aux_mask.astype(preacts.dtype)
+    aux_mask = sj.aux_select_mask(raw_scores, dead_vis, aux_budget)
+    z_aux = preacts_raw * aux_mask.astype(preacts_raw.dtype)
     r = jax.lax.stop_gradient(x32 - chat.astype(jnp.float32))
     rhat = sj.decode_global(params["D"], mu, z_aux, add_mu=False)
     l_aux = jnp.where(dead_f.any(), sj.aux_loss(r, rhat), jnp.float32(0.0))
@@ -163,6 +177,10 @@ def _global_loss(
         "l0_tok": z_pos.sum(axis=1).astype(jnp.int32),
         "fired_mask": mask.any(axis=0).reshape(1, f_dict),
         "bank_fire_counts": mask.sum().astype(jnp.int32).reshape(1),
+        # A1 diagnostics
+        "aux_selected": aux_mask.sum().astype(jnp.int32),
+        "aux_main_overlap": (aux_mask & mask).sum().astype(jnp.int32),
+        "aux_bank_counts": aux_mask.sum().astype(jnp.int32).reshape(1),
     }
     return loss, aux
 
@@ -194,6 +212,8 @@ class JaxRun:
         decoder_axis = type(cond.sae).DECODER_AXIS
         self.opt = sj.SpecAdamJax(self.params, decoder_axis)
         self._grad_fn = None
+        self._aux_grad_fn = None
+        self._kind = None
 
     # ---- helpers ---------------------------------------------------------- #
 
@@ -228,30 +248,66 @@ class JaxRun:
                 )
                 self.capacity = new_cap
                 self._grad_fn = None  # rebuilt with the new static capacity
+                self._aux_grad_fn = None
 
-    def _build_grad_fn(self, kind: str):
+    def _loss_fn(self, kind: str):
         c = self.cond
         if self.is_global:
-            fn = partial(
+            return partial(
                 _global_loss, kind=kind, k_bar=c.k_bar, f_dict=c.f_dict, d=c.d,
                 aux_alpha=c.aux_alpha, aux_budget=c.aux_token_budget,
             )
-        else:
-            fn = partial(
-                _routed_loss, kind=kind, k_bar=c.k_bar, cap=self.capacity,
-                n_banks=c.n_banks, f=c.f, d=c.d,
-                aux_alpha=c.aux_alpha, aux_budget=c.aux_token_budget,
-            )
-        return jax.jit(jax.value_and_grad(fn, has_aux=True))
+        return partial(
+            _routed_loss, kind=kind, k_bar=c.k_bar, cap=self.capacity,
+            n_banks=c.n_banks, f=c.f, d=c.d,
+            aux_alpha=c.aux_alpha, aux_budget=c.aux_token_budget,
+        )
+
+    def _build_grad_fn(self, kind: str):
+        self._kind = kind
+        return jax.jit(jax.value_and_grad(self._loss_fn(kind), has_aux=True))
+
+    def _build_aux_grad_fn(self):
+        """A1 (ii): gradient of the α-scaled aux term ONLY — a second
+        backward, mirroring moe_sae.train.loop.aux_grad_norm_ratio. Built
+        lazily and invoked exclusively at log steps (documented ~10% log-step
+        cost: one extra forward+backward of the same loss graph)."""
+        fn = self._loss_fn(self._kind)
+        alpha = self.cond.aux_alpha
+
+        def aux_term(*args):
+            _, aux = fn(*args)
+            return alpha * aux["l_aux"]
+
+        return jax.jit(jax.grad(aux_term))
+
+    def _aux_grad_ratio(self, call_args, grads) -> float:
+        """‖g_aux‖ / ‖g_main‖ with g_main = g_total − g_aux elementwise."""
+        if self._aux_grad_fn is None:
+            self._aux_grad_fn = self._build_aux_grad_fn()
+        g_aux = self._aux_grad_fn(*call_args)
+        aux_sq = sum(
+            jnp.sum(g.astype(jnp.float32) ** 2) for g in jax.tree.leaves(g_aux)
+        )
+        main_sq = sum(
+            jnp.sum((grads[k].astype(jnp.float32) - g_aux[k].astype(jnp.float32)) ** 2)
+            for k in grads
+        )
+        aux_norm = float(jnp.sqrt(aux_sq))
+        main_norm = float(jnp.sqrt(main_sq))
+        return aux_norm / max(main_norm, 1e-30)
 
     # ---- one training step ------------------------------------------------ #
 
-    def training_step(self, batch: TrainBatch, lr: float) -> dict:
+    def training_step(
+        self, batch: TrainBatch, lr: float, compute_aux_grad_ratio: bool = False
+    ) -> tuple[dict, torch.Tensor]:
         c = self.cond
         experts = batch.experts.to(torch.int64)
         host_route_counts = torch.bincount(experts.reshape(-1), minlength=64)
         dead_t = c.dead_tracker.dead_mask()  # [n_dict_banks, f_dict] torch bool
         dead = jnp.asarray(dead_t.numpy())
+        n_tokens = batch.c.shape[0]
 
         if self.is_global:
             x = jnp.asarray(
@@ -259,7 +315,8 @@ class JaxRun:
             )
             if self._grad_fn is None:
                 self._grad_fn = self._build_grad_fn("global")
-            (loss, aux), grads = self._grad_fn(self.params, x, self.mu, dead.reshape(-1))
+            call_args = (self.params, x, self.mu, dead.reshape(-1))
+            (loss, aux), grads = self._grad_fn(*call_args)
             dict_route_counts = torch.tensor([x.shape[0]], dtype=torch.int64)
             theta_b = float(aux["theta_b"])
         else:
@@ -288,25 +345,29 @@ class JaxRun:
                     scores_t.reshape(-1), bank_of_cand, budgets
                 )
                 ext_mask = jnp.asarray(mask_t.view(B, S, c.f).numpy())
-                (loss, aux), grads = self._grad_fn(
-                    self.params, cj, *args, self.mu, dead, ext_mask
-                )
+                call_args = (self.params, cj, *args, self.mu, dead, ext_mask)
+                (loss, aux), grads = self._grad_fn(*call_args)
             else:
                 kind = "per_token" if c.condition == "E" else "global"
                 if self._grad_fn is None:
                     self._grad_fn = self._build_grad_fn(kind)
-                (loss, aux), grads = self._grad_fn(
-                    self.params, cj, *args, self.mu, dead, None
-                )
+                call_args = (self.params, cj, *args, self.mu, dead, None)
+                (loss, aux), grads = self._grad_fn(*call_args)
                 theta_b = float(aux["theta_b"])
             dict_route_counts = torch.bincount(
                 bank_ids.reshape(-1), minlength=c.n_dict_banks
             )
 
+        # A1 (ii): second backward of the aux term ONLY at log steps.
+        aux_grad_ratio = None
+        if compute_aux_grad_ratio and int(dead_t.sum()) > 0:
+            aux_grad_ratio = self._aux_grad_ratio(call_args, grads)
+
         self.params, grad_norm = self.opt.step(self.params, grads, lr)
 
         l0 = np.asarray(aux["l0_tok"], np.float64)
         tt = batch.token_type.numpy()
+        n_aux_sel = int(aux["aux_selected"])
         out = {
             "loss": float(loss),
             "l_local": float(aux["l_local"]),
@@ -318,7 +379,20 @@ class JaxRun:
             "l0_text": float(l0[tt == 0].mean()) if (tt == 0).any() else 0.0,
             "n_dead_now": int(dead_t.sum()),
             "k_selected": int(aux["k_selected"]),
+            # A1 diagnostics (mirroring torch StepOutput.scalars key order)
+            "aux_primary_ratio": (
+                float(aux["l_aux"]) / float(aux["l_local"])
+                if float(aux["l_local"]) > 0 else 0.0
+            ),
+            "aux_mean_selected_per_token": n_aux_sel / n_tokens if n_tokens else 0.0,
+            "aux_frac_also_main": (
+                int(aux["aux_main_overlap"]) / n_aux_sel if n_aux_sel else 0.0
+            ),
+            "aux_grad_norm_ratio": aux_grad_ratio,
             "grad_norm": grad_norm,
+            "aux_bank_counts": torch.from_numpy(
+                np.asarray(aux["aux_bank_counts"], np.int64)
+            ),
         }
         # Tracker updates through the torch classes (identical semantics).
         c.theta_ema.update(out["theta_b"])
@@ -394,6 +468,8 @@ def train_jax(
 
     bank_loads = torch.zeros(64, dtype=torch.int64)
     theta_trajectory: list[float] = []
+    # A1 diagnostic (v): cumulative per-bank aux-selection counts (sidecar).
+    aux_bank_counts = torch.zeros(cond.n_dict_banks, dtype=torch.int64)
     gp = GoodputTracker()
     aux = None
     if ckpt_path is not None:
@@ -403,6 +479,8 @@ def train_jax(
         aux = load_aux(ckpt_path)
         bank_loads = torch.from_numpy(aux["bank_loads"].copy())
         theta_trajectory = [float(x) for x in aux["theta_trajectory"]]
+        if "aux_bank_counts" in aux.files:
+            aux_bank_counts = torch.from_numpy(aux["aux_bank_counts"].copy())
         if capacity is None and int(aux["capacity"]) > 0:
             capacity = int(aux["capacity"])  # identical static jit capacity
 
@@ -442,10 +520,16 @@ def train_jax(
             t_iter = time.perf_counter()
             with gp.data_wait():
                 batch = next(batch_iter)
+            is_log_step = step % cfg.log_every == 0 or step == n_steps - 1
             with gp.compute():
                 lr = lr_at_step(step, cfg)
-                out, host_route_counts = run.training_step(batch, lr)
+                out, host_route_counts = run.training_step(
+                    batch, lr, compute_aux_grad_ratio=is_log_step
+                )
                 grad_norm = out.pop("grad_norm")
+                aux_bank_counts += out.pop("aux_bank_counts")
+                if not is_log_step:
+                    out.pop("aux_grad_norm_ratio", None)
                 if not math.isfinite(out["loss"]) or not math.isfinite(grad_norm):
                     reason = (
                         "non-finite loss" if not math.isfinite(out["loss"])
@@ -467,7 +551,7 @@ def train_jax(
 
             dt = max(time.perf_counter() - t_iter, 1e-9)
             ops_stats = meter.update(dt) if meter is not None else {"steps_per_sec": 1.0 / dt}
-            if step % cfg.log_every == 0 or step == n_steps - 1:
+            if is_log_step:
                 sink.log(
                     step,
                     {
@@ -476,7 +560,18 @@ def train_jax(
                         "wall_time": time.time() - t_start, **out,
                     },
                 )
-                ops_sink.log(step, {**ops_stats, **gp.report()})
+                ops_sink.log(
+                    step,
+                    {
+                        **ops_stats,
+                        **gp.report(),
+                        # A1 diagnostics mirrored into the ops sidecar
+                        "aux_primary_ratio": out["aux_primary_ratio"],
+                        "aux_grad_norm_ratio": out["aux_grad_norm_ratio"],
+                        "aux_mean_selected_per_token": out["aux_mean_selected_per_token"],
+                        "aux_frac_also_main": out["aux_frac_also_main"],
+                    },
+                )
 
             if (step + 1) % cfg.ckpt_every_steps == 0 and (step + 1) < n_steps:
                 with gp.checkpoint():
@@ -484,7 +579,10 @@ def train_jax(
                     run.save_checkpoint(ckpt, step + 1)
                     save_aux(
                         aux_path_for(ckpt), bank_loads, theta_trajectory,
-                        _jax_aux_arrays(run),
+                        {
+                            **_jax_aux_arrays(run),
+                            "aux_bank_counts": aux_bank_counts.numpy(),
+                        },
                     )
     finally:
         sink.close()
@@ -502,4 +600,6 @@ def train_jax(
     np.save(out_dir / "theta_trajectory.npy", np.asarray(theta_trajectory, np.float64))
     np.save(out_dir / "final" / "bank_loads.npy", bank_loads.numpy())
     np.save(out_dir / "final" / "dead_final.npy", cond.dead_tracker.dead_mask().numpy())
+    # A1 diagnostic (v): cumulative per-bank aux pressure over the whole run.
+    np.save(out_dir / "final" / "aux_bank_counts.npy", aux_bank_counts.numpy())
     run.save_checkpoint(out_dir / "final" / "checkpoint.safetensors", n_steps)

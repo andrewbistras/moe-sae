@@ -18,7 +18,9 @@ TPU-specific decisions (recorded):
 - Condition D's per-bank selection reuses the torch engine on host (one run
   at discovery; correctness over device residency — decision recorded).
 - Aux-loss "min(512, #dead visible)" mirrors torch `_aux_select`: top-512 of
-  dead-masked scores, selections with score > -inf.
+  dead-masked RAW (pre-ReLU) preacts, selections with score > -inf; the
+  aux-selected latents contribute their RAW values to z_aux (A1 pin — MAIN
+  selection and z stay ReLU'd).
 """
 
 from __future__ import annotations
@@ -77,7 +79,7 @@ def grouping_plan(bank_ids: np.ndarray, n_banks: int, cap: int) -> GroupingPlan:
 # --------------------------------------------------------------------------- #
 
 
-@partial(jax.jit, static_argnames=("cap", "n_banks", "out_f"))
+@partial(jax.jit, static_argnames=("cap", "n_banks", "out_f", "raw"))
 def encode_routed(
     W_enc: jnp.ndarray,  # [E, f, d]
     b_enc: jnp.ndarray,  # [E, f]
@@ -89,8 +91,12 @@ def encode_routed(
     cap: int,
     n_banks: int,
     out_f: int,
+    raw: bool = False,
 ) -> jnp.ndarray:
-    """a = ReLU(W_enc_e (c − μ_e) + b_enc_e), grouped via capacity padding."""
+    """a = ReLU(W_enc_e (c − μ_e) + b_enc_e), grouped via capacity padding.
+
+    `raw=True` returns the pre-ReLU pre-activations (A1 pin: aux values are
+    raw; the MAIN path always consumes the ReLU'd activations)."""
     B, S, d = c.shape
     n = B * S
     dt = W_enc.dtype
@@ -100,7 +106,7 @@ def encode_routed(
         jnp.einsum("ecd,efd->ecf", xp.reshape(n_banks, cap, d), W_enc)
         + b_enc[:, None, :]
     )
-    a = jax.nn.relu(pre).reshape(n_banks * cap, out_f)
+    a = (pre if raw else jax.nn.relu(pre)).reshape(n_banks * cap, out_f)
     out = jnp.zeros((n, out_f), dt).at[order].set(a[dest])
     return out.reshape(B, S, out_f)
 
@@ -132,11 +138,13 @@ def decode_routed(
     return out.reshape(B, S, d)
 
 
-def encode_global(W_enc, b_enc, mu, x):
-    """GlobalSAE.encode mirror: [B, d] → [B, F]."""
+def encode_global(W_enc, b_enc, mu, x, raw: bool = False):
+    """GlobalSAE.encode mirror: [B, d] → [B, F]. `raw=True` returns pre-ReLU
+    pre-activations (A1 pin)."""
     dt = W_enc.dtype
     tilde = x.astype(dt) - mu.astype(dt)
-    return jax.nn.relu(tilde @ W_enc.T + b_enc)
+    pre = tilde @ W_enc.T + b_enc
+    return pre if raw else jax.nn.relu(pre)
 
 
 def decode_global(D, mu, z, add_mu: bool):
@@ -177,7 +185,9 @@ def thresholded_inference(preacts: jnp.ndarray, theta_star: float) -> jnp.ndarra
 
 def aux_select_mask(scores2d: jnp.ndarray, dead2d: jnp.ndarray, k_aux: int):
     """Torch `_aux_select` mirror: top min(k_aux, n) of dead-masked scores;
-    selected iff its masked score > -inf."""
+    selected iff its masked score > -inf. Under A1 the scores passed here are
+    RAW (pre-ReLU) preacts, so any dead candidate is selectable regardless of
+    sign."""
     masked = jnp.where(dead2d, scores2d.astype(jnp.float32), _NEG_INF)
     k = min(k_aux, masked.shape[1])
     vals, idx = jax.lax.top_k(masked, k)

@@ -186,6 +186,99 @@ def test_aux_loss_zero_without_dead_and_active_with(condition):
     assert out2.theta_b == out.theta_b and out2.l_local == pytest.approx(out.l_local)
 
 
+@pytest.mark.parametrize("condition", ["A", "B"])
+def test_aux_uses_raw_preacts_for_dead_latents(condition):
+    """A1 committee pin (Reviewer F): aux-selected dead latents contribute
+    their RAW (pre-ReLU) preact values — gradient must reach below-threshold
+    latents to revive them. With every preact forced negative, ReLU'd aux
+    values would be exactly zero (rhat == 0, l_aux == 1, zero gradient); raw
+    values give a live gradient path into the encoder."""
+    cond = build(condition)
+    with torch.no_grad():
+        cond.sae.b_enc.fill_(-50.0)  # every raw preact strongly negative
+    cond.dead_tracker.tokens_seen += 2 * cond.dead_tracker.window  # all dead
+    batch = make_batch()
+    out = cond.training_step(batch, step=0)
+    assert out.n_dead_now == cond.n_dict_banks * cond.f_dict
+    assert out.aux_selected > 0  # negative preacts ARE selected (> -inf rule)
+    assert out.l_aux > 0.0
+    # ReLU'd aux values would give rhat == 0 => l_aux == Σ‖r‖²/Σ‖r‖² == 1.0
+    assert out.l_aux != pytest.approx(1.0)
+    out.loss.backward()
+    # main path is fully dark (ReLU'd z == 0 everywhere): any encoder
+    # gradient must have come through the RAW aux values.
+    assert cond.sae.b_enc.grad is not None
+    assert float(cond.sae.b_enc.grad.abs().sum()) > 0.0
+    assert float(cond.sae.W_enc.grad.abs().sum()) > 0.0
+
+
+def test_aux_diagnostics_counts_and_scalars():
+    """A1 required diagnostics (Reviewer S): selection counts, overlap with
+    main, per-bank pressure, and the graph-attached aux term."""
+    cond = build("A")
+    cond.dead_tracker.tokens_seen += 2 * cond.dead_tracker.window  # all dead
+    batch = make_batch()
+    out = cond.training_step(batch, step=0)
+    # everything dead and budget (512) > 6f candidates: all 6f selected/token
+    expect = 6 * F_BANK * B
+    assert out.aux_selected == expect
+    assert int(out.aux_bank_counts.sum()) == expect
+    assert out.aux_bank_counts.shape == (cond.n_dict_banks,)
+    # every main-selected candidate is dead here, so it is also aux-selected
+    assert out.aux_main_overlap == out.k_selected
+    sc = out.scalars()
+    assert sc["aux_mean_selected_per_token"] == pytest.approx(expect / B)
+    assert sc["aux_primary_ratio"] == pytest.approx(out.l_aux / out.l_local)
+    assert sc["aux_frac_also_main"] == pytest.approx(out.k_selected / expect)
+    assert out.aux_term is not None and out.aux_term.requires_grad
+    assert float(out.aux_term.detach()) == pytest.approx(cond.aux_alpha * out.l_aux)
+    # per-bank counts follow the routed visibility (only routed banks selected)
+    loads = torch.bincount(batch.experts.reshape(-1), minlength=E)
+    assert torch.equal(out.aux_bank_counts, loads * F_BANK)
+
+    # nothing dead: diagnostics are all zero and no aux graph exists
+    fresh = build("A")
+    out0 = fresh.training_step(batch, step=0)
+    assert out0.aux_selected == 0 and out0.aux_main_overlap == 0
+    assert int(out0.aux_bank_counts.sum()) == 0
+    assert out0.aux_term is None
+
+
+def test_aux_grad_norm_ratio_second_backward():
+    """A1 diagnostic (ii): the loop's second backward of the aux term yields
+    ‖g_aux‖/‖g_main‖; None when nothing is dead."""
+    from moe_sae.train.loop import aux_grad_norm_ratio
+
+    cond = build("A")
+    cond.dead_tracker.tokens_seen += 2 * cond.dead_tracker.window
+    out = cond.training_step(make_batch(), step=0)
+    out.loss.backward(retain_graph=True)
+    params = list(cond.parameters())
+    ratio = aux_grad_norm_ratio(out.aux_term, params)
+    assert ratio is not None and ratio > 0.0 and np.isfinite(ratio)
+
+    # reference: grads of α·l_aux and of l_local computed independently
+    cond2 = build("A")
+    cond2.dead_tracker.tokens_seen += 2 * cond2.dead_tracker.window
+    out2 = cond2.training_step(make_batch(), step=0)
+    g_aux = torch.autograd.grad(
+        out2.aux_term, list(cond2.parameters()), retain_graph=True, allow_unused=True
+    )
+    g_tot = torch.autograd.grad(out2.loss, list(cond2.parameters()), allow_unused=True)
+    aux_sq = sum(float(g.pow(2).sum()) for g in g_aux if g is not None)
+    main_sq = sum(
+        float(((gt if gt is not None else 0) - (ga if ga is not None else 0)).pow(2).sum())
+        for gt, ga in zip(g_tot, g_aux)
+        if gt is not None or ga is not None
+    )
+    want = aux_sq**0.5 / max(main_sq**0.5, 1e-30)
+    assert ratio == pytest.approx(want, rel=1e-4)
+
+    fresh = build("A")
+    out0 = fresh.training_step(make_batch(), step=0)
+    assert aux_grad_norm_ratio(out0.aux_term, list(fresh.parameters())) is None
+
+
 def test_aux_respects_token_budget():
     cond = build("A")
     cond.aux_token_budget = 3  # tiny budget to make the cap bite
