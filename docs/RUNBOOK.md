@@ -320,7 +320,13 @@ spend) → capture_discovery.sh on the GPU box → 03_discovery_suite.sh.
 ~1 h of v4-32 (free under TRC). MFU >50% target applies to the A-shape
 training steps; F-runs are the wall-clock stragglers by construction.
 
-## Bucketless A100 lane (current discovery plan, 2026-07-08)
+## Bucketless A100 lane (superseded 2026-07-13 — see below; was current 2026-07-08)
+
+**Superseded:** streaming co-training on one A100 predates the A12 backend
+map (all 14 runs on TPU/JAX). Current Colab lane is capture-only:
+`scripts/cloud/colab_capture.sh` → `scripts/cloud/merge_in_bucket.py` →
+stats over gcsfuse on a TPU host (docs/PROCEDURE_DISCOVERY.md, Phase 3
+"Colab variant").
 
 No GCS/Drive. `notebooks/colab_discovery.ipynb` (rewritten) runs five phases
 on one A100-40: prefix stats (2k train examples → μ_e/baselines) → retained

@@ -14,6 +14,20 @@
 #
 # Budget note (Colab Pro ≈ 100 compute units/mo; A100 ≈ 11.8 CU/h): capture
 # ~3 h + suite ~2.5 h + eval ≈ ~70 CU. Sessions may die midway — that's fine.
+#
+# SUPERSEDED (2026-07-13): the training phases here predate the A12 backend
+# map (v0.1.2 addendum), which freezes ALL 14 discovery runs on the TPU/JAX
+# lane; and the capture phase overruns Colab's ~200 GB disk at full scale
+# (~770 GB, no eviction). Use scripts/cloud/colab_capture.sh for capture and
+# scripts/tpu/03_discovery_suite.sh for training. This script is retained
+# ONLY as the A10 cross-backend audit instrument (torch/CUDA replication of
+# the A-vs-C gate on a box with disk for the shards, e.g. GCE + gcsfuse) and
+# requires explicit opt-in:
+[ "${AUDIT:-0}" = 1 ] || {
+  echo "superseded — capture: scripts/cloud/colab_capture.sh; training: TPU lane (A12)."
+  echo "set AUDIT=1 only for the A10 cross-backend A-vs-C replication."
+  exit 2
+}
 set -u
 cd "$(dirname "$0")/../.."
 

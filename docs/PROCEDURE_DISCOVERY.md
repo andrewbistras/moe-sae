@@ -30,6 +30,9 @@ uv run python scripts/run_validate_gate.py --inputs validation_inputs \
   --out reports/hook_validation_cuda.json --device cuda
 ```
 FP32 gate must PASS on the CUDA path before any discovery shard counts.
+(Colab lane: `scripts/cloud/colab_capture.sh` runs this gate + the A3 check
+as its phase 0 in the same session type that captures, caching the PASS
+report in the bucket.)
 
 **A3 pre-capture contamination re-verification (consequence freeze):** before
 any discovery capture, re-verify zero train/dev/eval contamination under the
@@ -57,6 +60,19 @@ merged ≈50M tokens, stats.json bank loads sane (no unexplained starvation).
 modality-balanced (50/50) measure restricted to the train split — verify
 `stats.json` records `"measure": "balanced_train_split"` before any training
 run consumes the artifact.
+
+**Colab variant (A100 runtime, ~200 GB disk — ops-equivalent, 2026-07-13):**
+`scripts/cloud/colab_capture.sh` cuts the same 96k-example stream into 12
+disjoint slices (`--start`/`--examples`), captures each to completion,
+pushes + verifies to the bucket, wipes locally, and resumes across sessions.
+The merge then happens **in the bucket** (server-side copies, no data
+transits): `python scripts/cloud/merge_in_bucket.py --bucket $B --workers 12
+--execute`. The stats pass runs in-region for free over gcsfuse on a TPU
+host: `gcsfuse --implicit-dirs -o ro <bucket-name> /mnt/gcs && uv run
+--no-sync python scripts/run_stats.py --capture
+/mnt/gcs/captures/discovery_50m --out stats/discovery_50m` (then push stats
+to the bucket). Slice layout is storage-only: token order and downstream
+batches are identical to the 3-worker layout.
 
 ## Phase 4 — training suite (~35 min TPU; A12 backend map)
 - TPU hosts: rsync bucket → `/dev/shm/moe_sae/discovery_50m`.

@@ -30,8 +30,8 @@ gcloud compute tpus queued-resources create "$TPU_NAME" \
 
 # --- 3. shard upload (choose ONE source) ------------------------------------ #
 # (a) pipeline shards from the laptop (~16 GB — fine for smoke tests):
-#   gcloud storage rsync -r captures/pipeline_1m "$BUCKET/captures/pipeline_1m"
-#   gcloud storage rsync -r stats/pipeline_1m   "$BUCKET/stats/pipeline_1m"
-#   gcloud storage rsync -r runs/pipeline_1m_A  "$BUCKET/runs/pipeline_1m_A"   # for parity vs MPS
+# gcloud storage rsync -r captures/pipeline_1m "$BUCKET/captures/pipeline_1m"
+# gcloud storage rsync -r stats/pipeline_1m   "$BUCKET/stats/pipeline_1m"
+# gcloud storage rsync -r runs/pipeline_1m_A  "$BUCKET/runs/pipeline_1m_A"   # for parity vs MPS
 # (b) discovery shards (~770 GB): do NOT upload from a laptop — capture them
 #     in-cloud on a GPU box writing directly to $BUCKET (see scripts/cloud/).
