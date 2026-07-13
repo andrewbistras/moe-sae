@@ -125,18 +125,25 @@ class FakeGlobalSAE:
 
 
 def build_capture(root, n_per_pool=12, seed=0):
-    """Example ids alternate across train/dev/eval split residues."""
+    """Example ids alternate across train/dev/eval/dev split classes under the
+    A3 keyed hash (row i has domain i % 4; its id is searched to land in the
+    wanted bucket range for that domain)."""
+    from split_test_utils import ids_in_split
+
     g = torch.Generator().manual_seed(seed)
-    residues = [5, 82, 91, 88]  # train, dev, eval, dev
+    split_cycle = ("train", "dev", "eval", "dev")
     for pool, base in (("visual", 0), ("text", 1000)):
         w = ShardWriter(root, pool, shard_size=5)
         n = n_per_pool
         experts = torch.stack([torch.randperm(BANKS, generator=g)[:K] for _ in range(n)])
         c = torch.randn(n, K, D, generator=g)
         gates = torch.rand(n, K, generator=g)
-        ids = torch.tensor(
-            [base + 100 * i + residues[i % 4] for i in range(n)], dtype=torch.int32
-        )
+        raw_ids, cursor = [], base
+        for i in range(n):
+            eid = ids_in_split(i % 4, split_cycle[i % 4], 1, start=cursor)[0]
+            raw_ids.append(eid)
+            cursor = eid + 1
+        ids = torch.tensor(raw_ids, dtype=torch.int32)
         w.add(c, experts, gates, ids, (torch.arange(n) % 4).to(torch.uint8))
         w.close()
 
@@ -146,7 +153,7 @@ def naive_metrics(root, split, sae, theta):
     rows = []  # (pool, c f32 [K,D], experts [K])
     for pool in ("visual", "text"):
         for shard in iter_shards(root, pool):
-            keep = split_mask(shard["example_id"], split)
+            keep = split_mask(shard["domain"], shard["example_id"], split)
             for t in keep.nonzero(as_tuple=True)[0].tolist():
                 rows.append((pool, shard["c"][t], shard["experts"][t].to(torch.int64)))
     n_total = len(rows)
@@ -243,7 +250,7 @@ def test_dump_contents_match_encoding(tmp_path):
     kept = []
     for pool in ("visual", "text"):
         for shard in iter_shards(tmp_path / "cap", pool):
-            keep = split_mask(shard["example_id"], "dev")
+            keep = split_mask(shard["domain"], shard["example_id"], "dev")
             if keep.any():
                 kept.append((pool, {k: v[keep] for k, v in shard.items()}))
     assert len(shards) == len(kept)
@@ -286,14 +293,16 @@ def test_dump_contents_match_encoding(tmp_path):
 
 
 def test_split_filtering_is_example_level(tmp_path):
+    from moe_sae.data.splits import split_buckets
+
     build_capture(tmp_path / "cap")
     sae = FakeRoutedSAE()
     for split, (lo, hi) in (("dev", (80, 90)), ("eval", (90, 100))):
         out = tmp_path / f"dump_{split}"
         evaluate_reconstruction(sae, THETA, tmp_path / "cap", split, out)
         for shard in iter_dump_shards(out):
-            residues = shard["example_id"].to(torch.int64) % 100
-            assert ((residues >= lo) & (residues < hi)).all()
+            buckets = split_buckets(shard["domain"], shard["example_id"])
+            assert ((buckets >= lo) & (buckets < hi)).all()
 
 
 def test_global_condition(tmp_path):

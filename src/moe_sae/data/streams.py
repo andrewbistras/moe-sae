@@ -20,8 +20,8 @@ Example ids are frozen as ``DOMAIN_OFFSET + SPLIT_OFFSET + yielded index``
 (offsets below). **Determinism assumptions:** HF streaming yields records in a
 fixed order for a fixed dataset revision (parquet file order × row order), and
 the upstream repos are not rewritten. Given identical stream order the ids are
-stable across runs; they feed the `example_id % 100` train/dev/eval convention
-(docs/INTERFACES.md "Splits").
+stable across runs; they feed the frozen A3 keyed-hash train/dev/eval split
+(moe_sae.data.splits.split_bucket over (domain, example_id)).
 
 Record→Example field mapping is isolated in pure `map_*_record` functions so it
 is unit-testable on dict fixtures without the network.

@@ -15,7 +15,7 @@ Usage:
 scored on its dev-split tokens. The probes are FIT on --train-dump (a
 TRAIN-split dump from the same run); without --train-dump the probes are
 skipped with a logged notice. --include-eval-split additionally scores probes
-on the frozen eval split (example_id % 100 in 90–99) — POST-INTERVENTION ONLY:
+on the frozen eval split (A3 keyed-hash split_bucket in 90–99) — POST-INTERVENTION ONLY:
 spec §17/§20 require evaluation data untouched until the intervention runs.
 --condition/--f override missing meta.json fields (applied to --dump,
 --train-dump and --seed-dumps, which share the run's condition; --compare-dump

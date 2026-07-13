@@ -29,13 +29,26 @@ SHARD = 16  # tokens per synthetic shard
 D = 4
 
 
+def train_ids_for(id_base: int, n_shards: int) -> list[int]:
+    """One TRAIN-bucket example id per shard under the A3 keyed hash (the
+    composer's default split filter is active; domain cycles s % 4)."""
+    from split_test_utils import ids_in_split
+
+    out, cursor = [], id_base
+    for s in range(n_shards):
+        eid = ids_in_split(s % 4, "train", 1, start=cursor)[0]
+        out.append(eid)
+        cursor = eid + 1
+    return out
+
+
 def build_pool(root, pool, n_shards, id_base):
     """One example_id per shard so shard membership is recoverable from rows;
-    c is filled with the example_id so row integrity is checkable."""
+    c is filled with the example_id so row integrity is checkable. Ids are
+    TRAIN-bucket under the A3 hash so the default split filter keeps them."""
     torch.manual_seed(id_base)
     w = ShardWriter(root, pool, shard_size=SHARD)
-    for s in range(n_shards):
-        eid = id_base + s
+    for s, eid in enumerate(train_ids_for(id_base, n_shards)):
         w.add(
             c=torch.full((SHARD, 6, D), float(eid)),
             experts=torch.randint(0, 64, (SHARD, 6)),
@@ -101,7 +114,7 @@ def test_visual_epoch_is_a_permutation(capture_root):
     batches = list(islice(iter(make_composer(capture_root)), 8))
     vis_ids = torch.cat([b.example_id[b.token_type == 1] for b in batches])
     counts = {int(e): int((vis_ids == e).sum()) for e in vis_ids.unique()}
-    assert counts == {1000 + s: SHARD for s in range(8)}, (
+    assert counts == {e: SHARD for e in train_ids_for(1000, 8)}, (
         "each visual token must appear exactly once per epoch"
     )
 
@@ -141,10 +154,28 @@ def test_unaligned_half_size(capture_root):
     vis_ids = torch.cat([b.example_id[b.token_type == 1] for b in batches])
     # first visual epoch (128 rows) is still an exact permutation of the pool
     counts = {int(e): int((vis_ids[:128] == e).sum()) for e in vis_ids[:128].unique()}
-    assert counts == {1000 + s: SHARD for s in range(8)}
+    assert counts == {e: SHARD for e in train_ids_for(1000, 8)}
 
 
-def build_mixed_pool(root, pool, n_shards, ids):
+from split_test_utils import ids_in_split  # noqa: E402 (A3 keyed-hash helpers)
+
+# Fixed capture domains per pool: bucket membership under the A3 keyed hash
+# is a function of (domain, example_id).
+VIS_DOMAIN, TXT_DOMAIN = 2, 3
+# Per pool: 2 train ids + 1 dev + 1 eval (raw domain-offset id style).
+VIS_IDS = (
+    ids_in_split(VIS_DOMAIN, "train", 2, start=250_000_000)
+    + ids_in_split(VIS_DOMAIN, "dev", 1, start=250_000_000)
+    + ids_in_split(VIS_DOMAIN, "eval", 1, start=250_000_000)
+)
+TXT_IDS = (
+    ids_in_split(TXT_DOMAIN, "train", 2, start=300_000_000)
+    + ids_in_split(TXT_DOMAIN, "dev", 1, start=300_000_000)
+    + ids_in_split(TXT_DOMAIN, "eval", 1, start=300_000_000)
+)
+
+
+def build_mixed_pool(root, pool, n_shards, ids, domain_byte):
     """Rows cycle through `ids` (int32 domain-offset style), so every shard
     mixes train/dev/eval buckets; c is filled with the example_id per row."""
     torch.manual_seed(ids[0])
@@ -158,27 +189,26 @@ def build_mixed_pool(root, pool, n_shards, ids):
             experts=torch.randint(0, 64, (SHARD, 6)),
             gates=torch.rand(SHARD, 6),
             example_id=eid,
-            domain=torch.full((SHARD,), s % 4, dtype=torch.uint8),
+            domain=torch.full((SHARD,), domain_byte, dtype=torch.uint8),
         )
     assert w.close() == n_shards * SHARD
 
 
 @pytest.fixture()
 def mixed_root(tmp_path):
-    # raw int32 domain-offset ids; %100 gives buckets 0, 1, 85 (dev), 92 (eval)
-    vis_ids = [250000000, 250000001, 250000085, 250000092]
-    txt_ids = [300000000, 300000001, 300000185, 300000292]
-    build_mixed_pool(tmp_path, "visual", n_shards=8, ids=vis_ids)
-    build_mixed_pool(tmp_path, "text", n_shards=2, ids=txt_ids)
+    build_mixed_pool(tmp_path, "visual", n_shards=8, ids=VIS_IDS, domain_byte=VIS_DOMAIN)
+    build_mixed_pool(tmp_path, "text", n_shards=2, ids=TXT_IDS, domain_byte=TXT_DOMAIN)
     return tmp_path
 
 
 def test_split_filter_excludes_dev_and_eval_buckets(mixed_root):
-    # Regression (blocker): training stream must never see example_id%100 >= 80.
+    # Regression (blocker): training must never see A3 split_bucket >= 80.
+    from moe_sae.data.splits import split_buckets
+
     composer = make_composer(mixed_root)
     batches = list(islice(iter(composer), 12))  # > 1 epoch of each pool
     for b in batches:
-        assert (b.example_id.to(torch.int64) % 100 < 80).all(), (
+        assert (split_buckets(b.domain, b.example_id) < 80).all(), (
             "dev/eval buckets leaked into the training stream"
         )
     # half of every shard's rows are dev/eval: exclusions must be tracked
@@ -207,19 +237,23 @@ def test_split_filter_epoch_is_permutation_of_train_rows(mixed_root):
     batches = list(islice(iter(make_composer(mixed_root)), 4))
     vis_ids = torch.cat([b.example_id[b.token_type == 1] for b in batches])
     counts = {int(e): int((vis_ids == e).sum()) for e in vis_ids.unique()}
-    assert counts == {250000000: 32, 250000001: 32}, (
+    assert counts == {VIS_IDS[0]: 32, VIS_IDS[1]: 32}, (
         "each kept visual token must appear exactly once per epoch"
     )
 
 
 def test_split_none_disables_filter(mixed_root):
+    from moe_sae.data.splits import split_buckets
+
     composer = BatchComposer(
         mixed_root, batch_tokens=32, seed=7, buffer_shards=2,
         batch_cls=TrainBatch, split=None,
     )
     batches = list(islice(iter(composer), 8))  # full visual epoch (old behavior)
-    ids = torch.cat([b.example_id for b in batches]).to(torch.int64) % 100
-    assert (ids >= 80).any(), "split=None must keep dev/eval rows"
+    buckets = torch.cat(
+        [split_buckets(b.domain, b.example_id) for b in batches]
+    )
+    assert (buckets >= 80).any(), "split=None must keep dev/eval rows"
     assert composer.excluded_counts == {"visual": 0, "text": 0}
 
 

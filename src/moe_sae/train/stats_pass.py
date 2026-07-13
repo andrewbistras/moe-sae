@@ -17,12 +17,13 @@ Outputs `stats.safetensors` (tensors, float32/int64) plus a human-readable
 `stats.json` summary. Banks never routed to have μ_e = 0 and count 0.
 
 Decisions:
-- Split filtering (docs/INTERFACES.md §Splits): μ_e and the router baselines
+- Split filtering (A3, moe_sae.data.splits): μ_e and the router baselines
   are training-distribution statistics (spec §5 "initial statistics pass"), so
-  `compute_stats` consumes ONLY the train buckets (`example_id % 100` in 0–79)
-  by default (`split='train'`; `split=None` disables filtering). stats.json
-  reports kept and excluded token counts per pool plus the split used. The
-  modulo applies to the raw int32 domain-offset example_id.
+  `compute_stats` consumes ONLY the train buckets (keyed-hash split_bucket in
+  0–79) by default (`split='train'`; `split=None` disables filtering).
+  stats.json reports kept and excluded token counts per pool plus the split
+  used. Membership comes from each row's (domain, example_id) pair under the
+  frozen A3 keyed hash.
 """
 
 from __future__ import annotations
@@ -35,7 +36,7 @@ import torch
 from safetensors.torch import load_file, save_file
 
 from moe_sae.capture.writer import DOMAIN_NAMES, POOLS, iter_shards
-from moe_sae.data.batches import SPLIT_RANGES, split_mask
+from moe_sae.data.splits import SPLIT_RANGES, split_mask
 from moe_sae.model_loading import HIDDEN_SIZE, NUM_ROUTED_EXPERTS, TOP_K_ROUTED
 
 STATS_FILE = "stats.safetensors"
@@ -77,8 +78,8 @@ def compute_stats(
 ) -> ActivationStats:
     """Single streaming pass over both pools; all accumulators float64/int64.
 
-    Only `split` rows (default: train buckets, example_id % 100 in 0–79) are
-    accumulated; `split=None` disables the filter (debugging only).
+    Only `split` rows (default: train buckets, A3 keyed-hash bucket in 0–79)
+    are accumulated; `split=None` disables the filter (debugging only).
     """
     assert split is None or split in SPLIT_RANGES, split
     root = Path(capture_root)
@@ -95,7 +96,7 @@ def compute_stats(
     for pool in POOLS:
         for shard in iter_shards(root, pool):
             if split is not None:
-                keep = split_mask(shard["example_id"], split)
+                keep = split_mask(shard["domain"], shard["example_id"], split)
                 n_excluded[pool] += int((~keep).sum())
                 shard = {k: v[keep] for k, v in shard.items()}
                 if not bool(keep.any()):

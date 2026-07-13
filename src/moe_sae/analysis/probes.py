@@ -11,10 +11,10 @@ Regularized linear classifiers predict visual-vs-text token type from:
                           logistic regression (all conditions);
 4. combinations (1)+(2) and (1)+(3).
 
-Splits (frozen contract, docs/INTERFACES.md §Splits): example_id % 100 —
-0–79 train, 80–89 dev, 90–99 eval. Probes are fit on train-split tokens and
-scored on dev-split tokens; held-out at the *example* level, never at the
-position level (spec §16.4).
+Splits (frozen, A3 keyed hash — moe_sae.data.splits): split_bucket(domain,
+example_id) — 0–79 train, 80–89 dev, 90–99 eval. Probes are fit on
+train-split tokens and scored on dev-split tokens; held-out at the *example*
+level, never at the position level (spec §16.4).
 
 Classifier choices (frozen here): sklearn LogisticRegression.
 - Dense probes (1, 2, 1+2): penalty='l2', solver='lbfgs'. The spec asks only
@@ -32,7 +32,7 @@ Decisions:
   (+ masses) whose DEV-split tokens are scored. Passing the same object for
   both is valid for mixed-split dumps (e.g. synthetic fixtures); split
   membership is always re-derived from example_id, never trusted from meta.
-- The frozen EVAL split (example_id % 100 in 90–99) is scored only when
+- The frozen EVAL split (A3 split_bucket in 90–99) is scored only when
   include_eval_split=True (run_analysis --include-eval-split), a
   POST-INTERVENTION-ONLY switch: spec §17/§20 require evaluation data
   untouched until the intervention has run. By default the per-probe "eval"
@@ -58,20 +58,21 @@ from moe_sae.analysis.mass import (
     BankMasses,
     FeatureDump,
 )
+from moe_sae.data.splits import split_buckets
 from moe_sae.model_loading import NUM_ROUTED_EXPERTS
 from moe_sae.train.config import global_width
 
 SPLIT_TRAIN, SPLIT_DEV, SPLIT_EVAL = 0, 1, 2
 
 EVAL_SPLIT_NOTE = (
-    "eval split (example_id % 100 in 90–99) untouched pre-intervention "
+    "eval split (A3 split_bucket in 90–99) untouched pre-intervention "
     "(spec §17/§20); rerun with --include-eval-split after the intervention"
 )
 
 
-def example_split(example_id: np.ndarray) -> np.ndarray:
-    """Frozen split codes from example_id % 100 (contract §Splits)."""
-    r = np.asarray(example_id) % 100
+def example_split(domain: np.ndarray, example_id: np.ndarray) -> np.ndarray:
+    """Frozen split codes from the A3 keyed hash over (domain, example_id)."""
+    r = split_buckets(np.asarray(domain), np.asarray(example_id))
     return np.where(r < 80, SPLIT_TRAIN, np.where(r < 90, SPLIT_DEV, SPLIT_EVAL))
 
 
@@ -174,19 +175,19 @@ def run_probes(
         )
     y_tr = (train_dump.token_type == TOKEN_TYPE_VISUAL).astype(np.int64)
     y_sc = (score_dump.token_type == TOKEN_TYPE_VISUAL).astype(np.int64)
-    train = example_split(train_dump.example_id) == SPLIT_TRAIN
-    sc_split = example_split(score_dump.example_id)
+    train = example_split(train_dump.domain, train_dump.example_id) == SPLIT_TRAIN
+    sc_split = example_split(score_dump.domain, score_dump.example_id)
     dev = sc_split == SPLIT_DEV
     ev = sc_split == SPLIT_EVAL
     if not train.any() or np.unique(y_tr[train]).size < 2:
         raise ValueError(
-            "train dump has no train-split tokens (example_id % 100 < 80) or a "
+            "train dump has no train-split tokens (A3 split_bucket < 80) or a "
             "single class; cannot fit probes — pass a TRAIN-split FeatureDump "
             "(--train-dump on scripts/run_analysis.py)"
         )
     if not dev.any():
         raise ValueError(
-            "score dump has no dev-split tokens (example_id % 100 in 80–89); "
+            "score dump has no dev-split tokens (A3 split_bucket in 80–89); "
             "probes are scored on the dev split — pass a DEV-split FeatureDump "
             "(--dump on scripts/run_analysis.py)"
         )

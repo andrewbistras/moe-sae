@@ -22,14 +22,14 @@ starts) so this module stays import-safe while that package is developed in
 parallel; tests may inject a duck-typed substitute via ``batch_cls``.
 
 Decisions:
-- Split filtering (docs/INTERFACES.md §Splits): training consumes ONLY the
-  train buckets (``example_id % 100`` in 0–79) by default. The constructor
+- Split filtering (A3, moe_sae.data.splits): training consumes ONLY the
+  train buckets (keyed-hash split_bucket in 0–79) by default. The constructor
   takes ``split='train'`` (any key of ``SPLIT_RANGES``); ``split=None``
   disables filtering (debugging only). Rows are filtered at shard-load time,
   before the shuffle buffer, so the 50/50 halves and seed determinism are
   unchanged; excluded row counts are tracked in ``excluded_counts`` per pool
-  and logged at the end of each epoch. The modulo applies to the raw int32
-  domain-offset example_id.
+  and logged at the end of each epoch. Membership is resolved from the
+  shard's (domain, example_id) pair via the frozen A3 keyed hash.
 """
 
 from __future__ import annotations
@@ -43,20 +43,11 @@ import torch
 from safetensors.torch import load_file
 
 from moe_sae.capture.writer import POOLS, shard_paths
+from moe_sae.data.splits import SPLIT_RANGES, split_mask  # noqa: F401 (re-export)
 
 logger = logging.getLogger(__name__)
 
 _FIELDS = ("c", "experts", "gates", "example_id", "domain")
-
-# Frozen split convention (docs/INTERFACES.md §Splits): example_id % 100.
-SPLIT_RANGES = {"train": (0, 80), "dev": (80, 90), "eval": (90, 100)}
-
-
-def split_mask(example_id: torch.Tensor, split: str) -> torch.Tensor:
-    """Frozen example-level split membership (never position-level; spec §16.4)."""
-    lo, hi = SPLIT_RANGES[split]
-    m = example_id.to(torch.int64) % 100
-    return (m >= lo) & (m < hi)
 
 
 def _default_batch_cls():
@@ -139,7 +130,7 @@ class BatchComposer:
         shard = load_file(str(path))
         if self.split is None:
             return {k: shard[k] for k in _FIELDS}
-        keep = split_mask(shard["example_id"], self.split)
+        keep = split_mask(shard["domain"], shard["example_id"], self.split)
         self.excluded_counts[pool] += int((~keep).sum())
         return {k: shard[k][keep] for k in _FIELDS}
 

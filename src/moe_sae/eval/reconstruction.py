@@ -2,8 +2,8 @@
 and FeatureDump production (docs/INTERFACES.md §FeatureDump).
 
 Everything here runs on held-out capture shards: rows are filtered by the
-frozen split convention `example_id % 100` (0–79 train, 80–89 dev, 90–99 eval;
-docs/INTERFACES.md §Splits).
+frozen A3 keyed-hash split convention (moe_sae.data.splits.split_bucket over
+(domain, example_id); 0–79 train, 80–89 dev, 90–99 eval).
 
 Condition interface
 -------------------
@@ -48,10 +48,8 @@ import torch
 from safetensors.torch import load_file, save_file
 
 from moe_sae.capture.writer import POOLS, iter_shards
+from moe_sae.data.splits import SPLIT_RANGES, split_mask  # noqa: F401 (re-export)
 from moe_sae.model_loading import NUM_ROUTED_EXPERTS
-
-# Frozen split convention (docs/INTERFACES.md): example_id % 100.
-SPLIT_RANGES = {"train": (0, 80), "dev": (80, 90), "eval": (90, 100)}
 
 # Firing-frequency histogram bins (log10 of per-token firing rate).
 FREQ_HIST_EDGES = [-8.0 + 0.2 * i for i in range(41)]  # 40 bins, 1e-8 .. 1
@@ -88,13 +86,6 @@ class ThresholdedSAE(Protocol):
     ) -> ThresholdedEncoding: ...
 
     def decoder_cols(self, bank: torch.Tensor, latent: torch.Tensor) -> torch.Tensor: ...
-
-
-def split_mask(example_id: torch.Tensor, split: str) -> torch.Tensor:
-    """Frozen example-level split membership (never position-level; spec §16.4)."""
-    lo, hi = SPLIT_RANGES[split]
-    m = example_id.to(torch.int64) % 100
-    return (m >= lo) & (m < hi)
 
 
 def _encode_chunked(
@@ -185,7 +176,7 @@ def evaluate_reconstruction(
     n_total = 0
     for pool in POOLS:
         for shard in iter_shards(root, pool):
-            keep = split_mask(shard["example_id"], split)
+            keep = split_mask(shard["domain"], shard["example_id"], split)
             if not keep.any():
                 continue
             c = shard["c"][keep].to(torch.float64)
@@ -228,7 +219,7 @@ def evaluate_reconstruction(
 
     for pool in POOLS:
         for shard in iter_shards(root, pool):
-            keep = split_mask(shard["example_id"], split)
+            keep = split_mask(shard["domain"], shard["example_id"], split)
             if not keep.any():
                 continue
             c = shard["c"][keep]  # [n, 6, d] bf16

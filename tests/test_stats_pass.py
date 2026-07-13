@@ -3,12 +3,26 @@ on synthetic capture shards, and save/load round-trip."""
 
 import torch
 
+from split_test_utils import ids_in_split
+
 from moe_sae.capture.writer import ShardWriter, iter_shards
+from moe_sae.data.splits import split_bucket
 from moe_sae.train.stats_pass import compute_stats, load_stats, save_stats
 
 E = 8  # experts (subset of expert-id space; arrays still sized to E here)
 D = 4
 K = 6  # slots per token (frozen top-6 shape)
+
+
+def train_ids_mod4(n: int, start: int) -> list[int]:
+    """n TRAIN-bucket ids under domain = t % 4 (fixture convention), unique."""
+    out, cur = [], start
+    for t in range(n):
+        while split_bucket(t % 4, cur) >= 80:
+            cur += 1
+        out.append(cur)
+        cur += 1
+    return out
 
 
 def build_capture(root, n_visual=11, n_text=7, seed=0):
@@ -18,7 +32,8 @@ def build_capture(root, n_visual=11, n_text=7, seed=0):
         experts = torch.stack([torch.randperm(E, generator=g)[:K] for _ in range(n)])
         c = torch.randn(n, K, D, generator=g)
         gates = torch.rand(n, K, generator=g)
-        example_id = torch.arange(n, dtype=torch.int32) + id_base
+        # TRAIN-bucket ids under the A3 hash (compute_stats filters by default)
+        example_id = torch.tensor(train_ids_mod4(n, id_base), dtype=torch.int32)
         domain = (torch.arange(n) % 4).to(torch.uint8)
         w.add(c, experts, gates, example_id, domain)
         w.close()
@@ -88,7 +103,7 @@ def test_never_routed_bank_is_zero(tmp_path):
         torch.randn(n, K, D),
         experts,
         torch.rand(n, K),
-        torch.arange(n, dtype=torch.int32),
+        torch.tensor(ids_in_split(0, "train", n), dtype=torch.int32),
         torch.zeros(n, dtype=torch.uint8),
     )
     w.close()
@@ -97,7 +112,7 @@ def test_never_routed_bank_is_zero(tmp_path):
         torch.randn(2, K, D),
         experts[:2],
         torch.rand(2, K),
-        torch.arange(2, dtype=torch.int32),
+        torch.tensor(ids_in_split(0, "train", 2, start=1000), dtype=torch.int32),
         torch.zeros(2, dtype=torch.uint8),
     )
     w2.close()
@@ -117,13 +132,23 @@ def test_domain_counts(tmp_path):
     assert stats.domain_counts["text"] == {"coco": 2, "textvqa": 2, "chartqa": 2, "ai2d": 1}
 
 
+def mixed_ids(start: int) -> list[int]:
+    """4 ids for the fixture's domain = t % 4 convention: domains 0/1 land in
+    train, domain 2 in dev, domain 3 in eval (under the A3 keyed hash)."""
+    return [
+        ids_in_split(0, "train", 1, start=start)[0],
+        ids_in_split(1, "train", 1, start=start)[0],
+        ids_in_split(2, "dev", 1, start=start)[0],
+        ids_in_split(3, "eval", 1, start=start)[0],
+    ]
+
+
 def build_mixed_capture(root, seed=3):
-    """Both pools contain train, dev, and eval buckets (raw int32 domain-offset
-    ids: %100 in {0..79}, {80..89}, {90..99})."""
+    """Both pools contain train, dev, and eval buckets under the A3 hash."""
     g = torch.Generator().manual_seed(seed)
     ids = {
-        "visual": [250000000, 250000001, 250000085, 250000092],
-        "text": [300000002, 300000003, 300000188, 300000297],
+        "visual": mixed_ids(250_000_000),
+        "text": mixed_ids(300_000_000),
     }
     rows = {}
     for pool, n in (("visual", 12), ("text", 8)):
@@ -145,8 +170,8 @@ def test_split_filter_matches_train_only_reference(tmp_path):
     # reference capture holding ONLY the train-bucket rows
     g = torch.Generator().manual_seed(3)
     ids = {
-        "visual": [250000000, 250000001, 250000085, 250000092],
-        "text": [300000002, 300000003, 300000188, 300000297],
+        "visual": mixed_ids(250_000_000),
+        "text": mixed_ids(300_000_000),
     }
     for pool, n in (("visual", 12), ("text", 8)):
         w = ShardWriter(tmp_path / "trainonly", pool, shard_size=4)
@@ -154,8 +179,10 @@ def test_split_filter_matches_train_only_reference(tmp_path):
         c = torch.randn(n, K, D, generator=g)
         gates = torch.rand(n, K, generator=g)
         eid = torch.tensor([ids[pool][t % 4] for t in range(n)], dtype=torch.int32)
-        keep = (eid.to(torch.int64) % 100) < 80
         domain = (torch.arange(n) % 4).to(torch.uint8)
+        keep = torch.tensor(
+            [split_bucket(int(d), int(e)) < 80 for d, e in zip(domain, eid)]
+        )
         w.add(c[keep], experts[keep], gates[keep], eid[keep], domain[keep])
         w.close()
 

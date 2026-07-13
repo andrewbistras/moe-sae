@@ -260,10 +260,16 @@ input_ids, images, images_seq_mask, images_spatial_crop, example_id, domain) —
 prompt-only (no answers), mixed 4 domains, enough examples to cover ≥100k
 language-stack token positions.
 
-## Splits (frozen convention)
+## Splits (frozen convention — v0.1.2 A3 keyed hash)
 
-`example_id % 100`: 0–79 train, 80–89 development (enriched-set definition,
-§17), 90–99 evaluation (untouched until intervention run). Example-level, never
-position-level (spec §16.4). SAE training (`BatchComposer`) and the statistics
-pass (`compute_stats`) consume ONLY the train buckets 0–79 by default
-(`split='train'`; `split=None` disables filtering for debugging only).
+`split_bucket(domain, example_id) =
+int(sha256(f"{dataset_key}:{example_id}").hexdigest()[:8], 16) % 100`
+(`moe_sae.data.splits`), with `dataset_key` the capture domain's lowercase
+name (`coco`/`textvqa`/`chartqa`/`ai2d`; `text_control` for the eval-only
+pool byte 255): 0–79 train, 80–89 development (enriched-set definition, §17),
+90–99 evaluation (untouched until intervention run). Example-level, never
+position-level (spec §16.4). Language-native `hash()` is forbidden (A3). SAE
+training (`BatchComposer`) and the statistics pass (`compute_stats`) consume
+ONLY the train buckets 0–79 by default (`split='train'`; `split=None`
+disables filtering for debugging only). The former raw `example_id % 100`
+convention is superseded by A3.

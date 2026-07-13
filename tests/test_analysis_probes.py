@@ -12,6 +12,8 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
+from split_test_utils import ids_in_split, ids_in_split_domain_mod4
+
 from moe_sae.analysis.mass import FeatureDump, load_dump, token_bank_masses
 from moe_sae.analysis.probes import (
     SPLIT_DEV,
@@ -23,11 +25,20 @@ from moe_sae.analysis.probes import (
     run_probes,
     total_features,
 )
+from moe_sae.data.splits import split_bucket
 
 N_BANKS = 64
 TOP_K = 6
 VIS_BANKS = (1, 2, 3)
 TXT_BANKS = (10, 11)
+
+# Default mixed-split example ids (fixture convention: domain = ex % 4):
+# 100 train + 10 dev + 10 eval under the A3 keyed hash.
+DEFAULT_EX_IDS = (
+    ids_in_split_domain_mod4("train", 100)
+    + ids_in_split_domain_mod4("dev", 10)
+    + ids_in_split_domain_mod4("eval", 10)
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -36,19 +47,20 @@ TXT_BANKS = (10, 11)
 
 
 def write_synth_dump(
-    root, condition="A", f=16, n_examples=120, tokens_per_side=6, seed=0,
+    root, condition="A", f=16, tokens_per_side=6, seed=0,
     signal=5.0, noise=0.05, ex_ids=None,
 ):
     """Planted banked dump (visual -> banks 1,2,3; text -> banks 10,11).
-    `ex_ids` restricts example ids (default range(n_examples)) — used to
-    build single-split dumps matching the run_eval per-split layout."""
+    `ex_ids` restricts example ids (default DEFAULT_EX_IDS: 100 train + 10 dev
+    + 10 eval under the A3 hash, domain = ex % 4) — used to build single-split
+    dumps matching the run_eval per-split layout."""
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(seed)
     pt = {k: [] for k in ("experts", "gates", "token_type", "example_id", "domain", "l0")}
     ac = {k: [] for k in ("act_token", "act_slot", "act_latent", "act_value")}
     t = 0
-    for ex in ex_ids if ex_ids is not None else range(n_examples):
+    for ex in ex_ids if ex_ids is not None else DEFAULT_EX_IDS:
         for tt in (1, 0):
             banks = VIS_BANKS if tt else TXT_BANKS
             for _ in range(tokens_per_side):
@@ -80,7 +92,7 @@ def write_synth_dump(
     return root
 
 
-def write_synth_global_dump(root, condition="B", f=16, n_examples=120, tokens_per_side=6, seed=0):
+def write_synth_global_dump(root, condition="B", f=16, tokens_per_side=6, seed=0):
     """Global dump: act_slot == 0; visual latents [0,8), text latents [F-8,F)."""
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
@@ -89,7 +101,7 @@ def write_synth_global_dump(root, condition="B", f=16, n_examples=120, tokens_pe
     pt = {k: [] for k in ("experts", "gates", "token_type", "example_id", "domain", "l0")}
     ac = {k: [] for k in ("act_token", "act_slot", "act_latent", "act_value")}
     t = 0
-    for ex in range(n_examples):
+    for ex in DEFAULT_EX_IDS:
         for tt in (1, 0):
             lat_lo = 0 if tt else f_total - 8
             e_lo = 0 if tt else 8
@@ -147,17 +159,29 @@ def _save(root, condition, f, pt, ac):
 
 
 def test_example_split_exact():
-    ids = np.array([0, 79, 80, 89, 90, 99, 100, 179, 185, 195, 1_000_090])
-    expect = np.array(
-        [SPLIT_TRAIN, SPLIT_TRAIN, SPLIT_DEV, SPLIT_DEV, SPLIT_EVAL, SPLIT_EVAL,
-         SPLIT_TRAIN, SPLIT_TRAIN, SPLIT_DEV, SPLIT_EVAL, SPLIT_EVAL]
+    """Split codes follow the frozen A3 bucket thresholds per (domain, id)."""
+    ids = np.array(
+        ids_in_split(0, "train", 2)
+        + ids_in_split(1, "dev", 2)
+        + ids_in_split(2, "eval", 2),
+        dtype=np.int64,
     )
-    np.testing.assert_array_equal(example_split(ids), expect)
+    doms = np.array([0, 0, 1, 1, 2, 2], dtype=np.uint8)
+    expect = np.array(
+        [SPLIT_TRAIN, SPLIT_TRAIN, SPLIT_DEV, SPLIT_DEV, SPLIT_EVAL, SPLIT_EVAL]
+    )
+    np.testing.assert_array_equal(example_split(doms, ids), expect)
+    # and against the raw bucket function
+    for d, e, s in zip(doms, ids, expect):
+        b = split_bucket(int(d), int(e))
+        assert (b < 80) == (s == SPLIT_TRAIN)
+        assert (80 <= b < 90) == (s == SPLIT_DEV)
+        assert (b >= 90) == (s == SPLIT_EVAL)
 
 
 def test_split_is_example_level(tmp_path):
     dump = load_dump(write_synth_dump(tmp_path / "d"))
-    split = example_split(dump.example_id)
+    split = example_split(dump.domain, dump.example_id)
     # every example's tokens land in exactly one split
     for ex in np.unique(dump.example_id):
         assert np.unique(split[dump.example_id == ex]).size == 1
@@ -336,8 +360,10 @@ def test_probes_beat_chance_on_planted(tmp_path):
 def test_probes_separate_train_and_dev_dumps(tmp_path):
     """FINDING regression: run_eval produces single-split dumps — probes must
     fit on a TRAIN-split dump and score on a separate DEV-split dump."""
-    train = load_dump(write_synth_dump(tmp_path / "train", ex_ids=range(80)))
-    dev_ids = [b + o for o in (0, 100, 200) for b in range(80, 90)]
+    train = load_dump(
+        write_synth_dump(tmp_path / "train", ex_ids=ids_in_split_domain_mod4("train", 80))
+    )
+    dev_ids = ids_in_split_domain_mod4("dev", 30)
     dev = load_dump(write_synth_dump(tmp_path / "dev", ex_ids=dev_ids, seed=1))
     rep = run_probes(train, token_bank_masses(train), dev, token_bank_masses(dev))
     assert rep["splits"]["train"]["n_examples"] == 80
@@ -364,7 +390,9 @@ def test_probes_eval_split_requires_explicit_opt_in(tmp_path):
 
 
 def test_probes_reject_dev_dump_without_dev_tokens(tmp_path):
-    train = load_dump(write_synth_dump(tmp_path / "train", ex_ids=range(80)))
+    train = load_dump(
+        write_synth_dump(tmp_path / "train", ex_ids=ids_in_split_domain_mod4("train", 80))
+    )
     m = token_bank_masses(train)
     with pytest.raises(ValueError, match="dev-split"):
         run_probes(train, m, train, m)
@@ -378,7 +406,7 @@ def test_probes_reject_condition_mismatch(tmp_path):
 
 
 def test_probes_deterministic(tmp_path):
-    dump = load_dump(write_synth_dump(tmp_path / "d", n_examples=110))
+    dump = load_dump(write_synth_dump(tmp_path / "d", ex_ids=DEFAULT_EX_IDS[:110]))
     masses = token_bank_masses(dump)
     a = run_probes(dump, masses, dump, masses, seed=3)
     b = run_probes(dump, masses, dump, masses, seed=3)
@@ -399,6 +427,9 @@ def test_probes_global_condition_skips_bank_mass(tmp_path):
 
 def test_probes_raise_on_single_class_train():
     dump = make_tiny_dump()
-    dump.example_id = np.array([85, 86], np.int64)  # no train examples
+    # no train examples: dev-bucket ids for the dump's domains (0 and 1)
+    dump.example_id = np.array(
+        [ids_in_split(0, "dev", 1)[0], ids_in_split(1, "dev", 1)[0]], np.int64
+    )
     with pytest.raises(ValueError):
         run_probes(dump, token_bank_masses(dump), dump, token_bank_masses(dump))
