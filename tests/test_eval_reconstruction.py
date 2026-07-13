@@ -558,5 +558,12 @@ def test_sanity_gate(tmp_path):
     a3 = write_run("run_A3", 0.091)
     verdict = compare_sanity(a3, c, out)
     assert verdict["passed"] is False
-    assert "implementation audit" in verdict["interpretation"]
-    assert "not a hypothesis test" in verdict["interpretation"]
+    # A10 audit-first semantics: failure prescribes the audit protocol —
+    # never a halt-by-definition, never "failure means bug".
+    interp = verdict["interpretation"]
+    assert "audit" in interp
+    assert "STUDY CONTINUES" in interp or "study CONTINUES" in interp
+    assert "A18" in interp  # trigger still evaluated at its appointed step
+    assert "HALTED" not in interp
+    assert "audit_protocol" in verdict
+    assert "cross-backend" in verdict["audit_protocol"]
