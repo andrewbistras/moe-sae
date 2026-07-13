@@ -52,17 +52,24 @@ def per_bank_topk(
     scores: torch.Tensor,
     bank_of_candidate: torch.Tensor,
     budgets: torch.Tensor,
-) -> tuple[torch.Tensor, float]:
+) -> tuple[torch.Tensor, float, torch.Tensor]:
     """Condition D: independent per-bank budgets, no cross-bank competition.
 
     scores: [n] fp-any; bank_of_candidate: [n] int64; budgets: [E] int64
     (Σ budgets == k̄B, from largest-remainder rounding of this batch's loads).
-    Returns (mask [n] bool, θ_b = smallest selected score across the union).
+    Returns (mask [n] bool, θ_b = smallest selected score across the union —
+    the log-only scalar convention, kept as-is — and per_bank_theta [E]
+    float32: each bank's own selection threshold, the smallest selected score
+    within that bank; NaN for banks with zero budget this batch — A4
+    committee amendment: D's inference thresholds are per-bank θ*_e).
     """
     s = scores.float()
     assert s.shape == bank_of_candidate.shape
     mask = torch.zeros_like(s, dtype=torch.bool)
     theta = torch.inf
+    per_bank_theta = torch.full(
+        (budgets.shape[0],), float("nan"), dtype=torch.float32
+    )
     for e in torch.unique(bank_of_candidate).tolist():
         k = int(budgets[e].item())
         if k == 0:
@@ -73,9 +80,10 @@ def per_bank_topk(
         )
         vals, idx = torch.topk(s[rows], k, sorted=True)
         mask[rows[idx]] = True
+        per_bank_theta[e] = float(vals[-1].item())
         theta = min(theta, float(vals[-1].item()))
     assert int(mask.sum().item()) == int(budgets.sum().item())
-    return mask, theta
+    return mask, theta, per_bank_theta
 
 
 def per_token_topk(scores: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -92,9 +100,19 @@ def per_token_topk(scores: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Te
     return mask, vals[:, -1]
 
 
-def thresholded_inference(preacts: torch.Tensor, theta_star: float) -> torch.Tensor:
-    """Frozen-θ* inference (spec §6): z = a · 1[a > θ*]. Strict inequality."""
+def thresholded_inference(
+    preacts: torch.Tensor, theta_star: float | torch.Tensor
+) -> torch.Tensor:
+    """Frozen-θ* inference (spec §6): z = a · 1[a > θ*]. Strict inequality.
+
+    `theta_star` may be a scalar (all conditions but D) or a tensor
+    broadcastable against `preacts` (condition D under A4: per-assigned-bank
+    thresholds θ*_e). NaN thresholds (banks whose budget was never > 0 during
+    training, so θ*_e is undefined) compare False and yield no activations.
+    """
     a = preacts.float()
+    if isinstance(theta_star, torch.Tensor):
+        theta_star = theta_star.to(a.device, torch.float32)
     return a * (a > theta_star)
 
 
@@ -142,3 +160,48 @@ class ThetaEMA:
     def load_state_dict(self, state: dict) -> None:
         self.decay = float(state["decay"])
         self.value = None if state["value"] is None else float(state["value"])
+
+
+class ThetaEMAVector:
+    """Per-bank inference-threshold estimator for condition D (A4, v0.1.2
+    committee amendment, Reviewer F).
+
+    One EMA(0.999) per bank over that bank's own per-batch selection
+    threshold (`per_bank_topk`'s per-bank θ). Each bank's EMA initializes at
+    the FIRST batch that updates that bank (budget > 0); banks never updated
+    stay None (stored as NaN). The frozen vector θ*_e is used for all D
+    inference: z = a·1[a > θ*_{bank}].
+
+    D trains under per-bank budgets, so per-bank selection scales diverge by
+    construction; a single global θ* re-imposed at evaluation would
+    systematically mis-threshold low-scale banks (A4 reason).
+    """
+
+    def __init__(self, decay: float = THETA_EMA_DECAY, n_banks: int = 64):
+        self.decay = decay
+        self.n_banks = n_banks
+        # NaN encodes "never updated" (None semantics per bank).
+        self.value = torch.full((n_banks,), float("nan"), dtype=torch.float64)
+
+    def update(self, per_bank_theta: torch.Tensor) -> None:
+        """per_bank_theta: [n_banks] float, NaN for banks with no budget this
+        batch (those banks are left untouched)."""
+        t = per_bank_theta.to(torch.float64)
+        assert t.shape == (self.n_banks,), t.shape
+        seen = ~torch.isnan(t)
+        init = seen & torch.isnan(self.value)  # per-bank init at first update
+        upd = seen & ~torch.isnan(self.value)
+        self.value[init] = t[init]
+        self.value[upd] = self.decay * self.value[upd] + (1.0 - self.decay) * t[upd]
+
+    def values_list(self) -> list[float | None]:
+        """JSON-ready θ* vector (None for never-updated banks)."""
+        return [None if torch.isnan(v) else float(v) for v in self.value]
+
+    def state_dict(self) -> dict:
+        return {"decay": self.decay, "value": self.value.clone()}
+
+    def load_state_dict(self, state: dict) -> None:
+        self.decay = float(state["decay"])
+        self.value = state["value"].to(torch.float64).clone()
+        self.n_banks = self.value.shape[0]

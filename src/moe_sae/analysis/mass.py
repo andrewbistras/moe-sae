@@ -84,7 +84,8 @@ class FeatureDump:
     # normalized — see module Decisions); None if unknown
     split: str | None = None  # producer split tag from meta.json (train/dev/eval)
     num_banks: int | None = None  # dictionary bank count from meta.json (64 or 1)
-    theta_star: float | None = None  # frozen θ* from meta.json
+    theta_star: float | list | None = None  # frozen θ* from meta.json (scalar,
+    # or condition D's per-bank list under A4 — null entries = undefined banks)
 
     def act_banks(self) -> np.ndarray:
         """Bank of each activation: the dump's act_bank field when present
@@ -210,7 +211,13 @@ def load_dump(
         f_dict=f_dict,
         split=meta.get("split"),
         num_banks=int(meta["num_banks"]) if meta.get("num_banks") is not None else None,
-        theta_star=float(meta["theta_star"]) if meta.get("theta_star") is not None else None,
+        theta_star=(
+            None
+            if meta.get("theta_star") is None
+            else meta["theta_star"]
+            if isinstance(meta["theta_star"], list)  # A4: D's per-bank θ*
+            else float(meta["theta_star"])
+        ),
     )
 
 

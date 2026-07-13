@@ -27,7 +27,7 @@ class TrainBatch:
 # Re-exports (after TrainBatch so `from moe_sae.sae import TrainBatch` works
 # from within these submodules during package import).
 from moe_sae.sae.banks import GlobalSAE, RouterTiedBanks  # noqa: E402
-from moe_sae.sae.batchtopk import ThetaEMA  # noqa: E402
+from moe_sae.sae.batchtopk import ThetaEMA, ThetaEMAVector  # noqa: E402
 from moe_sae.sae.conditions import (  # noqa: E402
     SAECondition,
     StepOutput,
@@ -43,6 +43,7 @@ __all__ = [
     "RouterTiedBanks",
     "GlobalSAE",
     "ThetaEMA",
+    "ThetaEMAVector",
     "DeadTracker",
     "SpecAdam",
     "SAECondition",

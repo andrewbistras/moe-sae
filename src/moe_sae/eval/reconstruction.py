@@ -82,10 +82,20 @@ class ThresholdedSAE(Protocol):
         c: torch.Tensor,
         experts: torch.Tensor,
         example_id: torch.Tensor,
-        theta_star: float,
+        theta_star,  # float, or condition D's per-bank θ*_e vector (A4)
     ) -> ThresholdedEncoding: ...
 
     def decoder_cols(self, bank: torch.Tensor, latent: torch.Tensor) -> torch.Tensor: ...
+
+
+def theta_star_json(theta_star):
+    """JSON-safe θ*: a float for scalar-θ* conditions, or condition D's (A4)
+    per-bank list with null for banks whose θ*_e is undefined (never budgeted
+    during training; stored as NaN)."""
+    if isinstance(theta_star, (int, float)):
+        return float(theta_star)
+    vals = theta_star.tolist() if hasattr(theta_star, "tolist") else list(theta_star)
+    return [None if (v is None or v != v) else float(v) for v in vals]
 
 
 def _encode_chunked(
@@ -201,7 +211,7 @@ def evaluate_reconstruction(
                     "f_dict": condition.f_dict,
                     "num_banks": condition.num_banks,
                     "split": split,
-                    "theta_star": float(theta_star),
+                    "theta_star": theta_star_json(theta_star),
                 },
                 indent=2,
             )
@@ -303,7 +313,7 @@ def evaluate_reconstruction(
     metrics = {
         "condition": getattr(condition, "condition", "?"),
         "split": split,
-        "theta_star": float(theta_star),
+        "theta_star": theta_star_json(theta_star),
         "n_tokens": {"visual": n_pool["visual"], "text": n_pool["text"], "total": n_total},
         "local_micro_nmse": (num_local / den_local) if den_local > 0 else None,
         "local_macro_nmse": macro,

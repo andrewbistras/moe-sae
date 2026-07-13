@@ -64,6 +64,7 @@ from moe_sae.sae import TrainBatch
 from moe_sae.sae.banks import GlobalSAE, RouterTiedBanks
 from moe_sae.sae.batchtopk import (
     ThetaEMA,
+    ThetaEMAVector,
     global_batch_topk,
     largest_remainder_budgets,
     per_bank_topk,
@@ -137,6 +138,10 @@ class StepOutput:
     # aux/main gradient-norm ratio (A1 diagnostic (ii)); None when no latent
     # was dead (L_aux == 0 exactly, no graph)
     batch_tokens: int = 0  # B, for the mean-aux-selected-per-token diagnostic
+    # A4 (condition D only): this batch's per-bank selection thresholds
+    # ([n_banks] float32, NaN for zero-budget banks); the loop feeds them into
+    # the condition's ThetaEMAVector. None for all other conditions.
+    theta_b_per_bank: torch.Tensor | None = None
 
     def scalars(self) -> dict:
         """Loggable scalar fields for metrics.jsonl."""
@@ -203,6 +208,11 @@ class SAECondition(nn.Module):
 
         # Owned by the condition; the loop updates them after each step.
         self.theta_ema = ThetaEMA(theta_decay)
+        # A4: condition D maintains per-bank θ*_e EMAs (the scalar θ_b EMA is
+        # kept as the log-only convention); None for all other conditions.
+        self.theta_ema_vec = (
+            ThetaEMAVector(theta_decay, n_banks) if condition == "D" else None
+        )
         self.dead_tracker = DeadTracker(self.n_dict_banks, self.f_dict, dead_window)
         self._perm_cache: dict[int, torch.Tensor] = {}  # condition C only
 
@@ -276,28 +286,32 @@ class SAECondition(nn.Module):
 
     def _select(
         self, scores: torch.Tensor, bank_ids: torch.Tensor | None
-    ) -> tuple[torch.Tensor, float]:
-        """Main-TopK selection mask + θ_b. scores: [B, S, f] fp32 (routed) or
-        [B, F] fp32 (global; treated as S=1)."""
+    ) -> tuple[torch.Tensor, float, torch.Tensor | None]:
+        """Main-TopK selection mask + θ_b (+ D's per-bank thresholds, A4).
+        scores: [B, S, f] fp32 (routed) or [B, F] fp32 (global; treated as
+        S=1). The third element is per_bank_theta [n_banks] (NaN for
+        zero-budget banks) for condition D, None otherwise."""
         if scores.ndim == 2:
             scores = scores.unsqueeze(1)  # [B, 1, F]
         B, S, f = scores.shape
         k_total = self.k_bar * B
         if self.condition in ("A", "B", "C", "F"):
             mask, theta_b = global_batch_topk(scores.reshape(-1), k_total)
-            return mask.view(B, S, f), theta_b
+            return mask.view(B, S, f), theta_b, None
         if self.condition == "D":
             loads = torch.bincount(bank_ids.reshape(-1), minlength=self.n_banks)
             budgets = largest_remainder_budgets(loads.float(), k_total)
             bank_of_cand = (
                 bank_ids.unsqueeze(-1).expand(B, S, f).reshape(-1)
             )
-            mask, theta_b = per_bank_topk(scores.reshape(-1), bank_of_cand, budgets)
-            return mask.view(B, S, f), theta_b
+            mask, theta_b, per_bank_theta = per_bank_topk(
+                scores.reshape(-1), bank_of_cand, budgets
+            )
+            return mask.view(B, S, f), theta_b, per_bank_theta
         if self.condition == "E":
             mask2, per_tok_theta = per_token_topk(scores.reshape(B, S * f), self.k_bar)
             # Log-only convention: batch θ_b = mean of per-token thresholds.
-            return mask2.view(B, S, f), float(per_tok_theta.mean().item())
+            return mask2.view(B, S, f), float(per_tok_theta.mean().item()), None
         raise ValueError(self.condition)
 
     # ------------------------------------------------------------------ #
@@ -322,7 +336,7 @@ class SAECondition(nn.Module):
             raw = self.sae.encode(x, return_raw=True)  # [B, F] pre-ReLU
             preacts = torch.relu(raw)  # MAIN path semantics unchanged (A1)
             scores = preacts.detach().float()
-            mask, theta_b = self._select(scores, None)
+            mask, theta_b, theta_b_per_bank = self._select(scores, None)
             mask = mask.view(B, self.f_dict)
             z = preacts * mask.to(preacts.dtype)
             chat = self.sae.decode(z, add_mu=True)  # [B, d]
@@ -352,7 +366,7 @@ class SAECondition(nn.Module):
             raw = self.sae.encode(c, bank_ids, return_raw=True)  # [B, 6, f] pre-ReLU
             preacts = torch.relu(raw)  # MAIN path semantics unchanged (A1)
             scores = preacts.detach().float()
-            mask, theta_b = self._select(scores, bank_ids)
+            mask, theta_b, theta_b_per_bank = self._select(scores, bank_ids)
             z = preacts * mask.to(preacts.dtype)
             chat = self.sae.decode(z, bank_ids, add_mu=True)  # [B, 6, d]
 
@@ -407,6 +421,7 @@ class SAECondition(nn.Module):
             aux_bank_counts=aux_stats["bank_counts"],
             aux_term=(self.aux_alpha * l_aux_t) if l_aux_t.requires_grad else None,
             batch_tokens=B,
+            theta_b_per_bank=theta_b_per_bank,
         )
 
     # ------------------------------------------------------------------ #
@@ -509,16 +524,37 @@ class SAECondition(nn.Module):
         c: torch.Tensor,
         experts: torch.Tensor,
         example_id: torch.Tensor,
-        theta_star: float,
+        theta_star,
         return_preacts: bool = False,
     ) -> ThresholdedEncoding:
         """z = a·1[a > θ*] over N tokens (spec §6 frozen-θ* inference).
+
+        `theta_star` is a scalar for conditions A/B/C/E/F. For condition D
+        (A4) it may be the frozen per-bank vector θ*_e — a sequence/array/
+        tensor of length n_banks (None entries → NaN → that bank yields no
+        activations: its budget was never > 0 in training) — and each
+        candidate is thresholded by its ASSIGNED bank's θ*: z = a·1[a >
+        θ*_{bank}]. A scalar stays accepted for every condition (backward
+        compatible).
 
         Returns the sparse activations plus per-slot reconstructions and μ
         (the eval contract). `example_id` is required: condition C's bank
         assignment is a per-example permutation even at inference. For B/F,
         operates on c_route with a single slot (S=1)."""
         dev = self.device
+        theta_vec: torch.Tensor | None = None
+        if not isinstance(theta_star, (int, float)):
+            vals = [
+                float("nan") if v is None else float(v)
+                for v in (
+                    theta_star.tolist()
+                    if isinstance(theta_star, torch.Tensor)
+                    else list(theta_star)
+                )
+            ]
+            theta_vec = torch.tensor(vals, dtype=torch.float32)
+            assert not self.is_global, "per-bank θ* is undefined for global conditions"
+            assert theta_vec.shape == (self.n_banks,), theta_vec.shape
         if self.is_global:
             x = c.to(dev).float().sum(dim=1).to(self.compute_dtype)
             preacts = self.sae.encode(x)  # [N, F]
@@ -534,7 +570,12 @@ class SAECondition(nn.Module):
             xc = c.to(dev).to(self.compute_dtype)
             bank_ids = self._bank_ids(experts.to(dev), example_id)
             preacts = self.sae.encode(xc, bank_ids)  # [N, 6, f]
-            z = thresholded_inference(preacts, theta_star)
+            if theta_vec is not None:
+                # A4: per-assigned-bank thresholds, broadcast over latents.
+                theta = theta_vec.to(dev)[bank_ids].unsqueeze(-1)  # [N, 6, 1]
+                z = thresholded_inference(preacts, theta)
+            else:
+                z = thresholded_inference(preacts, theta_star)
             tok, slot, lat = (z > 0).nonzero(as_tuple=True)
             bank = bank_ids[tok, slot]
             values = z[tok, slot, lat]
@@ -596,6 +637,11 @@ class SAECondition(nn.Module):
             "dead_window": dead_state["window"],
             "step": torch.tensor(step, dtype=torch.int64),
         }
+        if self.theta_ema_vec is not None:
+            # A4 (condition D): per-bank θ EMA vector (NaN = never updated).
+            # Other conditions keep the scalar-only format — backward
+            # compatible: readers treat the key as optional.
+            tensors["theta_value_per_bank"] = self.theta_ema_vec.value.detach().cpu().contiguous()
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         save_file(tensors, str(path), metadata={"config": json.dumps(self._init_args())})
 
@@ -620,6 +666,13 @@ class SAECondition(nn.Module):
         cond.theta_ema.load_state_dict(
             {"decay": float(tensors["theta_decay"].item()), "value": theta_star}
         )
+        if cond.theta_ema_vec is not None and "theta_value_per_bank" in tensors:
+            cond.theta_ema_vec.load_state_dict(
+                {
+                    "decay": float(tensors["theta_decay"].item()),
+                    "value": tensors["theta_value_per_bank"],
+                }
+            )
         cond.dead_tracker.load_state_dict(
             {
                 "tokens_seen": tensors["dead_tokens_seen"],
@@ -644,11 +697,15 @@ def load_condition_from_run(
     Checkpoint resolution: prefer run_dir/final/checkpoint.safetensors, else
     the highest-step run_dir/checkpoints/{step}.safetensors (numeric order).
     θ* resolution: canonical source is run_dir/final/theta_star.json
-    ({'theta_star': x} or a bare float), falling back to the checkpoint's
-    stored θ EMA value; errors if neither exists.
+    ({'theta_star': x}, a bare float, or — condition D under A4 —
+    {'theta_star_per_bank': [...]} whose entries may be null for
+    never-budgeted banks), falling back to the checkpoint's stored θ EMA
+    state (per-bank vector for D when present, else the scalar); errors if
+    nothing resolves.
 
-    Returns (condition-on-device, theta_star, extras) with extras as produced
-    by `SAECondition.load_checkpoint`.
+    Returns (condition-on-device, theta_star, extras); theta_star is a float
+    or, for condition D, a [n_banks] float32 tensor (NaN = undefined bank) —
+    both forms are accepted by `encode_thresholded` and the eval stack.
     """
     run_dir = Path(run_dir)
     ckpt = run_dir / "final" / "checkpoint.safetensors"
@@ -669,10 +726,25 @@ def load_condition_from_run(
     condition, ckpt_theta, extras = SAECondition.load_checkpoint(ckpt)
     condition = condition.to(torch.device(device))
 
+    def _vec(values) -> torch.Tensor:
+        return torch.tensor(
+            [float("nan") if v is None else float(v) for v in values],
+            dtype=torch.float32,
+        )
+
     theta_path = run_dir / "final" / "theta_star.json"
     if theta_path.exists():
         raw = json.loads(theta_path.read_text())
-        theta_star = float(raw["theta_star"]) if isinstance(raw, dict) else float(raw)
+        if isinstance(raw, dict) and raw.get("theta_star_per_bank") is not None:
+            theta_star = _vec(raw["theta_star_per_bank"])  # A4: condition D
+        elif isinstance(raw, dict):
+            theta_star = float(raw["theta_star"])
+        else:
+            theta_star = float(raw)
+    elif condition.theta_ema_vec is not None and not bool(
+        torch.isnan(condition.theta_ema_vec.value).all()
+    ):
+        theta_star = condition.theta_ema_vec.value.to(torch.float32)
     elif ckpt_theta is not None:
         theta_star = float(ckpt_theta)
     else:

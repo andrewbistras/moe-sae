@@ -30,7 +30,7 @@ import torch
 import torch.nn.functional as F
 
 from moe_sae.capture.hooks import instrumented_capture
-from moe_sae.eval.reconstruction import ThresholdedSAE
+from moe_sae.eval.reconstruction import ThresholdedSAE, theta_star_json
 
 FIDELITY_MODES = ("matched", "full")
 
@@ -175,7 +175,7 @@ def run_fidelity(
     return {
         "mode": mode,
         "condition": getattr(condition, "condition", "?"),
-        "theta_star": float(theta_star),
+        "theta_star": theta_star_json(theta_star),
         "per_domain": _aggregate_by_domain(records),
         "overall": _aggregate(records),
         "examples": records,

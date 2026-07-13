@@ -182,6 +182,8 @@ def restore_condition(condition: SAECondition, ckpt_path: str | Path) -> int:
             assert dst.shape == src.shape, (name, dst.shape, src.shape)
             dst.copy_(src.to(dst.device))
     condition.theta_ema.load_state_dict(restored.theta_ema.state_dict())
+    if condition.theta_ema_vec is not None and restored.theta_ema_vec is not None:
+        condition.theta_ema_vec.load_state_dict(restored.theta_ema_vec.state_dict())
     condition.dead_tracker.load_state_dict(restored.dead_tracker.state_dict())
     return extras["step"]
 
@@ -447,6 +449,8 @@ def train(
                     )
 
                 theta_ema.update(out.theta_b)
+                if out.theta_b_per_bank is not None and condition.theta_ema_vec is not None:
+                    condition.theta_ema_vec.update(out.theta_b_per_bank)  # A4 (D)
                 dead_tracker.update(out.dict_route_counts, out.fired_mask)
                 theta_trajectory.append(out.theta_b)
                 if bank_loads is None:
@@ -499,18 +503,23 @@ def train(
         sink.close()
         ops_sink.close()
 
-    # θ* frozen at end of training (spec §6, changelog #6).
+    # θ* frozen at end of training (spec §6, changelog #6). Condition D
+    # additionally freezes the per-bank vector θ*_e (A4); the scalar stays as
+    # the log-only convention.
+    theta_star_record = {
+        "theta_star": theta_ema.value,
+        "decay": theta_ema.decay,
+        "n_steps": n_steps,
+        "condition": condition.condition,
+        "seed": cfg.seed,
+    }
+    if condition.theta_ema_vec is not None:
+        theta_star_record = {
+            "theta_star_per_bank": condition.theta_ema_vec.values_list(),
+            **theta_star_record,
+        }
     (out_dir / "final" / "theta_star.json").write_text(
-        json.dumps(
-            {
-                "theta_star": theta_ema.value,
-                "decay": theta_ema.decay,
-                "n_steps": n_steps,
-                "condition": condition.condition,
-                "seed": cfg.seed,
-            },
-            indent=2,
-        )
+        json.dumps(theta_star_record, indent=2)
     )
     np.save(out_dir / "theta_trajectory.npy", np.asarray(theta_trajectory, dtype=np.float64))
     np.save(out_dir / "final" / "bank_loads.npy", bank_loads.numpy())

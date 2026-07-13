@@ -57,7 +57,12 @@ from moe_sae.eval.fidelity import (
     answer_ce_and_acc,
     forward_logits,
 )
-from moe_sae.eval.reconstruction import ThresholdedEncoding, ThresholdedSAE, iter_dump_shards
+from moe_sae.eval.reconstruction import (
+    ThresholdedEncoding,
+    ThresholdedSAE,
+    iter_dump_shards,
+    theta_star_json,
+)
 
 # Load floor for enrichment rankings (spec §16.3, frozen for discovery scale).
 LOAD_FLOOR_DISCOVERY = 500_000
@@ -500,7 +505,7 @@ def run_intervention(
     ]
     return {
         "condition": getattr(condition, "condition", "?"),
-        "theta_star": float(theta_star),
+        "theta_star": theta_star_json(theta_star),
         "n_ablation_latents": len(J),
         "per_domain": _aggregate_by_domain(mapped),
         "overall": _aggregate(mapped),

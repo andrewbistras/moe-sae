@@ -65,7 +65,7 @@ def test_per_bank_topk_budgets_and_theta():
     scores = torch.rand(n)
     bank_of = torch.randint(0, E, (n,))
     budgets = torch.tensor([5, 0, 11, 3])
-    mask, theta = per_bank_topk(scores, bank_of, budgets)
+    mask, theta, per_bank = per_bank_topk(scores, bank_of, budgets)
     assert int(mask.sum()) == 19
     for e in range(E):
         sel_e = mask & (bank_of == e)
@@ -73,7 +73,47 @@ def test_per_bank_topk_budgets_and_theta():
         if budgets[e] > 0:
             # within-bank top-k property
             assert scores[sel_e].min() >= scores[(bank_of == e) & ~mask].max()
+            # A4: per-bank θ = smallest selected score WITHIN the bank
+            assert float(per_bank[e]) == scores[sel_e].min().item()
+        else:
+            assert torch.isnan(per_bank[e])  # zero-budget bank: no θ this batch
     assert theta == scores[mask].min().item()
+    # the scalar (log-only) θ_b is the min over the per-bank thetas
+    assert theta == float(per_bank[~torch.isnan(per_bank)].min())
+
+
+def test_theta_ema_vector_per_bank_semantics():
+    """A4: per-bank EMA(0.999); each bank initializes at ITS first update;
+    never-updated banks stay None (NaN)."""
+    from moe_sae.sae.batchtopk import ThetaEMAVector
+
+    v = ThetaEMAVector(n_banks=4)
+    assert v.decay == 0.999
+    nan = float("nan")
+    v.update(torch.tensor([2.0, nan, 3.0, nan]))
+    assert float(v.value[0]) == 2.0 and float(v.value[2]) == 3.0
+    assert torch.isnan(v.value[1]) and torch.isnan(v.value[3])
+    # bank 1 initializes at its FIRST update (this one), bank 0 EMAs
+    v.update(torch.tensor([1.0, 5.0, nan, nan]))
+    assert abs(float(v.value[0]) - (0.999 * 2.0 + 0.001 * 1.0)) < 1e-12
+    assert float(v.value[1]) == 5.0
+    assert float(v.value[2]) == 3.0  # untouched this batch
+    assert torch.isnan(v.value[3])  # never updated → None
+    assert v.values_list()[3] is None
+    # state round trip
+    v2 = ThetaEMAVector(n_banks=4)
+    v2.load_state_dict(v.state_dict())
+    assert v2.values_list() == v.values_list()
+
+
+def test_thresholded_inference_per_bank_vector():
+    """A4: tensor θ broadcasts; NaN thresholds yield no activations."""
+    a = torch.tensor([[0.5, 1.5], [0.5, 1.5], [0.5, 1.5]])
+    theta = torch.tensor([[0.0], [1.0], [float("nan")]])  # per-row (per-bank)
+    z = thresholded_inference(a, theta)
+    assert torch.equal(z[0], torch.tensor([0.5, 1.5]))
+    assert torch.equal(z[1], torch.tensor([0.0, 1.5]))
+    assert torch.equal(z[2], torch.tensor([0.0, 0.0]))  # NaN → never fires
 
 
 def test_largest_remainder_budgets_sum_and_proportionality():

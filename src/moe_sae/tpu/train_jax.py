@@ -341,9 +341,11 @@ class JaxRun:
                 loads = torch.bincount(bank_ids.reshape(-1), minlength=c.n_banks)
                 budgets = largest_remainder_budgets(loads.float(), c.k_bar * B)
                 bank_of_cand = bank_ids.unsqueeze(-1).expand(B, S, c.f).reshape(-1)
-                mask_t, theta_b = per_bank_topk(
+                mask_t, theta_b, theta_b_per_bank = per_bank_topk(
                     scores_t.reshape(-1), bank_of_cand, budgets
                 )
+                if c.theta_ema_vec is not None:
+                    c.theta_ema_vec.update(theta_b_per_bank)  # A4 (D)
                 ext_mask = jnp.asarray(mask_t.view(B, S, c.f).numpy())
                 call_args = (self.params, cj, *args, self.mu, dead, ext_mask)
                 (loss, aux), grads = self._grad_fn(*call_args)
@@ -588,14 +590,19 @@ def train_jax(
         sink.close()
         ops_sink.close()
 
+    # θ* frozen at end of training; condition D freezes the per-bank vector
+    # θ*_e (A4), the scalar staying as the log-only convention.
+    theta_star_record = {
+        "theta_star": cond.theta_ema.value, "decay": cond.theta_ema.decay,
+        "n_steps": n_steps, "condition": cond.condition, "seed": cfg.seed,
+    }
+    if cond.theta_ema_vec is not None:
+        theta_star_record = {
+            "theta_star_per_bank": cond.theta_ema_vec.values_list(),
+            **theta_star_record,
+        }
     (out_dir / "final" / "theta_star.json").write_text(
-        json.dumps(
-            {
-                "theta_star": cond.theta_ema.value, "decay": cond.theta_ema.decay,
-                "n_steps": n_steps, "condition": cond.condition, "seed": cfg.seed,
-            },
-            indent=2,
-        )
+        json.dumps(theta_star_record, indent=2)
     )
     np.save(out_dir / "theta_trajectory.npy", np.asarray(theta_trajectory, np.float64))
     np.save(out_dir / "final" / "bank_loads.npy", bank_loads.numpy())

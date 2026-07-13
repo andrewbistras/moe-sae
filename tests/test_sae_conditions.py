@@ -152,6 +152,105 @@ def test_condition_d_budgets_follow_loads():
     assert int((out.bank_fire_counts[loads == 0]).sum()) == 0
 
 
+def test_condition_d_step_reports_per_bank_thetas():
+    """A4: D's StepOutput carries this batch's per-bank thresholds; other
+    conditions report None."""
+    cond = build("D")
+    batch = make_batch()
+    out = cond.training_step(batch, step=0)
+    assert out.theta_b_per_bank is not None
+    assert out.theta_b_per_bank.shape == (E,)
+    loads = torch.bincount(batch.experts.reshape(-1), minlength=E)
+    budgets = largest_remainder_budgets(loads.float(), K_BAR * B)
+    has_theta = ~torch.isnan(out.theta_b_per_bank)
+    assert torch.equal(has_theta, budgets > 0)
+    # the log-only scalar θ_b (kept as-is) is the min over per-bank thetas
+    assert out.theta_b == pytest.approx(float(out.theta_b_per_bank[has_theta].min()))
+    for other in ("A", "E"):
+        assert build(other).training_step(batch, step=0).theta_b_per_bank is None
+
+
+def test_condition_d_checkpoint_roundtrip_theta_vector(tmp_path):
+    cond = build("D")
+    batch = make_batch()
+    out = cond.training_step(batch, step=0)
+    cond.theta_ema_vec.update(out.theta_b_per_bank)
+    path = tmp_path / "ckpt.safetensors"
+    cond.save_checkpoint(path, cond.theta_ema, cond.dead_tracker, step=1)
+    cond2, _, _ = SAECondition.load_checkpoint(path)
+    a, b = cond.theta_ema_vec.value, cond2.theta_ema_vec.value
+    assert torch.equal(torch.isnan(a), torch.isnan(b))
+    assert torch.equal(a[~torch.isnan(a)], b[~torch.isnan(b)])
+    # non-D checkpoints keep the scalar-only format (backward compatible)
+    condA = build("A")
+    pA = tmp_path / "ckptA.safetensors"
+    condA.save_checkpoint(pA, condA.theta_ema, condA.dead_tracker, step=1)
+    from safetensors import safe_open
+
+    with safe_open(str(pA), framework="pt") as fh:
+        assert "theta_value_per_bank" not in fh.keys()
+
+
+def test_condition_d_trains_and_freezes_theta_star_vector(tmp_path):
+    """A4 end-to-end: D trains through the loop, freezes the θ*_e vector in
+    theta_star.json, and load_condition_from_run hands the vector to eval."""
+    from moe_sae.train.loop import train
+
+    cfg = tiny_config("D", out_root=str(tmp_path))
+    cond = build("D")
+    batches = [make_batch(seed=s) for s in range(3)]
+    train(cfg, cond, iter(batches), cfg.out_dir)
+
+    raw = json.loads((cfg.out_dir / "final" / "theta_star.json").read_text())
+    vec = raw["theta_star_per_bank"]
+    assert isinstance(vec, list) and len(vec) == E
+    assert raw["theta_star"] is not None  # scalar log-only value kept
+    assert vec == cond.theta_ema_vec.values_list()
+    assert any(v is not None for v in vec)
+
+    cond2, theta_star, _ = load_condition_from_run(cfg.out_dir)
+    assert isinstance(theta_star, torch.Tensor) and theta_star.shape == (E,)
+    want = torch.tensor(
+        [float("nan") if v is None else v for v in vec], dtype=torch.float32
+    )
+    assert torch.equal(torch.isnan(theta_star), torch.isnan(want))
+    assert torch.allclose(theta_star[~torch.isnan(want)], want[~torch.isnan(want)])
+    # inference accepts the vector
+    b = make_batch(seed=9)
+    enc = cond2.encode_thresholded(b.c, b.experts, b.example_id, theta_star)
+    assert torch.isfinite(enc.recon_slots).all()
+
+
+def test_condition_d_inference_uses_per_bank_thresholds():
+    """A4: plant scale-divergent per-bank thresholds and assert the resulting
+    activation pattern is exactly per-bank — and NOT producible by any global
+    scalar θ*."""
+    cond = build("D")
+    batch = make_batch()
+    theta = torch.full((E,), 1e9)  # high-θ banks: never fire
+    low_banks = list(range(0, E, 2))
+    for e in low_banks:
+        theta[e] = 0.05
+    theta_list = [None if e == 0 else float(theta[e]) for e in range(E)]  # bank 0: undefined
+    enc = cond.encode_thresholded(batch.c, batch.experts, batch.example_id, theta_list)
+
+    with torch.no_grad():
+        a = cond.sae.encode(batch.c.float(), batch.experts).float()
+    theta_eff = theta.clone()
+    theta_eff[0] = float("nan")  # None → NaN → never fires
+    dense = a * (a > theta_eff[batch.experts].unsqueeze(-1))
+    tok, slot, lat = (dense > 0).nonzero(as_tuple=True)
+    assert enc.act_value.numel() == tok.numel() > 0
+    assert torch.allclose(enc.act_value, dense[tok, slot, lat])
+    fired_banks = set(enc.act_bank.tolist())
+    assert fired_banks <= set(low_banks) - {0}  # NaN bank 0 never fires
+    # per-bank thresholding differs from ANY global scalar: some unfired
+    # candidate's preact exceeds some fired candidate's value — impossible
+    # under a single θ (scalar thresholding is monotone in the preact).
+    unfired = a[(dense == 0) & (a > 0)]
+    assert float(unfired.max()) > float(enc.act_value.min())
+
+
 def test_condition_e_exact_k_per_token():
     cond = build("E")
     batch = make_batch()
