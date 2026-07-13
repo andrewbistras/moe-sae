@@ -12,6 +12,9 @@ from moe_sae.eval.fidelity import (
     add_to_moe_output,
     answer_ce_and_acc,
     forward_logits,
+    greedy_generate_with_replacement,
+    normalize_answer,
+    prompt_length,
     replacement_mask,
     run_fidelity,
 )
@@ -76,14 +79,25 @@ class StubEvalExample:
     images_spatial_crop: None = None
 
 
-def make_example(t=12, n_answer=3, example_id=0, domain="coco", seed=0):
+def make_example(t=12, n_answer=3, example_id=0, domain="coco", seed=0, answer_text=""):
     g = torch.Generator().manual_seed(seed)
     input_ids = torch.randint(0, VOCAB, (t,), generator=g)
     answer_mask = torch.zeros(t, dtype=torch.bool)
     answer_mask[-n_answer:] = True
     visual_mask = torch.zeros(t, dtype=torch.bool)
     visual_mask[1:5] = True
-    return StubEvalExample(input_ids, answer_mask, visual_mask, example_id, domain)
+    return StubEvalExample(
+        input_ids, answer_mask, visual_mask, example_id, domain, answer_text
+    )
+
+
+class StubTokenizer:
+    """Decode-capable stand-in (A8 accuracy is generated-text exact match)."""
+
+    eos_token_id = None
+
+    def decode(self, ids, skip_special_tokens=True):
+        return " ".join(str(int(i)) for i in ids)
 
 
 class PerfectSAE:
@@ -233,10 +247,16 @@ def test_run_fidelity_perfect_sae_is_noop():
     examples = [make_example(seed=i, example_id=i, domain=d)
                 for i, d in enumerate(["coco", "coco", "textvqa"])]
     for mode in ("matched", "full"):
-        res = run_fidelity(model, None, PerfectSAE(), 0.0, examples, mode=mode, moe=moe)
+        res = run_fidelity(
+            model, StubTokenizer(), PerfectSAE(), 0.0, examples, mode=mode, moe=moe
+        )
         assert res["overall"]["n"] == 3
         assert res["overall"]["ce_delta"] == 0.0
+        # A8: accuracy is generation-based; a zero delta leaves generation
+        # identical to the clean run, so the delta is exactly zero.
         assert res["overall"]["acc_delta"] == 0.0
+        for rec in res["examples"]:
+            assert rec["generated_clean"] == rec["generated_replaced"]
         assert set(res["per_domain"]) == {"coco", "textvqa"}
         assert res["per_domain"]["coco"]["n"] == 2
 
@@ -246,8 +266,9 @@ def test_run_fidelity_matches_manual_replacement():
     model = TinyVLM(moe).eval()
     ex = make_example(seed=5, example_id=7, domain="chartqa")
     sae = MeanSAE()
+    tok = StubTokenizer()
 
-    res = run_fidelity(model, None, sae, 0.0, [ex], mode="matched", moe=moe)
+    res = run_fidelity(model, tok, sae, 0.0, [ex], mode="matched", moe=moe)
     rec = res["examples"][0]
 
     # manual: capture c_route, delta = 0 − c_route at matched positions
@@ -260,14 +281,120 @@ def test_run_fidelity_matches_manual_replacement():
         with add_to_moe_output(moe, delta, mask):
             logits_rep = forward_logits(model, ex, "cpu")
 
-    ce_c, acc_c = answer_ce_and_acc(logits_clean, ex.input_ids, ex.answer_mask)
-    ce_r, acc_r = answer_ce_and_acc(logits_rep, ex.input_ids, ex.answer_mask)
+    ce_c, _ = answer_ce_and_acc(logits_clean, ex.input_ids, ex.answer_mask)
+    ce_r, _ = answer_ce_and_acc(logits_rep, ex.input_ids, ex.answer_mask)
+    # A8: CE stays teacher-forced
     assert rec["ce_clean"] == ce_c
     assert rec["ce_replaced"] == ce_r
-    assert rec["acc_clean"] == acc_c and rec["acc_replaced"] == acc_r
     assert rec["n_replaced"] == int(mask.sum())
     # removing the routed contribution must actually change the answer CE
     assert rec["ce_delta"] != 0.0
+
+    # A8: accuracy is greedy-generation exact match — recompute manually
+    limit = int(ex.answer_mask.sum()) + 8
+    with torch.no_grad():
+        gen_clean = greedy_generate_with_replacement(
+            model, ex, torch.zeros_like(delta), torch.zeros_like(mask),
+            moe, "cpu", limit,
+        )
+        gen_rep = greedy_generate_with_replacement(
+            model, ex, delta, mask, moe, "cpu", limit
+        )
+    want = normalize_answer(ex.answer_text)
+    assert rec["generated_clean"] == normalize_answer(tok.decode(gen_clean))
+    assert rec["generated_replaced"] == normalize_answer(tok.decode(gen_rep))
+    assert rec["acc_clean"] == float(rec["generated_clean"] == want)
+    assert rec["acc_replaced"] == float(rec["generated_replaced"] == want)
+
+
+def test_run_fidelity_generation_accuracy_exact_match():
+    """A8: an example whose answer_text equals the model's clean greedy
+    continuation scores acc_clean == 1.0; a full c_route removal perturbs the
+    forward yet accuracy stays a produced, in-range metric."""
+    moe = make_moe()
+    model = TinyVLM(moe).eval()
+    ex = make_example(seed=11, example_id=3, domain="coco")
+    limit = int(ex.answer_mask.sum()) + 8
+    d = D_MODEL
+    with torch.no_grad():
+        gen = greedy_generate_with_replacement(
+            model, ex, torch.zeros(ex.input_ids.shape[0], d),
+            torch.zeros(ex.input_ids.shape[0], dtype=torch.bool),
+            moe, "cpu", limit,
+        )
+    ex.answer_text = StubTokenizer().decode(gen)  # plant the "right" answer
+
+    res = run_fidelity(model, StubTokenizer(), MeanSAE(), 0.0, [ex], mode="matched", moe=moe)
+    rec = res["examples"][0]
+    assert rec["acc_clean"] == 1.0  # clean generation reproduces answer_text
+    assert rec["acc_replaced"] in (0.0, 1.0)  # exact-match metric produced
+    assert res["overall"]["acc_delta"] == rec["acc_replaced"] - 1.0
+
+
+def test_generation_replacement_masks_prefill_only(monkeypatch):
+    """A8 mechanics: during generation the replacement mask covers ONLY the
+    frozen prompt positions — generated tokens are never replaced (mask False,
+    delta rows zero at every step)."""
+    import moe_sae.eval.fidelity as fid
+
+    moe = make_moe()
+    model = TinyVLM(moe).eval()
+    ex = make_example(t=12, n_answer=3, seed=3)
+    mask = replacement_mask(ex.answer_mask, "matched")
+    g = torch.Generator().manual_seed(0)
+    delta = torch.randn(12, D_MODEL, generator=g)
+    plen = prompt_length(ex.answer_mask)
+    assert plen == 9
+
+    seen = []
+    real = fid.add_to_moe_output
+
+    def spy(moe_, delta_, positions_):
+        seen.append((delta_.clone(), positions_.clone()))
+        return real(moe_, delta_, positions_)
+
+    monkeypatch.setattr(fid, "add_to_moe_output", spy)
+    with torch.no_grad():
+        gen = fid.greedy_generate_with_replacement(
+            model, ex, delta, mask, moe, "cpu", max_new_tokens=4
+        )
+    assert len(gen) == 4 and len(seen) == 4
+    for step, (d_, p_) in enumerate(seen):
+        assert p_.shape[0] == plen + step
+        assert torch.equal(p_[:plen], mask[:plen])  # prefill mask respected
+        assert not p_[plen:].any()  # generated positions never replaced
+        assert torch.equal(d_[:plen], delta[:plen])
+        assert (d_[plen:] == 0).all()
+
+
+def test_generation_eos_and_unhooked_equivalence():
+    """Greedy generation with a zero delta equals naive unhooked greedy
+    decoding; eos_token_id terminates generation early."""
+    moe = make_moe()
+    model = TinyVLM(moe).eval()
+    ex = make_example(t=10, n_answer=2, seed=6)
+    plen = prompt_length(ex.answer_mask)
+    zero_d = torch.zeros(10, D_MODEL)
+    no_mask = torch.zeros(10, dtype=torch.bool)
+    with torch.no_grad():
+        gen = greedy_generate_with_replacement(
+            model, ex, zero_d, no_mask, moe, "cpu", max_new_tokens=5
+        )
+        # naive reference: full re-forward argmax without any hook
+        ids = ex.input_ids[:plen].clone()
+        want = []
+        for _ in range(5):
+            logits = model(input_ids=ids.unsqueeze(0)).logits[0]
+            nxt = int(logits[-1].argmax())
+            want.append(nxt)
+            ids = torch.cat([ids, torch.tensor([nxt])])
+    assert gen == want
+    with torch.no_grad():
+        gen_eos = greedy_generate_with_replacement(
+            model, ex, zero_d, no_mask, moe, "cpu", max_new_tokens=5,
+            eos_token_id=want[0],
+        )
+    assert gen_eos == [want[0]]  # stopped at EOS
 
 
 def test_run_fidelity_matched_vs_full_differ():
@@ -275,8 +402,9 @@ def test_run_fidelity_matched_vs_full_differ():
     model = TinyVLM(moe).eval()
     ex = make_example(seed=9, example_id=1, domain="ai2d")
     sae = MeanSAE()
-    r_matched = run_fidelity(model, None, sae, 0.0, [ex], mode="matched", moe=moe)
-    r_full = run_fidelity(model, None, sae, 0.0, [ex], mode="full", moe=moe)
+    tok = StubTokenizer()
+    r_matched = run_fidelity(model, tok, sae, 0.0, [ex], mode="matched", moe=moe)
+    r_full = run_fidelity(model, tok, sae, 0.0, [ex], mode="full", moe=moe)
     # full mode additionally perturbs answer/BOS positions
     assert r_matched["examples"][0]["n_replaced"] < r_full["examples"][0]["n_replaced"]
     assert r_matched["examples"][0]["ce_replaced"] != r_full["examples"][0]["ce_replaced"]
