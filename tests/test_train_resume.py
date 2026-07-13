@@ -362,5 +362,28 @@ def test_metrics_lines_byte_identical_to_registered_format(tmp_path):
         for x in (cfg.out_dir / "ops_metrics.jsonl").read_text().splitlines()
     ]
     assert [o["step"] for o in ops] == list(range(N_STEPS))
+    assert all("load_max" not in json.loads(line) for line in raw)  # A19 is ops-only
     for o in ops:
         assert "steps_per_sec" in o and "compute_frac" in o and "total_seconds" in o
+        # A19 load-dispersion diagnostics live in the ops sidecar
+        assert "load_max" in o and "load_gini" in o and "load_zero_frac" in o
+        assert o["load_max"] > 0 and 0.0 <= o["load_gini"] < 1.0
+        assert 0.0 <= o["load_zero_frac"] <= 1.0
+        assert "budget_max" not in o  # budget stats are condition-D-only
+
+
+def test_ops_sidecar_condition_d_budget_stats(tmp_path):
+    """A19: condition D additionally logs its allocated-budget distribution
+    (max/Gini) in the ops sidecar; no training-math change."""
+    write_capture(tmp_path / "captures")
+    cfg = tiny_config("D", tmp_path, "dbudget")
+    train(cfg, make_condition(cfg), fresh_batches(cfg), cfg.out_dir)
+    ops = [
+        json.loads(x)
+        for x in (cfg.out_dir / "ops_metrics.jsonl").read_text().splitlines()
+    ]
+    assert ops
+    for o in ops:
+        assert o["budget_max"] > 0
+        assert 0.0 <= o["budget_gini"] < 1.0
+        assert "load_max" in o and "load_gini" in o and "load_zero_frac" in o

@@ -91,6 +91,7 @@ from moe_sae.util.metrics import (
     MetricsSink,
     MFUMeter,
     flops_per_step_estimate,
+    load_dispersion_stats,
 )
 
 OPS_METRICS_NAME = "ops_metrics.jsonl"
@@ -475,6 +476,18 @@ def train(
                         **scalars,
                     },
                 )
+                # A19: per-batch load-dispersion diagnostics (max bank load,
+                # Gini, zero-token-bank fraction) from bank_route_counts;
+                # condition D also logs its allocated-budget distribution.
+                a19 = load_dispersion_stats(out.bank_route_counts.numpy())
+                if condition.condition == "D":
+                    from moe_sae.sae.batchtopk import largest_remainder_budgets
+
+                    budgets = largest_remainder_budgets(
+                        out.bank_route_counts.float(), cfg.k_bar * out.batch_tokens
+                    )
+                    b19 = load_dispersion_stats(budgets.numpy(), prefix="budget")
+                    a19 = {**a19, "budget_max": b19["budget_max"], "budget_gini": b19["budget_gini"]}
                 ops_sink.log(
                     step,
                     {
@@ -485,6 +498,7 @@ def train(
                         "aux_grad_norm_ratio": aux_grad_ratio,
                         "aux_mean_selected_per_token": scalars["aux_mean_selected_per_token"],
                         "aux_frac_also_main": scalars["aux_frac_also_main"],
+                        **a19,
                     },
                 )
 

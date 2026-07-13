@@ -240,3 +240,31 @@ def test_goodput_zero_elapsed():
     assert rep["total_seconds"] == 0.0
     assert rep["compute_frac"] == 0.0
     assert rep["other_frac"] == 0.0
+
+
+# --------------------------------------------------------------------------- #
+# A19 load-dispersion diagnostics                                              #
+# --------------------------------------------------------------------------- #
+
+
+def test_gini_coefficient_exact():
+    from moe_sae.util.metrics import gini_coefficient
+
+    assert gini_coefficient([5, 5, 5, 5]) == pytest.approx(0.0)  # uniform
+    n = 8
+    assert gini_coefficient([0] * (n - 1) + [10]) == pytest.approx((n - 1) / n)
+    # hand-computed: sorted [0,0,1,3]; G = 2(3·1 + 4·3)/(4·4) − 5/4 = 0.625
+    assert gini_coefficient([3, 0, 1, 0]) == pytest.approx(0.625)
+    assert gini_coefficient([0, 0, 0]) == 0.0  # zero-total guard
+
+
+def test_load_dispersion_stats_keys_and_values():
+    from moe_sae.util.metrics import load_dispersion_stats
+
+    s = load_dispersion_stats([3, 0, 1, 0])
+    assert s["load_max"] == 3
+    assert s["load_gini"] == pytest.approx(0.625)
+    assert s["load_zero_frac"] == pytest.approx(0.5)
+    s2 = load_dispersion_stats([1, 2, 3], prefix="budget")
+    assert set(s2) == {"budget_max", "budget_gini", "budget_zero_frac"}
+    assert s2["budget_max"] == 3 and s2["budget_zero_frac"] == 0.0

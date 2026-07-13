@@ -54,7 +54,12 @@ from moe_sae.train.loop import (
     truncate_metrics_jsonl,
 )
 from moe_sae.util.manifest import logbook_append
-from moe_sae.util.metrics import GoodputTracker, MFUMeter, flops_per_step_estimate
+from moe_sae.util.metrics import (
+    GoodputTracker,
+    MFUMeter,
+    flops_per_step_estimate,
+    load_dispersion_stats,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -562,6 +567,15 @@ def train_jax(
                         "wall_time": time.time() - t_start, **out,
                     },
                 )
+                # A19: per-batch load-dispersion diagnostics; condition D also
+                # logs its allocated-budget distribution (max/Gini).
+                a19 = load_dispersion_stats(host_route_counts.numpy())
+                if cond.condition == "D":
+                    budgets = largest_remainder_budgets(
+                        host_route_counts.float(), cfg.k_bar * batch.c.shape[0]
+                    )
+                    b19 = load_dispersion_stats(budgets.numpy(), prefix="budget")
+                    a19 = {**a19, "budget_max": b19["budget_max"], "budget_gini": b19["budget_gini"]}
                 ops_sink.log(
                     step,
                     {
@@ -572,6 +586,7 @@ def train_jax(
                         "aux_grad_norm_ratio": out["aux_grad_norm_ratio"],
                         "aux_mean_selected_per_token": out["aux_mean_selected_per_token"],
                         "aux_frac_also_main": out["aux_frac_also_main"],
+                        **a19,
                     },
                 )
 

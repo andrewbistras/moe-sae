@@ -51,10 +51,37 @@ from typing import Callable, Iterator
 
 from contextlib import contextmanager
 
+import numpy as np
+
 from moe_sae.model_loading import NUM_ROUTED_EXPERTS, TOP_K_ROUTED
 from moe_sae.train.config import CONDITIONS, global_width
 
 ROUTED_CONDITIONS = ("A", "C", "D", "E")
+
+
+def gini_coefficient(x) -> float:
+    """Gini coefficient of a nonnegative count vector (0 = perfectly uniform,
+    (n−1)/n = all mass on one entry). Zero-total vectors return 0.0."""
+    v = np.sort(np.asarray(x, dtype=np.float64))
+    n = v.size
+    s = float(v.sum())
+    if n == 0 or s <= 0:
+        return 0.0
+    idx = np.arange(1, n + 1, dtype=np.float64)
+    return float((2.0 * np.sum(idx * v)) / (n * s) - (n + 1) / n)
+
+
+def load_dispersion_stats(counts, prefix: str = "load") -> dict:
+    """A19 (v0.1.2 addendum) per-batch load-dispersion diagnostics from a
+    per-bank count vector (`bank_route_counts` for host loads; condition D's
+    allocated budgets for `prefix='budget'`): max, Gini, and the fraction of
+    zero-count banks. Ops-only observability — no training-math change."""
+    v = np.asarray(counts, dtype=np.int64)
+    return {
+        f"{prefix}_max": int(v.max()) if v.size else 0,
+        f"{prefix}_gini": gini_coefficient(v),
+        f"{prefix}_zero_frac": float((v == 0).mean()) if v.size else 0.0,
+    }
 
 
 class MetricsSink:
