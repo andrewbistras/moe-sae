@@ -121,6 +121,14 @@ pusher_loop() {
     done
   done
 }
+# Kill-drill lesson (docs/RUNBOOK.md): an interrupted previous run can orphan
+# capture workers and its pusher — Jupyter interrupts don't reliably reach
+# background subshells, and two writers on one capture dir corrupt shard
+# numbering. Sweep before launching anything.
+pkill -f "scripts/run_capture.py --out captures/" 2>/dev/null || true
+pkill -f "gcloud storage rsync .*discovery_50m" 2>/dev/null || true
+sleep 2
+
 pusher_loop & PUSHER=$!
 trap 'kill "$PUSHER" 2>/dev/null || true' EXIT
 
