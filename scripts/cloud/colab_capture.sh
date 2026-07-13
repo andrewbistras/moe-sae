@@ -42,6 +42,12 @@ PER=$((EXAMPLES / SLICES))
 say() { echo "[capture $(date '+%F %T')] $*"; }
 mkdir -p logs reports
 
+# Parallel composite uploads break under concurrent rsyncs of the same dir
+# (the pusher + a slice finalization): each rsync garbage-collects the other's
+# temp components -> GcsNotFoundError storms. Plain uploads are plenty fast
+# for ~180 MB shards and keep objects md5-verifiable.
+gcloud config set storage/parallel_composite_upload_enabled False 2>/dev/null || true
+
 # A7 substrate guard: shards from an ungated GPU class are inadmissible.
 nvidia-smi --query-gpu=name --format=csv,noheader | grep -q "A100" \
   || { say "not an A100 runtime (A7: gate + capture must share a substrate) — refusing"; exit 1; }
@@ -49,9 +55,15 @@ nvidia-smi --query-gpu=name --format=csv,noheader | grep -q "A100" \
 complete_json() { # $1 = progress.json path; exit 0 iff capture complete
   python3 -c "import json,sys;sys.exit(0 if json.load(open(sys.argv[1])).get('complete') else 1)" "$1" 2>/dev/null
 }
-bucket_slice_complete() { # $1 = slice index
+bucket_slice_complete() { # $1 = slice index: progress complete AND all shards present.
+  # progress.json can reach the bucket before the last shards do (rsync order
+  # is arbitrary), so "complete" is only trusted with a matching object count.
   gcloud storage cp "$BUCKET/${CAP}_w$1/progress.json" "/tmp/prog_$1.json" >/dev/null 2>&1 \
-    && complete_json "/tmp/prog_$1.json"
+    && complete_json "/tmp/prog_$1.json" || return 1
+  local want got
+  want=$(python3 -c "import json;print(sum(json.load(open('/tmp/prog_$1.json'))['shards'].values()))")
+  got=$(gcloud storage ls "$BUCKET/${CAP}_w$1/*/shard_*.safetensors" 2>/dev/null | wc -l | tr -d ' ')
+  [ "$want" -eq "$got" ]
 }
 verify_local_shards() { # $1 = worker root: files on disk match progress.json exactly
   python3 - "$1" <<'EOF'
@@ -76,6 +88,14 @@ if gcloud storage cp "$BUCKET/$GATE" "$GATE" >/dev/null 2>&1 \
 else
   say "A7 gate: running FP32 hook validation on this runtime (~40 min)"
   python scripts/run_capture.py --export-validation-inputs validation_inputs --seed "$SEED"
+  # the streamed FP32 reference forward reads safetensors straight from the HF
+  # cache (CheckpointStreamer) — prefetch weights on a fresh VM before gating
+  say "prefetching model weights into the HF cache"
+  python - <<'EOF'
+from huggingface_hub import snapshot_download
+from moe_sae.model_loading import MODEL_ID
+snapshot_download(MODEL_ID, allow_patterns=["*.safetensors*", "*.json", "*.model", "*.txt"])
+EOF
   # exits nonzero on FAIL -> set -e halts everything (halt, never skip)
   python scripts/run_validate_gate.py --inputs validation_inputs --out "$GATE" --device cuda
   say "A3: split-contamination re-verification (consequence freeze)"
@@ -89,7 +109,11 @@ pusher_loop() {
   while :; do
     sleep 600
     for d in ${CAP}_w*; do
-      [ -d "$d" ] && gcloud storage rsync -r -q "$d" "$BUCKET/$d" 2>/dev/null || true
+      [ -d "$d" ] || continue
+      # a completed slice belongs to its slot's verified finalization push —
+      # never rsync it concurrently (temp-object races corrupt the upload)
+      complete_json "$d/progress.json" && continue
+      gcloud storage rsync -r -q "$d" "$BUCKET/$d" 2>/dev/null || true
     done
   done
 }
