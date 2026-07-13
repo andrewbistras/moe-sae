@@ -156,6 +156,17 @@ def main(argv: list[str] | None = None) -> None:
         "--include-eval-split", action="store_true",
         help="also score probes on the frozen eval split — POST-INTERVENTION ONLY (spec §17/§20)",
     )
+    ap.add_argument(
+        "--draw-epoch-robustness", action="store_true",
+        help="A15: stratify TRAIN-split text tokens by training draw count and "
+        "recompute §16.1 JSD + §16.4 probe scores per stratum (needs "
+        "--train-dump, --capture and --draw-counts); writes draw_epoch.json",
+    )
+    ap.add_argument("--capture", default=None, help="capture root (A15 alignment)")
+    ap.add_argument(
+        "--draw-counts", default=None,
+        help="runs/<run>/final/text_draw_counts.npz (A15 training draw counts)",
+    )
     ap.add_argument("--compare-dump", default=None, help="condition-C dump for §16.1")
     ap.add_argument("--seed-dumps", nargs="*", default=[], help="replicate-seed dumps for §16.3")
     ap.add_argument("--condition", default=None, help="override dump meta condition (metaless dumps)")
@@ -250,9 +261,33 @@ def main(argv: list[str] | None = None) -> None:
         json.dumps(stab if stab is not None else {"condition": dump.condition, "note": GLOBAL_NOTE}, indent=2)
     )
 
-    # ---- §16.4 probes (all conditions; fit on --train-dump, scored on --dump) ----
+    # ---- A15 draw-epoch robustness (train-split dump; §16.1 + §16.4 per
+    # draw-count stratum) ----
+    tdump = None
     if args.train_dump:
         tdump = load_dump(args.train_dump, condition=args.condition, f=args.f)
+    if args.draw_epoch_robustness:
+        assert tdump is not None and args.capture and args.draw_counts, (
+            "--draw-epoch-robustness needs --train-dump (the stratification "
+            "runs on the TRAIN-split dump; A15), --capture and --draw-counts"
+        )
+        from moe_sae.analysis.draw_epoch import (
+            draw_epoch_robustness,
+            load_text_draw_counts,
+            per_token_draw_counts,
+        )
+
+        counts = per_token_draw_counts(
+            tdump, args.capture, load_text_draw_counts(args.draw_counts)
+        )
+        rep = draw_epoch_robustness(
+            tdump, token_bank_masses(tdump), counts, c=args.probe_c, seed=args.seed
+        )
+        (out / "draw_epoch.json").write_text(json.dumps(rep, indent=2))
+        print(f"A15 draw-epoch robustness written ({rep['n_strata']} strata)")
+
+    # ---- §16.4 probes (all conditions; fit on --train-dump, scored on --dump) ----
+    if tdump is not None:
         prob = run_probes(
             tdump,
             token_bank_masses(tdump),

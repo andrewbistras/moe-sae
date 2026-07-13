@@ -30,6 +30,15 @@ Decisions:
   unchanged; excluded row counts are tracked in ``excluded_counts`` per pool
   and logged at the end of each epoch. Membership is resolved from the
   shard's (domain, example_id) pair via the frozen A3 keyed hash.
+- Text draw-count recording (A15, v0.1.2 addendum): ``record_draws=True``
+  additionally tracks, for the TEXT pool only, how many times each capture
+  row was drawn into a yielded batch — an int64 array per text shard keyed
+  by the row's ORIGINAL (pre-filter) index, i.e. keyed by (shard_idx, row).
+  Bookkeeping only: the yielded stream is bit-identical with recording on or
+  off. The training loop persists the final counts as
+  final/text_draw_counts.npz (arrays named ``shard_{i:05d}``); the A15
+  draw-epoch robustness analysis stratifies train-split text tokens by these
+  counts.
 """
 
 from __future__ import annotations
@@ -67,6 +76,7 @@ class BatchComposer:
         buffer_shards: int = 4,
         batch_cls=None,
         split: str | None = "train",
+        record_draws: bool = False,
     ):
         assert batch_tokens % 2 == 0, "batch must split into equal halves (spec §9)"
         assert buffer_shards >= 1
@@ -89,6 +99,12 @@ class BatchComposer:
         # Rows dropped by the split filter, cumulative per pool (contract:
         # exclusions are tracked and logged).
         self.excluded_counts = {pool: 0 for pool in POOLS}
+        # A15: per-(shard_idx, row) draw counts for the TEXT pool.
+        self.record_draws = record_draws
+        self.text_draw_counts: dict[int, torch.Tensor] = {}
+        self._path_index = {
+            pool: {p: i for i, p in enumerate(self._paths[pool])} for pool in POOLS
+        }
 
     # ------------------------------------------------------------------ #
 
@@ -107,7 +123,8 @@ class BatchComposer:
             for i in range(0, len(order), self.buffer_shards):
                 group = order[i : i + self.buffer_shards]
                 shards = [self._load_filtered(pool, p) for p in group]
-                cat = {k: torch.cat([s[k] for s in shards], dim=0) for k in _FIELDS}
+                keys = list(shards[0].keys())  # _FIELDS (+ A15 provenance)
+                cat = {k: torch.cat([s[k] for s in shards], dim=0) for k in keys}
                 n = cat["domain"].shape[0]
                 gen.manual_seed(rng.getrandbits(62))
                 if n == 0:  # every row of the group was filtered out
@@ -126,13 +143,31 @@ class BatchComposer:
             )
 
     def _load_filtered(self, pool: str, path: Path) -> dict[str, torch.Tensor]:
-        """Load one shard, dropping non-`split` rows before the shuffle buffer."""
+        """Load one shard, dropping non-`split` rows before the shuffle buffer.
+
+        With A15 recording on, TEXT rows additionally carry provenance
+        columns (`_shard`, `_row`: the shard index and ORIGINAL row index) so
+        draws can be counted per (shard_idx, row) at yield time."""
         shard = load_file(str(path))
+        n = shard["domain"].shape[0]
+        track = self.record_draws and pool == "text"
+        if track:
+            idx = self._path_index[pool][path]
+            self.text_draw_counts.setdefault(idx, torch.zeros(n, dtype=torch.int64))
         if self.split is None:
-            return {k: shard[k] for k in _FIELDS}
+            out = {k: shard[k] for k in _FIELDS}
+            if track:
+                out["_shard"] = torch.full((n,), idx, dtype=torch.int64)
+                out["_row"] = torch.arange(n, dtype=torch.int64)
+            return out
         keep = split_mask(shard["domain"], shard["example_id"], self.split)
         self.excluded_counts[pool] += int((~keep).sum())
-        return {k: shard[k][keep] for k in _FIELDS}
+        out = {k: shard[k][keep] for k in _FIELDS}
+        if track:
+            rows = keep.nonzero(as_tuple=True)[0].to(torch.int64)
+            out["_shard"] = torch.full((rows.shape[0],), idx, dtype=torch.int64)
+            out["_row"] = rows
+        return out
 
     @staticmethod
     def _take(
@@ -158,7 +193,23 @@ class BatchComposer:
                 taken.append({k: v[:need] for k, v in head.items()})
                 pending[0] = {k: v[need:] for k, v in head.items()}
                 need = 0
-        return {k: torch.cat([t[k] for t in taken], dim=0) for k in _FIELDS}
+        keys = list(taken[0].keys())
+        return {k: torch.cat([t[k] for t in taken], dim=0) for k in keys}
+
+    def _count_draws(self, txt: dict[str, torch.Tensor]) -> None:
+        """A15: increment per-(shard_idx, row) draw counts for one text half."""
+        for idx in torch.unique(txt["_shard"]).tolist():
+            rows = txt["_row"][txt["_shard"] == idx]
+            self.text_draw_counts[idx].index_add_(
+                0, rows, torch.ones(rows.shape[0], dtype=torch.int64)
+            )
+
+    def text_draw_counts_arrays(self) -> dict:
+        """npz-ready A15 arrays: {'shard_{i:05d}': int64 counts per original
+        row} for every text shard touched so far."""
+        return {
+            f"shard_{i:05d}": t.numpy() for i, t in sorted(self.text_draw_counts.items())
+        }
 
     # ------------------------------------------------------------------ #
 
@@ -170,6 +221,8 @@ class BatchComposer:
         while True:
             vis = self._take(chunk_iters["visual"], pending["visual"], half)
             txt = self._take(chunk_iters["text"], pending["text"], half)
+            if self.record_draws:
+                self._count_draws(txt)
             token_type = torch.cat(
                 [
                     torch.ones(half, dtype=torch.uint8),  # visual rows first

@@ -459,7 +459,11 @@ def train_jax(
     *,
     resume: bool = False,
     peak_flops: float | None = None,
+    composer=None,
 ):
+    """`composer` (optional): the BatchComposer behind `batch_iter`; when it
+    records A15 text draw counts they are persisted as
+    final/text_draw_counts.npz (mirrors moe_sae.train.loop.train)."""
     out_dir = Path(out_dir)
     start_step, ckpt_path, complete = resolve_resume(out_dir, resume)
     if complete:
@@ -624,4 +628,10 @@ def train_jax(
     np.save(out_dir / "final" / "dead_final.npy", cond.dead_tracker.dead_mask().numpy())
     # A1 diagnostic (v): cumulative per-bank aux pressure over the whole run.
     np.save(out_dir / "final" / "aux_bank_counts.npy", aux_bank_counts.numpy())
+    # A15: text draw counts (per (shard_idx, row)) for the robustness check.
+    if composer is not None and getattr(composer, "record_draws", False):
+        np.savez(
+            str(out_dir / "final" / "text_draw_counts.npz"),
+            **composer.text_draw_counts_arrays(),
+        )
     run.save_checkpoint(out_dir / "final" / "checkpoint.safetensors", n_steps)

@@ -261,3 +261,51 @@ def test_missing_pool_raises(tmp_path):
     build_pool(tmp_path, "visual", n_shards=1, id_base=0)
     with pytest.raises(FileNotFoundError):
         make_composer(tmp_path)
+
+
+# --------------------------------------------------------------------------- #
+# A15: text draw-count recording                                               #
+# --------------------------------------------------------------------------- #
+
+
+def test_record_draws_counts_text_epochs(capture_root):
+    composer = BatchComposer(
+        capture_root, batch_tokens=32, seed=7, buffer_shards=2,
+        batch_cls=TrainBatch, record_draws=True,
+    )
+    batches = list(islice(iter(composer), 4))
+    # text pool: 2 shards × 16 rows; 4 batches × 16 text rows = 64 draws =
+    # exactly 2 text epochs → every row drawn exactly twice
+    arrays = composer.text_draw_counts_arrays()
+    assert set(arrays) == {"shard_00000", "shard_00001"}
+    assert sum(int(a.sum()) for a in arrays.values()) == 64
+    for a in arrays.values():
+        assert a.shape == (SHARD,) and (a == 2).all()
+    # bookkeeping only: the yielded stream is bit-identical with recording off
+    plain = make_composer(capture_root)
+    for x, y in zip(batches, islice(iter(plain), 4)):
+        for f in ("c", "experts", "gates", "token_type", "example_id", "domain"):
+            assert torch.equal(getattr(x, f), getattr(y, f)), f
+    # batches never leak the provenance columns
+    assert not hasattr(batches[0], "_shard")
+
+
+def test_record_draws_keyed_by_original_row_after_filter(mixed_root):
+    """Counts are keyed by (shard_idx, ORIGINAL row): rows dropped by the A3
+    split filter stay at zero; kept rows accumulate at their original index."""
+    from moe_sae.data.splits import split_buckets
+
+    composer = BatchComposer(
+        mixed_root, batch_tokens=32, seed=7, buffer_shards=2,
+        batch_cls=TrainBatch, record_draws=True,
+    )
+    list(islice(iter(composer), 2))  # 32 text draws over 16 kept rows = 2 epochs
+    arrays = composer.text_draw_counts_arrays()
+    assert set(arrays) == {"shard_00000", "shard_00001"}
+    for s, a in enumerate(arrays.values()):
+        # shard rows cycle TXT_IDS with domain TXT_DOMAIN; train rows drawn
+        # exactly twice, dev/eval rows never
+        for r in range(SHARD):
+            eid = TXT_IDS[(s * SHARD + r) % 4]
+            is_train = bool(split_buckets(TXT_DOMAIN, torch.tensor([eid]))[0] < 80)
+            assert int(a[r]) == (2 if is_train else 0), (s, r)

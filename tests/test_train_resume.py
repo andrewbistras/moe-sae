@@ -372,6 +372,24 @@ def test_metrics_lines_byte_identical_to_registered_format(tmp_path):
         assert "budget_max" not in o  # budget stats are condition-D-only
 
 
+def test_text_draw_counts_persisted(tmp_path):
+    """A15: with a recording BatchComposer handed to the loop, the final
+    per-(shard, row) text draw counts land in final/text_draw_counts.npz."""
+    from moe_sae.data.batches import BatchComposer
+
+    write_capture(tmp_path / "captures")
+    cfg = tiny_config("A", tmp_path, "draws")
+    composer = BatchComposer(
+        cfg.capture_root, cfg.batch_tokens, cfg.data_seed,
+        batch_cls=TrainBatch, record_draws=True,
+    )
+    train(cfg, make_condition(cfg), iter(composer), cfg.out_dir, composer=composer)
+    npz = np.load(cfg.out_dir / "final" / "text_draw_counts.npz")
+    assert npz.files, "no per-shard draw-count arrays persisted"
+    total = sum(int(npz[f].sum()) for f in npz.files)
+    assert total == N_STEPS * (B // 2)  # every text half-row draw counted
+
+
 def test_ops_sidecar_condition_d_budget_stats(tmp_path):
     """A19: condition D additionally logs its allocated-budget distribution
     (max/Gini) in the ops sidecar; no training-math change."""

@@ -65,7 +65,11 @@ def main() -> None:
     from moe_sae.data.batches import BatchComposer
 
     condition = build_condition(cfg.condition, cfg, mu_e, mu_route, cfg.seed).to(device)
-    composer = BatchComposer(cfg.capture_root, cfg.batch_tokens, cfg.data_seed)
+    # record_draws (A15): per-(shard, row) text draw counts, persisted by the
+    # loop as final/text_draw_counts.npz (bookkeeping only; stream unchanged).
+    composer = BatchComposer(
+        cfg.capture_root, cfg.batch_tokens, cfg.data_seed, record_draws=True
+    )
 
     write_run_manifest(
         cfg.out_dir,
@@ -84,6 +88,7 @@ def main() -> None:
         cfg.out_dir,
         resume=args.resume,
         peak_flops=None if args.peak_tflops is None else args.peak_tflops * 1e12,
+        composer=composer,
     )
 
 
