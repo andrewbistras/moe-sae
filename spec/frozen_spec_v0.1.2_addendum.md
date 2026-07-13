@@ -217,7 +217,7 @@ Q1 → A19 (confirmed + battery). Q2 → A15 (added). Q3 → A16 ($m^{\mathrm{ac
 
 ## 6. Sign-off
 
-- **A. Bistras (implementer):** ________________
+- **A. Bistras (implementer):** human PI
 - **Reviewer F:** reviewed the briefing; proposed A11–A14, the A1 pin, the A4-D amendment, and the A18 mechanics; answered Q1–Q7; priors filed; **approved for discovery** conditional on this addendum as written.
 - **Reviewer S:** accepted v0.1.2 in spirit; contributed the hash-split, audit-first gate, two-route trigger, validity rule, evaluation pins, aux diagnostics, and provenance language; priors filed; closing instruction — *stop editing and run discovery* — adopted by the committee as unanimous.
 
