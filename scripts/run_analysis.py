@@ -296,6 +296,7 @@ def main(argv: list[str] | None = None) -> None:
             c=args.probe_c,
             seed=args.seed,
             include_eval_split=args.include_eval_split,
+            n_boot=args.n_boot,  # A18 advantage-CI bootstrap replicates
         )
     else:
         prob = {

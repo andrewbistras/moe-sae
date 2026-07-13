@@ -122,6 +122,51 @@ def write_synth_global_dump(root, condition="B", f=16, tokens_per_side=6, seed=0
     return root
 
 
+def write_advantage_dump(
+    root, f=16, tokens_per_side=6, seed=0, informative=True, ex_ids=None,
+    flip=0.0,
+):
+    """A18 advantage fixture: ROUTING carries no modality signal (every token
+    routes to banks 0..5 with equal gates), so probe 1 is at chance.
+
+    informative=True: visual tokens fire a bank-0 latent in [0, 8), text
+    tokens in [8, 16) → probe 3 (feature identity) separates perfectly and
+    provably beats probe 1. `flip` swaps a token's latent range with that
+    probability (imperfect separation → bootstrap replicates vary).
+    informative=False: every token fires latent (0, 0) — identity is constant
+    too, so no probe can beat probe 1 and the per-replicate advantage is
+    exactly zero (null structure)."""
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng(seed)
+    pt = {k: [] for k in ("experts", "gates", "token_type", "example_id", "domain", "l0")}
+    ac = {k: [] for k in ("act_token", "act_slot", "act_latent", "act_value")}
+    t = 0
+    for ex in ex_ids if ex_ids is not None else DEFAULT_EX_IDS:
+        for tt in (1, 0):
+            for _ in range(tokens_per_side):
+                side = tt if rng.random() >= flip else 1 - tt
+                if not informative:
+                    lat = 0
+                elif side:
+                    lat = int(rng.integers(0, 8))
+                else:
+                    lat = int(rng.integers(8, 16))
+                ac["act_token"].append(t)
+                ac["act_slot"].append(0)  # bank = experts[t, 0] = 0
+                ac["act_latent"].append(lat)
+                ac["act_value"].append(1.0)
+                pt["experts"].append(np.arange(TOP_K))  # identical routing
+                pt["gates"].append(np.full(TOP_K, 1.0 / TOP_K))  # equal gates
+                pt["token_type"].append(tt)
+                pt["example_id"].append(ex)
+                pt["domain"].append(ex % 4)
+                pt["l0"].append(1)
+                t += 1
+    _save(root, "A", f, pt, ac)
+    return root
+
+
 def _save(root, condition, f, pt, ac):
     shard = {
         "experts": torch.from_numpy(np.asarray(pt["experts"], np.uint8)),
@@ -433,3 +478,86 @@ def test_probes_raise_on_single_class_train():
     )
     with pytest.raises(ValueError):
         run_probes(dump, token_bank_masses(dump), dump, token_bank_masses(dump))
+
+
+# --------------------------------------------------------------------------- #
+# A18: advantages_vs_router (representation-route producer)                    #
+# --------------------------------------------------------------------------- #
+
+ADVANTAGE_KEYS = (
+    "sae_bank_mass",
+    "feature_identity",
+    "gates_plus_bank_mass",
+    "gates_plus_identity",
+)
+
+
+def test_advantage_ci_excludes_zero_on_planted(tmp_path):
+    """Planted structure where probe 3 provably beats probe 1: routing is
+    identical for every token (probe 1 at chance) while identity separates
+    the modalities perfectly — the 95% example-level bootstrap CI of the
+    accuracy advantage must exclude zero."""
+    dump = load_dump(write_advantage_dump(tmp_path / "adv", informative=True))
+    masses = token_bank_masses(dump)
+    rep = run_probes(dump, masses, dump, masses, seed=0)
+
+    adv = rep["advantages_vs_router"]
+    assert set(adv) == set(ADVANTAGE_KEYS)  # exact evaluate_trigger schema
+    fi = adv["feature_identity"]
+    assert set(fi) == {"point", "ci_low", "ci_high", "n_boot"}
+    assert fi["n_boot"] == 1000
+    # probe 1 is at chance (~0.5), probe 3 near-perfect: point ≈ 0.5
+    assert rep["probes"]["router_gates"]["dev"]["accuracy"] == pytest.approx(0.5, abs=0.05)
+    assert rep["probes"]["feature_identity"]["dev"]["accuracy"] > 0.95
+    assert fi["point"] > 0.4
+    assert fi["ci_low"] > 0.0, "CI must exclude zero on planted structure"
+    assert fi["ci_low"] <= fi["point"] <= fi["ci_high"]
+    # the (1)+(3) combination inherits the identity signal
+    assert adv["gates_plus_identity"]["ci_low"] > 0.0
+    # bank-mass probes see constant mass (all bank 0, value 1): no advantage
+    assert adv["sae_bank_mass"]["ci_low"] <= 0.0 <= adv["sae_bank_mass"]["ci_high"]
+
+
+def test_advantage_ci_straddles_zero_on_null_structure(tmp_path):
+    """Null structure: identity is constant, so no probe can beat probe 1 —
+    the advantage is exactly zero per replicate and the CI straddles zero."""
+    dump = load_dump(write_advantage_dump(tmp_path / "null", informative=False))
+    masses = token_bank_masses(dump)
+    rep = run_probes(dump, masses, dump, masses, seed=0)
+    for key in ADVANTAGE_KEYS:
+        entry = rep["advantages_vs_router"][key]
+        assert entry is not None
+        assert entry["point"] == pytest.approx(0.0, abs=1e-12)
+        assert entry["ci_low"] <= 0.0 <= entry["ci_high"], key
+
+
+def test_advantage_global_condition_null_entries(tmp_path):
+    """A20: probe 2 (and the (1)+(2) combination) is undefined for B/F — the
+    advantage entries are null; the identity advantages are still produced."""
+    dump = load_dump(write_synth_global_dump(tmp_path / "g", condition="B"))
+    rep = run_probes(dump, None, dump, None, seed=0)
+    adv = rep["advantages_vs_router"]
+    assert adv["sae_bank_mass"] is None
+    assert adv["gates_plus_bank_mass"] is None
+    assert adv["feature_identity"] is not None
+    assert adv["gates_plus_identity"] is not None
+
+
+def test_advantage_bootstrap_seeded_and_unit_is_example(tmp_path):
+    """Same seed → identical CIs; different seed → different replicates (the
+    planted separation is imperfect via `flip`, so per-example accuracies
+    vary and the example-level resampling is visible in the CI)."""
+    dump = load_dump(write_advantage_dump(tmp_path / "adv", informative=True, flip=0.2))
+    masses = token_bank_masses(dump)
+    a = run_probes(dump, masses, dump, masses, seed=3, n_boot=200)
+    b = run_probes(dump, masses, dump, masses, seed=3, n_boot=200)
+    assert a["advantages_vs_router"] == b["advantages_vs_router"]
+    fi = a["advantages_vs_router"]["feature_identity"]
+    assert fi["ci_low"] < fi["ci_high"]  # non-degenerate under imperfect signal
+    c = run_probes(dump, masses, dump, masses, seed=4, n_boot=200)
+    assert (
+        c["advantages_vs_router"]["feature_identity"]["ci_low"]
+        != fi["ci_low"]
+        or c["advantages_vs_router"]["feature_identity"]["ci_high"]
+        != fi["ci_high"]
+    )

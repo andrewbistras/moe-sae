@@ -178,6 +178,56 @@ def test_gate_failure_blocks_trigger(artifacts):
     assert rec["confirmatory_run_proceeds"] is False  # ...but the gate gates
 
 
+def test_representation_route_end_to_end_with_real_probes_json(tmp_path):
+    """End-to-end schema check: probes.json PRODUCED BY run_probes on
+    synthetic dumps (not a hand-built artifact) feeds evaluate_trigger and
+    triggers the representation route — the producer emits exactly the
+    `advantages_vs_router` schema the trigger consumes."""
+    from test_analysis_probes import write_advantage_dump
+
+    from moe_sae.analysis.mass import load_dump, token_bank_masses
+    from moe_sae.analysis.probes import run_probes
+
+    # "A" run: identity provably beats routing; "C" run: null structure.
+    a_dump = load_dump(write_advantage_dump(tmp_path / "adv_a", informative=True))
+    c_dump = load_dump(write_advantage_dump(tmp_path / "adv_c", informative=False, seed=1))
+    a_prob = run_probes(
+        a_dump, token_bank_masses(a_dump), a_dump, token_bank_masses(a_dump),
+        seed=0, n_boot=200,
+    )
+    c_prob = run_probes(
+        c_dump, token_bank_masses(c_dump), c_dump, token_bank_masses(c_dump),
+        seed=0, n_boot=200,
+    )
+    a_probes = [write(tmp_path / f"probes_a{s}.json", a_prob) for s in range(3)]
+    c_probes = [write(tmp_path / f"probes_c{s}.json", c_prob) for s in range(3)]
+
+    mod = _script()
+    paths = {"gate": write(tmp_path / "gate.json", gate(True))}
+    paths["a_metrics"] = [
+        write(tmp_path / f"a{s}.json", metrics(0.08, nmse_agg=0.5)) for s in range(3)
+    ]
+    paths["c_metrics"] = [
+        write(tmp_path / f"c{s}.json", metrics(0.10, nmse_agg=0.9)) for s in range(3)
+    ]
+    # B beats A on aggregate NMSE: only the representation route can trigger
+    b = [write(tmp_path / f"b{s}.json", metrics(0.2, nmse_agg=0.1)) for s in range(3)]
+
+    rec = run(mod, tmp_path, paths, **{"b-metrics": b, "a-probes": a_probes,
+                                       "c-probes": c_probes})
+    assert rec["architecture_route"]["triggers"] is False
+    route = rec["representation_route"]
+    assert route["evaluated"] is True
+    fi = route["per_probe"]["feature_identity"]
+    assert fi["n_seeds_passing"] == 3 and fi["holds"] is True
+    for seed_rec in fi["per_seed"]:
+        assert seed_rec["available"] is True
+        assert seed_rec["ci_excludes_zero"] and seed_rec["beats_condition_c"]
+    # A20 null entries pass through as unavailable, never as errors
+    assert not route["per_probe"]["sae_bank_mass"]["holds"]
+    assert rec["confirmatory_run_proceeds"] is True
+
+
 def test_dev_split_only_guard(tmp_path):
     """A18 is evaluated on the dev split only — eval-split artifacts abort."""
     mod = _script()
