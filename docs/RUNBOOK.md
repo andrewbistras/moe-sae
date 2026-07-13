@@ -149,9 +149,13 @@ uv run python scripts/sanity_gate.py \
 ```
 
 Gate: A must beat C on **local micro-averaged NMSE by ≥10% relative** under
-frozen-θ* inference. Failure **halts the study for an implementation audit** —
-this is an implementation gate, not a hypothesis test, and is recorded as such
-(spec §20.5).
+frozen-θ* inference. Failure semantics (**A10, v0.1.2 addendum — audit-first,
+not halt-by-definition**): an implementation audit runs (full regression
+suite + cross-backend A-vs-C replication on the second lane with the parity
+suite green); a found fault is fixed, documented, and the gate re-run; if no
+fault is found and both backends agree, **the study continues**, the result
+is recorded as evidence against the stable-router-partition hypothesis, and
+the A18 confirmatory trigger is evaluated normally at its appointed step.
 
 ## §20.6 — Reconstruction + downstream fidelity
 
@@ -343,11 +347,23 @@ backup. Lesson recorded: capture-and-train-in-place on session-limited,
 disk-limited VMs couples the two most failure-prone phases; the
 capture-once-to-durable-storage design decouples them.
 
-## Lane assignment note: condition D runs on the GPU
+## Lane assignment note: condition D — SUPERSEDED by A12 (v0.1.2 addendum)
 
-D's per-bank variable budgets are host-side under the JAX static-shape port
-(~400 MB/step PCIe → hours). The torch/CUDA path selects on-device natively:
-train D on the A100 (~15 min) in parallel with the TPU suite. Same shards,
-same composer seed → matched data order (§10) holds; A7 + parity legitimize
-the mixed backend. TPU-only fallback (no GPU available): accept ~2-3 h with
-pinned f32 transfers, or host-CPU torch for D.
+**Superseded (2026-07-12, A12 backend map):** the earlier plan below assigned
+condition D to the GPU lane. A12 freezes the (condition × seed) → backend
+assignment with the constraint that all conditions within a matched seed
+share one backend; the frozen map is **ALL 14 training runs (A/B/C/F ×
+seeds 1–3, plus D/E seed 1) on the TPU/JAX lane**. D therefore runs on TPU,
+accepting the ~2–3 h host-transfer selection path (per-bank budgets computed
+host-side under the static-shape port; pinned f32 transfers). Capture and
+fidelity remain on CUDA per A7; the cross-backend A-vs-C replication on the
+torch/CUDA lane is kept as a robustness check (and is the A10 audit
+instrument on gate failure).
+
+*Original note (historical):* D's per-bank variable budgets are host-side
+under the JAX static-shape port (~400 MB/step PCIe → hours). The torch/CUDA
+path selects on-device natively: train D on the A100 (~15 min) in parallel
+with the TPU suite. Same shards, same composer seed → matched data order
+(§10) holds; A7 + parity legitimize the mixed backend. TPU-only fallback (no
+GPU available): accept ~2-3 h with pinned f32 transfers, or host-CPU torch
+for D.
