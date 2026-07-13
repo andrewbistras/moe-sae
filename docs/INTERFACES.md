@@ -36,8 +36,8 @@ Frozen SAE constants (spec §5–§11), in `moe_sae.train.config`:
 | Adam | β1=0.9, β2=0.999, no weight decay, grad-clip 1.0 | same |
 | aux α | 1/32, per-token budget 512 dead candidates across visible banks | same |
 | deadness window | 250,000 bank-relative tokens | 250,000 |
-| θ EMA decay | 0.999, init = first batch's θ_b | same |
-| load floor (analysis) | 500,000 routed training tokens/bank | scaled: 10,000 |
+| θ EMA decay | 0.999, init = first batch's θ_b (D: per-bank vector, A4) | same |
+| load floor (analysis) | A13: 10% of split-uniform expectation (split_tokens×6)/64, per-split counts | same rule |
 
 ## Capture record format (spec §3 manifest)
 
@@ -120,9 +120,11 @@ All implement `SAECondition` (`moe_sae.sae.conditions`) with
 - **F** capacity-matched global: like B with F=262,144 (discovery) / 65,536
   (pipeline), k̄=64.
 
-θ_b logging + EMA applies to every condition (for D: the global-pool threshold
-is still recorded from the union of selected candidates: the smallest selected
-score; for E: per-token k-th largest — logged, and θ* frozen the same way).
+θ_b logging + EMA applies to every condition (for D: the log-only scalar is
+the smallest selected score across the union, AND — A4 — D maintains a
+per-bank ThetaEMAVector whose frozen θ*_e vector is used for all D inference,
+stored as `theta_star_per_bank` in theta_star.json and in the checkpoint;
+for E: per-token k-th largest — logged, and θ* frozen the same way).
 
 ## Optimizer (spec §11) — `moe_sae.sae.optim.SpecAdam`
 
@@ -150,8 +152,11 @@ construction (spec changelog #3).
 
 - Candidate pool: latents dead *now*, among the token's 6 visible banks
   (A/C/D/E) or the global dictionary (B/F).
-- Selection: per token, top `min(512, #dead_visible)` dead candidates by
-  pre-activation a (ReLU'd), token-level competition.
+- Selection (A1 committee pin): per token, top `min(512, #dead_visible)` dead
+  candidates by RAW (pre-ReLU) pre-activation, token-level competition;
+  aux-selected latents contribute their RAW values to z_aux (negatives
+  allowed — gradient must reach below-threshold latents). MAIN selection and
+  z stay ReLU'd.
 - Target: r_te = c_te − ĉ_te (detached); selected dead latents' activations
   reconstruct r̂_te through their own bank's decoder.
 - Normalization (decision): L_aux = Σ_te ‖r_te − r̂_te‖² / Σ_te ‖r_te‖²
