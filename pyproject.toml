@@ -1,26 +1,27 @@
 [project]
 name = "moe-sae"
-version = "0.1.1"
-description = "Router-Tied BatchTopK Sparse Autoencoders for Multimodal Mixture-of-Experts Models (frozen spec v0.1.1)"
-requires-python = ">=3.11,<3.13"
+version = "0.2.0"
+description = "Router-conditioned sparse autoencoders for Gemma 4 MoE activations"
+requires-python = ">=3.12,<3.13"
 dependencies = [
-    "accelerate>=1.14.0",
-    "datasets>=5.0.0",
-    "einops>=0.8.2",
-    "jax>=0.4.35",
-    "numpy>=2.4.6",
-    "pillow>=12.3.0",
-    "pyyaml>=6.0.3",
-    "safetensors>=0.8.0",
-    "scikit-learn>=1.9.0",
-    "scipy>=1.17.1",
-    "sentencepiece>=0.2.1",
-    "timm>=1.0.27",
-    "torch>=2.12.1",
-    "torchvision",
-    "tqdm>=4.68.3",
-    "transformers==4.38.2",
+    "jax>=0.8.0,<0.11",
+    "numpy>=2.0",
+    "pyyaml>=6.0",
+    "safetensors>=0.5",
 ]
+
+[project.optional-dependencies]
+tpu = [
+    "maxtext[tpu]==0.2.3",
+    "orbax-checkpoint>=0.12.1,<0.13",
+]
+conversion = [
+    "maxtext[tpu]==0.2.3",
+    "torch>=2.8",
+]
+
+[project.scripts]
+moe-sae = "moe_sae.cli:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -32,8 +33,20 @@ packages = ["src/moe_sae"]
 [tool.uv]
 package = true
 
+[tool.uv.sources]
+maxtext = { git = "https://github.com/AI-Hypercomputer/maxtext.git", rev = "48c7da3e28e8f57fe36ddf09d00eec53072a2ea0" }
+torch = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
 [dependency-groups]
 dev = [
     "pytest>=8.0",
-    "tensorboard",
 ]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]

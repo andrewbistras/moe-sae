@@ -1,90 +1,72 @@
-# moe-sae — Router-Tied BatchTopK SAEs for Multimodal MoE Models
+# moe-sae
 
-This repository implements a frozen interpretability experiment: train one
-sparse-autoencoder dictionary per routed expert of DeepSeek-VL2-Tiny, tied to
-the model's own router, with a single batch-wide BatchTopK competition across
-all visible expert banks — and test, against pre-registered control
-architectures, whether explanatory feature mass concentrates stably and
-causally on a small set of experts for visual tokens beyond what the router
-itself already explains. The experimental design is frozen before results are
-seen; every scientific constant in this codebase is a citation to
-`spec/frozen_spec_v0.1.1.md`, not a tunable.
+This repository runs one focused Gemma 4 experiment:
 
-The frozen one-sentence specification (spec v0.1.1):
+> Router-conditioned A recovers **G%** of the full-dictionary reconstruction
+> gain at **C%** of its measured marginal SAE training cost.
 
-> Train a jointly optimized bank of 64 expert-specific BatchTopK SAEs on the
-> gated routed-expert contributions at block 6 of DeepSeek-VL2-Tiny, with
-> 4,096 features per expert and a single batch-wide budget averaging 64 active
-> features per original token; test — against compute-matched,
-> capacity-matched, random-routing, independent-budget, and per-token controls
-> — whether explanatory feature mass concentrates stably and causally on a
-> small set of experts for visual tokens beyond what is explained by the
-> model's router itself.
+The active model is `google/gemma-4-26B-A4B`, text only. Activations are the
+aggregate routed-MoE branch at one-indexed block 15, immediately after
+`post_feedforward_layernorm_2`. Conditions A, B, and F reconstruct exactly the
+same globally centered target with exact per-token TopK-64.
 
-## Repo map
+The previous DeepSeek-VL2/spec-era implementation is intentionally absent from
+the active tree. It is preserved at Git tag
+`deepseek-vl2-final-a291707`; ignored historical `runs/`, `captures/`, and
+`stats/` directories are never read or migrated.
 
-```
-spec/frozen_spec_v0.1.1.md   The constitution. Nothing may contradict it.
-docs/INTERFACES.md           Engineering contract: formats, APIs, frozen constants.
-docs/RUNBOOK.md              Operational manual for spec §20's execution order.
-configs/                     RunConfig YAMLs: 3 pipeline + 14 discovery runs.
-src/moe_sae/
-  model_loading.py           Frozen model load + spec §2 startup assertions.
-  vendor/deepseek_vl2/       Vendored DeepSeek-VL2 modeling code (see PATCHES.md).
-  capture/                   Activation-site hooks, FP32 validation gate, shard writer.
-  data/                      Batch composition (§9), eval example provider, splits.
-  sae/                       Conditions A–F, BatchTopK engine, SpecAdam, dead tracking.
-  train/                     RunConfig + training loop (θ EMA, aux loss, artifacts).
-  eval/                      Reconstruction metrics, downstream replacement, dumps.
-  analysis/                  §14–§16 mass/enrichment/stability/information analyses.
-scripts/                     CLI entry points (run_capture, run_train, run_eval, ...).
-tests/                       CPU-only unit tests vs naive reference implementations.
-```
+## Active surface
 
-## Quickstart
+- [`configs/gemma4_26b_a4b.yaml`](configs/gemma4_26b_a4b.yaml) — the single
+  production configuration.
+- `moe-sae` — the single CLI, with `preflight`, `convert-checkpoint`,
+  `benchmark-harvest`, `harvest`, `train`, `eval`, `report`, and `run`.
+- [`src/moe_sae/model.py`](src/moe_sae/model.py) — pinned MaxText prefix adapter.
+- [`src/moe_sae/artifacts.py`](src/moe_sae/artifacts.py) — content-addressed
+  capture shards, atomic manifests, and deterministic resume.
+- [`src/moe_sae/sae.py`](src/moe_sae/sae.py) — exact A/B/F scoring, distributed
+  TopK, sparse decode, and optimizer math.
+- [`src/moe_sae/metrics.py`](src/moe_sae/metrics.py) — reconstruction and cost
+  report contract.
 
-Requires Python 3.11 and [uv](https://docs.astral.sh/uv/). All heavy lifting
-is `torch` (MPS on Apple silicon, CUDA in the cloud); `transformers` is pinned
-to 4.38.2 for the vendored DeepSeek-VL2 code.
+## Local development
+
+Python 3.12 and [uv](https://docs.astral.sh/uv/) are required.
 
 ```sh
-uv sync                      # create the environment (installs moe_sae editable)
-uv run pytest -q             # unit tests: CPU-only, seconds, no model download
-uv run python scripts/smoke_load.py   # downloads deepseek-vl2-tiny (~7 GB) and
-                                      # runs the spec §2 architecture assertions
+uv sync
+uv run pytest -q
+uv run moe-sae --help
 ```
 
-Then follow **`docs/RUNBOOK.md`**, which maps spec §20's execution order to
-commands: (1) hook-validation hard gate, (2) statistics pass, (3) 1M pipeline
-run on a laptop, (4+) 50M-token discovery runs on a cloud GPU, evaluation,
-analysis, and the subtraction-intervention causal test.
+TPU hosts additionally install the pinned MaxText runtime:
 
-## Status
+```sh
+uv sync --extra tpu
+```
 
-- [x] Frozen spec v0.1.1 and engineering contract
-- [x] Vendored model code + frozen loading/assertions (`smoke_load.py`)
-- [x] Capture hooks (instrumented + FP32 reference paths) with bit-identity tests
-- [x] Capture shard writer / reader
-- [x] Run configurations (pipeline + discovery) and runbook
-- [ ] FP32 validation gate run on 100k tokens (spec §20.1)
-- [ ] Statistics pass (μ_e, routing baselines, bank loads)
-- [ ] 1M pipeline run, conditions A/B/C
-- [ ] Discovery runs A/B/C/F × 3 seeds + D/E (cloud)
-- [ ] A-vs-C implementation sanity gate
-- [ ] Evaluation, analyses, interventions (§20.6–§20.10)
+Checkpoint conversion uses a separate CPU-only Torch environment:
 
-## Licenses
+```sh
+uv sync --extra conversion
+```
 
-- **Vendored model code** (`src/moe_sae/vendor/deepseek_vl2/`) comes from the
-  upstream [DeepSeek-VL2](https://github.com/deepseek-ai/DeepSeek-VL2)
-  repository, whose code is MIT-licensed; `modeling_deepseek.py` additionally
-  carries an Apache-2.0 header from its HuggingFace GPT-NeoX/OPT lineage. Both
-  headers are preserved in the files. Local patches are execution-backend
-  only, never math, and are logged in
-  `src/moe_sae/vendor/deepseek_vl2/PATCHES.md`.
-- **Model weights** (`deepseek-ai/deepseek-vl2-tiny`) are distributed under the
-  [DeepSeek Model License](https://github.com/deepseek-ai/DeepSeek-VL2/blob/main/DeepSeek-MODEL-LICENSE),
-  which permits commercial use with use-based restrictions; they are downloaded
-  from HuggingFace at runtime and never redistributed by this repository.
-- Original code in this repository: research code accompanying the frozen
-  spec; no separate license file yet.
+MaxText resolves from commit
+`48c7da3e28e8f57fe36ddf09d00eec53072a2ea0`. Torch is not a training-runtime
+dependency; install CPU Torch only in the isolated checkpoint-conversion
+environment.
+
+On multi-host TPU runs, `artifacts/gemma4_v1/` must be a shared POSIX mount;
+preflight proves cross-host visibility. The converter writes a self-hashed
+parity attestation and checkpoint inventory digest that all later commands
+require, and the `run`
+subcommand resumes only stages whose config, checkpoint, capture, code, and
+environment provenance still match. Production commands reject artifact roots
+outside this namespace and independently recompute the staged checkpoint
+inventory before trusting the supplied digest. The attestation hash is bound
+into benchmark, capture, campaign, and report metadata. C4 provenance is likewise
+derived from a verified staging manifest and ordered ArrayRecord SHA-256
+inventory; no operator-supplied dataset label is trusted.
+
+Read [`docs/EXPERIMENT.md`](docs/EXPERIMENT.md) for the scientific contract and
+[`docs/RUNBOOK.md`](docs/RUNBOOK.md) for the fail-closed execution sequence.

@@ -2,10 +2,18 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+.DS_Store
 captures/
 runs/
 dumps/
 stats/
 reports/
 validation_inputs/
+artifacts/
+.maxtext/
+dist/
+build/
 *.egg-info/
+
+# User-owned pre-reset README copy; preserve locally but keep it out of the active tree.
+README 2.md
