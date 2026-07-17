@@ -20,14 +20,18 @@ from moe_sae.cli import (
     _coordinator_write_json,
     _global_barrier,
     _load_conversion_attestation,
+    _load_storage_attestation,
+    _load_storage_attestation_payload,
     _mesh_by_name,
     _new_run_instance_id,
     _process_context,
     _require_production_artifact_root,
     _sha256_argument,
+    _storage_layout,
     _verify_checkpoint_inventory,
 )
 from moe_sae.config import load_config
+from moe_sae.object_store import join_gcs_uri
 from moe_sae.runtime import atomic_write_json, require_v4_32_runtime
 
 
@@ -55,6 +59,9 @@ def _bootstrap(args: argparse.Namespace) -> int:
         artifact_root, config, args.checkpoint_sha256
     )
     environment = _coordinated_environment()
+    storage_attestation_sha256 = _load_storage_attestation(
+        artifact_root, config, environment=environment
+    )
     process_index, process_count = _process_context()
     sweep_id = _new_run_instance_id()
     sweep_root = output / ".supervisor" / "sweeps" / sweep_id
@@ -84,6 +91,7 @@ def _bootstrap(args: argparse.Namespace) -> int:
                 args, "_checkpoint_verification_seconds", 0.0
             ),
             "environment": environment,
+            "storage_attestation_sha256": storage_attestation_sha256,
             "process_count": process_count,
         },
         barrier=f"gemma4-benchmark-bootstrap-record-{sweep_id}",
@@ -113,6 +121,11 @@ def _candidate(args: argparse.Namespace) -> int:
         if not isinstance(bootstrap, dict):
             raise RuntimeError("benchmark bootstrap record must be an object")
         environment = _coordinated_environment()
+        storage_payload = _load_storage_attestation_payload(
+            artifact_root, config, environment=environment
+        )
+        storage_attestation_sha256 = str(storage_payload["attestation_sha256"])
+        storage_layout = _storage_layout(storage_payload)
         conversion_attestation_sha256 = _load_conversion_attestation(
             artifact_root, config, args.checkpoint_sha256
         )
@@ -124,6 +137,8 @@ def _candidate(args: argparse.Namespace) -> int:
             or bootstrap.get("checkpoint_sha256") != args.checkpoint_sha256
             or bootstrap.get("conversion_attestation_sha256")
             != conversion_attestation_sha256
+            or bootstrap.get("storage_attestation_sha256")
+            != storage_attestation_sha256
             or int(bootstrap.get("process_count", 0)) != actual_count
             or not isinstance(bootstrap.get("environment"), dict)
             or bootstrap["environment"].get("sha256")
@@ -141,6 +156,15 @@ def _candidate(args: argparse.Namespace) -> int:
             config=config,
             measured_steps=max(args.steps, config.benchmark_steps),
             output_directory=output,
+            storage_attestation_sha256=storage_attestation_sha256,
+            object_prefix=join_gcs_uri(
+                storage_layout["bulk_gcs_root"],
+                "benchmarks",
+                config.config_hash,
+                args.sweep_id,
+                f"{args.mesh}-b{args.per_device_sequence_batch}",
+            ),
+            local_buffer_root=storage_layout["local_buffer_root"],
         )
         observation = _aggregate_benchmark_observation(observation)
         _coordinator_write_json(

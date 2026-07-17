@@ -8,6 +8,7 @@ import moe_sae.cli as cli_module
 
 from moe_sae.cli import (
     _balanced_padding_ids,
+    _checkpoint_identity_expected,
     _load_harvester_report,
     _precompute_a_capacity,
     _sae_config,
@@ -15,6 +16,7 @@ from moe_sae.cli import (
     main,
 )
 from moe_sae.config import Gemma4Config
+from moe_sae.data import PACKED_DATASET_SCHEMA, PACKED_RECORD_FORMAT
 from moe_sae.harvest import CampaignSummary
 
 
@@ -71,6 +73,8 @@ def test_single_cli_exposes_exact_subcommands():
     parser = build_parser()
     action = next(action for action in parser._actions if action.dest == "command")
     assert set(action.choices) == {
+        "stage-c4",
+        "qualify-storage",
         "preflight",
         "convert-checkpoint",
         "benchmark-harvest",
@@ -80,6 +84,55 @@ def test_single_cli_exposes_exact_subcommands():
         "report",
         "run",
     }
+
+
+def test_storage_roots_and_orbax_probe_are_fail_closed():
+    bulk, checkpoint = cli_module._validate_gcs_storage_roots(
+        "gs://bucket/experiment", "gs://bucket/experiment/checkpoints/"
+    )
+    assert bulk == "gs://bucket/experiment"
+    assert checkpoint == "gs://bucket/experiment/checkpoints"
+    with pytest.raises(RuntimeError, match="must be below"):
+        cli_module._validate_gcs_storage_roots(
+            "gs://bucket/experiment", "gs://bucket/other"
+        )
+
+    run_id = "qualification-run"
+    digest = "a" * 64
+    record = {
+        "schema_version": "gemma4-orbax-storage-qualification-v1",
+        "payload_uri": (
+            "gs://bucket/experiment/checkpoints/qualification/"
+            "orbax-qualification-run"
+        ),
+        "process_count": 1,
+        "global_device_count": 16,
+        "expected_local_sha256_by_process": [digest],
+        "restored_local_sha256_by_process": [digest],
+        "save_seconds_by_process": [1.0],
+        "restore_seconds_by_process": [2.0],
+        "max_save_seconds": 1.0,
+        "max_restore_seconds": 2.0,
+        "finalized": True,
+        "metadata_round_trip": True,
+        "failures": [],
+    }
+    cli_module._validate_orbax_qualification(
+        record,
+        checkpoint_root=checkpoint,
+        run_id=run_id,
+        process_count=1,
+        global_device_count=16,
+    )
+    record["finalized"] = False
+    with pytest.raises(RuntimeError, match="Orbax qualification is invalid"):
+        cli_module._validate_orbax_qualification(
+            record,
+            checkpoint_root=checkpoint,
+            run_id=run_id,
+            process_count=1,
+            global_device_count=16,
+        )
 
 
 def test_checkpoint_claim_is_verified_against_actual_inventory(tmp_path):
@@ -94,6 +147,34 @@ def test_checkpoint_claim_is_verified_against_actual_inventory(tmp_path):
     changed = SimpleNamespace(checkpoint=str(checkpoint), checkpoint_sha256=actual)
     with pytest.raises(RuntimeError, match="does not match"):
         cli_module._verify_checkpoint_inventory(changed)
+
+
+def test_checkpoint_save_and_restore_share_one_exact_identity_builder():
+    identity = _checkpoint_identity_expected(
+        Gemma4Config(),
+        capture_manifest_sha256="a" * 64,
+        capture_checkpoint_sha256="b" * 64,
+        environment_sha256="c" * 64,
+        condition="A",
+        seed=1,
+        run_instance_id="d" * 32,
+        storage_attestation_sha256="e" * 64,
+        checkpoint_payload_root="gs://bucket/checkpoints",
+    )
+
+    assert set(identity) == {
+        "config_sha256",
+        "capture_manifest_sha256",
+        "capture_checkpoint_sha256",
+        "environment_sha256",
+        "condition",
+        "seed",
+        "run_instance_id",
+        "storage_attestation_sha256",
+        "checkpoint_payload_root",
+    }
+    assert "tokens_seen" not in identity
+    assert "steps" not in identity
 
 
 def test_conversion_attestation_is_self_hashed_and_parity_gated(tmp_path):
@@ -173,26 +254,59 @@ def _write_staged_manifest(tmp_path, split: str, scientific_tokens: int):
     manifest_path.write_text(
         json.dumps(
             {
-                "schema_version": "gemma4-c4-arrayrecord-v1",
+                "schema_version": PACKED_DATASET_SCHEMA,
                 "dataset": {
                     "name": "c4",
                     "config": "en",
                     "version": "3.1.0",
                     "split": split,
                 },
-                "tokenizer_id": "google/gemma-4-26B-A4B",
+                "source": {
+                    "provider": "tensorflow_datasets",
+                    "full_name": "c4/en/3.1.0",
+                    "dataset_info_sha256": "b" * 64,
+                },
+                "tokenizer": {
+                    "id": "google/gemma-4-26B-A4B",
+                    "revision": "a" * 40,
+                    "padding_id": 0,
+                    "eos_id": 1,
+                    "bos_id": 2,
+                },
                 "sequence_length": 1024,
+                "record_format": {
+                    "name": PACKED_RECORD_FORMAT,
+                    "arrayrecord_options": "group_size:1",
+                    "token_ids": "int32[1024]",
+                    "positions": "uint16[1024]",
+                    "segment_ids": "uint16[1024]",
+                },
                 "packing": {
-                    "strategy": "packed_fixed_length",
+                    "strategy": "ordered_next_fit_offline",
                     "exclude_from_scientific_count": ["padding", "bos", "eos"],
                     "special_token_ids": {"padding": 0, "eos": 1, "bos": 2},
                 },
+                "consumer": {
+                    "process_count": 4,
+                    "host_sharding": "record_index_mod_process_count",
+                    "per_device_sequence_batches": [1, 2, 4],
+                },
+                "target_scientific_tokens": scientific_tokens,
+                "source_examples": 1,
+                "scientific_tokens": scientific_tokens,
+                "record_count": 64,
+                "lane_scientific_tokens": [
+                    scientific_tokens // 4
+                    + (1 if index < scientific_tokens % 4 else 0)
+                    for index in range(4)
+                ],
                 "files": [
                     {
-                        "uri": str(file_path),
+                        "uri": file_path.name,
                         "sha256": hashlib.sha256(file_path.read_bytes()).hexdigest(),
                         "size_bytes": file_path.stat().st_size,
-                        "record_count": 1,
+                        "first_record_index": 0,
+                        "record_count": 64,
                         "scientific_tokens": scientific_tokens,
                     }
                 ],
@@ -294,6 +408,7 @@ def test_harvester_report_uses_measured_train_and_eval_capture_cost(tmp_path):
                 "config_sha256": config.config_hash,
                 "checkpoint_sha256": "a" * 64,
                 "conversion_attestation_sha256": "9" * 64,
+                "storage_attestation_sha256": "8" * 64,
                 "selected": {
                     "mesh": {"name": "ep16-fsdp1-tp1"},
                     "per_device_sequence_batch": 1,
@@ -325,6 +440,7 @@ def test_harvester_report_uses_measured_train_and_eval_capture_cost(tmp_path):
                     "dataset_fingerprint": "5" * 64,
                     "environment_sha256": "b" * 64,
                     "conversion_attestation_sha256": "9" * 64,
+                    "storage_attestation_sha256": "8" * 64,
                 }
             }
 
@@ -419,6 +535,7 @@ def _selected_benchmark(config):
         "config_sha256": config.config_hash,
         "checkpoint_sha256": "a" * 64,
         "conversion_attestation_sha256": "9" * 64,
+        "storage_attestation_sha256": "8" * 64,
         "environment": cli_module._coordinated_environment(),
         "selected": {
             "mesh": {"name": "ep16-fsdp1-tp1"},
@@ -462,6 +579,19 @@ def test_run_fresh_state_orders_canary_health_production_and_eval(
     monkeypatch.setattr(
         cli_module, "_load_conversion_attestation", lambda *args: "9" * 64
     )
+    monkeypatch.setattr(
+        cli_module,
+        "_load_storage_attestation_payload",
+        lambda *args, **kwargs: {"attestation_sha256": "8" * 64},
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_storage_layout",
+        lambda payload: {
+            "bulk_gcs_root": "gs://test-bucket/bulk",
+            "sae_checkpoint_root": "gs://test-bucket/checkpoints",
+        },
+    )
     monkeypatch.setattr(cli_module, "_release_accelerator_state", lambda label: None)
     monkeypatch.setattr(
         cli_module,
@@ -501,7 +631,7 @@ def test_run_fresh_state_orders_canary_health_production_and_eval(
         }
         return 0
 
-    def resume_run(root, cfg, capture, condition, seed):
+    def resume_run(root, cfg, capture, condition, seed, **kwargs):
         del root, cfg, capture
         return progress.get((condition, seed))
 
@@ -574,6 +704,19 @@ def test_run_resume_skips_every_matching_sealed_stage(tmp_path, monkeypatch):
     monkeypatch.setattr(
         cli_module, "_load_conversion_attestation", lambda *args: "9" * 64
     )
+    monkeypatch.setattr(
+        cli_module,
+        "_load_storage_attestation_payload",
+        lambda *args, **kwargs: {"attestation_sha256": "8" * 64},
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_storage_layout",
+        lambda payload: {
+            "bulk_gcs_root": "gs://test-bucket/bulk",
+            "sae_checkpoint_root": "gs://test-bucket/checkpoints",
+        },
+    )
     monkeypatch.setattr(cli_module, "_sealed_dataset", lambda path: Dataset())
     monkeypatch.setattr(cli_module, "_require_exact_capture", lambda *args: None)
     monkeypatch.setattr(
@@ -585,7 +728,10 @@ def test_run_resume_skips_every_matching_sealed_stage(tmp_path, monkeypatch):
     monkeypatch.setattr(
         cli_module,
         "_load_resume_run",
-        lambda *args: {"tokens_seen": config.train_tokens, "chip_seconds": 1.0},
+        lambda *args, **kwargs: {
+            "tokens_seen": config.train_tokens,
+            "chip_seconds": 1.0,
+        },
     )
     monkeypatch.setattr(cli_module, "_existing_evaluation", lambda *args: {})
     monkeypatch.setattr(

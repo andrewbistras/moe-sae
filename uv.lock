@@ -2088,7 +2088,16 @@ conversion = [
     { name = "torch", version = "2.13.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform == 'darwin'" },
     { name = "torch", version = "2.13.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform != 'darwin'" },
 ]
+data = [
+    { name = "array-record" },
+    { name = "google-cloud-storage" },
+    { name = "grain" },
+    { name = "tensorflow" },
+    { name = "tensorflow-datasets" },
+    { name = "transformers" },
+]
 tpu = [
+    { name = "google-cloud-storage" },
     { name = "maxtext", extra = ["tpu"] },
     { name = "orbax-checkpoint" },
 ]
@@ -2100,6 +2109,10 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "array-record", marker = "extra == 'data'", specifier = "==0.8.3" },
+    { name = "google-cloud-storage", marker = "extra == 'data'", specifier = "==3.13.0" },
+    { name = "google-cloud-storage", marker = "extra == 'tpu'", specifier = "==3.13.0" },
+    { name = "grain", marker = "extra == 'data'", specifier = "==0.2.18" },
     { name = "jax", specifier = ">=0.8.0,<0.11" },
     { name = "maxtext", extras = ["tpu"], marker = "extra == 'conversion'", git = "https://github.com/AI-Hypercomputer/maxtext.git?rev=48c7da3e28e8f57fe36ddf09d00eec53072a2ea0" },
     { name = "maxtext", extras = ["tpu"], marker = "extra == 'tpu'", git = "https://github.com/AI-Hypercomputer/maxtext.git?rev=48c7da3e28e8f57fe36ddf09d00eec53072a2ea0" },
@@ -2107,9 +2120,12 @@ requires-dist = [
     { name = "orbax-checkpoint", marker = "extra == 'tpu'", specifier = ">=0.12.1,<0.13" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "safetensors", specifier = ">=0.5" },
+    { name = "tensorflow", marker = "extra == 'data'", specifier = "==2.20.0" },
+    { name = "tensorflow-datasets", marker = "extra == 'data'", specifier = "==4.9.10" },
     { name = "torch", marker = "extra == 'conversion'", specifier = ">=2.8", index = "https://download.pytorch.org/whl/cpu" },
+    { name = "transformers", marker = "extra == 'data'", specifier = "==5.13.1" },
 ]
-provides-extras = ["tpu", "conversion"]
+provides-extras = ["tpu", "conversion", "data"]
 
 [package.metadata.requires-dev]
 dev = [{ name = "pytest", specifier = ">=8.0" }]

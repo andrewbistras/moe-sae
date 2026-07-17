@@ -29,6 +29,16 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from moe_sae.artifacts import ArtifactDataset, bf16_bits_to_float32
+from moe_sae.checkpointing import (
+    checkpoint_payload_uri,
+    final_pointer_from_latest,
+    load_pointer,
+    make_pointer,
+    new_attempt_id,
+    normalize_payload_root,
+    pointer_path,
+    publish_pointer,
+)
 from moe_sae.pipeline import (
     ActivationBatch,
     EvaluationResult,
@@ -805,11 +815,88 @@ def _global_max_seconds(value: float) -> float:
     return float(np.max(np.asarray(gathered)))
 
 
-def _checkpoint_child(root: str | Path, name: str) -> str:
-    value = str(root)
-    if "://" in value:
-        return f"{value.rstrip('/')}/{name}"
-    return str(Path(value) / name)
+def _effective_checkpoint_payload_root(
+    checkpoint_dir: str | Path,
+    checkpoint_payload_root: str | Path | None,
+) -> str:
+    """Resolve the immutable payload root.
+
+    The local default keeps tests and small deployments self-contained while
+    still separating mutable control pointers from immutable Orbax payloads.
+    Production callers should pass their qualified ``gs://`` payload root.
+    """
+
+    if checkpoint_payload_root is None:
+        checkpoint_payload_root = Path(checkpoint_dir) / "checkpoint_payloads"
+    return normalize_payload_root(checkpoint_payload_root)
+
+
+def _collective_attempt_id() -> str:
+    """Generate one unpredictable checkpoint attempt ID shared by all hosts."""
+
+    attempt = new_attempt_id() if jax.process_index() == 0 else "0" * 32
+    if jax.process_count() == 1:
+        return attempt
+    from jax.experimental import multihost_utils
+
+    local = np.frombuffer(bytes.fromhex(attempt), dtype=np.uint8)
+    gathered = np.asarray(multihost_utils.process_allgather(local), dtype=np.uint8)
+    first = gathered.reshape(jax.process_count(), 16)[0]
+    result = bytes(first.tolist()).hex()
+    if result == "0" * 32:
+        raise RuntimeError("coordinator did not publish a checkpoint attempt ID")
+    return result
+
+
+def _checkpoint_barrier(label: str) -> None:
+    if jax.process_count() > 1:
+        from jax.experimental import multihost_utils
+
+        multihost_utils.sync_global_devices(label)
+
+
+def _publish_checkpoint_pointer(
+    checkpoint_dir: str | Path,
+    pointer: Mapping[str, Any],
+) -> str:
+    if jax.process_index() == 0:
+        publish_pointer(checkpoint_dir, pointer)
+    kind = str(pointer["kind"])
+    tokens = int(pointer["tokens_seen"])
+    _checkpoint_barrier(f"gemma4-sae-{kind}-pointer-{tokens}")
+    return str(pointer_path(checkpoint_dir, kind))
+
+
+def _delete_stale_checkpoint_payload(payload_uri: str, *, tokens_seen: int) -> None:
+    """Collectively remove an immutable payload after its pointer is superseded."""
+
+    _checkpoint_barrier(f"gemma4-sae-stale-checkpoint-ready-{tokens_seen}")
+    failed = 0
+    if jax.process_index() == 0:
+        try:
+            from etils import epath
+
+            path = epath.Path(payload_uri)
+            path.rmtree(missing_ok=True)
+            if path.exists():
+                raise RuntimeError("stale checkpoint payload still exists")
+        except Exception:
+            failed = 1
+    if jax.process_count() > 1:
+        from jax.experimental import multihost_utils
+
+        failures = np.asarray(
+            multihost_utils.process_allgather(
+                np.asarray([failed], dtype=np.int32), tiled=False
+            )
+        )
+        failed = int(np.max(failures))
+    _checkpoint_barrier(f"gemma4-sae-stale-checkpoint-done-{tokens_seen}")
+    if failed:
+        raise RuntimeError(
+            "new latest pointer is durable, but stale checkpoint cleanup failed: "
+            f"{payload_uri}"
+        )
 
 
 def _checkpoint_timing_path(root: str | Path) -> Path:
@@ -884,6 +971,7 @@ def run_distributed_training(
     distributed: DistributedConfig | None = None,
     a_capacity: int | None = None,
     checkpoint_dir: str | Path | None = None,
+    checkpoint_payload_root: str | Path | None = None,
     stop_after_tokens: int | None = None,
     require_health_pass: bool = True,
     metric_callback: Any | None = None,
@@ -907,6 +995,11 @@ def run_distributed_training(
         microbatches_per_update=training_config.microbatches_per_update
     )
     checkpoint_identity = dict(checkpoint_identity or {})
+    payload_root: str | None = None
+    if checkpoint_dir is not None:
+        payload_root = _effective_checkpoint_payload_root(
+            checkpoint_dir, checkpoint_payload_root
+        )
     if distributed.microbatches_per_update != training_config.microbatches_per_update:
         raise ValueError("distributed and training microbatch counts disagree")
     _validate_mesh_model(mesh, training_config.sae, distributed)
@@ -925,6 +1018,29 @@ def run_distributed_training(
         if not math.isfinite(value) or value < 0:
             raise ValueError(f"{name} must be finite and nonnegative")
     start_tokens = int(np.asarray(jax.device_get(state.tokens_seen)))
+    start_step = int(np.asarray(jax.device_get(state.step)))
+    existing_latest_pointer: dict[str, Any] | None = None
+    if checkpoint_dir is not None:
+        assert payload_root is not None
+        existing_latest_pointer = load_pointer(
+            checkpoint_dir,
+            kind="latest",
+            payload_root=payload_root,
+            run_identity=checkpoint_identity,
+        )
+        if existing_latest_pointer is not None:
+            if not _orbax_path_finalized(
+                _import_orbax(), str(existing_latest_pointer["payload_uri"])
+            ):
+                raise RuntimeError("latest checkpoint payload is not finalized")
+            if (
+                int(existing_latest_pointer["tokens_seen"]) != start_tokens
+                or int(existing_latest_pointer["step"]) != start_step
+            ):
+                raise RuntimeError(
+                    "training state does not match the validated latest "
+                    "checkpoint pointer"
+                )
     if start_tokens > training_config.total_tokens:
         raise ValueError("checkpoint exceeds configured token budget")
     if (
@@ -994,9 +1110,18 @@ def run_distributed_training(
     compile_seconds = 0.0
     optimizer_seconds_local = 0.0
     checkpoint_seconds_local = 0.0
-    latest_checkpoint: str | None = None
+    latest_checkpoint: str | None = (
+        str(pointer_path(checkpoint_dir, "latest"))
+        if existing_latest_pointer is not None and checkpoint_dir is not None
+        else None
+    )
     final_checkpoint: str | None = None
-    latest_saved_tokens: int | None = None
+    latest_pointer = existing_latest_pointer
+    latest_saved_tokens: int | None = (
+        int(existing_latest_pointer["tokens_seen"])
+        if existing_latest_pointer is not None
+        else None
+    )
     next_checkpoint = (
         (start_tokens // training_config.checkpoint_every_tokens) + 1
     ) * training_config.checkpoint_every_tokens
@@ -1040,7 +1165,7 @@ def run_distributed_training(
 
         tokens_seen = int(np.asarray(jax.device_get(state.tokens_seen)))
         if checkpoint_dir is not None and tokens_seen >= next_checkpoint:
-            latest_checkpoint = _checkpoint_child(checkpoint_dir, "latest")
+            assert payload_root is not None
             cumulative_optimizer = prior_optimizer_wall_seconds + _global_max_seconds(
                 optimizer_seconds_local
             )
@@ -1048,8 +1173,17 @@ def run_distributed_training(
                 compile_seconds
             )
             checkpoint_started = time.perf_counter()
+            step = int(np.asarray(jax.device_get(state.step)))
+            attempt_id = _collective_attempt_id()
+            payload_uri = checkpoint_payload_uri(
+                payload_root,
+                checkpoint_identity,
+                step=step,
+                tokens_seen=tokens_seen,
+                attempt_id=attempt_id,
+            )
             save_distributed_checkpoint(
-                latest_checkpoint,
+                payload_uri,
                 state,
                 mesh,
                 training_config,
@@ -1063,6 +1197,30 @@ def run_distributed_training(
                     + checkpoint_seconds_local,
                 },
             )
+            previous_payload_uri = (
+                str(latest_pointer["payload_uri"])
+                if latest_pointer is not None
+                else None
+            )
+            new_latest_pointer = make_pointer(
+                kind="latest",
+                payload_uri=payload_uri,
+                step=step,
+                tokens_seen=tokens_seen,
+                attempt_id=attempt_id,
+                run_identity=checkpoint_identity,
+            )
+            latest_checkpoint = _publish_checkpoint_pointer(
+                checkpoint_dir, new_latest_pointer
+            )
+            if (
+                previous_payload_uri is not None
+                and previous_payload_uri != payload_uri
+            ):
+                _delete_stale_checkpoint_payload(
+                    previous_payload_uri, tokens_seen=tokens_seen
+                )
+            latest_pointer = new_latest_pointer
             checkpoint_seconds_local += time.perf_counter() - checkpoint_started
             _publish_checkpoint_timing(
                 checkpoint_dir,
@@ -1080,7 +1238,7 @@ def run_distributed_training(
 
     tokens_seen = int(np.asarray(jax.device_get(state.tokens_seen)))
     if checkpoint_dir is not None:
-        latest_checkpoint = _checkpoint_child(checkpoint_dir, "latest")
+        assert payload_root is not None
         cumulative_optimizer = prior_optimizer_wall_seconds + _global_max_seconds(
             optimizer_seconds_local
         )
@@ -1089,8 +1247,17 @@ def run_distributed_training(
         )
         if latest_saved_tokens != tokens_seen:
             checkpoint_started = time.perf_counter()
+            step = int(np.asarray(jax.device_get(state.step)))
+            attempt_id = _collective_attempt_id()
+            payload_uri = checkpoint_payload_uri(
+                payload_root,
+                checkpoint_identity,
+                step=step,
+                tokens_seen=tokens_seen,
+                attempt_id=attempt_id,
+            )
             save_distributed_checkpoint(
-                latest_checkpoint,
+                payload_uri,
                 state,
                 mesh,
                 training_config,
@@ -1104,6 +1271,30 @@ def run_distributed_training(
                     + checkpoint_seconds_local,
                 },
             )
+            previous_payload_uri = (
+                str(latest_pointer["payload_uri"])
+                if latest_pointer is not None
+                else None
+            )
+            new_latest_pointer = make_pointer(
+                kind="latest",
+                payload_uri=payload_uri,
+                step=step,
+                tokens_seen=tokens_seen,
+                attempt_id=attempt_id,
+                run_identity=checkpoint_identity,
+            )
+            latest_checkpoint = _publish_checkpoint_pointer(
+                checkpoint_dir, new_latest_pointer
+            )
+            if (
+                previous_payload_uri is not None
+                and previous_payload_uri != payload_uri
+            ):
+                _delete_stale_checkpoint_payload(
+                    previous_payload_uri, tokens_seen=tokens_seen
+                )
+            latest_pointer = new_latest_pointer
             checkpoint_seconds_local += time.perf_counter() - checkpoint_started
             _publish_checkpoint_timing(
                 checkpoint_dir,
@@ -1117,22 +1308,12 @@ def run_distributed_training(
             )
             latest_saved_tokens = tokens_seen
         if tokens_seen == training_config.total_tokens:
-            final_checkpoint = _checkpoint_child(checkpoint_dir, "final")
+            if latest_pointer is None or latest_saved_tokens != tokens_seen:
+                raise RuntimeError("final checkpoint has no matching latest payload")
             checkpoint_started = time.perf_counter()
-            save_distributed_checkpoint(
-                final_checkpoint,
-                state,
-                mesh,
-                training_config,
-                metadata={
-                    **checkpoint_identity,
-                    "tokens_seen": tokens_seen,
-                    "steps": int(state.step),
-                    "optimizer_wall_seconds": cumulative_optimizer,
-                    "compile_seconds": cumulative_compile,
-                    "checkpoint_seconds": prior_checkpoint_seconds
-                    + checkpoint_seconds_local,
-                },
+            final_pointer = final_pointer_from_latest(latest_pointer)
+            final_checkpoint = _publish_checkpoint_pointer(
+                checkpoint_dir, final_pointer
             )
             checkpoint_seconds_local += time.perf_counter() - checkpoint_started
             _publish_checkpoint_timing(
@@ -1412,17 +1593,74 @@ def save_distributed_checkpoint(
     training_config: TrainingConfig,
     metadata: Mapping[str, Any] | None = None,
 ) -> None:
-    """Collectively save sharded state with Orbax; every host must call."""
+    """Collectively save one immutable payload; every host must call."""
 
+    bound_metadata = dict(metadata or {})
+    reserved = {
+        "checkpoint_payload_uri": str(path),
+        "tokens_seen": int(np.asarray(jax.device_get(state.tokens_seen))),
+        "steps": int(np.asarray(jax.device_get(state.step))),
+    }
+    conflicts = {
+        name: (bound_metadata.get(name), value)
+        for name, value in reserved.items()
+        if name in bound_metadata and bound_metadata[name] != value
+    }
+    if conflicts:
+        raise ValueError(
+            "checkpoint metadata conflicts with payload/state: "
+            + ", ".join(sorted(conflicts))
+        )
+    bound_metadata.update(reserved)
     ocp = _import_orbax()
     checkpointer = ocp.StandardCheckpointer()
-    checkpointer.save(
-        path,
-        state,
-        force=True,
-        custom_metadata=_checkpoint_header(training_config, mesh, metadata),
-    )
-    checkpointer.wait_until_finished()
+    try:
+        checkpointer.save(
+            path,
+            state,
+            force=False,
+            custom_metadata=_checkpoint_header(
+                training_config, mesh, bound_metadata
+            ),
+        )
+        checkpointer.wait_until_finished()
+        if not _orbax_path_finalized(ocp, path):
+            raise RuntimeError(f"Orbax checkpoint payload is not finalized: {path}")
+    finally:
+        checkpointer.close()
+
+
+def _restore_distributed_payload(
+    path: str | Path,
+    template: TrainState,
+    mesh: Mesh,
+    training_config: TrainingConfig,
+) -> tuple[TrainState, dict[str, Any]]:
+    """Restore a payload after its control pointer has already been validated."""
+
+    ocp = _import_orbax()
+    if not _orbax_path_finalized(ocp, path):
+        raise RuntimeError(f"Orbax checkpoint payload is not finalized: {path}")
+    checkpointer = ocp.StandardCheckpointer()
+    try:
+        checkpoint_metadata = checkpointer.metadata(path).custom_metadata or {}
+        expected = _checkpoint_header(training_config, mesh, None)
+        if (
+            checkpoint_metadata.get("checkpoint_version")
+            != expected["checkpoint_version"]
+        ):
+            raise ValueError("unsupported distributed checkpoint version")
+        if (
+            checkpoint_metadata.get("training_config_sha256")
+            != expected["training_config_sha256"]
+        ):
+            raise ValueError("distributed checkpoint configuration mismatch")
+        if checkpoint_metadata.get("mesh_shape") != expected["mesh_shape"]:
+            raise ValueError("distributed checkpoint mesh shape mismatch")
+        restored = checkpointer.restore(path, target=template)
+        return restored, dict(checkpoint_metadata.get("metadata", {}))
+    finally:
+        checkpointer.close()
 
 
 def restore_distributed_checkpoint(
@@ -1430,31 +1668,73 @@ def restore_distributed_checkpoint(
     template: TrainState,
     mesh: Mesh,
     training_config: TrainingConfig,
+    *,
+    checkpoint_payload_root: str | Path | None = None,
+    checkpoint_identity: Mapping[str, Any] | None = None,
 ) -> tuple[TrainState, dict[str, Any]]:
-    """Collectively restore directly into template shardings on every host."""
+    """Restore only through a validated ``latest.json`` or ``final.json`` pointer."""
 
-    ocp = _import_orbax()
-    checkpointer = ocp.StandardCheckpointer()
-    checkpoint_metadata = checkpointer.metadata(path).custom_metadata or {}
-    expected = _checkpoint_header(training_config, mesh, None)
-    if checkpoint_metadata.get("checkpoint_version") != expected["checkpoint_version"]:
-        raise ValueError("unsupported distributed checkpoint version")
+    if "://" in str(path):
+        raise ValueError("checkpoint control pointer must be a POSIX path")
+    pointer_file = Path(path)
+    if pointer_file.name not in {"latest.json", "final.json"}:
+        raise ValueError(
+            "distributed checkpoint restore requires latest.json or final.json"
+        )
+    kind = "latest" if pointer_file.name == "latest.json" else "final"
+    identity = dict(checkpoint_identity or {})
+    payload_root = _effective_checkpoint_payload_root(
+        pointer_file.parent, checkpoint_payload_root
+    )
+    pointer = load_pointer(
+        pointer_file.parent,
+        kind=kind,
+        payload_root=payload_root,
+        run_identity=identity,
+    )
+    if pointer is None:
+        raise RuntimeError(f"checkpoint pointer is missing: {pointer_file}")
+    restored, metadata = _restore_distributed_payload(
+        str(pointer["payload_uri"]), template, mesh, training_config
+    )
+    restored_tokens = int(np.asarray(jax.device_get(restored.tokens_seen)))
+    restored_step = int(np.asarray(jax.device_get(restored.step)))
     if (
-        checkpoint_metadata.get("training_config_sha256")
-        != expected["training_config_sha256"]
+        int(pointer["tokens_seen"]) != restored_tokens
+        or int(pointer["step"]) != restored_step
     ):
-        raise ValueError("distributed checkpoint configuration mismatch")
-    if checkpoint_metadata.get("mesh_shape") != expected["mesh_shape"]:
-        raise ValueError("distributed checkpoint mesh shape mismatch")
-    restored = checkpointer.restore(path, target=template)
-    return restored, dict(checkpoint_metadata.get("metadata", {}))
+        raise RuntimeError("checkpoint pointer disagrees with restored payload state")
+    if (
+        metadata.get("checkpoint_payload_uri") != pointer["payload_uri"]
+        or metadata.get("tokens_seen") != restored_tokens
+        or metadata.get("steps") != restored_step
+    ):
+        raise RuntimeError("checkpoint payload metadata disagrees with its pointer")
+    mismatches = {
+        name: (metadata.get(name), expected)
+        for name, expected in identity.items()
+        if metadata.get(name) != expected
+    }
+    if mismatches:
+        raise RuntimeError(
+            "checkpoint payload belongs to a different run: "
+            + ", ".join(sorted(mismatches))
+        )
+    return restored, metadata
 
 
-def _checkpoint_exists(path: str | Path) -> bool:
-    _import_orbax()
-    from etils import epath
+def _orbax_path_finalized(ocp: Any, path: str | Path) -> bool:
+    """Call Orbax's synchronous public wrapper around ``is_path_finalized``."""
 
-    return bool(epath.Path(path).exists())
+    # Orbax 0.12 exposes the underlying `is_path_finalized` implementation as
+    # `is_checkpoint_finalized`; support the direct name as well for compatible
+    # patch releases without reaching into Orbax private modules.
+    finalized = getattr(ocp.utils, "is_path_finalized", None)
+    if finalized is None:
+        finalized = getattr(ocp.utils, "is_checkpoint_finalized", None)
+    if finalized is None:
+        raise RuntimeError("installed Orbax does not expose path finalization checks")
+    return bool(finalized(path))
 
 
 def _process_local_source(
@@ -1609,6 +1889,7 @@ def train_distributed(
     mean: Any,
     *,
     checkpoint_dir: str | Path | None = None,
+    checkpoint_payload_root: str | Path | None = None,
     stop_after_tokens: int | None = None,
     metric_callback: Any | None = None,
     checkpoint_identity: Mapping[str, Any] | None = None,
@@ -1617,8 +1898,9 @@ def train_distributed(
     """CLI-facing multi-host train/resume entrypoint.
 
     ``batches`` must be an :class:`ArtifactDataset` on multi-host runs so each
-    process loads only its contiguous token partition.  ``latest`` is restored
-    collectively when present; completed runs write ``<checkpoint_dir>/final``.
+    process loads only its contiguous token partition.  Resume follows only a
+    validated ``latest.json`` control pointer; completed runs publish
+    ``final.json`` to the same immutable payload as the final latest pointer.
     """
 
     distributed = DistributedConfig(
@@ -1639,12 +1921,35 @@ def train_distributed(
     )
     prior_timing: dict[str, Any] = {}
     checkpoint_identity = dict(checkpoint_identity or {})
+    payload_root: str | None = None
     if checkpoint_dir is not None:
-        latest = _checkpoint_child(checkpoint_dir, "latest")
-        if _checkpoint_exists(latest):
+        payload_root = _effective_checkpoint_payload_root(
+            checkpoint_dir, checkpoint_payload_root
+        )
+        latest = load_pointer(
+            checkpoint_dir,
+            kind="latest",
+            payload_root=payload_root,
+            run_identity=checkpoint_identity,
+        )
+        if latest is not None:
             state, prior_timing = restore_distributed_checkpoint(
-                latest, state, mesh, training_config
+                pointer_path(checkpoint_dir, "latest"),
+                state,
+                mesh,
+                training_config,
+                checkpoint_payload_root=payload_root,
+                checkpoint_identity=checkpoint_identity,
             )
+            if (
+                int(latest["tokens_seen"])
+                != int(np.asarray(jax.device_get(state.tokens_seen)))
+                or int(latest["step"])
+                != int(np.asarray(jax.device_get(state.step)))
+            ):
+                raise RuntimeError(
+                    "latest checkpoint pointer disagrees with restored payload state"
+                )
             mismatches = {
                 name: (prior_timing.get(name), expected)
                 for name, expected in checkpoint_identity.items()
@@ -1698,6 +2003,7 @@ def train_distributed(
         distributed=distributed,
         a_capacity=training_config.a_capacity,
         checkpoint_dir=checkpoint_dir,
+        checkpoint_payload_root=payload_root,
         stop_after_tokens=stop_after_tokens,
         require_health_pass=False,
         # Metrics are logically replicated across hosts; only process zero may
@@ -1723,8 +2029,9 @@ def evaluate_distributed(
     max_tokens: int | None = None,
     expected_sst: float | None = None,
     checkpoint_identity: Mapping[str, Any] | None = None,
+    checkpoint_payload_root: str | Path | None = None,
 ) -> EvaluationResult:
-    """CLI-facing sharded restore/evaluation entrypoint."""
+    """CLI-facing evaluation restored only through a final control pointer."""
 
     distributed = DistributedConfig(
         microbatches_per_update=training_config.microbatches_per_update
@@ -1736,20 +2043,20 @@ def evaluate_distributed(
         training_config.sae,
         distributed,
     )
-    state, checkpoint_metadata = restore_distributed_checkpoint(
-        checkpoint_path, template, mesh, training_config
-    )
     checkpoint_identity = dict(checkpoint_identity or {})
-    mismatches = {
-        name: (checkpoint_metadata.get(name), expected)
-        for name, expected in checkpoint_identity.items()
-        if checkpoint_metadata.get(name) != expected
-    }
-    if mismatches:
-        raise RuntimeError(
-            "evaluation checkpoint belongs to a different capture/run: "
-            + ", ".join(sorted(mismatches))
-        )
+    if "://" in str(checkpoint_path):
+        raise ValueError("evaluation checkpoint pointer must be a POSIX path")
+    pointer_file = pointer_path(Path(checkpoint_path).parent, "final")
+    if str(pointer_file) != str(Path(checkpoint_path)):
+        raise ValueError("evaluation checkpoint path must be final.json")
+    state, _ = restore_distributed_checkpoint(
+        pointer_file,
+        template,
+        mesh,
+        training_config,
+        checkpoint_payload_root=checkpoint_payload_root,
+        checkpoint_identity=checkpoint_identity,
+    )
     restored_tokens = int(np.asarray(jax.device_get(state.tokens_seen)))
     restored_steps = int(np.asarray(jax.device_get(state.step)))
     if (

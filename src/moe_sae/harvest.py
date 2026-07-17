@@ -34,6 +34,11 @@ from moe_sae.artifacts import (
 )
 from moe_sae.config import Gemma4Config
 from moe_sae.model import CaptureBatch, Gemma4PrefixAdapter, validate_capture_batch
+from moe_sae.object_store import (
+    GCSObjectStore,
+    ImmutableObjectStore,
+    object_identity_from_mapping,
+)
 from moe_sae.runtime import (
     BoundedArtifactSink,
     BenchmarkObservation,
@@ -550,6 +555,8 @@ def capture_metadata(
     conversion_attestation_sha256: str,
     dataset_fingerprint: str,
     split: str,
+    storage_attestation_sha256: str | None = None,
+    object_prefix: str | None = None,
     environment: Mapping[str, Any] | None = None,
     repo_root: str | Path | None = None,
 ) -> CaptureMetadata:
@@ -572,6 +579,8 @@ def capture_metadata(
         config_sha256=config.config_hash,
         environment_sha256=environment_sha,
         conversion_attestation_sha256=conversion_attestation_sha256,
+        storage_attestation_sha256=storage_attestation_sha256,
+        object_prefix=object_prefix,
     )
 
 
@@ -661,7 +670,8 @@ class _PhaseTelemetryJournal:
         )
         if accounted != existing_tokens:
             raise HarvestError(
-                f"phase journal accounts for {accounted} durable tokens, host has {existing_tokens}"
+                f"phase journal accounts for {accounted} durable tokens, "
+                f"host has {existing_tokens}"
             )
         if attempt_compile_seconds < 0.0 or not math.isfinite(attempt_compile_seconds):
             raise ValueError("attempt_compile_seconds must be finite and nonnegative")
@@ -792,6 +802,9 @@ def harvest_host(
     batch_collective: Callable[[bool, bool], tuple[bool, bool]] | None = None,
     baseline_resumed_tokens: int = 0,
     compile_seconds: float = 0.0,
+    local_buffer_root: str | Path | None = None,
+    object_prefix: str | None = None,
+    object_store: ImmutableObjectStore | None = None,
     clock: Callable[[], float] = time.perf_counter,
 ) -> HarvestResult:
     """Harvest one process's deterministic quota and durably finalize its host.
@@ -820,7 +833,14 @@ def harvest_host(
             "artifact store is already sealed; no host harvesting is permitted"
         )
 
-    writer = ArtifactWriter(root, host_id, metadata)
+    writer = ArtifactWriter(
+        root,
+        host_id,
+        metadata,
+        local_buffer_root=local_buffer_root,
+        object_prefix=object_prefix,
+        object_store=object_store,
+    )
     committed = _committed_parts(root, host_id, split, process_index)
     existing_manifest = (
         _read_host_manifest(root, host_id)
@@ -1108,6 +1128,7 @@ def publish_completed_capture(
     *,
     process_count: int,
     total_tokens: int,
+    object_store: ImmutableObjectStore | None = None,
 ) -> Path:
     """Seal only an exact, complete set of finalized host quotas."""
 
@@ -1116,6 +1137,7 @@ def publish_completed_capture(
         metadata,
         expected_hosts=process_count,
         expected_tokens=total_tokens,
+        object_store=object_store,
     )
     manifest = load_manifest(artifact_root)
     if manifest["total_tokens"] != total_tokens:
@@ -1133,6 +1155,7 @@ def _publish_production_after_telemetry(
     total_tokens: int,
     process_count: int,
     process_index: int,
+    object_store: ImmutableObjectStore | None = None,
 ) -> float:
     status_path = _telemetry_directory(artifact_root) / (
         f"publication-stop-{total_tokens:012d}.json"
@@ -1180,6 +1203,7 @@ def _publish_production_after_telemetry(
                 metadata,
                 process_count=process_count,
                 total_tokens=total_tokens,
+                object_store=object_store,
             )
             atomic_write_json(
                 status_path,
@@ -1248,6 +1272,9 @@ def run_harvest(
     baseline_resumed_tokens: int = 0,
     compile_seconds: float = 0.0,
     publish: bool = True,
+    local_buffer_root: str | Path | None = None,
+    object_prefix: str | None = None,
+    object_store: ImmutableObjectStore | None = None,
 ) -> HarvestResult:
     """Run one host, synchronize hosts, and coordinator-publish a full capture."""
 
@@ -1270,6 +1297,9 @@ def run_harvest(
         batch_collective=batch_collective,
         baseline_resumed_tokens=baseline_resumed_tokens,
         compile_seconds=compile_seconds,
+        local_buffer_root=local_buffer_root,
+        object_prefix=object_prefix,
+        object_store=object_store,
     )
     synchronize(f"gemma4-{split}-{stop}-hosts")
 
@@ -1285,6 +1315,7 @@ def run_harvest(
                     metadata,
                     process_count=process_count,
                     total_tokens=total_tokens,
+                    object_store=object_store,
                 )
                 atomic_write_json(publication_status, {"ok": True})
             except Exception as exc:
@@ -1325,10 +1356,23 @@ def benchmark_production_candidate(
     config: Gemma4Config,
     output_directory: str | Path,
     measured_steps: int = 200,
+    storage_attestation_sha256: str | None = None,
+    object_prefix: str | None = None,
+    local_buffer_root: str | Path | None = None,
+    object_store: ImmutableObjectStore | None = None,
 ) -> BenchmarkObservation:
     """Create the native MaxText runtime and benchmark one v4-32 candidate."""
 
     config.validate()
+    remote_values = (storage_attestation_sha256, object_prefix, local_buffer_root)
+    if any(value is not None for value in remote_values) and not all(
+        value is not None for value in remote_values
+    ):
+        raise ValueError(
+            "benchmark remote persistence requires attestation, GCS prefix, and local buffer"
+        )
+    if object_prefix is not None and object_store is None:
+        object_store = GCSObjectStore()
     Path(output_directory).mkdir(parents=True, exist_ok=True)
     argv = build_maxtext_argv(
         checkpoint_path=checkpoint_path,
@@ -1398,6 +1442,8 @@ def benchmark_production_candidate(
             config_sha256=config.config_hash,
             environment_sha256=str(environment["sha256"]),
             conversion_attestation_sha256="0" * 64,
+            storage_attestation_sha256=storage_attestation_sha256,
+            object_prefix=object_prefix,
         )
         persistence = _ProductionBenchmarkPersist(
             scratch,
@@ -1406,6 +1452,9 @@ def benchmark_production_candidate(
             process_count=process_count,
             process_index=process_index,
             reference_instrumentation_equal=instrumentation_equal,
+            local_buffer_root=local_buffer_root,
+            object_prefix=object_prefix,
+            object_store=object_store,
         )
         with maxtext_mesh_context(runtime):
             warmed_benchmark_batches, _benchmark_compile_seconds = (
@@ -1430,6 +1479,11 @@ def benchmark_production_candidate(
         try:
             if persistence is not None:
                 persistence.close()
+                cleanup_remote = getattr(
+                    persistence, "cleanup_remote_objects", None
+                )
+                if cleanup_remote is not None:
+                    cleanup_remote()
         finally:
             try:
                 _close_maxtext_runtime(runtime)
@@ -1483,10 +1537,14 @@ def run_production_harvest(
     split: str,
     checkpoint_path: str,
     grain_files: str,
+    staged_files: Sequence[str] | None = None,
     artifact_root: str | Path,
     checkpoint_sha256: str,
     conversion_attestation_sha256: str,
     dataset_fingerprint: str,
+    storage_attestation_sha256: str,
+    capture_object_prefix: str,
+    local_buffer_root: str | Path,
     mesh_candidate: MeshCandidate,
     per_device_sequence_batch: int,
     stop_after_tokens: int | None = None,
@@ -1501,6 +1559,14 @@ def run_production_harvest(
         raise ValueError("split must be 'train' or 'eval'")
     if not grain_files:
         raise ValueError("grain_files must be an explicit pre-staged pattern")
+    if not staged_files:
+        raise ValueError("staged_files must be the verified ordered manifest inventory")
+    if not re.fullmatch(r"[0-9a-f]{64}", storage_attestation_sha256):
+        raise ValueError("storage_attestation_sha256 must be a SHA-256 digest")
+    if not capture_object_prefix.startswith("gs://"):
+        raise ValueError("production capture objects require a gs:// prefix")
+    if not str(local_buffer_root):
+        raise ValueError("production capture requires a host-local buffer root")
     total_tokens = config.train_tokens if split == "train" else config.eval_tokens
     stop = total_tokens if stop_after_tokens is None else stop_after_tokens
     _validate_campaign(split, total_tokens, 1, 0, stop)
@@ -1533,8 +1599,11 @@ def run_production_harvest(
         conversion_attestation_sha256=conversion_attestation_sha256,
         dataset_fingerprint=dataset_fingerprint,
         split=split,
+        storage_attestation_sha256=storage_attestation_sha256,
+        object_prefix=capture_object_prefix,
         environment=environment,
     )
+    object_store = GCSObjectStore()
     benchmark = _benchmark_telemetry(
         benchmark_observation,
         mesh=mesh_candidate,
@@ -1607,6 +1676,7 @@ def run_production_harvest(
             benchmark=benchmark,
             prior_summary=prior_summary,
             expected_capture_metadata=metadata.to_dict(),
+            object_store=object_store,
         )
 
     argv = build_maxtext_argv(
@@ -1620,7 +1690,11 @@ def run_production_harvest(
         per_device_sequence_batch=per_device_sequence_batch,
         synthetic=False,
     )
-    runtime = create_maxtext_runtime(argv)
+    runtime = create_maxtext_runtime(
+        argv,
+        packed_train_files=tuple(staged_files),
+        packed_eval_files=tuple(staged_files),
+    )
     adapter = Gemma4PrefixAdapter.from_maxtext(runtime.model, config)
     step = compile_adapter_step(adapter)
     iterator = runtime.train_iterator if split == "train" else runtime.eval_iterator
@@ -1655,6 +1729,9 @@ def run_production_harvest(
             # High-level orchestration publishes only after every host's
             # phase telemetry is durable, closing the manifest/metrics gap.
             publish=False,
+            local_buffer_root=local_buffer_root,
+            object_prefix=capture_object_prefix,
+            object_store=object_store,
         )
     if stop == total_tokens and publish:
         host_result = _replace_result_manifest(
@@ -1674,6 +1751,7 @@ def run_production_harvest(
             total_tokens=total_tokens,
             process_count=process_count,
             process_index=process_index,
+            object_store=object_store,
         )
 
     if process_index == 0:
@@ -1741,12 +1819,24 @@ class _ProductionBenchmarkPersist:
         process_count: int,
         process_index: int,
         reference_instrumentation_equal: bool,
+        local_buffer_root: str | Path | None = None,
+        object_prefix: str | None = None,
+        object_store: ImmutableObjectStore | None = None,
     ) -> None:
         self.config = config
         self.process_count = process_count
         self.process_index = process_index
         self.reference_instrumentation_equal = reference_instrumentation_equal
-        self.writer = ArtifactWriter(root, f"p{process_index:05d}", metadata)
+        self.control_root = Path(root)
+        self.object_store = object_store
+        self.writer = ArtifactWriter(
+            root,
+            f"p{process_index:05d}",
+            metadata,
+            local_buffer_root=local_buffer_root,
+            object_prefix=object_prefix,
+            object_store=object_store,
+        )
         self.sink = BoundedArtifactSink(self.writer.write_range, max_pending=1)
         self.offset = 0
         self.calls = 0
@@ -1755,6 +1845,38 @@ class _ProductionBenchmarkPersist:
         self._compiled_step: Any | None = None
         self._closed = False
         self._finalized = False
+
+    def cleanup_remote_objects(self) -> None:
+        """Remove only this disposable benchmark's exact object generations."""
+
+        if self.object_store is None:
+            return
+        host_path = (
+            self.control_root
+            / "hosts"
+            / f"host-p{self.process_index:05d}.json"
+        )
+        entries: list[Mapping[str, Any]] = []
+        if host_path.exists():
+            entries.extend(_read_json_mapping(host_path).get("shards", ()))
+        receipt_dir = (
+            self.control_root
+            / "receipts"
+            / f"host-p{self.process_index:05d}"
+        )
+        for receipt_path in sorted(receipt_dir.glob("*.json")):
+            receipt = _read_json_mapping(receipt_path)
+            entry = receipt.get("entry")
+            if isinstance(entry, Mapping):
+                entries.append(entry)
+        identities = {}
+        for entry in entries:
+            if "object" not in entry:
+                raise HarvestError("benchmark remote ledger lacks an object identity")
+            identity = object_identity_from_mapping(entry["object"])
+            identities[(identity.uri, identity.generation)] = identity
+        for identity in identities.values():
+            self.object_store.delete(identity)
 
     @property
     def max_observed_backlog(self) -> int:
@@ -2300,6 +2422,7 @@ def _recover_interrupted_publication(
     process_count: int,
     process_index: int,
     split: str,
+    object_store: ImmutableObjectStore | None = None,
 ) -> dict[str, Any]:
     """Finish telemetry after a crash between manifest sealing and status commit."""
 
@@ -2320,13 +2443,29 @@ def _recover_interrupted_publication(
     recovery_started = time.time()
     if process_index == 0:
         try:
-            dataset = ArtifactDataset(
-                artifact_root,
-                verify_hashes=True,
-                verify_statistics=True,
-                decode_bf16=False,
-            )
-            verified_tokens = sum(shard.batch.rows for shard in dataset.iter_shards())
+            manifest = load_manifest(artifact_root)
+            if any("object" in entry for entry in manifest["shards"]):
+                if object_store is None:
+                    raise HarvestError(
+                        "remote publication recovery requires object-store verification"
+                    )
+                for entry in manifest["shards"]:
+                    object_store.verify(
+                        object_identity_from_mapping(entry["object"])
+                    )
+                verified_tokens = sum(
+                    int(entry["tokens"]) for entry in manifest["shards"]
+                )
+            else:
+                dataset = ArtifactDataset(
+                    artifact_root,
+                    verify_hashes=True,
+                    verify_statistics=True,
+                    decode_bf16=False,
+                )
+                verified_tokens = sum(
+                    shard.batch.rows for shard in dataset.iter_shards()
+                )
             if verified_tokens != total_tokens:
                 raise HarvestError(
                     f"sealed recovery verified {verified_tokens}/{total_tokens} tokens"
@@ -2379,6 +2518,7 @@ def _recover_sealed_campaign(
     benchmark: Mapping[str, Any],
     prior_summary: CampaignSummary | None,
     expected_capture_metadata: Mapping[str, Any],
+    object_store: ImmutableObjectStore | None = None,
 ) -> CampaignSummary:
     """Rebuild only a missing summary after exact manifest publication."""
 
@@ -2407,6 +2547,7 @@ def _recover_sealed_campaign(
         process_count=process_count,
         process_index=process_index,
         split=split,
+        object_store=object_store,
     )
     publication_seconds = float(publication_status.get("publication_seconds", -1.0))
     if not math.isfinite(publication_seconds) or publication_seconds < 0.0:

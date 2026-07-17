@@ -104,6 +104,13 @@ class Gemma4Config:
     max_writer_backlog_batches: int = 2
     health_gate_tokens: int = 5_000_000
     min_live_feature_fraction: float = 0.95
+    min_control_free_bytes: int = 10_000_000_000
+    min_local_buffer_free_bytes: int = 128 * 1024**3
+    gcs_probe_bytes_per_process: int = 8 * 1024**3
+    gcs_probe_block_bytes: int = 8 * 1024**2
+    min_gcs_upload_bytes_per_second: float = 4_000_000_000.0
+    min_gcs_download_bytes_per_second: float = 4_000_000_000.0
+    capture_cache_max_bytes: int = 100 * 1024**3
 
     def __post_init__(self) -> None:
         # YAML represents tuples as lists.  Normalize at the boundary while
@@ -241,6 +248,11 @@ class Gemma4Config:
             "canary_tokens",
             "max_writer_backlog_batches",
             "health_gate_tokens",
+            "min_control_free_bytes",
+            "min_local_buffer_free_bytes",
+            "gcs_probe_bytes_per_process",
+            "gcs_probe_block_bytes",
+            "capture_cache_max_bytes",
         )
         for name in positive_ints:
             value = getattr(self, name)
@@ -303,6 +315,40 @@ class Gemma4Config:
             raise ValueError(
                 "min_live_feature_fraction cannot weaken the 95% health gate"
             )
+        if self.min_control_free_bytes < 10_000_000_000:
+            raise ValueError("min_control_free_bytes cannot weaken the 10 GB gate")
+        if self.min_local_buffer_free_bytes < 128 * 1024**3:
+            raise ValueError(
+                "min_local_buffer_free_bytes cannot weaken the 128 GiB gate"
+            )
+        if self.gcs_probe_bytes_per_process < 8 * 1024**3:
+            raise ValueError("GCS probe must transfer at least 8 GiB per controller")
+        if self.gcs_probe_block_bytes < 1024**2:
+            raise ValueError("GCS probe block size must be at least 1 MiB")
+        for name in (
+            "min_gcs_upload_bytes_per_second",
+            "min_gcs_download_bytes_per_second",
+        ):
+            value = getattr(self, name)
+            if (
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or not math.isfinite(value)
+            ):
+                raise ValueError(f"{name} must be finite")
+        if self.min_gcs_upload_bytes_per_second < 4_000_000_000.0:
+            raise ValueError("GCS upload gate cannot be below 4 GB/s")
+        if self.min_gcs_download_bytes_per_second < 4_000_000_000.0:
+            raise ValueError("GCS download gate cannot be below 4 GB/s")
+        if self.capture_cache_max_bytes < 100 * 1024**3:
+            raise ValueError("capture cache must hold at least 100 GiB per controller")
+        required_local = (
+            self.capture_cache_max_bytes + 2 * self.gcs_probe_bytes_per_process
+        )
+        if self.min_local_buffer_free_bytes < required_local:
+            raise ValueError(
+                "local-buffer gate must cover the bounded cache plus upload/download probes"
+            )
         if not self.artifacts_root.strip():
             raise ValueError("artifacts_root cannot be empty")
 
@@ -331,6 +377,13 @@ class Gemma4Config:
             "canary_tokens": 2_000_000,
             "health_gate_tokens": 5_000_000,
             "min_live_feature_fraction": 0.95,
+            "min_control_free_bytes": 10_000_000_000,
+            "min_local_buffer_free_bytes": 128 * 1024**3,
+            "gcs_probe_bytes_per_process": 8 * 1024**3,
+            "gcs_probe_block_bytes": 8 * 1024**2,
+            "min_gcs_upload_bytes_per_second": 4_000_000_000.0,
+            "min_gcs_download_bytes_per_second": 4_000_000_000.0,
+            "capture_cache_max_bytes": 100 * 1024**3,
         }
         for name, required in expected.items():
             actual = getattr(self, name)

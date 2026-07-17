@@ -37,7 +37,23 @@ import numpy as np
 from safetensors import safe_open
 from safetensors.numpy import load_file, save_file
 
+from moe_sae.data import (
+    DEFAULT_PER_DEVICE_SEQUENCE_BATCHES,
+    DEFAULT_PROCESS_COUNT,
+    PACKED_DATASET_SCHEMA,
+    PACKED_RECORD_FORMAT,
+    verify_packed_source,
+)
 from moe_sae.model import CaptureBatch
+from moe_sae.object_store import (
+    GCSObjectStore,
+    ImmutableObjectStore,
+    ObjectStoreError,
+    ShardCache,
+    join_gcs_uri,
+    object_identity_from_mapping,
+    parse_gcs_uri,
+)
 
 
 SCHEMA_VERSION = "gemma4-router-aggregate-v1"
@@ -48,7 +64,7 @@ NUM_EXPERTS = 128
 TOP_K_EXPERTS = 8
 TARGET_LAYER_ONE_INDEXED = 15
 DEFAULT_CAPTURE_SITE = "routed_moe.post_feedforward_layernorm_2"
-STAGED_DATASET_SCHEMA_VERSION = "gemma4-c4-arrayrecord-v1"
+STAGED_DATASET_SCHEMA_VERSION = PACKED_DATASET_SCHEMA
 
 _STATS_COUNT = "__stats_count"
 _STATS_SUM = "__stats_sum"
@@ -113,6 +129,20 @@ def _sha256_file(path: Path, chunk_bytes: int = 8 << 20) -> str:
     return digest.hexdigest()
 
 
+def _gcs_object_under(prefix: str, uri: str) -> bool:
+    """Return whether ``uri`` is lexically below ``prefix`` by bucket/name."""
+
+    try:
+        bucket, name = parse_gcs_uri(uri)
+        remainder = prefix.removeprefix("gs://").rstrip("/")
+        prefix_bucket, separator, prefix_name = remainder.partition("/")
+    except ValueError:
+        return False
+    if not prefix.startswith("gs://") or bucket != prefix_bucket:
+        return False
+    return bool(name) if not separator else name.startswith(f"{prefix_name}/")
+
+
 def _read_json_location(location: str) -> Mapping[str, Any]:
     if location.startswith("gs://"):
         try:
@@ -138,6 +168,17 @@ def _read_json_location(location: str) -> Mapping[str, Any]:
             raise IntegrityError(
                 f"cannot read staged dataset manifest: {location}"
             ) from exc
+    if location.startswith("gs://"):
+        filename = location.rsplit("/", 1)[-1]
+        match = re.fullmatch(r"([0-9a-f]{64})\.json", filename)
+        if match is None:
+            raise IntegrityError(
+                "staged GCS manifest URI is not content-addressed"
+            )
+        if hashlib.sha256(raw).hexdigest() != match.group(1):
+            raise IntegrityError(
+                "staged GCS manifest bytes differ from their content address"
+            )
     try:
         value = json.loads(raw)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -235,6 +276,7 @@ def verify_staged_dataset_manifest(
     sequence_length: int,
     verify_file_hashes: bool = True,
     verify_arrayrecord_count: bool = False,
+    object_store: ImmutableObjectStore | None = None,
 ) -> StagedDatasetProvenance:
     """Verify a C4 staging manifest and derive its content fingerprint.
 
@@ -248,14 +290,22 @@ def verify_staged_dataset_manifest(
     required = {
         "schema_version",
         "dataset",
-        "tokenizer_id",
+        "source",
+        "tokenizer",
         "sequence_length",
+        "record_format",
         "packing",
+        "consumer",
+        "target_scientific_tokens",
+        "source_examples",
+        "scientific_tokens",
+        "record_count",
+        "lane_scientific_tokens",
         "files",
     }
     if set(value) != required:
         raise IntegrityError(
-            "staged dataset manifest fields differ from the v1 contract"
+            "staged dataset manifest fields differ from the packed v1 contract"
         )
     if value.get("schema_version") != STAGED_DATASET_SCHEMA_VERSION:
         raise IntegrityError("unsupported staged dataset manifest schema")
@@ -267,39 +317,102 @@ def verify_staged_dataset_manifest(
     }
     if value.get("dataset") != expected_dataset:
         raise IntegrityError("staged dataset is not the required C4 English split")
-    if value.get("tokenizer_id") != tokenizer_id:
+    source = value.get("source")
+    if not isinstance(source, Mapping) or set(source) != {
+        "provider",
+        "full_name",
+        "dataset_info_sha256",
+    }:
+        raise IntegrityError("staged dataset source provenance is incomplete")
+    if (
+        source.get("provider") != "tensorflow_datasets"
+        or source.get("full_name") != "c4/en/3.1.0"
+        or not re.fullmatch(r"[0-9a-f]{64}", str(source.get("dataset_info_sha256", "")))
+    ):
+        raise IntegrityError("staged dataset is not a verified TFDS C4/en 3.1.0 preparation")
+    tokenizer = value.get("tokenizer")
+    if not isinstance(tokenizer, Mapping) or set(tokenizer) != {
+        "id",
+        "revision",
+        "padding_id",
+        "eos_id",
+        "bos_id",
+    }:
+        raise IntegrityError("staged tokenizer provenance is incomplete")
+    if (
+        tokenizer.get("id") != tokenizer_id
+        or not re.fullmatch(r"[0-9a-f]{40}", str(tokenizer.get("revision", "")))
+        or (
+            tokenizer.get("padding_id"),
+            tokenizer.get("eos_id"),
+            tokenizer.get("bos_id"),
+        )
+        != (0, 1, 2)
+    ):
         raise IntegrityError("staged dataset uses a different tokenizer")
     if value.get("sequence_length") != sequence_length:
         raise IntegrityError("staged dataset uses a different packed sequence length")
+    if value.get("record_format") != {
+        "name": PACKED_RECORD_FORMAT,
+        "arrayrecord_options": "group_size:1",
+        "token_ids": "int32[1024]",
+        "positions": "uint16[1024]",
+        "segment_ids": "uint16[1024]",
+    }:
+        raise IntegrityError("staged ArrayRecord payload format is incompatible")
     packing = value.get("packing")
     if not isinstance(packing, Mapping) or dict(packing) != {
-        "strategy": "packed_fixed_length",
+        "strategy": "ordered_next_fit_offline",
         "exclude_from_scientific_count": ["padding", "bos", "eos"],
         "special_token_ids": {"padding": 0, "eos": 1, "bos": 2},
     }:
         raise IntegrityError("staged dataset packing/counting contract is incompatible")
+    if value.get("consumer") != {
+        "process_count": DEFAULT_PROCESS_COUNT,
+        "host_sharding": "record_index_mod_process_count",
+        "per_device_sequence_batches": list(DEFAULT_PER_DEVICE_SEQUENCE_BATCHES),
+    }:
+        raise IntegrityError("staged dataset has an incompatible TPU consumption layout")
+    if value.get("target_scientific_tokens") != expected_tokens:
+        raise IntegrityError("staged dataset was built for a different token target")
+    if (
+        isinstance(value.get("source_examples"), bool)
+        or not isinstance(value.get("source_examples"), int)
+        or int(value["source_examples"]) <= 0
+    ):
+        raise IntegrityError("staged dataset has an invalid source-example count")
     raw_files = value.get("files")
     if not isinstance(raw_files, list) or not raw_files:
         raise IntegrityError("staged dataset manifest must inventory at least one file")
 
     resolved = _resolve_staged_files(grain_files)
+    is_remote = manifest_location.startswith("gs://")
+    if is_remote and verify_file_hashes and object_store is None:
+        object_store = GCSObjectStore()
     declared: list[str] = []
     declared_records = 0
     scientific_tokens = 0
+    expected_first_record = 0
+    remote_identities = []
     for entry in raw_files:
-        if not isinstance(entry, Mapping) or set(entry) != {
+        expected_entry_fields = {
             "uri",
             "sha256",
             "size_bytes",
+            "first_record_index",
             "record_count",
             "scientific_tokens",
-        }:
+        }
+        if is_remote:
+            expected_entry_fields.add("object")
+        if not isinstance(entry, Mapping) or set(entry) != expected_entry_fields:
             raise IntegrityError("staged file inventory entry has incompatible fields")
         uri = _normalize_declared_uri(str(entry.get("uri", "")), manifest_location)
         digest = str(entry.get("sha256", ""))
         size = entry.get("size_bytes")
         records = entry.get("record_count")
         tokens = entry.get("scientific_tokens")
+        first_record = entry.get("first_record_index")
         if not re.fullmatch(r"[0-9a-f]{64}", digest):
             raise IntegrityError("staged file inventory has an invalid SHA-256")
         if (
@@ -311,24 +424,86 @@ def verify_staged_dataset_manifest(
             or records <= 0
             or isinstance(tokens, bool)
             or not isinstance(tokens, int)
-            or tokens <= 0
+            or tokens < 0
+            or isinstance(first_record, bool)
+            or not isinstance(first_record, int)
+            or first_record != expected_first_record
         ):
             raise IntegrityError("staged file inventory has invalid counts")
         declared.append(uri)
         declared_records += records
+        expected_first_record += records
         scientific_tokens += tokens
+        identity = None
+        if is_remote:
+            try:
+                identity = object_identity_from_mapping(entry.get("object"))
+            except ObjectStoreError as exc:
+                raise IntegrityError(
+                    "staged GCS object identity is malformed"
+                ) from exc
+            if (
+                identity.uri != uri
+                or identity.sha256 != digest
+                or identity.size_bytes != size
+            ):
+                raise IntegrityError(
+                    "staged GCS object identity differs from its file inventory"
+                )
+            remote_identities.append(identity)
         if verify_file_hashes:
+            if identity is not None:
+                assert object_store is not None
+                try:
+                    object_store.verify(identity)
+                except Exception as exc:
+                    raise IntegrityError(
+                        f"staged GCS object generation changed: {uri}"
+                    ) from exc
             actual_digest, actual_size = _hash_location(uri)
             if actual_digest != digest or actual_size != size:
                 raise IntegrityError(f"staged ArrayRecord hash/size mismatch: {uri}")
+            if identity is not None:
+                try:
+                    object_store.verify(identity)
+                except Exception as exc:
+                    raise IntegrityError(
+                        f"staged GCS object changed during verification: {uri}"
+                    ) from exc
     if tuple(declared) != resolved:
         raise IntegrityError(
             "ordered staged manifest inventory differs from --grain-files"
         )
+    lane_counts = value.get("lane_scientific_tokens")
+    if (
+        not isinstance(lane_counts, list)
+        or len(lane_counts) != DEFAULT_PROCESS_COUNT
+        or any(
+            isinstance(count, bool) or not isinstance(count, int) or count < 0
+            for count in lane_counts
+        )
+        or sum(lane_counts) != scientific_tokens
+    ):
+        raise IntegrityError("staged per-controller scientific-token counts are invalid")
+    for process_index, count in enumerate(lane_counts):
+        quota = expected_tokens // DEFAULT_PROCESS_COUNT + (
+            1 if process_index < expected_tokens % DEFAULT_PROCESS_COUNT else 0
+        )
+        if count < quota:
+            raise IntegrityError(
+                "a staged controller lane cannot reach its scientific-token quota"
+            )
+    if (
+        value.get("record_count") != declared_records
+        or value.get("scientific_tokens") != scientific_tokens
+        or declared_records % 64
+    ):
+        raise IntegrityError("staged aggregate record/token counts are inconsistent")
     if verify_arrayrecord_count:
         try:
-            grain = import_module("grain.python")
-            actual_records = len(grain.ArrayRecordDataSource(list(resolved)))
+            actual_records, actual_scientific, actual_lanes = verify_packed_source(
+                resolved, sequence_length=sequence_length
+            )
         except (
             AttributeError,
             ImportError,
@@ -346,11 +521,25 @@ def verify_staged_dataset_manifest(
                 "staged ArrayRecord count differs from the manifest: "
                 f"{actual_records:,} != {declared_records:,}"
             )
+        if actual_scientific != scientific_tokens or actual_lanes != tuple(lane_counts):
+            raise IntegrityError(
+                "decoded packed ArrayRecords differ from manifest scientific counts"
+            )
     if scientific_tokens < expected_tokens:
         raise IntegrityError(
             f"staged split contains only {scientific_tokens:,} scientific tokens; "
             f"need at least {expected_tokens:,}"
         )
+    if verify_file_hashes and remote_identities:
+        assert object_store is not None
+        for identity in remote_identities:
+            try:
+                object_store.verify(identity)
+            except Exception as exc:
+                raise IntegrityError(
+                    "a staged GCS object changed before dataset verification completed: "
+                    f"{identity.uri}"
+                ) from exc
     fingerprint = _sha256_json(value)
     return StagedDatasetProvenance(
         fingerprint_sha256=fingerprint,
@@ -553,6 +742,8 @@ class CaptureMetadata:
     config_sha256: str
     environment_sha256: str
     conversion_attestation_sha256: str
+    storage_attestation_sha256: str | None = None
+    object_prefix: str | None = None
     model_id: str = "google/gemma-4-26B-A4B"
     dataset: str = "c4/en:3.1.0"
     tokenizer_id: str = "google/gemma-4-26B-A4B"
@@ -586,6 +777,19 @@ class CaptureMetadata:
             value = getattr(self, name)
             if not re.fullmatch(r"[0-9a-f]{64}", value):
                 raise SchemaError(f"{name} must be a lowercase SHA-256 hex digest")
+        if self.storage_attestation_sha256 is not None and not re.fullmatch(
+            r"[0-9a-f]{64}", self.storage_attestation_sha256
+        ):
+            raise SchemaError(
+                "storage_attestation_sha256 must be a lowercase SHA-256 hex digest"
+            )
+        if self.object_prefix is not None:
+            try:
+                # Validate the bucket and prefix without pretending that the
+                # prefix itself is an object.
+                join_gcs_uri(self.object_prefix, "identity-probe")
+            except ValueError as error:
+                raise SchemaError("object_prefix must be a safe gs:// prefix") from error
         if not self.maxtext_commit:
             raise SchemaError("maxtext_commit is required")
         if not re.fullmatch(r"[0-9a-f]{64}", self.dataset_fingerprint):
@@ -637,6 +841,20 @@ def _metadata_dict(metadata: CaptureMetadata | Mapping[str, Any]) -> dict[str, A
         digest = value.get(name)
         if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
             raise SchemaError(f"metadata {name} must be a lowercase SHA-256 hex digest")
+    storage_digest = value.get("storage_attestation_sha256")
+    if storage_digest is not None and (
+        not isinstance(storage_digest, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", storage_digest)
+    ):
+        raise SchemaError(
+            "metadata storage_attestation_sha256 must be a lowercase SHA-256"
+        )
+    object_prefix = value.get("object_prefix")
+    if object_prefix is not None:
+        try:
+            join_gcs_uri(str(object_prefix), "identity-probe")
+        except ValueError as error:
+            raise SchemaError("metadata object_prefix must be a safe gs:// prefix") from error
     fixed = {
         "model_id": "google/gemma-4-26B-A4B",
         "maxtext_commit": "48c7da3e28e8f57fe36ddf09d00eec53072a2ea0",
@@ -689,6 +907,55 @@ def _batch_stats(
 
 def _host_manifest_path(root: Path, host_id: str) -> Path:
     return root / "hosts" / f"host-{host_id}.json"
+
+
+def _upload_receipt_path(
+    root: Path, host_id: str, range_id: str, start: int, end: int
+) -> Path:
+    identity = _sha256_json(
+        {
+            "host_id": host_id,
+            "range_id": range_id,
+            "range_start": int(start),
+            "range_end": int(end),
+        }
+    )
+    return root / "receipts" / f"host-{host_id}" / f"{identity}.json"
+
+
+def _validate_upload_receipt(
+    root: Path,
+    entry: Mapping[str, Any],
+    *,
+    metadata_sha256: str,
+) -> dict[str, Any]:
+    """Prove a remote ledger entry is exactly its durable self-hashed receipt."""
+
+    path = _upload_receipt_path(
+        root,
+        str(entry.get("host_id", "")),
+        str(entry.get("range_id", "")),
+        int(entry.get("range_start", -1)),
+        int(entry.get("range_end", -1)),
+    )
+    receipt = _read_json(path)
+    claimed = receipt.get("receipt_sha256")
+    unsigned = {key: value for key, value in receipt.items() if key != "receipt_sha256"}
+    if (
+        receipt.get("schema_version") != "gemma4-capture-upload-receipt-v1"
+        or receipt.get("metadata_sha256") != metadata_sha256
+        or receipt.get("host_id") != entry.get("host_id")
+        or receipt.get("range_id") != entry.get("range_id")
+        or receipt.get("range_start") != entry.get("range_start")
+        or receipt.get("range_end") != entry.get("range_end")
+        or not isinstance(claimed, str)
+        or claimed != _sha256_json(unsigned)
+        or receipt.get("entry") != dict(entry)
+    ):
+        raise IntegrityError(
+            f"remote shard ledger differs from its upload receipt: {path}"
+        )
+    return receipt
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -758,6 +1025,9 @@ class ArtifactWriter:
         metadata: CaptureMetadata | Mapping[str, Any],
         *,
         max_tokens: int = MAX_SHARD_TOKENS,
+        local_buffer_root: str | Path | None = None,
+        object_prefix: str | None = None,
+        object_store: ImmutableObjectStore | None = None,
     ) -> None:
         if not _HOST_RE.fullmatch(host_id):
             raise ArtifactError(f"unsafe host_id {host_id!r}")
@@ -768,8 +1038,28 @@ class ArtifactWriter:
         self.metadata = _metadata_dict(metadata)
         self.metadata_sha256 = _sha256_json(self.metadata)
         self.max_tokens = int(max_tokens)
-        (self.root / "shards" / f"host-{host_id}").mkdir(parents=True, exist_ok=True)
-        (self.root / ".staging" / f"host-{host_id}").mkdir(parents=True, exist_ok=True)
+        if (object_prefix is None) != (object_store is None):
+            raise ArtifactError("object_prefix and object_store must be supplied together")
+        self.object_prefix = None if object_prefix is None else object_prefix.rstrip("/")
+        self.object_store = object_store
+        if self.object_prefix is None:
+            self.staging_dir = self.root / ".staging" / f"host-{host_id}"
+            (self.root / "shards" / f"host-{host_id}").mkdir(
+                parents=True, exist_ok=True
+            )
+        else:
+            if local_buffer_root is None:
+                raise ArtifactError("remote shard publication requires a host-local buffer root")
+            self.staging_dir = (
+                Path(local_buffer_root).expanduser().resolve()
+                / "capture-shards"
+                / self.metadata_sha256
+                / f"host-{host_id}"
+            )
+            (self.root / "receipts" / f"host-{host_id}").mkdir(
+                parents=True, exist_ok=True
+            )
+        self.staging_dir.mkdir(parents=True, exist_ok=True)
         (self.root / "hosts").mkdir(parents=True, exist_ok=True)
         with _store_lock(self.root, self.host_id):
             if (self.root / MANIFEST_NAME).exists():
@@ -796,10 +1086,111 @@ class ArtifactWriter:
     def has_range(self, range_id: str, start: int, end: int) -> bool:
         """Return true for an exact committed identity; reject any conflict."""
         self._validate_range(range_id, start, end)
+        existing: dict[str, Any] | None = None
         with _store_lock(self.root, self.host_id):
             path = _host_manifest_path(self.root, self.host_id)
             entries = _read_json(path).get("shards", []) if path.exists() else []
-            return _find_range_conflict(entries, range_id, start, end) is not None
+            existing = _find_range_conflict(entries, range_id, start, end)
+        if existing is not None:
+            if self.object_store is not None:
+                receipt = self._load_receipt(range_id, start, end)
+                if receipt is None or receipt["entry"] != existing:
+                    raise IntegrityError(
+                        "committed range differs from its durable upload receipt"
+                    )
+            return True
+        # A process may have died after the object and receipt became durable
+        # but before the host ledger advanced.  Verify and adopt that receipt
+        # so deterministic resume never reruns the expensive model prefix.
+        receipt = self._load_receipt(range_id, start, end)
+        if receipt is None:
+            return False
+        with _store_lock(self.root, self.host_id):
+            self._commit_entry_locked(dict(receipt["entry"]))
+        return True
+
+    def _receipt_path(self, range_id: str, start: int, end: int) -> Path:
+        return _upload_receipt_path(
+            self.root, self.host_id, range_id, start, end
+        )
+
+    def _load_receipt(
+        self, range_id: str, start: int, end: int
+    ) -> dict[str, Any] | None:
+        if self.object_store is None:
+            return None
+        path = self._receipt_path(range_id, start, end)
+        if not path.exists():
+            return None
+        receipt = _read_json(path)
+        claimed = receipt.get("receipt_sha256")
+        unsigned = {k: v for k, v in receipt.items() if k != "receipt_sha256"}
+        entry = receipt.get("entry")
+        if (
+            receipt.get("schema_version") != "gemma4-capture-upload-receipt-v1"
+            or receipt.get("metadata_sha256") != self.metadata_sha256
+            or receipt.get("host_id") != self.host_id
+            or receipt.get("range_id") != range_id
+            or receipt.get("range_start") != start
+            or receipt.get("range_end") != end
+            or not isinstance(claimed, str)
+            or claimed != _sha256_json(unsigned)
+            or not isinstance(entry, dict)
+            or "object" not in entry
+        ):
+            raise IntegrityError(f"invalid upload receipt {path}")
+        _validate_entry_shape(entry)
+        if (
+            entry["host_id"] != self.host_id
+            or entry["range_id"] != range_id
+            or entry["range_start"] != start
+            or entry["range_end"] != end
+        ):
+            raise IntegrityError(f"upload receipt range identity changed: {path}")
+        identity = object_identity_from_mapping(entry["object"])
+        self.object_store.verify(identity)
+        return receipt
+
+    def _commit_entry_locked(self, entry: dict[str, Any]) -> dict[str, Any]:
+        """Append one already-durable entry while holding this host's lock."""
+
+        if (self.root / MANIFEST_NAME).exists():
+            raise ArtifactError("artifact store was sealed before range commit")
+        host_path = _host_manifest_path(self.root, self.host_id)
+        host_manifest = _read_json(host_path) if host_path.exists() else None
+        entries = host_manifest.get("shards", []) if host_manifest is not None else []
+        existing = _find_range_conflict(
+            entries,
+            str(entry["range_id"]),
+            int(entry["range_start"]),
+            int(entry["range_end"]),
+        )
+        if existing is not None:
+            if existing != entry:
+                raise IntegrityError("committed range differs from its durable receipt")
+            return existing
+        if host_manifest is None:
+            host_manifest = {
+                "schema_version": SCHEMA_VERSION,
+                "host_id": self.host_id,
+                "metadata_sha256": self.metadata_sha256,
+                "metadata": self.metadata,
+                "complete": False,
+                "shards": [],
+            }
+        elif host_manifest.get("metadata_sha256") != self.metadata_sha256:
+            raise SchemaError("capture metadata changed during host commit")
+        elif host_manifest.get("complete") is True:
+            raise ArtifactError(
+                f"host {self.host_id!r} is finalized; no new ranges are allowed"
+            )
+        host_manifest["shards"].append(entry)
+        host_manifest["shards"].sort(
+            key=lambda value: (value["range_start"], value["range_id"])
+        )
+        host_manifest["updated_at"] = _utc_now()
+        _atomic_json(host_path, host_manifest)
+        return entry
 
     def write_range(
         self,
@@ -838,9 +1229,8 @@ class ArtifactWriter:
             }
         )
 
-        staging_dir = self.root / ".staging" / f"host-{self.host_id}"
         fd, tmp_name = tempfile.mkstemp(
-            prefix="shard-", suffix=".safetensors", dir=staging_dir
+            prefix="shard-", suffix=".safetensors", dir=self.staging_dir
         )
         os.close(fd)
         tmp = Path(tmp_name)
@@ -871,8 +1261,30 @@ class ArtifactWriter:
                 "path": relative.as_posix(),
                 "sha256": digest,
                 "tokens": _token_count(batch),
+                "sum": total.tolist(),
                 "squared_norm": float(squared_norm[0]),
             }
+            if self.object_prefix is not None:
+                assert self.object_store is not None
+                uri = join_gcs_uri(
+                    self.object_prefix,
+                    f"host-{self.host_id}",
+                    f"{digest}.safetensors",
+                )
+                entry["object"] = self.object_store.put_if_absent(
+                    tmp, uri, sha256=digest
+                ).as_dict()
+                receipt: dict[str, Any] = {
+                    "schema_version": "gemma4-capture-upload-receipt-v1",
+                    "metadata_sha256": self.metadata_sha256,
+                    "host_id": self.host_id,
+                    "range_id": range_id,
+                    "range_start": int(start),
+                    "range_end": int(end),
+                    "entry": entry,
+                }
+                receipt["receipt_sha256"] = _sha256_json(receipt)
+                _atomic_json(self._receipt_path(range_id, start, end), receipt)
 
             with _store_lock(self.root, self.host_id):
                 if (self.root / MANIFEST_NAME).exists():
@@ -886,39 +1298,16 @@ class ArtifactWriter:
                 existing = _find_range_conflict(host_entries, range_id, start, end)
                 if existing is not None:
                     return existing
-                if destination.exists():
+                if self.object_prefix is None and destination.exists():
                     if _sha256_file(destination) != digest:
                         raise IntegrityError(
                             f"content-address collision at {destination}"
                         )
 
-                if host_path.exists():
-                    host_manifest = _read_json(host_path)
-                    if host_manifest.get("metadata_sha256") != self.metadata_sha256:
-                        raise SchemaError("capture metadata changed during host commit")
-                    if host_manifest.get("complete") is True:
-                        raise ArtifactError(
-                            f"host {self.host_id!r} is finalized; no new ranges are allowed"
-                        )
-                else:
-                    host_manifest = {
-                        "schema_version": SCHEMA_VERSION,
-                        "host_id": self.host_id,
-                        "metadata_sha256": self.metadata_sha256,
-                        "metadata": self.metadata,
-                        "complete": False,
-                        "shards": [],
-                    }
-                if not destination.exists():
+                if self.object_prefix is None and not destination.exists():
                     os.replace(tmp, destination)
                     _fsync_dir(destination.parent)
-                host_manifest["shards"].append(entry)
-                host_manifest["shards"].sort(
-                    key=lambda x: (x["range_start"], x["range_id"])
-                )
-                host_manifest["updated_at"] = _utc_now()
-                _atomic_json(host_path, host_manifest)
-            return entry
+                return self._commit_entry_locked(entry)
         finally:
             tmp.unlink(missing_ok=True)
 
@@ -977,6 +1366,10 @@ def _validate_entry_shape(entry: Mapping[str, Any]) -> None:
         raise IntegrityError("shard squared_norm must be finite")
     if entry["squared_norm"] < 0:
         raise IntegrityError("shard squared_norm must be nonnegative")
+    if "sum" in entry:
+        total = np.asarray(entry["sum"], dtype=np.float64)
+        if total.shape != (HIDDEN_SIZE,) or not np.isfinite(total).all():
+            raise IntegrityError("shard FP64 sum must be a finite hidden-width vector")
     if not re.fullmatch(r"[0-9a-f]{64}", str(entry["sha256"])):
         raise IntegrityError("invalid shard SHA-256")
     path = Path(str(entry["path"]))
@@ -985,6 +1378,19 @@ def _validate_entry_shape(entry: Mapping[str, Any]) -> None:
     expected_prefix = Path("shards") / f"host-{entry['host_id']}"
     if path.parent != expected_prefix or path.name != f"{entry['sha256']}.safetensors":
         raise IntegrityError("shard path is not host-specific and content-addressed")
+    if "object" in entry:
+        try:
+            identity = object_identity_from_mapping(entry["object"])
+        except (ObjectStoreError, ValueError) as error:
+            raise IntegrityError("shard object identity is invalid") from error
+        if identity.sha256 != entry["sha256"]:
+            raise IntegrityError("shard object and logical path have different hashes")
+        _, object_name = identity.uri[5:].split("/", 1)
+        expected_suffix = f"/host-{entry['host_id']}/{entry['sha256']}.safetensors"
+        if not f"/{object_name}".endswith(expected_suffix):
+            raise IntegrityError("shard object URI is not host-specific/content-addressed")
+        if "sum" not in entry:
+            raise IntegrityError("remote shard entry lacks its publication statistic")
 
 
 def _load_shard(
@@ -994,9 +1400,15 @@ def _load_shard(
     *,
     return_stats: bool = False,
     verify_statistics: bool = True,
+    materialize: Any | None = None,
 ) -> CaptureBatch | tuple[CaptureBatch, tuple[np.ndarray, np.ndarray, np.ndarray]]:
     _validate_entry_shape(entry)
-    path = root / str(entry["path"])
+    if "object" in entry:
+        if materialize is None:
+            raise IntegrityError("remote shard requires a hash-verifying local cache")
+        path = Path(materialize(entry["object"]))
+    else:
+        path = root / str(entry["path"])
     if not path.is_file():
         raise IntegrityError(f"missing shard {path}")
     if verify_hash and _sha256_file(path) != entry["sha256"]:
@@ -1042,6 +1454,7 @@ def publish_manifest(
     *,
     expected_hosts: int | None = None,
     expected_tokens: int | None = None,
+    object_store: ImmutableObjectStore | None = None,
 ) -> Path:
     """Verify all host shards and atomically publish the sealing manifest."""
     root = Path(root)
@@ -1108,6 +1521,25 @@ def publish_manifest(
         entries = [entry for host in hosts for entry in host.get("shards", [])]
         if not entries:
             raise ArtifactError("cannot publish a store with no shards")
+        remote_flags = {"object" in entry for entry in entries}
+        if len(remote_flags) != 1:
+            raise IntegrityError("capture cannot mix POSIX and object-store shards")
+        remote_capture = True in remote_flags
+        if remote_capture:
+            object_prefix = metadata_dict.get("object_prefix")
+            storage_digest = metadata_dict.get("storage_attestation_sha256")
+            if not isinstance(object_prefix, str) or not isinstance(
+                storage_digest, str
+            ):
+                raise SchemaError(
+                    "remote capture metadata must bind its object prefix and storage attestation"
+                )
+            for entry in entries:
+                identity = object_identity_from_mapping(entry["object"])
+                if not _gcs_object_under(object_prefix, identity.uri):
+                    raise IntegrityError(
+                        "capture object lies outside the metadata-bound GCS prefix"
+                    )
         entries.sort(key=lambda x: (x["range_start"], x["range_id"]))
         seen: list[dict[str, Any]] = []
         count = 0
@@ -1133,12 +1565,26 @@ def publish_manifest(
             ):
                 raise RangeConflictError(f"duplicate input range {entry['range_id']!r}")
             seen.append(entry)
-            _, (shard_count, shard_total, shard_sq) = _load_shard(
-                root, entry, verify_hash=True, return_stats=True
-            )
-            count += int(shard_count[0])
-            total += shard_total
-            squared_norm += float(shard_sq[0])
+            if "object" in entry:
+                if object_store is None:
+                    raise ArtifactError(
+                        "remote capture publication requires an object-store verifier"
+                    )
+                _validate_upload_receipt(
+                    root, entry, metadata_sha256=metadata_sha
+                )
+                identity = object_identity_from_mapping(entry["object"])
+                object_store.verify(identity)
+                count += int(entry["tokens"])
+                total += np.asarray(entry["sum"], dtype=np.float64)
+                squared_norm += float(entry["squared_norm"])
+            else:
+                _, (shard_count, shard_total, shard_sq) = _load_shard(
+                    root, entry, verify_hash=True, return_stats=True
+                )
+                count += int(shard_count[0])
+                total += shard_total
+                squared_norm += float(shard_sq[0])
         if expected_tokens is not None and count != expected_tokens:
             raise ArtifactError(
                 f"cannot publish: captured {count} tokens, expected {expected_tokens}"
@@ -1166,6 +1612,21 @@ def publish_manifest(
                     0.0, squared_norm - float(np.dot(total, total)) / count
                 ),
             },
+            "storage": (
+                {
+                    "kind": "gcs-immutable",
+                    "object_prefix": metadata_dict["object_prefix"],
+                    "identity_fields": [
+                        "uri",
+                        "generation",
+                        "size_bytes",
+                        "crc32c",
+                        "sha256",
+                    ],
+                }
+                if remote_capture
+                else {"kind": "posix-local"}
+            ),
             "shards": entries,
         }
         manifest["manifest_sha256"] = _sha256_json(manifest)
@@ -1226,6 +1687,23 @@ def load_manifest(root: str | Path) -> dict[str, Any]:
         ):
             raise IntegrityError(f"duplicate input range {entry['range_id']!r}")
         seen.append(entry)
+    remote_flags = {"object" in entry for entry in entries}
+    if len(remote_flags) != 1:
+        raise IntegrityError("manifest mixes POSIX and object-store shards")
+    remote_capture = True in remote_flags
+    storage = manifest.get("storage")
+    if storage is not None:
+        expected_kind = "gcs-immutable" if remote_capture else "posix-local"
+        if not isinstance(storage, dict) or storage.get("kind") != expected_kind:
+            raise IntegrityError("manifest storage layout is inconsistent with shards")
+    if remote_capture:
+        object_prefix = manifest["metadata"].get("object_prefix")
+        if not isinstance(object_prefix, str):
+            raise IntegrityError("remote manifest lacks its bound object prefix")
+        for entry in entries:
+            identity = object_identity_from_mapping(entry["object"])
+            if not _gcs_object_under(object_prefix, identity.uri):
+                raise IntegrityError("manifest object lies outside its bound GCS prefix")
     if manifest.get("shard_count") != len(entries):
         raise IntegrityError("manifest shard_count mismatch")
     host_count = manifest.get("host_count")
@@ -1280,12 +1758,47 @@ class ArtifactDataset:
         verify_hashes: bool = True,
         verify_statistics: bool = True,
         decode_bf16: bool = True,
+        cache: ShardCache | None = None,
     ) -> None:
         self.root = Path(root)
         self.manifest = load_manifest(self.root)
         self.verify_hashes = bool(verify_hashes)
         self.verify_statistics = bool(verify_statistics)
         self.decode_bf16 = bool(decode_bf16)
+        self.cache = cache
+
+    def _materialize(self, entry: Mapping[str, Any]) -> Path:
+        if "object" not in entry:
+            return self.root / str(entry["path"])
+        if self.cache is None:  # guarded in __init__; keep the read path fail-closed
+            raise ArtifactError("remote capture has no configured local cache")
+        return self.cache.materialize(entry["object"])
+
+    def prefetch_token_range(self, start: int, end: int) -> dict[str, int]:
+        """Materialize every shard overlapping ``[start,end)`` before SAE timing."""
+
+        for name, value in (("start", start), ("end", end)):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{name} must be an integer")
+        if not 0 <= start <= end <= self.total_tokens:
+            raise ValueError(
+                f"token range must satisfy 0 <= start <= end <= {self.total_tokens}"
+            )
+        offset = 0
+        objects = 0
+        bytes_materialized = 0
+        for entry in self.manifest["shards"]:
+            shard_start = offset
+            shard_end = offset + int(entry["tokens"])
+            offset = shard_end
+            if max(start, shard_start) >= min(end, shard_end):
+                continue
+            path = self._materialize(entry)
+            if not path.is_file():
+                raise IntegrityError(f"materialized shard is missing: {path}")
+            objects += 1
+            bytes_materialized += path.stat().st_size
+        return {"objects": objects, "bytes": bytes_materialized}
 
     @property
     def total_tokens(self) -> int:
@@ -1344,6 +1857,7 @@ class ArtifactDataset:
                 entry,
                 verify_hash=self.verify_hashes,
                 verify_statistics=self.verify_statistics,
+                materialize=(self.cache.materialize if self.cache is not None else None),
             )
             assert isinstance(batch, CaptureBatch)
             if self.decode_bf16:
@@ -1388,7 +1902,7 @@ class ArtifactDataset:
             if overlap_start >= overlap_end:
                 continue
             _validate_entry_shape(entry)
-            path = self.root / str(entry["path"])
+            path = self._materialize(entry)
             if not path.is_file():
                 raise IntegrityError(f"missing shard {path}")
             with safe_open(path, framework="numpy") as handle:
@@ -1450,6 +1964,7 @@ class ArtifactDataset:
                 entry,
                 verify_hash=self.verify_hashes,
                 verify_statistics=self.verify_statistics,
+                materialize=(self.cache.materialize if self.cache is not None else None),
             )
             assert isinstance(loaded, CaptureBatch)
             if self.decode_bf16:

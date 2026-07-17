@@ -457,7 +457,14 @@ def build_maxtext_argv(
         "dtype": "bfloat16",
         "weight_dtype": "bfloat16",
         "max_target_length": TARGET_SEQUENCE_LENGTH,
-        "packing": "true",
+        # Real data is already tokenized and packed offline.  These flags are
+        # also a fail-safe if MaxText's stock input path is reached by mistake.
+        "tokenize_train_data": "false",
+        "tokenize_eval_data": "false",
+        "add_bos": "false",
+        "add_eos": "false",
+        "packing": "false",
+        "grain_file_type": "arrayrecord",
         "enable_data_shuffling": "false",
         "per_device_batch_size": per_device_sequence_batch,
         "ici_expert_parallelism": mesh.expert_parallelism,
@@ -478,7 +485,12 @@ def build_maxtext_argv(
     return argv
 
 
-def create_maxtext_runtime(argv: Sequence[str]) -> MaxTextRuntime:
+def create_maxtext_runtime(
+    argv: Sequence[str],
+    *,
+    packed_train_files: Sequence[str] | None = None,
+    packed_eval_files: Sequence[str] | None = None,
+) -> MaxTextRuntime:
     """Load the pinned MaxText model and iterators without importing Torch."""
 
     try:
@@ -499,9 +511,31 @@ def create_maxtext_runtime(argv: Sequence[str]) -> MaxTextRuntime:
     model = model_creation_utils.from_pretrained(
         config, mesh=mesh, model_mode=MODEL_MODE_TRAIN
     )
-    train_iterator, eval_iterator = input_pipeline_interface.create_data_iterator(
-        config, mesh
-    )
+    if packed_train_files is None and packed_eval_files is None:
+        train_iterator, eval_iterator = input_pipeline_interface.create_data_iterator(
+            config, mesh
+        )
+    else:
+        from moe_sae.data import build_maxtext_packed_iterator
+
+        if not packed_train_files or not packed_eval_files:
+            raise ValueError("packed runtime requires exact train and eval file inventories")
+        train_iterator = build_maxtext_packed_iterator(
+            packed_train_files,
+            config=config,
+            mesh=mesh,
+            global_batch_size=int(config.global_batch_size_to_load),
+        )
+        eval_batch = int(
+            getattr(config, "global_batch_size_to_load_eval", 0)
+            or config.global_batch_size_to_load
+        )
+        eval_iterator = build_maxtext_packed_iterator(
+            packed_eval_files,
+            config=config,
+            mesh=mesh,
+            global_batch_size=eval_batch,
+        )
     return MaxTextRuntime(config, mesh, model, train_iterator, eval_iterator)
 
 
@@ -875,19 +909,6 @@ def run_preflight(
             "; ".join(f"{check.name}: {check.detail}" for check in failures)
         )
     return checks
-
-
-def sync_artifacts_to_gcs(local_root: Path, destination: str) -> None:
-    """Publish an already validated local tree to GCS with the gcloud CLI."""
-
-    if not destination.startswith("gs://"):
-        raise ValueError("destination must be a gs:// URI")
-    if not (local_root / "manifest.json").is_file():
-        raise RuntimeError("refusing to publish before the merged manifest exists")
-    subprocess.run(
-        ["gcloud", "storage", "rsync", "--recursive", str(local_root), destination],
-        check=True,
-    )
 
 
 def timed_synchronized_steps(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -11,6 +12,12 @@ import numpy as np
 import pytest
 
 import moe_sae.distributed as distributed_module
+from moe_sae.checkpointing import (
+    checkpoint_payload_uri,
+    final_pointer_from_latest,
+    make_pointer,
+    publish_pointer,
+)
 from moe_sae.distributed import (
     DistributedConfig,
     create_mesh,
@@ -225,6 +232,7 @@ def test_final_checkpoint_boundary_does_not_reserialize_latest(
 
     monkeypatch.setattr(distributed_module, "save_distributed_checkpoint", record_save)
     monkeypatch.setattr(distributed_module, "_publish_checkpoint_timing", record_timing)
+    payload_root = tmp_path / "bulk-checkpoints"
     result = run_distributed_training(
         training,
         [ActivationBatch(np.ones((2, 2), np.float32))],
@@ -233,14 +241,20 @@ def test_final_checkpoint_boundary_does_not_reserialize_latest(
         state=state,
         distributed=distributed,
         checkpoint_dir=tmp_path,
+        checkpoint_payload_root=payload_root,
         require_health_pass=False,
     )
 
-    assert saved == ["latest", "final"]
+    assert len(saved) == 1
+    assert saved[0].startswith("step-00000001-tokens-000000000002-attempt-")
     assert len(timing_sidecars) == 2
     assert all(item["tokens_seen"] == 2 for item in timing_sidecars)
-    assert result.latest_checkpoint == str(tmp_path / "latest")
-    assert result.final_checkpoint == str(tmp_path / "final")
+    assert result.latest_checkpoint == str(tmp_path / "latest.json")
+    assert result.final_checkpoint == str(tmp_path / "final.json")
+    latest = json.loads((tmp_path / "latest.json").read_text(encoding="utf-8"))
+    final = json.loads((tmp_path / "final.json").read_text(encoding="utf-8"))
+    assert latest["payload_uri"] == final["payload_uri"]
+    assert Path(latest["payload_uri"]).is_relative_to(payload_root)
 
 
 def test_orbax_sharded_checkpoint_roundtrip_when_tpu_extra_installed(
@@ -270,27 +284,55 @@ def test_orbax_sharded_checkpoint_roundtrip_when_tpu_extra_installed(
     distributed = DistributedConfig(microbatches_per_update=2)
     mesh = create_mesh(distributed)
     state = init_distributed_state(jax.random.PRNGKey(0), mesh, sae, distributed)
-    destination = tmp_path / "orbax"
+    payload_root = tmp_path / "payloads"
+    attempt_id = "c" * 32
+    destination = checkpoint_payload_uri(
+        payload_root,
+        {},
+        step=0,
+        tokens_seen=0,
+        attempt_id=attempt_id,
+    )
     save_distributed_checkpoint(
         destination, state, mesh, training, {"purpose": "roundtrip"}
     )
-    restored, metadata = restore_distributed_checkpoint(
-        destination, state, mesh, training
+    with pytest.raises(ValueError, match="latest.json or final.json"):
+        restore_distributed_checkpoint(destination, state, mesh, training)
+    latest = make_pointer(
+        kind="latest",
+        payload_uri=destination,
+        step=0,
+        tokens_seen=0,
+        attempt_id=attempt_id,
+        run_identity={},
     )
-    assert metadata == {"purpose": "roundtrip"}
+    publish_pointer(tmp_path / "control", latest)
+    restored, metadata = restore_distributed_checkpoint(
+        tmp_path / "control" / "latest.json",
+        state,
+        mesh,
+        training,
+        checkpoint_payload_root=payload_root,
+    )
+    assert metadata["purpose"] == "roundtrip"
+    assert metadata["checkpoint_payload_uri"] == destination
+    assert metadata["tokens_seen"] == 0
+    assert metadata["steps"] == 0
     for actual, expected in zip(
         jax.tree_util.tree_leaves(restored),
         jax.tree_util.tree_leaves(state),
         strict=True,
     ):
         np.testing.assert_array_equal(actual, expected)
+    publish_pointer(tmp_path / "control", final_pointer_from_latest(latest))
     with pytest.raises(RuntimeError, match="not final"):
         evaluate_distributed(
-            destination,
+            tmp_path / "control" / "final.json",
             training,
             [ActivationBatch(np.ones((2, 2), np.float32))],
             np.zeros(2, np.float32),
             max_tokens=2,
+            checkpoint_payload_root=payload_root,
         )
 
 
@@ -353,26 +395,13 @@ def test_orbax_interrupted_training_matches_uninterrupted_on_same_mesh(
     )
     template = init_distributed_state(jax.random.PRNGKey(7), mesh, sae, distributed)
     restored, timing = restore_distributed_checkpoint(
-        tmp_path / "latest", template, mesh, training
+        tmp_path / "latest.json",
+        template,
+        mesh,
+        training,
+        checkpoint_identity=identity,
     )
     assert timing["capture_manifest_sha256"] == "a" * 64
-
-    # A periodic Orbax checkpoint can be newer than the last stage-level
-    # run.json after preemption; the valid checkpoint must remain resumable.
-    stale_run_json_resume = train_distributed(
-        training,
-        [source],
-        np.zeros(2, np.float32),
-        checkpoint_dir=tmp_path,
-        checkpoint_identity=identity,
-        prior_run_timing={"tokens_seen": 0},
-    )
-    for actual, expected in zip(
-        jax.tree_util.tree_leaves(stale_run_json_resume.state),
-        jax.tree_util.tree_leaves(uninterrupted.state),
-        strict=True,
-    ):
-        np.testing.assert_array_equal(actual, expected)
 
     resumed = run_distributed_training(
         training,
@@ -390,6 +419,28 @@ def test_orbax_interrupted_training_matches_uninterrupted_on_same_mesh(
     )
     for actual, expected in zip(
         jax.tree_util.tree_leaves(resumed.state),
+        jax.tree_util.tree_leaves(uninterrupted.state),
+        strict=True,
+    ):
+        np.testing.assert_array_equal(actual, expected)
+    payload_directories = list(
+        (tmp_path / "checkpoint_payloads" / "runs").glob("*/*")
+    )
+    assert len(payload_directories) == 1
+    assert "tokens-000000000004" in payload_directories[0].name
+
+    # A valid latest pointer is authoritative even when the stage-level
+    # run.json was not updated before a preemption.
+    stale_run_json_resume = train_distributed(
+        training,
+        [source],
+        np.zeros(2, np.float32),
+        checkpoint_dir=tmp_path,
+        checkpoint_identity=identity,
+        prior_run_timing={"tokens_seen": 0},
+    )
+    for actual, expected in zip(
+        jax.tree_util.tree_leaves(stale_run_json_resume.state),
         jax.tree_util.tree_leaves(uninterrupted.state),
         strict=True,
     ):

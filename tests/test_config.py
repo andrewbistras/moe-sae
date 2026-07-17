@@ -33,6 +33,9 @@ def test_approved_defaults_and_derived_contract():
     assert cfg.width_for_condition("B") == 8_192
     assert cfg.candidates_per_token("A") == cfg.candidates_per_token("B") == 8_192
     assert cfg.candidates_per_token("F") == 131_072
+    assert cfg.min_control_free_bytes == 10_000_000_000
+    assert cfg.min_local_buffer_free_bytes == 128 * 1024**3
+    assert cfg.capture_cache_max_bytes == 100 * 1024**3
 
 
 @pytest.mark.parametrize(
@@ -49,6 +52,8 @@ def test_approved_defaults_and_derived_contract():
         ({"min_harvester_mfu": 0.49}, "50% hard gate"),
         ({"benchmark_steps": 199}, "at least 200"),
         ({"max_writer_backlog_batches": 3}, "fixed at two"),
+        ({"min_local_buffer_free_bytes": 100_000_000_000}, "128 GiB gate"),
+        ({"capture_cache_max_bytes": 99 * 1024**3}, "at least 100 GiB"),
     ],
 )
 def test_validation_rejects_drift(change, message):

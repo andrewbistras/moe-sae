@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 from dataclasses import replace
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -26,7 +27,13 @@ from moe_sae.artifacts import (
     publish_manifest,
     verify_staged_dataset_manifest,
 )
+from moe_sae.data import (
+    PACKED_DATASET_SCHEMA,
+    PACKED_RECORD_FORMAT,
+    publish_staged_dataset,
+)
 from moe_sae.model import CaptureBatch as ModelCaptureBatch
+from moe_sae.object_store import LocalObjectStore, ShardCache
 
 
 def metadata(split: str = "train") -> CaptureMetadata:
@@ -39,6 +46,24 @@ def metadata(split: str = "train") -> CaptureMetadata:
         environment_sha256="3" * 64,
         conversion_attestation_sha256="9" * 64,
     )
+
+
+def test_remote_staging_manifest_uri_binds_exact_bytes(monkeypatch):
+    raw = b'{"schema":"probe"}\n'
+    digest = hashlib.sha256(raw).hexdigest()
+    monkeypatch.setattr(
+        artifacts_module.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(stdout=raw),
+    )
+
+    assert artifacts_module._read_json_location(
+        f"gs://bucket/manifests/{digest}.json"
+    ) == {"schema": "probe"}
+    with pytest.raises(IntegrityError, match="content address"):
+        artifacts_module._read_json_location(
+            f"gs://bucket/manifests/{'0' * 64}.json"
+        )
 
 
 def batch(n: int, offset: float = 0.0) -> CaptureBatch:
@@ -387,40 +412,218 @@ def test_provenance_hashes_are_required_lowercase_sha256(tmp_path):
         )
 
 
+def test_remote_capture_receipts_seal_without_bulk_posix_and_cache_on_read(tmp_path):
+    control = tmp_path / "control"
+    objects = tmp_path / "objects"
+    local_buffer = tmp_path / "buffer"
+    store = LocalObjectStore(objects)
+    remote_metadata = replace(
+        metadata(),
+        storage_attestation_sha256="a" * 64,
+        object_prefix="gs://capture-test/experiment/train",
+    )
+    writer = ArtifactWriter(
+        control,
+        "host-0",
+        remote_metadata,
+        local_buffer_root=local_buffer,
+        object_prefix=remote_metadata.object_prefix,
+        object_store=store,
+    )
+    entry = writer.write_range("range", 0, 2, batch(2))
+    writer.finalize_host()
+
+    assert "object" in entry
+    assert not list(control.rglob("*.safetensors"))
+    assert len(list((control / "receipts").rglob("*.json"))) == 1
+    publish_manifest(
+        control,
+        remote_metadata,
+        expected_hosts=1,
+        expected_tokens=2,
+        object_store=store,
+    )
+    manifest = load_manifest(control)
+    assert manifest["storage"]["kind"] == "gcs-immutable"
+    assert manifest["statistics"]["count"] == 2
+
+    uncached = ArtifactDataset(control)
+    with pytest.raises(ArtifactError, match="hash-verifying local cache"):
+        list(uncached.iter_batches())
+    cache = ShardCache(tmp_path / "cache", store, max_bytes=64 * 1024**2)
+    dataset = ArtifactDataset(control, cache=cache)
+    assert dataset.prefetch_token_range(0, 2)["objects"] == 1
+    loaded = next(dataset.iter_batches())
+    assert loaded.activation.shape == (2, HIDDEN_SIZE)
+    assert list(dataset.iter_expert_ids_range(0, 2))[0].shape == (2, 8)
+
+
+def test_remote_receipt_is_adopted_after_ledger_crash(tmp_path, monkeypatch):
+    control = tmp_path / "control"
+    store = LocalObjectStore(tmp_path / "objects")
+    remote_metadata = replace(
+        metadata(),
+        storage_attestation_sha256="a" * 64,
+        object_prefix="gs://capture-test/experiment/train",
+    )
+    writer = ArtifactWriter(
+        control,
+        "host-0",
+        remote_metadata,
+        local_buffer_root=tmp_path / "buffer",
+        object_prefix=remote_metadata.object_prefix,
+        object_store=store,
+    )
+
+    def crash_after_receipt(_entry):
+        raise RuntimeError("simulated ledger crash")
+
+    monkeypatch.setattr(writer, "_commit_entry_locked", crash_after_receipt)
+    with pytest.raises(RuntimeError, match="ledger crash"):
+        writer.write_range("range", 0, 1, batch(1))
+    assert len(list((control / "receipts").rglob("*.json"))) == 1
+    assert not (control / "hosts" / "host-host-0.json").exists()
+
+    resumed = ArtifactWriter(
+        control,
+        "host-0",
+        remote_metadata,
+        local_buffer_root=tmp_path / "buffer",
+        object_prefix=remote_metadata.object_prefix,
+        object_store=store,
+    )
+    assert resumed.has_range("range", 0, 1)
+    assert len(resumed.finalize_host()["shards"]) == 1
+
+
+def test_remote_resume_reverifies_receipt_and_object(tmp_path):
+    control = tmp_path / "control"
+    objects = tmp_path / "objects"
+    store = LocalObjectStore(objects)
+    remote_metadata = replace(
+        metadata(),
+        storage_attestation_sha256="a" * 64,
+        object_prefix="gs://capture-test/experiment/train",
+    )
+    writer = ArtifactWriter(
+        control,
+        "host-0",
+        remote_metadata,
+        local_buffer_root=tmp_path / "buffer",
+        object_prefix=remote_metadata.object_prefix,
+        object_store=store,
+    )
+    entry = writer.write_range("range", 0, 1, batch(1))
+    assert writer.has_range("range", 0, 1)
+
+    identity = entry["object"]
+    bucket, name = artifacts_module.parse_gcs_uri(identity["uri"])
+    (objects / bucket / name).unlink()
+    with pytest.raises(Exception, match="object"):
+        writer.has_range("range", 0, 1)
+
+
+def test_remote_seal_rejects_ledger_statistics_not_bound_to_receipt(tmp_path):
+    control = tmp_path / "control"
+    store = LocalObjectStore(tmp_path / "objects")
+    remote_metadata = replace(
+        metadata(),
+        storage_attestation_sha256="a" * 64,
+        object_prefix="gs://capture-test/experiment/train",
+    )
+    writer = ArtifactWriter(
+        control,
+        "host-0",
+        remote_metadata,
+        local_buffer_root=tmp_path / "buffer",
+        object_prefix=remote_metadata.object_prefix,
+        object_store=store,
+    )
+    writer.write_range("range", 0, 1, batch(1))
+    writer.finalize_host()
+    ledger_path = control / "hosts" / "host-host-0.json"
+    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    ledger["shards"][0]["sum"][0] += 1.0
+    ledger_path.write_text(json.dumps(ledger), encoding="utf-8")
+
+    with pytest.raises(IntegrityError, match="differs from its upload receipt"):
+        publish_manifest(
+            control,
+            remote_metadata,
+            expected_hosts=1,
+            expected_tokens=1,
+            object_store=store,
+        )
+
+
 def _staging_manifest(tmp_path):
     first = tmp_path / "part-000.array_record"
     second = tmp_path / "part-001.array_record"
     first.write_bytes(b"first-packed-shard")
     second.write_bytes(b"second-packed-shard")
     entries = []
-    for index, path in enumerate((first, second)):
+    first_record_index = 0
+    for path, record_count, scientific_tokens in (
+        (first, 32, 60),
+        (second, 32, 61),
+    ):
         entries.append(
             {
                 "uri": path.name,
                 "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
                 "size_bytes": path.stat().st_size,
-                "record_count": 10 + index,
-                "scientific_tokens": 60 + index,
+                "first_record_index": first_record_index,
+                "record_count": record_count,
+                "scientific_tokens": scientific_tokens,
             }
         )
+        first_record_index += record_count
     manifest = tmp_path / "train.manifest.json"
     manifest.write_text(
         json.dumps(
             {
-                "schema_version": "gemma4-c4-arrayrecord-v1",
+                "schema_version": PACKED_DATASET_SCHEMA,
                 "dataset": {
                     "name": "c4",
                     "config": "en",
                     "version": "3.1.0",
                     "split": "train",
                 },
-                "tokenizer_id": "google/gemma-4-26B-A4B",
+                "source": {
+                    "provider": "tensorflow_datasets",
+                    "full_name": "c4/en/3.1.0",
+                    "dataset_info_sha256": "b" * 64,
+                },
+                "tokenizer": {
+                    "id": "google/gemma-4-26B-A4B",
+                    "revision": "a" * 40,
+                    "padding_id": 0,
+                    "eos_id": 1,
+                    "bos_id": 2,
+                },
                 "sequence_length": 1024,
+                "record_format": {
+                    "name": PACKED_RECORD_FORMAT,
+                    "arrayrecord_options": "group_size:1",
+                    "token_ids": "int32[1024]",
+                    "positions": "uint16[1024]",
+                    "segment_ids": "uint16[1024]",
+                },
                 "packing": {
-                    "strategy": "packed_fixed_length",
+                    "strategy": "ordered_next_fit_offline",
                     "exclude_from_scientific_count": ["padding", "bos", "eos"],
                     "special_token_ids": {"padding": 0, "eos": 1, "bos": 2},
                 },
+                "consumer": {
+                    "process_count": 4,
+                    "host_sharding": "record_index_mod_process_count",
+                    "per_device_sequence_batches": [1, 2, 4],
+                },
+                "target_scientific_tokens": 121,
+                "source_examples": 2,
+                "scientific_tokens": 121,
+                "record_count": 64,
+                "lane_scientific_tokens": [31, 30, 30, 30],
                 "files": entries,
             }
         ),
@@ -444,20 +647,70 @@ def test_staged_dataset_fingerprint_is_derived_from_verified_inventory(tmp_path)
     assert result.scientific_tokens == 121
 
 
+def test_remote_staged_dataset_pins_and_reverifies_object_generations(
+    tmp_path, monkeypatch
+):
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    manifest, _, _ = _staging_manifest(stage)
+    objects = tmp_path / "objects"
+    store = LocalObjectStore(objects)
+    published = publish_staged_dataset(
+        manifest,
+        "gs://staging-test/c4/train",
+        object_store=store,
+    )
+    bucket, name = artifacts_module.parse_gcs_uri(published.manifest_location)
+    remote_manifest = json.loads(
+        (objects / bucket / name).read_text(encoding="utf-8")
+    )
+    files = tuple(entry["uri"] for entry in remote_manifest["files"])
+    inventory = {
+        entry["uri"]: (entry["sha256"], entry["size_bytes"])
+        for entry in remote_manifest["files"]
+    }
+    monkeypatch.setattr(
+        artifacts_module, "_read_json_location", lambda _location: remote_manifest
+    )
+    monkeypatch.setattr(
+        artifacts_module, "_resolve_staged_files", lambda _pattern: files
+    )
+    monkeypatch.setattr(
+        artifacts_module, "_hash_location", lambda location: inventory[location]
+    )
+
+    verified = verify_staged_dataset_manifest(
+        published.manifest_location,
+        published.grain_files,
+        expected_split="train",
+        expected_tokens=121,
+        tokenizer_id="google/gemma-4-26B-A4B",
+        sequence_length=1024,
+        object_store=store,
+    )
+    assert verified.files == files
+
+    identity = remote_manifest["files"][0]["object"]
+    object_bucket, object_name = artifacts_module.parse_gcs_uri(identity["uri"])
+    (objects / object_bucket / object_name).unlink()
+    with pytest.raises(IntegrityError, match="generation changed"):
+        verify_staged_dataset_manifest(
+            published.manifest_location,
+            published.grain_files,
+            expected_split="train",
+            expected_tokens=121,
+            tokenizer_id="google/gemma-4-26B-A4B",
+            sequence_length=1024,
+            object_store=store,
+        )
+
+
 def test_production_staging_check_recomputes_arrayrecord_count(tmp_path, monkeypatch):
     manifest, _, _ = _staging_manifest(tmp_path)
-
-    class ArrayRecordDataSource:
-        def __init__(self, files):
-            assert len(files) == 2
-
-        def __len__(self):
-            return 20
-
     monkeypatch.setattr(
         artifacts_module,
-        "import_module",
-        lambda name: type("Grain", (), {"ArrayRecordDataSource": ArrayRecordDataSource}),
+        "verify_packed_source",
+        lambda files, *, sequence_length: (63, 121, (31, 30, 30, 30)),
     )
     with pytest.raises(IntegrityError, match="count differs"):
         verify_staged_dataset_manifest(

@@ -59,6 +59,8 @@ def test_public_cli_import_is_jax_cold_and_keeps_eight_commands():
     parser = cli.build_parser()
     action = next(item for item in parser._actions if item.dest == "command")
     assert set(action.choices) == {
+        "stage-c4",
+        "qualify-storage",
         "preflight",
         "convert-checkpoint",
         "benchmark-harvest",
@@ -263,7 +265,8 @@ def test_every_fresh_candidate_reverifies_checkpoint_inventory(tmp_path, monkeyp
                 "config_sha256": config.config_hash,
                 "checkpoint": "checkpoint",
                 "checkpoint_sha256": "a" * 64,
-                "conversion_attestation_sha256": "9" * 64,
+                    "conversion_attestation_sha256": "9" * 64,
+                    "storage_attestation_sha256": "8" * 64,
                 "process_count": 1,
                 "environment": {"sha256": "e" * 64},
             }
@@ -306,6 +309,19 @@ def test_every_fresh_candidate_reverifies_checkpoint_inventory(tmp_path, monkeyp
         benchmark_worker,
         "_load_conversion_attestation",
         lambda *args: "9" * 64,
+    )
+    monkeypatch.setattr(
+        benchmark_worker,
+        "_load_storage_attestation_payload",
+        lambda *args, **kwargs: {"attestation_sha256": "8" * 64},
+    )
+    monkeypatch.setattr(
+        benchmark_worker,
+        "_storage_layout",
+        lambda payload: {
+            "bulk_gcs_root": "gs://test-bucket/bulk",
+            "local_buffer_root": tmp_path / "buffer",
+        },
     )
     monkeypatch.setattr(
         "moe_sae.harvest.benchmark_production_candidate",

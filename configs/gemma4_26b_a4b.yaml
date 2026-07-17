@@ -67,3 +67,10 @@ max_input_wait_fraction: 0.05
 max_writer_backlog_batches: 2
 health_gate_tokens: 5000000
 min_live_feature_fraction: 0.95
+min_control_free_bytes: 10000000000
+min_local_buffer_free_bytes: 137438953472
+gcs_probe_bytes_per_process: 8589934592
+gcs_probe_block_bytes: 8388608
+min_gcs_upload_bytes_per_second: 4000000000.0
+min_gcs_download_bytes_per_second: 4000000000.0
+capture_cache_max_bytes: 107374182400

@@ -24,6 +24,7 @@ import numpy as np
 from moe_sae.artifacts import (
     ArtifactDataset,
     StagedDatasetProvenance,
+    load_manifest,
     verify_staged_dataset_manifest,
 )
 from moe_sae.config import Gemma4Config, load_config
@@ -43,6 +44,7 @@ from moe_sae.model import (
     maxtext_checkout_environment,
     verify_maxtext_checkout,
 )
+from moe_sae.object_store import GCSObjectStore, ShardCache, join_gcs_uri
 from moe_sae.runtime import (
     BenchmarkObservation,
     HARVEST_MESHES,
@@ -53,7 +55,6 @@ from moe_sae.runtime import (
     environment_fingerprint,
     require_v4_32_runtime,
     run_preflight,
-    sync_artifacts_to_gcs,
 )
 
 
@@ -106,6 +107,264 @@ def _conversion_attestation_digest(payload: dict[str, Any]) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+def _storage_attestation_path(root: Path) -> Path:
+    return root / "preflight" / "storage.json"
+
+
+def _validate_gcs_storage_roots(
+    bulk_gcs_root: str, checkpoint_root: str
+) -> tuple[str, str]:
+    """Return normalized roots after proving checkpoint storage is contained."""
+
+    from moe_sae.object_store import join_gcs_uri
+
+    bulk = str(bulk_gcs_root).rstrip("/")
+    checkpoint = str(checkpoint_root).rstrip("/")
+    try:
+        join_gcs_uri(bulk, "identity-probe")
+        join_gcs_uri(checkpoint, "identity-probe")
+    except ValueError as error:
+        raise RuntimeError("storage roots must be safe gs:// prefixes") from error
+    bulk_bucket, _, bulk_prefix = bulk[5:].partition("/")
+    checkpoint_bucket, _, checkpoint_prefix = checkpoint[5:].partition("/")
+    if (
+        checkpoint_bucket != bulk_bucket
+        or not checkpoint_prefix
+        or (
+            bulk_prefix
+            and not checkpoint_prefix.startswith(f"{bulk_prefix}/")
+        )
+    ):
+        raise RuntimeError(
+            "checkpoint payload root must be below the qualified bulk GCS root"
+        )
+    return bulk, checkpoint
+
+
+def _validate_orbax_qualification(
+    value: Any,
+    *,
+    checkpoint_root: str,
+    run_id: str,
+    process_count: int,
+    global_device_count: int,
+) -> None:
+    """Validate the checkpoint-backend proof sealed into an attestation."""
+
+    from moe_sae.object_store import join_gcs_uri
+    from moe_sae.storage import ORBAX_QUALIFICATION_SCHEMA
+
+    if not isinstance(value, Mapping):
+        raise RuntimeError("storage attestation lacks Orbax qualification")
+    expected_uri = join_gcs_uri(
+        checkpoint_root, "qualification", f"orbax-{run_id}"
+    )
+    expected_digests = value.get("expected_local_sha256_by_process")
+    restored_digests = value.get("restored_local_sha256_by_process")
+    save_seconds = value.get("save_seconds_by_process")
+    restore_seconds = value.get("restore_seconds_by_process")
+    if (
+        value.get("schema_version") != ORBAX_QUALIFICATION_SCHEMA
+        or value.get("payload_uri") != expected_uri
+        or value.get("process_count") != process_count
+        or value.get("global_device_count") != global_device_count
+        or value.get("failures") not in ([], ())
+        or value.get("finalized") is not True
+        or value.get("metadata_round_trip") is not True
+        or not isinstance(expected_digests, (list, tuple))
+        or len(expected_digests) != process_count
+        or not isinstance(restored_digests, (list, tuple))
+        or len(restored_digests) != process_count
+        or tuple(expected_digests) != tuple(restored_digests)
+        or any(
+            re.fullmatch(r"[0-9a-f]{64}", str(digest)) is None
+            for digest in expected_digests
+        )
+        or not isinstance(save_seconds, (list, tuple))
+        or len(save_seconds) != process_count
+        or not isinstance(restore_seconds, (list, tuple))
+        or len(restore_seconds) != process_count
+    ):
+        raise RuntimeError("storage attestation Orbax qualification is invalid")
+    for label, timings, maximum in (
+        ("save", save_seconds, value.get("max_save_seconds")),
+        ("restore", restore_seconds, value.get("max_restore_seconds")),
+    ):
+        try:
+            numbers = tuple(float(item) for item in timings)
+        except (TypeError, ValueError) as error:
+            raise RuntimeError(
+                f"storage attestation Orbax {label} timings are invalid"
+            ) from error
+        if (
+            any(not math.isfinite(item) or item <= 0.0 for item in numbers)
+            or not isinstance(maximum, (int, float))
+            or isinstance(maximum, bool)
+            or not math.isclose(float(maximum), max(numbers), rel_tol=1e-12)
+        ):
+            raise RuntimeError(
+                f"storage attestation Orbax {label} timings are invalid"
+            )
+
+
+def _validate_storage_attestation_payload(
+    payload: Mapping[str, Any],
+    *,
+    root: Path,
+    config: Gemma4Config,
+    environment_sha256: str,
+    process_count: int,
+    global_device_count: int,
+) -> str:
+    from moe_sae.storage import (
+        StoragePlanesQualificationConfig,
+        validate_storage_attestation,
+    )
+
+    qualification = payload.get("qualification")
+    topology = payload.get("topology")
+    metadata = payload.get("metadata")
+    expected_contract = dataclasses.asdict(
+        StoragePlanesQualificationConfig(
+            minimum_control_free_bytes=config.min_control_free_bytes,
+            minimum_local_buffer_free_bytes=config.min_local_buffer_free_bytes,
+            gcs_probe_bytes_per_process=config.gcs_probe_bytes_per_process,
+            gcs_probe_block_bytes=config.gcs_probe_block_bytes,
+            minimum_aggregate_upload_bytes_per_second=(
+                config.min_gcs_upload_bytes_per_second
+            ),
+            minimum_aggregate_download_bytes_per_second=(
+                config.min_gcs_download_bytes_per_second
+            ),
+            cleanup=True,
+        )
+    )
+    if (
+        payload.get("contract") != expected_contract
+        or not isinstance(qualification, Mapping)
+        or qualification.get("process_count") != process_count
+        or not isinstance(topology, Mapping)
+        or topology.get("process_count") != process_count
+        or topology.get("global_device_count") != global_device_count
+        or not isinstance(metadata, Mapping)
+    ):
+        raise RuntimeError(
+            "storage attestation does not prove the current config/environment/topology"
+        )
+    control = qualification.get("control")
+    local = qualification.get("local_buffer")
+    gcs = qualification.get("gcs")
+    bulk_gcs_root = metadata.get("bulk_gcs_root")
+    checkpoint_root = metadata.get("sae_checkpoint_root")
+    if (
+        not isinstance(control, Mapping)
+        or not isinstance(local, Mapping)
+        or not isinstance(gcs, Mapping)
+        or not isinstance(bulk_gcs_root, str)
+        or not isinstance(checkpoint_root, str)
+        or metadata.get("capture_cache_max_bytes") != config.capture_cache_max_bytes
+    ):
+        raise RuntimeError("storage attestation deployment layout is incomplete")
+    bulk_gcs_root, checkpoint_root = _validate_gcs_storage_roots(
+        bulk_gcs_root, checkpoint_root
+    )
+    if gcs.get("prefix") != bulk_gcs_root:
+        raise RuntimeError("storage attestation GCS root changed")
+    run_id = qualification.get("run_id")
+    if not isinstance(run_id, str):
+        raise RuntimeError("storage attestation qualification has no run ID")
+    _validate_orbax_qualification(
+        metadata.get("orbax_checkpoint_qualification"),
+        checkpoint_root=checkpoint_root,
+        run_id=run_id,
+        process_count=process_count,
+        global_device_count=global_device_count,
+    )
+    local_directories = local.get("directories")
+    if (
+        not isinstance(local_directories, (list, tuple))
+        or len(local_directories) != process_count
+        or any(not isinstance(path, str) or not path for path in local_directories)
+    ):
+        raise RuntimeError("storage attestation local-buffer layout is incompatible")
+    try:
+        return validate_storage_attestation(
+            payload,
+            expected_config_sha256=config.config_hash,
+            expected_environment_sha256=environment_sha256,
+            expected_control_directory=root,
+            expected_local_directories=local_directories,
+            expected_object_prefix=str(gcs.get("prefix", "")),
+        )
+    except RuntimeError as error:
+        raise RuntimeError("storage attestation validation failed") from error
+
+
+def _load_storage_attestation_payload(
+    root: Path,
+    config: Gemma4Config,
+    *,
+    environment: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Load and bind the sealed three-plane deployment record."""
+
+    path = _storage_attestation_path(root)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"missing/invalid storage attestation: {path}") from error
+    if not isinstance(payload, dict):
+        raise RuntimeError("storage attestation must be an object")
+    current_environment = dict(environment or _coordinated_environment())
+    _, process_count = _process_context()
+    try:
+        import jax
+
+        global_device_count = int(jax.device_count())
+    except ImportError:
+        global_device_count = 1
+    _validate_storage_attestation_payload(
+        payload,
+        root=root,
+        config=config,
+        environment_sha256=str(current_environment.get("sha256", "")),
+        process_count=process_count,
+        global_device_count=global_device_count,
+    )
+    return payload
+
+
+def _load_storage_attestation(
+    root: Path,
+    config: Gemma4Config,
+    *,
+    environment: Mapping[str, Any] | None = None,
+) -> str:
+    return str(
+        _load_storage_attestation_payload(root, config, environment=environment)[
+            "attestation_sha256"
+        ]
+    )
+
+
+def _storage_layout(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Resolve this controller's attested local root and shared GCS roots."""
+
+    process_index, process_count = _process_context()
+    qualification = payload["qualification"]
+    directories = qualification["local_buffer"]["directories"]
+    if len(directories) != process_count:
+        raise RuntimeError("storage layout no longer matches the process topology")
+    metadata = payload["metadata"]
+    return {
+        "local_buffer_root": Path(directories[process_index]),
+        "capture_cache_root": Path(directories[process_index]) / "capture-cache",
+        "bulk_gcs_root": str(metadata["bulk_gcs_root"]).rstrip("/"),
+        "sae_checkpoint_root": str(metadata["sae_checkpoint_root"]).rstrip("/"),
+        "attestation_sha256": str(payload["attestation_sha256"]),
+    }
+
+
 def _load_conversion_attestation(
     root: Path, config: Gemma4Config, checkpoint_sha256: str
 ) -> str:
@@ -144,16 +403,55 @@ def _load_conversion_attestation(
     return claimed
 
 
-def _sealed_dataset(root: Path) -> ArtifactDataset:
+def _sealed_dataset(
+    root: Path,
+    *,
+    cache_root: Path | None = None,
+    cache_max_bytes: int | None = None,
+) -> ArtifactDataset:
     """Open a sealed capture and hash each shard as the consumer reads it.
 
     Publication is not treated as a permanent integrity waiver: training and
     evaluation detect post-publication corruption.  Sufficient statistics do
-    not need to be recomputed because they are covered by the shard hash and
-    were compared byte-for-byte during publication.
+    not need to be recomputed: they are serialized into the hashed shard, and
+    the identical ledger values are bound by a self-hashed upload receipt that
+    the coordinator validates before sealing.
     """
 
-    return ArtifactDataset(root, verify_hashes=True, verify_statistics=False)
+    manifest = load_manifest(root)
+    remote = any("object" in entry for entry in manifest["shards"])
+    cache = None
+    if remote:
+        if (cache_root is None) != (cache_max_bytes is None):
+            raise RuntimeError("capture cache root and bound must be supplied together")
+        if cache_root is not None and cache_max_bytes is not None:
+            cache = ShardCache(
+                cache_root,
+                GCSObjectStore(),
+                max_bytes=cache_max_bytes,
+            )
+    return ArtifactDataset(
+        root,
+        verify_hashes=True,
+        verify_statistics=False,
+        cache=cache,
+    )
+
+
+def _prefetch_process_partition(
+    dataset: ArtifactDataset, total_tokens: int, *, label: str
+) -> tuple[dict[str, int], float]:
+    """Warm this controller's immutable capture partition outside SAE timing."""
+
+    process_index, process_count = _process_context()
+    start = (total_tokens * process_index) // process_count
+    end = (total_tokens * (process_index + 1)) // process_count
+    _global_barrier(f"gemma4-{label}-prefetch-start")
+    started = time.perf_counter()
+    result = dataset.prefetch_token_range(start, end)
+    elapsed = _global_max_seconds(time.perf_counter() - started)
+    _global_barrier(f"gemma4-{label}-prefetch-complete")
+    return result, elapsed
 
 
 def _run_root(root: Path, condition: str, seed: int) -> Path:
@@ -168,6 +466,8 @@ def _run_identity_expected(
     environment_sha256: str,
     condition: str,
     seed: int,
+    storage_attestation_sha256: str | None = None,
+    checkpoint_payload_root: str | None = None,
 ) -> dict[str, Any]:
     return {
         "schema_version": "gemma4-sae-run-identity-v1",
@@ -177,7 +477,38 @@ def _run_identity_expected(
         "environment_sha256": environment_sha256,
         "condition": condition,
         "seed": seed,
+        "storage_attestation_sha256": storage_attestation_sha256,
+        "checkpoint_payload_root": checkpoint_payload_root,
     }
+
+
+def _checkpoint_identity_expected(
+    config: Gemma4Config,
+    *,
+    capture_manifest_sha256: str,
+    capture_checkpoint_sha256: str,
+    environment_sha256: str,
+    condition: str,
+    seed: int,
+    run_instance_id: str,
+    storage_attestation_sha256: str | None,
+    checkpoint_payload_root: str | None,
+) -> dict[str, Any]:
+    """Build the exact immutable identity shared by save and restore."""
+
+    identity = _run_identity_expected(
+        config,
+        capture_manifest_sha256=capture_manifest_sha256,
+        capture_checkpoint_sha256=capture_checkpoint_sha256,
+        environment_sha256=environment_sha256,
+        condition=condition,
+        seed=seed,
+        storage_attestation_sha256=storage_attestation_sha256,
+        checkpoint_payload_root=checkpoint_payload_root,
+    )
+    identity.pop("schema_version")
+    identity["run_instance_id"] = run_instance_id
+    return identity
 
 
 def _load_run_identity(path: Path, expected: dict[str, Any]) -> str:
@@ -398,6 +729,8 @@ def _require_capture_identity(
     conversion_attestation_sha256: str | None = None,
     dataset_fingerprint: str | None = None,
     environment_sha256: str | None = None,
+    storage_attestation_sha256: str | None = None,
+    object_prefix: str | None = None,
 ) -> None:
     """Reject a valid v1 capture produced by a different experiment identity."""
 
@@ -421,6 +754,10 @@ def _require_capture_identity(
         expected["dataset_fingerprint"] = dataset_fingerprint
     if environment_sha256 is not None:
         expected["environment_sha256"] = environment_sha256
+    if storage_attestation_sha256 is not None:
+        expected["storage_attestation_sha256"] = storage_attestation_sha256
+    if object_prefix is not None:
+        expected["object_prefix"] = object_prefix
     changed = {
         name: (metadata.get(name), value)
         for name, value in expected.items()
@@ -708,6 +1045,154 @@ def _release_accelerator_state(label: str) -> None:
     _global_barrier(f"gemma4-release-{label}-after")
 
 
+def _command_stage_c4(args: argparse.Namespace) -> int:
+    """Stage one exact TFDS C4/en 3.1.0 split on a CPU coordinator."""
+
+    from moe_sae.data import publish_staged_dataset, stage_c4_split
+
+    config = _config(args)
+    split = args.split
+    expected = config.train_tokens if split == config.train_split else config.eval_tokens
+    target = expected if args.target_tokens is None else int(args.target_tokens)
+    if target != expected and not args.local_smoke:
+        raise RuntimeError("production C4 staging uses the configured exact token target")
+    root = _artifact_root(config, args.artifact_root)
+    output = (
+        Path(args.output_directory).expanduser()
+        if args.output_directory
+        else root / "staging" / "c4" / split
+    )
+    result = stage_c4_split(
+        split=split,
+        target_scientific_tokens=target,
+        output_directory=output,
+        tfds_data_dir=args.tfds_data_dir,
+        tokenizer_id=config.tokenizer_path,
+        tokenizer_revision=args.tokenizer_revision,
+        records_per_shard=args.records_per_shard,
+        sequence_length=config.sequence_length,
+    )
+    if args.publish_gcs:
+        result = publish_staged_dataset(result.manifest_location, args.publish_gcs)
+    print(json.dumps(result.as_dict(), indent=2, sort_keys=True))
+    return 0
+
+
+def _command_qualify_storage(args: argparse.Namespace) -> int:
+    """Qualify the POSIX control plane, local buffers, and GCS data plane."""
+
+    from moe_sae.object_store import GCSObjectStore, LocalObjectStore
+    from moe_sae.storage import (
+        StoragePlanesQualificationConfig,
+        build_storage_attestation,
+        jax_coordination_hooks,
+        local_coordination_hooks,
+        qualify_orbax_checkpoint_storage,
+        qualify_storage_planes,
+    )
+
+    config = _config(args)
+    root = _artifact_root(config, args.artifact_root).resolve()
+    local_buffer_root = Path(args.local_buffer_root).expanduser().resolve()
+    bulk_gcs_root, sae_checkpoint_root = _validate_gcs_storage_roots(
+        str(args.bulk_gcs_root), str(args.sae_checkpoint_root)
+    )
+    if args.local:
+        hooks = local_coordination_hooks()
+        qualification_config = StoragePlanesQualificationConfig(
+            minimum_control_free_bytes=int(args.minimum_control_free_bytes or 1),
+            minimum_local_buffer_free_bytes=int(args.minimum_local_free_bytes or 1),
+            gcs_probe_bytes_per_process=int(args.probe_bytes or 8 * 1024**2),
+            gcs_probe_block_bytes=int(args.block_bytes or 1024**2),
+            minimum_aggregate_upload_bytes_per_second=float(
+                args.minimum_bytes_per_second or 0.0
+            ),
+            minimum_aggregate_download_bytes_per_second=float(
+                args.minimum_bytes_per_second or 0.0
+            ),
+        )
+        object_store = LocalObjectStore(
+            args.local_object_store_root or root / "preflight" / "object-store-smoke"
+        )
+        global_device_count = 1
+    else:
+        config.validate_production()
+        _require_production_artifact_root(root)
+        require_v4_32_runtime()
+        if any(
+            value is not None
+            for value in (
+                args.minimum_control_free_bytes,
+                args.minimum_local_free_bytes,
+                args.probe_bytes,
+                args.block_bytes,
+                args.minimum_bytes_per_second,
+                args.local_object_store_root,
+            )
+        ):
+            raise RuntimeError("production storage qualification thresholds cannot be overridden")
+        hooks = jax_coordination_hooks()
+        qualification_config = StoragePlanesQualificationConfig(
+            minimum_control_free_bytes=config.min_control_free_bytes,
+            minimum_local_buffer_free_bytes=config.min_local_buffer_free_bytes,
+            gcs_probe_bytes_per_process=config.gcs_probe_bytes_per_process,
+            gcs_probe_block_bytes=config.gcs_probe_block_bytes,
+            minimum_aggregate_upload_bytes_per_second=(
+                config.min_gcs_upload_bytes_per_second
+            ),
+            minimum_aggregate_download_bytes_per_second=(
+                config.min_gcs_download_bytes_per_second
+            ),
+        )
+        object_store = GCSObjectStore()
+        import jax
+
+        global_device_count = int(jax.device_count())
+    result = qualify_storage_planes(
+        root,
+        local_buffer_root,
+        bulk_gcs_root,
+        object_store,
+        config=qualification_config,
+        coordination=hooks,
+    )
+    result.require_pass()
+    if args.local:
+        print(json.dumps(dataclasses.asdict(result), indent=2, sort_keys=True))
+        return 0
+
+    orbax_qualification = qualify_orbax_checkpoint_storage(
+        sae_checkpoint_root,
+        result.run_id,
+        coordination=hooks,
+    )
+    orbax_qualification.require_pass()
+    environment = _coordinated_environment()
+    payload = build_storage_attestation(
+        result,
+        qualification_config,
+        config_sha256=config.config_hash,
+        environment_sha256=str(environment["sha256"]),
+        global_device_count=global_device_count,
+        metadata={
+            "bulk_gcs_root": bulk_gcs_root,
+            "sae_checkpoint_root": sae_checkpoint_root,
+            "capture_cache_max_bytes": config.capture_cache_max_bytes,
+            "orbax_checkpoint_qualification": dataclasses.asdict(
+                orbax_qualification
+            ),
+        },
+    )
+    coordinator = _coordinator_write_json(
+        _storage_attestation_path(root),
+        payload,
+        barrier="gemma4-storage-qualification-attested",
+    )
+    if coordinator:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    return 0
+
+
 def _command_preflight(args: argparse.Namespace) -> int:
     config = _config(args)
     root = _artifact_root(config, args.artifact_root)
@@ -718,6 +1203,9 @@ def _command_preflight(args: argparse.Namespace) -> int:
         grain_train_files=args.grain_train,
         grain_eval_files=args.grain_eval,
         require_tpu=not args.local,
+    )
+    storage_attestation_sha256 = (
+        None if args.local else _load_storage_attestation(root, config)
     )
     train_provenance = _verified_dataset_provenance(
         args,
@@ -744,6 +1232,11 @@ def _command_preflight(args: argparse.Namespace) -> int:
         "passed": True,
         "detail": eval_provenance.fingerprint_sha256,
     }
+    if storage_attestation_sha256 is not None:
+        payload["storage_attestation"] = {
+            "passed": True,
+            "detail": storage_attestation_sha256,
+        }
     if args.json:
         print(json.dumps(payload, indent=2, sort_keys=True))
     else:
@@ -751,6 +1244,8 @@ def _command_preflight(args: argparse.Namespace) -> int:
             print(f"PASS {check.name}: {check.detail}")
         print(f"PASS dataset_train_manifest: {train_provenance.fingerprint_sha256}")
         print(f"PASS dataset_eval_manifest: {eval_provenance.fingerprint_sha256}")
+        if storage_attestation_sha256 is not None:
+            print(f"PASS storage_attestation: {storage_attestation_sha256}")
     return 0
 
 
@@ -992,6 +1487,9 @@ def _bootstrap_benchmark_supervisor(
         or int(bootstrap.get("process_count", 0)) != process_count
         or bootstrap.get("config_sha256") != config.config_hash
         or bootstrap.get("checkpoint_sha256") != args.checkpoint_sha256
+        or not re.fullmatch(
+            r"[0-9a-f]{64}", str(bootstrap.get("storage_attestation_sha256", ""))
+        )
     ):
         raise RuntimeError("benchmark bootstrap provenance is incompatible")
     return {
@@ -1269,6 +1767,9 @@ def _command_benchmark_harvest(args: argparse.Namespace) -> int:
                     "checkpoint_verification_seconds"
                 ],
                 "environment": bootstrap["environment"],
+                "storage_attestation_sha256": bootstrap[
+                    "storage_attestation_sha256"
+                ],
                 "benchmark_sweep_id": supervisor["sweep_id"],
                 "observations": [item.as_dict() for item in observations],
                 "selected": chosen.as_dict(),
@@ -1321,6 +1822,7 @@ def _load_selected_benchmark(
     config: Gemma4Config,
     checkpoint_sha256: str,
     conversion_attestation_sha256: str,
+    storage_attestation_sha256: str | None = None,
 ) -> dict[str, Any]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -1334,6 +1836,11 @@ def _load_selected_benchmark(
         or payload.get("checkpoint_sha256") != checkpoint_sha256
         or payload.get("conversion_attestation_sha256")
         != conversion_attestation_sha256
+        or (
+            storage_attestation_sha256 is not None
+            and payload.get("storage_attestation_sha256")
+            != storage_attestation_sha256
+        )
         or not isinstance(environment, dict)
         or environment.get("sha256") != current_environment.get("sha256")
     ):
@@ -1360,6 +1867,9 @@ def _command_harvest(args: argparse.Namespace) -> int:
     conversion_attestation_sha256 = _load_conversion_attestation(
         root, config, args.checkpoint_sha256
     )
+    storage_payload = _load_storage_attestation_payload(root, config)
+    storage_layout = _storage_layout(storage_payload)
+    storage_attestation_sha256 = str(storage_payload["attestation_sha256"])
     split = args.split
     expected = config.train_tokens if split == "train" else config.eval_tokens
     stop_after = config.canary_tokens if args.canary else expected
@@ -1378,6 +1888,7 @@ def _command_harvest(args: argparse.Namespace) -> int:
         config,
         args.checkpoint_sha256,
         conversion_attestation_sha256,
+        storage_attestation_sha256,
     )
     selected_mesh = selected.get("mesh")
     selected_mesh_name = (
@@ -1396,10 +1907,19 @@ def _command_harvest(args: argparse.Namespace) -> int:
         split=split,
         checkpoint_path=args.checkpoint,
         grain_files=args.grain_files,
+        staged_files=provenance.files,
         artifact_root=_capture_root(root, split),
         checkpoint_sha256=args.checkpoint_sha256,
         conversion_attestation_sha256=conversion_attestation_sha256,
         dataset_fingerprint=provenance.fingerprint_sha256,
+        storage_attestation_sha256=storage_attestation_sha256,
+        capture_object_prefix=join_gcs_uri(
+            storage_layout["bulk_gcs_root"],
+            "captures",
+            config.config_hash,
+            split,
+        ),
+        local_buffer_root=storage_layout["local_buffer_root"],
         mesh_candidate=_mesh_by_name(str(mesh_name)),
         per_device_sequence_batch=sequence_batch,
         stop_after_tokens=stop_after,
@@ -1413,10 +1933,6 @@ def _command_harvest(args: argparse.Namespace) -> int:
     coordinator = _coordinator_write_json(
         output, payload, barrier=f"gemma4-{split}-{stop_after}-summary"
     )
-    if args.publish_gcs and not args.canary:
-        if coordinator:
-            sync_artifacts_to_gcs(_capture_root(root, split), args.publish_gcs)
-        _global_barrier(f"gemma4-{split}-gcs-published")
     if coordinator:
         print(json.dumps(payload, indent=2, sort_keys=True))
     return 0
@@ -1435,7 +1951,26 @@ def _command_train(args: argparse.Namespace) -> int:
     if not args.reference:
         _require_production_artifact_root(root)
     current_environment = _coordinated_environment()
-    dataset = _sealed_dataset(_capture_root(root, "train"))
+    if args.reference:
+        storage_layout = None
+        storage_attestation_sha256 = None
+        checkpoint_payload_root = None
+    else:
+        storage_payload = _load_storage_attestation_payload(
+            root, config, environment=current_environment
+        )
+        storage_layout = _storage_layout(storage_payload)
+        storage_attestation_sha256 = str(storage_payload["attestation_sha256"])
+        checkpoint_payload_root = str(storage_layout["sae_checkpoint_root"])
+    dataset = _sealed_dataset(
+        _capture_root(root, "train"),
+        cache_root=(
+            None if storage_layout is None else storage_layout["capture_cache_root"]
+        ),
+        cache_max_bytes=(
+            None if storage_layout is None else config.capture_cache_max_bytes
+        ),
+    )
     _require_exact_capture(dataset, config.train_tokens, "training")
     capture_manifest_sha256 = dataset.manifest_sha256
     capture_checkpoint_sha256 = str(dataset.manifest["metadata"]["checkpoint_sha256"])
@@ -1450,7 +1985,24 @@ def _command_train(args: argparse.Namespace) -> int:
         "train",
         conversion_attestation_sha256=conversion_attestation_sha256,
         environment_sha256=current_environment["sha256"],
+        storage_attestation_sha256=storage_attestation_sha256,
+        object_prefix=(
+            None
+            if storage_layout is None
+            else join_gcs_uri(
+                storage_layout["bulk_gcs_root"],
+                "captures",
+                config.config_hash,
+                "train",
+            )
+        ),
     )
+    capture_prefetch = {"objects": 0, "bytes": 0}
+    capture_prefetch_wall_seconds = 0.0
+    if storage_layout is not None:
+        capture_prefetch, capture_prefetch_wall_seconds = _prefetch_process_partition(
+            dataset, config.train_tokens, label="train-capture"
+        )
     capacity = args.a_capacity
     capacity_precompute_wall_seconds = 0.0
     training_config = _training_config(
@@ -1484,6 +2036,8 @@ def _command_train(args: argparse.Namespace) -> int:
         environment_sha256=current_environment["sha256"],
         condition=args.condition,
         seed=args.seed,
+        storage_attestation_sha256=storage_attestation_sha256,
+        checkpoint_payload_root=checkpoint_payload_root,
     )
     if prior_path.exists():
         prior = json.loads(prior_path.read_text(encoding="utf-8"))
@@ -1493,6 +2047,9 @@ def _command_train(args: argparse.Namespace) -> int:
             or prior.get("seed") != args.seed
             or prior.get("capture_manifest_sha256") != capture_manifest_sha256
             or prior.get("capture_checkpoint_sha256") != capture_checkpoint_sha256
+            or prior.get("storage_attestation_sha256")
+            != storage_attestation_sha256
+            or prior.get("checkpoint_payload_root") != checkpoint_payload_root
             or not re.fullmatch(r"[0-9a-f]{32}", str(prior.get("run_instance_id", "")))
             or not isinstance(prior.get("environment"), dict)
             or prior["environment"].get("sha256") != current_environment.get("sha256")
@@ -1515,13 +2072,13 @@ def _command_train(args: argparse.Namespace) -> int:
         raise RuntimeError("run.json and immutable run identity disagree")
     if prior:
         prior_tokens = int(prior.get("tokens_seen", -1))
-        latest_name = "latest.npz" if args.reference else "latest"
+        latest_name = "latest.npz" if args.reference else "latest.json"
         if prior_tokens > 0 and not (run_root / latest_name).exists():
             raise RuntimeError(
                 "existing run metadata has progress but its latest checkpoint is missing"
             )
         if prior_tokens == config.train_tokens:
-            final_name = "final.npz" if args.reference else "final"
+            final_name = "final.npz" if args.reference else "final.json"
             if not (run_root / final_name).exists():
                 raise RuntimeError(
                     "complete run metadata exists without its final checkpoint"
@@ -1558,17 +2115,20 @@ def _command_train(args: argparse.Namespace) -> int:
             dataset,
             dataset.mean,
             checkpoint_dir=run_root,
+            checkpoint_payload_root=checkpoint_payload_root,
             stop_after_tokens=args.stop_after_tokens,
             metric_callback=lambda metric: sink.log(_metric_record(metric)),
-            checkpoint_identity={
-                "config_sha256": config.config_hash,
-                "capture_manifest_sha256": capture_manifest_sha256,
-                "capture_checkpoint_sha256": capture_checkpoint_sha256,
-                "environment_sha256": current_environment["sha256"],
-                "condition": args.condition,
-                "seed": args.seed,
-                "run_instance_id": run_instance_id,
-            },
+            checkpoint_identity=_checkpoint_identity_expected(
+                config,
+                capture_manifest_sha256=capture_manifest_sha256,
+                capture_checkpoint_sha256=capture_checkpoint_sha256,
+                environment_sha256=current_environment["sha256"],
+                condition=args.condition,
+                seed=args.seed,
+                run_instance_id=run_instance_id,
+                storage_attestation_sha256=storage_attestation_sha256,
+                checkpoint_payload_root=checkpoint_payload_root,
+            ),
             prior_run_timing=prior,
         )
         segment_optimizer_seconds = result.optimizer_wall_seconds
@@ -1615,6 +2175,10 @@ def _command_train(args: argparse.Namespace) -> int:
         "optimizer_wall_seconds": optimizer_wall_seconds,
         "compile_seconds": compile_seconds,
         "checkpoint_seconds": checkpoint_seconds,
+        "storage_attestation_sha256": storage_attestation_sha256,
+        "checkpoint_payload_root": checkpoint_payload_root,
+        "capture_prefetch": capture_prefetch,
+        "capture_prefetch_wall_seconds_excluded": capture_prefetch_wall_seconds,
         "a_capacity_precompute_wall_seconds": capacity_precompute_wall_seconds,
         "marginal_wall_seconds": marginal_wall_seconds,
         "chip_count": chip_count,
@@ -1651,8 +2215,33 @@ def _command_eval_one(
     if not args.reference:
         _require_production_artifact_root(root)
     current_environment = _coordinated_environment()
-    train_dataset = _sealed_dataset(_capture_root(root, "train"))
-    eval_dataset = _sealed_dataset(_capture_root(root, "eval"))
+    if args.reference:
+        storage_layout = None
+        storage_attestation_sha256 = None
+        checkpoint_payload_root = None
+    else:
+        storage_payload = _load_storage_attestation_payload(
+            root, config, environment=current_environment
+        )
+        storage_layout = _storage_layout(storage_payload)
+        storage_attestation_sha256 = str(storage_payload["attestation_sha256"])
+        checkpoint_payload_root = str(storage_layout["sae_checkpoint_root"])
+    cache_root = (
+        None if storage_layout is None else storage_layout["capture_cache_root"]
+    )
+    cache_max_bytes = (
+        None if storage_layout is None else config.capture_cache_max_bytes
+    )
+    train_dataset = _sealed_dataset(
+        _capture_root(root, "train"),
+        cache_root=cache_root,
+        cache_max_bytes=cache_max_bytes,
+    )
+    eval_dataset = _sealed_dataset(
+        _capture_root(root, "eval"),
+        cache_root=cache_root,
+        cache_max_bytes=cache_max_bytes,
+    )
     _require_exact_capture(train_dataset, config.train_tokens, "training")
     _require_exact_capture(eval_dataset, config.eval_tokens, "held-out")
     train_checkpoint_sha = str(train_dataset.manifest["metadata"]["checkpoint_sha256"])
@@ -1670,6 +2259,17 @@ def _command_eval_one(
         "train",
         conversion_attestation_sha256=conversion_attestation_sha256,
         environment_sha256=current_environment["sha256"],
+        storage_attestation_sha256=storage_attestation_sha256,
+        object_prefix=(
+            None
+            if storage_layout is None
+            else join_gcs_uri(
+                storage_layout["bulk_gcs_root"],
+                "captures",
+                config.config_hash,
+                "train",
+            )
+        ),
     )
     _require_capture_identity(
         eval_dataset,
@@ -1677,7 +2277,26 @@ def _command_eval_one(
         "eval",
         conversion_attestation_sha256=conversion_attestation_sha256,
         environment_sha256=current_environment["sha256"],
+        storage_attestation_sha256=storage_attestation_sha256,
+        object_prefix=(
+            None
+            if storage_layout is None
+            else join_gcs_uri(
+                storage_layout["bulk_gcs_root"],
+                "captures",
+                config.config_hash,
+                "eval",
+            )
+        ),
     )
+    evaluation_prefetch = {"objects": 0, "bytes": 0}
+    evaluation_prefetch_seconds = 0.0
+    if storage_layout is not None:
+        evaluation_prefetch, evaluation_prefetch_seconds = (
+            _prefetch_process_partition(
+                eval_dataset, config.eval_tokens, label="eval-capture"
+            )
+        )
     run_root = _run_root(root, condition, seed)
     timing = json.loads((run_root / "run.json").read_text(encoding="utf-8"))
     run_instance_id = _load_run_identity(
@@ -1689,6 +2308,8 @@ def _command_eval_one(
             environment_sha256=current_environment["sha256"],
             condition=condition,
             seed=seed,
+            storage_attestation_sha256=storage_attestation_sha256,
+            checkpoint_payload_root=checkpoint_payload_root,
         ),
     )
     if (
@@ -1698,6 +2319,9 @@ def _command_eval_one(
         or int(timing.get("tokens_seen", -1)) != config.train_tokens
         or timing.get("capture_manifest_sha256") != train_dataset.manifest_sha256
         or timing.get("capture_checkpoint_sha256") != train_checkpoint_sha
+        or timing.get("storage_attestation_sha256")
+        != storage_attestation_sha256
+        or timing.get("checkpoint_payload_root") != checkpoint_payload_root
         or not re.fullmatch(r"[0-9a-f]{32}", str(timing.get("run_instance_id", "")))
         or timing.get("run_instance_id") != run_instance_id
         or not isinstance(timing.get("environment"), dict)
@@ -1770,23 +2394,24 @@ def _command_eval_one(
         from moe_sae.distributed import evaluate_distributed
 
         result = evaluate_distributed(
-            run_root / "final",
+            run_root / "final.json",
             training_config,
             eval_dataset,
             train_dataset.mean,
             max_tokens=config.eval_tokens,
             expected_sst=expected_sst,
-            checkpoint_identity={
-                "config_sha256": config.config_hash,
-                "capture_manifest_sha256": train_dataset.manifest_sha256,
-                "capture_checkpoint_sha256": train_checkpoint_sha,
-                "environment_sha256": timing["environment"]["sha256"],
-                "condition": condition,
-                "seed": seed,
-                "run_instance_id": timing["run_instance_id"],
-                "tokens_seen": config.train_tokens,
-                "steps": config.planned_updates,
-            },
+            checkpoint_identity=_checkpoint_identity_expected(
+                config,
+                capture_manifest_sha256=train_dataset.manifest_sha256,
+                capture_checkpoint_sha256=train_checkpoint_sha,
+                environment_sha256=timing["environment"]["sha256"],
+                condition=condition,
+                seed=seed,
+                run_instance_id=timing["run_instance_id"],
+                storage_attestation_sha256=storage_attestation_sha256,
+                checkpoint_payload_root=checkpoint_payload_root,
+            ),
+            checkpoint_payload_root=checkpoint_payload_root,
         )
     evaluation_seconds = time.perf_counter() - started
     if not args.reference:
@@ -1815,7 +2440,13 @@ def _command_eval_one(
             "marginal_wall_seconds", timing["optimizer_wall_seconds"]
         ),
         "tokens_per_second": timing["tokens_per_second"],
-        "evaluation_seconds_excluded": evaluation_seconds + evaluation_capacity_seconds,
+        "evaluation_seconds_excluded": (
+            evaluation_seconds
+            + evaluation_capacity_seconds
+            + evaluation_prefetch_seconds
+        ),
+        "capture_prefetch": evaluation_prefetch,
+        "capture_prefetch_wall_seconds_excluded": evaluation_prefetch_seconds,
         "evaluation_capacity": training_config.a_capacity if condition == "A" else None,
         "evaluation_capacity_precompute_seconds_excluded": evaluation_capacity_seconds,
     }
@@ -1855,6 +2486,7 @@ def _load_harvester_report(
     expected_captures: dict[str, ArtifactDataset] | None = None,
     environment_sha256: str | None = None,
     conversion_attestation_sha256: str | None = None,
+    storage_attestation_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Combine the selected MFU benchmark with measured shared capture cost."""
 
@@ -1874,6 +2506,11 @@ def _load_harvester_report(
             conversion_attestation_sha256 is not None
             and value.get("conversion_attestation_sha256")
             != conversion_attestation_sha256
+        )
+        or (
+            storage_attestation_sha256 is not None
+            and value.get("storage_attestation_sha256")
+            != storage_attestation_sha256
         )
         or (
             environment_sha256 is not None
@@ -1896,6 +2533,9 @@ def _load_harvester_report(
     result["conversion_attestation_sha256"] = value.get(
         "conversion_attestation_sha256"
     )
+    result["storage_attestation_sha256"] = value.get(
+        "storage_attestation_sha256"
+    )
     if not re.fullmatch(r"[0-9a-f]{64}", str(result["checkpoint_sha256"])):
         raise RuntimeError("selected harvester benchmark lacks checkpoint provenance")
     if not re.fullmatch(
@@ -1904,6 +2544,10 @@ def _load_harvester_report(
         raise RuntimeError(
             "selected harvester benchmark lacks conversion-parity provenance"
         )
+    if not re.fullmatch(
+        r"[0-9a-f]{64}", str(result["storage_attestation_sha256"])
+    ):
+        raise RuntimeError("selected harvester benchmark lacks storage provenance")
 
     campaigns: dict[str, Any] = {}
     capture_chip_seconds = 0.0
@@ -1967,6 +2611,8 @@ def _load_harvester_report(
                 != capture_metadata.get("environment_sha256")
                 or capture_metadata.get("conversion_attestation_sha256")
                 != result["conversion_attestation_sha256"]
+                or capture_metadata.get("storage_attestation_sha256")
+                != result["storage_attestation_sha256"]
             ):
                 raise RuntimeError(
                     f"{split} harvest cost is not bound to the sealed capture"
@@ -2096,6 +2742,11 @@ def _command_report(args: argparse.Namespace) -> int:
     root = _artifact_root(config, args.artifact_root)
     _require_production_artifact_root(root)
     current_environment = _coordinated_environment()
+    storage_payload = _load_storage_attestation_payload(
+        root, config, environment=current_environment
+    )
+    storage_layout = _storage_layout(storage_payload)
+    storage_attestation_sha256 = str(storage_payload["attestation_sha256"])
     pairs = [
         (condition, seed) for condition in config.conditions for seed in config.seeds
     ]
@@ -2124,6 +2775,13 @@ def _command_report(args: argparse.Namespace) -> int:
         "train",
         conversion_attestation_sha256=conversion_attestation_sha256,
         environment_sha256=producer_environment_sha256,
+        storage_attestation_sha256=storage_attestation_sha256,
+        object_prefix=join_gcs_uri(
+            storage_layout["bulk_gcs_root"],
+            "captures",
+            config.config_hash,
+            "train",
+        ),
     )
     _require_capture_identity(
         eval_capture,
@@ -2131,6 +2789,13 @@ def _command_report(args: argparse.Namespace) -> int:
         "eval",
         conversion_attestation_sha256=conversion_attestation_sha256,
         environment_sha256=producer_environment_sha256,
+        storage_attestation_sha256=storage_attestation_sha256,
+        object_prefix=join_gcs_uri(
+            storage_layout["bulk_gcs_root"],
+            "captures",
+            config.config_hash,
+            "eval",
+        ),
     )
     common_sst = eval_capture.sst_about(train_capture.mean)
     canonical_evaluations: list[dict[str, Any]] = []
@@ -2162,6 +2827,7 @@ def _command_report(args: argparse.Namespace) -> int:
         expected_captures={"train": train_capture, "eval": eval_capture},
         environment_sha256=producer_environment_sha256,
         conversion_attestation_sha256=conversion_attestation_sha256,
+        storage_attestation_sha256=storage_attestation_sha256,
     )
     if harvester.get("checkpoint_sha256") != checkpoint_sha:
         raise RuntimeError("benchmark and captures use different checkpoints")
@@ -2189,6 +2855,8 @@ def _command_report(args: argparse.Namespace) -> int:
                 environment_sha256=producer_environment_sha256,
                 condition=condition,
                 seed=seed,
+                storage_attestation_sha256=storage_attestation_sha256,
+                checkpoint_payload_root=storage_layout["sae_checkpoint_root"],
             ),
         )
         if (
@@ -2203,6 +2871,10 @@ def _command_report(args: argparse.Namespace) -> int:
             or run_record.get("capture_manifest_sha256")
             != train_capture.manifest_sha256
             or run_record.get("capture_checkpoint_sha256") != checkpoint_sha
+            or run_record.get("storage_attestation_sha256")
+            != storage_attestation_sha256
+            or run_record.get("checkpoint_payload_root")
+            != storage_layout["sae_checkpoint_root"]
             or not re.fullmatch(
                 r"[0-9a-f]{32}", str(run_record.get("run_instance_id", ""))
             )
@@ -2236,6 +2908,34 @@ def _command_report(args: argparse.Namespace) -> int:
         evaluation_seconds=evaluation_seconds,
         nominal_candidate_exposure_percent=100.0 * config.candidate_exposure,
     )
+    prefetch_by_run = {
+        f"{condition}/seed-{seed}": {
+            "seconds": float(
+                record.get("capture_prefetch_wall_seconds_excluded", 0.0)
+            ),
+            "objects": int(record.get("capture_prefetch", {}).get("objects", 0)),
+            "bytes": int(record.get("capture_prefetch", {}).get("bytes", 0)),
+        }
+        for (condition, seed), record in zip(pairs, run_records, strict=True)
+    }
+    report["capture_prefetch_excluded"] = {
+        "by_run": prefetch_by_run,
+        "sum_wall_seconds": sum(
+            item["seconds"] for item in prefetch_by_run.values()
+        ),
+        "basis": (
+            "generation-pinned GCS capture shards are cached before optimizer "
+            "timing and reused across A/B/F"
+        ),
+    }
+    storage_qualification = storage_payload["qualification"]
+    report["storage_planes"] = {
+        "attestation_sha256": storage_attestation_sha256,
+        "control": storage_qualification["control"],
+        "local_buffer": storage_qualification["local_buffer"],
+        "gcs": storage_qualification["gcs"],
+        "contract": storage_payload["contract"],
+    }
     report["experiment"] = {
         "config_sha256": config.config_hash,
         "model_id": config.model_id,
@@ -2248,6 +2948,9 @@ def _command_report(args: argparse.Namespace) -> int:
         "conditions": list(config.conditions),
         "checkpoint_sha256": checkpoint_sha,
         "conversion_attestation_sha256": conversion_attestation_sha256,
+        "storage_attestation_sha256": storage_attestation_sha256,
+        "bulk_gcs_root": storage_layout["bulk_gcs_root"],
+        "sae_checkpoint_root": storage_layout["sae_checkpoint_root"],
         "train_capture_manifest_sha256": train_capture.manifest_sha256,
         "eval_capture_manifest_sha256": eval_capture.manifest_sha256,
         "train_dataset_fingerprint": train_capture.manifest["metadata"][
@@ -2283,6 +2986,9 @@ def _load_resume_run(
     train_capture: ArtifactDataset,
     condition: str,
     seed: int,
+    *,
+    storage_attestation_sha256: str,
+    checkpoint_payload_root: str,
 ) -> dict[str, Any] | None:
     """Validate existing run state before the production state machine skips it."""
 
@@ -2308,6 +3014,8 @@ def _load_resume_run(
         environment_sha256=current_environment["sha256"],
         condition=condition,
         seed=seed,
+        storage_attestation_sha256=storage_attestation_sha256,
+        checkpoint_payload_root=checkpoint_payload_root,
     )
     run_instance_id = _load_run_identity(run_root / "identity.json", expected_identity)
     valid_boundary = tokens == config.train_tokens or (
@@ -2321,6 +3029,9 @@ def _load_resume_run(
         or int(record.get("chip_count", -1)) != 16
         or record.get("capture_manifest_sha256") != train_capture.manifest_sha256
         or record.get("capture_checkpoint_sha256") != checkpoint_sha
+        or record.get("storage_attestation_sha256")
+        != storage_attestation_sha256
+        or record.get("checkpoint_payload_root") != checkpoint_payload_root
         or not re.fullmatch(r"[0-9a-f]{32}", str(record.get("run_instance_id", "")))
         or record.get("run_instance_id") != run_instance_id
         or not isinstance(record.get("environment"), dict)
@@ -2332,7 +3043,9 @@ def _load_resume_run(
         health = record.get("health")
         if not isinstance(health, dict) or health.get("passed") is not True:
             raise RuntimeError(f"existing run failed or lacks its health gate: {path}")
-    checkpoint = run_root / ("final" if tokens == config.train_tokens else "latest")
+    checkpoint = run_root / (
+        "final.json" if tokens == config.train_tokens else "latest.json"
+    )
     if not checkpoint.exists():
         raise RuntimeError(f"existing run lacks its resumable checkpoint: {checkpoint}")
     return record
@@ -2486,6 +3199,11 @@ def _command_run(args: argparse.Namespace) -> int:
         ),
     }
     current_environment = _coordinated_environment()
+    storage_payload = _load_storage_attestation_payload(
+        root, config, environment=current_environment
+    )
+    storage_layout = _storage_layout(storage_payload)
+    storage_attestation_sha256 = str(storage_payload["attestation_sha256"])
     conversion_attestation_sha256 = _load_conversion_attestation(
         root, config, args.checkpoint_sha256
     )
@@ -2495,6 +3213,7 @@ def _command_run(args: argparse.Namespace) -> int:
         config,
         args.checkpoint_sha256,
         conversion_attestation_sha256,
+        storage_attestation_sha256,
     )
     selected_mesh = selected.get("mesh")
     mesh_name = (
@@ -2527,6 +3246,13 @@ def _command_run(args: argparse.Namespace) -> int:
                 conversion_attestation_sha256=conversion_attestation_sha256,
                 dataset_fingerprint=dataset_fingerprint,
                 environment_sha256=current_environment["sha256"],
+                storage_attestation_sha256=storage_attestation_sha256,
+                object_prefix=join_gcs_uri(
+                    storage_layout["bulk_gcs_root"],
+                    "captures",
+                    config.config_hash,
+                    split,
+                ),
             )
         if split == "train" and not sealed:
             canary_args = argparse.Namespace(**vars(args))
@@ -2537,7 +3263,6 @@ def _command_run(args: argparse.Namespace) -> int:
             canary_args.benchmark = str(benchmark)
             canary_args.mesh = mesh_name
             canary_args.per_device_sequence_batch = sequence_batch
-            canary_args.publish_gcs = None
             _command_harvest(canary_args)
             _release_accelerator_state("train-canary")
 
@@ -2565,7 +3290,6 @@ def _command_run(args: argparse.Namespace) -> int:
             harvest_args.benchmark = str(benchmark)
             harvest_args.mesh = mesh_name
             harvest_args.per_device_sequence_batch = sequence_batch
-            harvest_args.publish_gcs = None
             _command_harvest(harvest_args)
             _release_accelerator_state(f"{split}-production-harvest")
 
@@ -2581,6 +3305,13 @@ def _command_run(args: argparse.Namespace) -> int:
         conversion_attestation_sha256=conversion_attestation_sha256,
         dataset_fingerprint=staged["train"].fingerprint_sha256,
         environment_sha256=current_environment["sha256"],
+        storage_attestation_sha256=storage_attestation_sha256,
+        object_prefix=join_gcs_uri(
+            storage_layout["bulk_gcs_root"],
+            "captures",
+            config.config_hash,
+            "train",
+        ),
     )
     _require_capture_identity(
         eval_capture,
@@ -2590,10 +3321,25 @@ def _command_run(args: argparse.Namespace) -> int:
         conversion_attestation_sha256=conversion_attestation_sha256,
         dataset_fingerprint=staged["eval"].fingerprint_sha256,
         environment_sha256=current_environment["sha256"],
+        storage_attestation_sha256=storage_attestation_sha256,
+        object_prefix=join_gcs_uri(
+            storage_layout["bulk_gcs_root"],
+            "captures",
+            config.config_hash,
+            "eval",
+        ),
     )
 
     def train_to(condition: str, seed: int, stop_after: int | None) -> dict[str, Any]:
-        existing = _load_resume_run(root, config, train_capture, condition, seed)
+        existing = _load_resume_run(
+            root,
+            config,
+            train_capture,
+            condition,
+            seed,
+            storage_attestation_sha256=storage_attestation_sha256,
+            checkpoint_payload_root=storage_layout["sae_checkpoint_root"],
+        )
         target = config.train_tokens if stop_after is None else stop_after
         if existing is not None and int(existing["tokens_seen"]) >= target:
             return existing
@@ -2605,7 +3351,15 @@ def _command_run(args: argparse.Namespace) -> int:
         train_args.reference = False
         _command_train(train_args)
         _release_accelerator_state(f"train-{condition}-{seed}-{target}")
-        completed = _load_resume_run(root, config, train_capture, condition, seed)
+        completed = _load_resume_run(
+            root,
+            config,
+            train_capture,
+            condition,
+            seed,
+            storage_attestation_sha256=storage_attestation_sha256,
+            checkpoint_payload_root=storage_layout["sae_checkpoint_root"],
+        )
         if completed is None or int(completed["tokens_seen"]) < target:
             raise RuntimeError(
                 f"training stage did not reach {condition}/seed-{seed} target"
@@ -2623,7 +3377,15 @@ def _command_run(args: argparse.Namespace) -> int:
 
     for condition in config.conditions:
         for seed in config.seeds:
-            run_record = _load_resume_run(root, config, train_capture, condition, seed)
+            run_record = _load_resume_run(
+                root,
+                config,
+                train_capture,
+                condition,
+                seed,
+                storage_attestation_sha256=storage_attestation_sha256,
+                checkpoint_payload_root=storage_layout["sae_checkpoint_root"],
+            )
             if (
                 run_record is None
                 or int(run_record["tokens_seen"]) != config.train_tokens
@@ -2661,6 +3423,42 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="moe-sae")
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    stage = subparsers.add_parser(
+        "stage-c4", help="offline-pack exact TFDS C4/en 3.1.0 into ArrayRecord"
+    )
+    _add_common(stage)
+    stage.add_argument("--split", choices=("train", "validation"), required=True)
+    stage.add_argument("--tfds-data-dir", required=True)
+    stage.add_argument("--tokenizer-revision", required=True)
+    stage.add_argument("--output-directory")
+    stage.add_argument("--records-per-shard", type=int, default=4_096)
+    stage.add_argument("--publish-gcs")
+    stage.add_argument("--target-tokens", type=int)
+    stage.add_argument(
+        "--local-smoke",
+        action="store_true",
+        help="allow a reduced token target for local validation",
+    )
+    stage.set_defaults(handler=_command_stage_c4)
+
+    storage = subparsers.add_parser(
+        "qualify-storage", help="qualify control POSIX, local buffers, and GCS"
+    )
+    _add_common(storage)
+    storage.add_argument("--local-buffer-root", required=True)
+    storage.add_argument("--bulk-gcs-root", required=True)
+    storage.add_argument("--sae-checkpoint-root", required=True)
+    storage.add_argument(
+        "--local", action="store_true", help="single-process smoke qualification"
+    )
+    storage.add_argument("--local-object-store-root")
+    storage.add_argument("--minimum-control-free-bytes", type=int)
+    storage.add_argument("--minimum-local-free-bytes", type=int)
+    storage.add_argument("--probe-bytes", type=int)
+    storage.add_argument("--block-bytes", type=int)
+    storage.add_argument("--minimum-bytes-per-second", type=float)
+    storage.set_defaults(handler=_command_qualify_storage)
 
     preflight = subparsers.add_parser(
         "preflight", help="fail-closed environment validation"
@@ -2712,7 +3510,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--per-device-sequence-batch", type=int, choices=PER_DEVICE_SEQUENCE_BATCHES
     )
     harvest.add_argument("--canary", action="store_true")
-    harvest.add_argument("--publish-gcs")
     harvest.set_defaults(handler=_command_harvest)
 
     train_parser = subparsers.add_parser("train", help="train or resume one A/B/F seed")
