@@ -17,6 +17,8 @@ tpu = [
     "orbax-checkpoint>=0.12.1,<0.13",
 ]
 conversion = [
+    "google-cloud-storage==3.13.0",
+    "huggingface-hub==1.23.0",
     "maxtext[tpu]==0.2.3",
     "torch>=2.8",
 ]
@@ -24,8 +26,7 @@ data = [
     "array-record==0.8.3",
     "google-cloud-storage==3.13.0",
     "grain==0.2.18",
-    "tensorflow==2.20.0",
-    "tensorflow-datasets==4.9.10",
+    "huggingface-hub==1.23.0",
     "transformers==5.13.1",
 ]
 

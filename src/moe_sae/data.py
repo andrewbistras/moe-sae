@@ -7,30 +7,40 @@ owns the small data boundary: C4 documents are tokenized and packed once, and
 the TPU runtime only batches already-complete records.
 
 Optional data dependencies are imported lazily so importing :mod:`moe_sae.cli`
-does not initialize Hugging Face, Grain, TensorFlow, or JAX.
+does not initialize Hugging Face, Grain, or JAX.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
+import gzip
 import hashlib
 import itertools
 import json
 import os
 from pathlib import Path
 import re
+import shutil
 import struct
 import subprocess
 from typing import Any
 
 import numpy as np
 
+from moe_sae.config import C4_REPOSITORY, C4_REVISION
+from moe_sae.model import (
+    GEMMA4_REPOSITORY_FILES,
+    expected_hf_repository_inventory_sha256,
+)
 
-PACKED_DATASET_SCHEMA = "gemma4-c4-packed-arrayrecord-v1"
+
+PACKED_DATASET_SCHEMA = "gemma4-c4-packed-arrayrecord-v2"
 PACKED_RECORD_FORMAT = "moe-sae-packed-sequence-v1"
 PACKED_RECORD_MAGIC = b"MSAEPK01"
 PACKED_RECORD_VERSION = 1
+ALLENAI_C4_REPO_ID = C4_REPOSITORY
+ALLENAI_C4_REVISION = C4_REVISION
 DEFAULT_SEQUENCE_LENGTH = 1_024
 DEFAULT_PROCESS_COUNT = 4
 DEFAULT_PER_DEVICE_SEQUENCE_BATCHES = (1, 2, 4)
@@ -45,6 +55,48 @@ _SHA256 = re.compile(r"[0-9a-f]{64}")
 
 class StagingError(RuntimeError):
     """Raised when deterministic staging cannot be proven."""
+
+
+@dataclass(frozen=True, slots=True)
+class SourceFile:
+    """One immutable compressed source object in the bounded C4 input."""
+
+    path: str
+    sha256: str
+    size_bytes: int
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "path": self.path,
+            "sha256": self.sha256,
+            "size_bytes": self.size_bytes,
+        }
+
+
+ALLENAI_C4_SOURCE_FILES: Mapping[str, tuple[SourceFile, ...]] = {
+    "train": (
+        SourceFile(
+            path="en/c4-train.00000-of-01024.json.gz",
+            sha256="8ef8d75b0e045dec4aa5123a671b4564466b0707086a7ed1ba8721626dfffbc9",
+            size_bytes=319_308_785,
+        ),
+    ),
+    "validation": (
+        SourceFile(
+            path="en/c4-validation.00000-of-00008.json.gz",
+            sha256="1f25b6af12da84115301d4ee93ea5246c8fea5bb4a2008472794d95b917cc97f",
+            size_bytes=40_471_190,
+        ),
+    ),
+}
+GEMMA4_TOKENIZER_SOURCE_FILES = tuple(
+    entry
+    for entry in GEMMA4_REPOSITORY_FILES
+    if entry.path in {"tokenizer.json", "tokenizer_config.json"}
+)
+GEMMA4_TOKENIZER_INVENTORY_SHA256 = expected_hf_repository_inventory_sha256(
+    GEMMA4_TOKENIZER_SOURCE_FILES
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -375,28 +427,29 @@ def _array_record_source(files: Sequence[str]):
 def _manifest_identity(
     *,
     split: str,
-    source_info_sha256: str,
+    source_identity: Mapping[str, Any],
     tokenizer_id: str,
     tokenizer_revision: str,
     sequence_length: int,
     process_count: int,
 ) -> dict[str, Any]:
+    source = _validated_source_identity(source_identity)
     return {
         "schema_version": PACKED_DATASET_SCHEMA,
         "dataset": {
-            "name": "c4",
+            "name": source["repo_id"],
             "config": "en",
-            "version": "3.1.0",
+            "revision": source["revision"],
             "split": split,
         },
-        "source": {
-            "provider": "tensorflow_datasets",
-            "full_name": "c4/en/3.1.0",
-            "dataset_info_sha256": source_info_sha256,
-        },
+        "source": source,
         "tokenizer": {
             "id": tokenizer_id,
             "revision": tokenizer_revision,
+            "repository_inventory_sha256": GEMMA4_TOKENIZER_INVENTORY_SHA256,
+            "files": [
+                entry.as_dict() for entry in GEMMA4_TOKENIZER_SOURCE_FILES
+            ],
             "padding_id": PAD_ID,
             "eos_id": EOS_ID,
             "bos_id": BOS_ID,
@@ -419,6 +472,75 @@ def _manifest_identity(
             "host_sharding": "record_index_mod_process_count",
             "per_device_sequence_batches": list(DEFAULT_PER_DEVICE_SEQUENCE_BATCHES),
         },
+    }
+
+
+def _validated_source_identity(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a canonical copy of an exact, content-bound source identity."""
+
+    required = {"provider", "repo_type", "repo_id", "revision", "files"}
+    if not isinstance(value, Mapping) or set(value) != required:
+        raise ValueError(
+            "source_identity must contain provider, repo_type, repo_id, revision, and files"
+        )
+    provider = value.get("provider")
+    repo_type = value.get("repo_type")
+    repo_id = value.get("repo_id")
+    revision = value.get("revision")
+    files = value.get("files")
+    if not isinstance(provider, str) or not provider:
+        raise ValueError("source_identity provider must be a non-empty string")
+    if repo_type != "dataset":
+        raise ValueError("source_identity repo_type must be 'dataset'")
+    if (
+        not isinstance(repo_id, str)
+        or not repo_id
+        or repo_id.startswith("/")
+        or repo_id.endswith("/")
+    ):
+        raise ValueError("source_identity repo_id is invalid")
+    if not isinstance(revision, str):
+        raise ValueError("source_identity revision must be a string")
+    _validate_revision(revision, "source_identity revision")
+    if not isinstance(files, Sequence) or isinstance(files, (str, bytes)) or not files:
+        raise ValueError("source_identity files must be a non-empty sequence")
+
+    canonical_files: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for entry in files:
+        if not isinstance(entry, Mapping) or set(entry) != {
+            "path",
+            "sha256",
+            "size_bytes",
+        }:
+            raise ValueError(
+                "each source_identity file must contain path, sha256, and size_bytes"
+            )
+        path = entry.get("path")
+        digest = entry.get("sha256")
+        size = entry.get("size_bytes")
+        if (
+            not isinstance(path, str)
+            or not path
+            or Path(path).is_absolute()
+            or ".." in Path(path).parts
+            or path in seen
+        ):
+            raise ValueError("source_identity contains an unsafe or duplicate path")
+        if not isinstance(digest, str) or not _SHA256.fullmatch(digest):
+            raise ValueError("source_identity contains an invalid SHA-256")
+        if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+            raise ValueError("source_identity contains an invalid file size")
+        seen.add(path)
+        canonical_files.append(
+            {"path": path, "sha256": digest, "size_bytes": size}
+        )
+    return {
+        "provider": provider,
+        "repo_type": repo_type,
+        "repo_id": repo_id,
+        "revision": revision,
+        "files": canonical_files,
     }
 
 
@@ -554,44 +676,210 @@ def _iter_text_values(values: Iterable[Any]) -> Iterator[str]:
             raise StagingError("C4 source yielded an element without string field 'text'")
 
 
-def tfds_c4_stream(
-    split: str, data_dir: str | Path
-) -> tuple[Iterable[str], str]:
-    """Open an already-prepared, exact TFDS C4/en 3.1.0 source.
-
-    C4 3.1.0 is not byte-equivalent to the commonly published 3.0.1 shards.
-    Downloading or preparing data here would also make resume identity
-    ambiguous, so this boundary only accepts an existing TFDS preparation.
-    """
-
+def _download_hf_source_file(
+    *, repo_id: str, revision: str, filename: str, cache_dir: Path
+) -> Path:
     try:
-        import tensorflow_datasets as tfds
+        from huggingface_hub import hf_hub_download
     except ImportError as error:
         raise StagingError(
-            "TensorFlow Datasets is unavailable; run `uv sync --extra data`"
+            "Hugging Face Hub is unavailable; run `uv sync --extra data`"
         ) from error
-    builder = tfds.builder("c4/en:3.1.0", data_dir=str(Path(data_dir).expanduser()))
-    if str(builder.info.full_name) != "c4/en/3.1.0":
-        raise StagingError(
-            f"prepared source is {builder.info.full_name}, require c4/en/3.1.0"
+    try:
+        downloaded = hf_hub_download(
+            repo_id=repo_id,
+            repo_type="dataset",
+            revision=revision,
+            filename=filename,
+            cache_dir=str(cache_dir),
+            token=os.environ.get("HF_TOKEN"),
         )
-    info_path = Path(os.fspath(builder.data_path)) / "dataset_info.json"
-    if not info_path.is_file():
+    except Exception as error:
         raise StagingError(
-            "C4/en 3.1.0 is not prepared under --tfds-data-dir; "
-            "staging never downloads it implicitly"
+            f"cannot materialize immutable C4 source file {filename!r}"
+        ) from error
+    return Path(downloaded)
+
+
+def _download_hf_model_file(
+    *, repo_id: str, revision: str, filename: str, cache_dir: Path
+) -> Path:
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError as error:
+        raise StagingError(
+            "Hugging Face Hub is unavailable; run `uv sync --extra data`"
+        ) from error
+    try:
+        downloaded = hf_hub_download(
+            repo_id=repo_id,
+            repo_type="model",
+            revision=revision,
+            filename=filename,
+            cache_dir=str(cache_dir),
+            token=os.environ.get("HF_TOKEN"),
         )
-    info_sha256, _ = _sha256_file(info_path)
-    dataset = builder.as_dataset(
-        split=split,
-        shuffle_files=False,
-        read_config=tfds.ReadConfig(shuffle_seed=0),
-    )
-    return _iter_text_values(tfds.as_numpy(dataset)), info_sha256
+    except Exception as error:
+        raise StagingError(
+            f"cannot materialize immutable Gemma tokenizer file {filename!r}"
+        ) from error
+    return Path(downloaded)
+
+
+def _verify_gemma_tokenizer_view(path: Path) -> None:
+    children = tuple(sorted(path.iterdir(), key=lambda item: item.name))
+    actual = tuple(item.name for item in children)
+    expected = tuple(entry.path for entry in GEMMA4_TOKENIZER_SOURCE_FILES)
+    if actual != expected or any(not item.is_file() for item in children):
+        raise StagingError(
+            "local Gemma tokenizer view differs from its pinned two-file inventory"
+        )
+    for entry in GEMMA4_TOKENIZER_SOURCE_FILES:
+        digest, size = _sha256_file(path / entry.path)
+        if (digest, size) != (entry.content_sha256, entry.size_bytes):
+            raise StagingError(
+                f"local Gemma tokenizer content changed: {entry.path}"
+            )
+
+
+def materialize_gemma_tokenizer(
+    tokenizer_id: str, revision: str, cache_dir: str | Path
+) -> Path:
+    """Build a verified two-file local tokenizer view at the pinned revision."""
+
+    from moe_sae.config import MODEL_ID, MODEL_REVISION
+
+    if tokenizer_id != MODEL_ID or revision != MODEL_REVISION:
+        raise StagingError("Gemma tokenizer ID/revision differs from the pinned model")
+    cache = Path(cache_dir).expanduser().resolve()
+    cache.mkdir(parents=True, exist_ok=True)
+    view = cache / "gemma-tokenizer" / revision
+    view.mkdir(parents=True, exist_ok=True)
+    for partial in view.glob(".*.partial"):
+        partial.unlink()
+
+    for entry in GEMMA4_TOKENIZER_SOURCE_FILES:
+        source = _download_hf_model_file(
+            repo_id=tokenizer_id,
+            revision=revision,
+            filename=entry.path,
+            cache_dir=cache,
+        )
+        digest, size = _sha256_file(source)
+        if (digest, size) != (entry.content_sha256, entry.size_bytes):
+            raise StagingError(
+                "immutable Gemma tokenizer hash/size mismatch for "
+                f"{entry.path}: got {digest}/{size}, expected "
+                f"{entry.content_sha256}/{entry.size_bytes}"
+            )
+        destination = view / entry.path
+        if destination.exists():
+            existing_digest, existing_size = _sha256_file(destination)
+            if (existing_digest, existing_size) != (
+                entry.content_sha256,
+                entry.size_bytes,
+            ):
+                raise StagingError(
+                    f"existing local Gemma tokenizer view is corrupt: {destination}"
+                )
+            continue
+        temporary = destination.with_name(f".{destination.name}.{os.getpid()}.partial")
+        temporary.unlink(missing_ok=True)
+        try:
+            shutil.copyfile(source, temporary)
+            with temporary.open("rb") as handle:
+                os.fsync(handle.fileno())
+            copied_digest, copied_size = _sha256_file(temporary)
+            if (copied_digest, copied_size) != (
+                entry.content_sha256,
+                entry.size_bytes,
+            ):
+                raise StagingError(
+                    f"copied Gemma tokenizer content changed: {entry.path}"
+                )
+            os.replace(temporary, destination)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    _verify_gemma_tokenizer_view(view)
+    return view
+
+
+def _json_gzip_text_stream(path: Path) -> Iterator[str]:
+    """Yield strict JSONL ``text`` values from one verified gzip object."""
+
+    try:
+        with gzip.open(path, mode="rt", encoding="utf-8", errors="strict") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                if not line.strip():
+                    raise StagingError(
+                        f"C4 source contains a blank JSON line at {path}:{line_number}"
+                    )
+                try:
+                    value = json.loads(line)
+                except json.JSONDecodeError as error:
+                    raise StagingError(
+                        f"C4 source contains invalid JSON at {path}:{line_number}"
+                    ) from error
+                if not isinstance(value, Mapping) or not isinstance(
+                    value.get("text"), str
+                ):
+                    raise StagingError(
+                        f"C4 source lacks a string 'text' field at {path}:{line_number}"
+                    )
+                yield value["text"]
+    except StagingError:
+        raise
+    except (OSError, EOFError, UnicodeError) as error:
+        raise StagingError(f"cannot decode immutable C4 source file {path}") from error
+
+
+def allenai_c4_stream(
+    split: str, source_cache: str | Path
+) -> tuple[Iterable[str], dict[str, Any]]:
+    """Materialize, verify, and stream the bounded immutable AllenAI C4 source."""
+
+    if split not in ALLENAI_C4_SOURCE_FILES:
+        raise ValueError("split must be 'train' or 'validation'")
+    cache = Path(source_cache).expanduser().resolve()
+    cache.mkdir(parents=True, exist_ok=True)
+    specifications = ALLENAI_C4_SOURCE_FILES[split]
+    local_files: list[Path] = []
+    for specification in specifications:
+        local_path = _download_hf_source_file(
+            repo_id=ALLENAI_C4_REPO_ID,
+            revision=ALLENAI_C4_REVISION,
+            filename=specification.path,
+            cache_dir=cache,
+        )
+        actual_digest, actual_size = _sha256_file(local_path)
+        if (actual_digest, actual_size) != (
+            specification.sha256,
+            specification.size_bytes,
+        ):
+            raise StagingError(
+                "immutable C4 source hash/size mismatch for "
+                f"{specification.path}: got {actual_digest}/{actual_size}, expected "
+                f"{specification.sha256}/{specification.size_bytes}"
+            )
+        local_files.append(local_path)
+
+    def stream() -> Iterator[str]:
+        for local_path in local_files:
+            yield from _json_gzip_text_stream(local_path)
+
+    identity = {
+        "provider": "huggingface_hub",
+        "repo_type": "dataset",
+        "repo_id": ALLENAI_C4_REPO_ID,
+        "revision": ALLENAI_C4_REVISION,
+        "files": [specification.as_dict() for specification in specifications],
+    }
+    return stream(), _validated_source_identity(identity)
 
 
 def gemma_tokenizer(
-    tokenizer_id: str, revision: str
+    tokenizer_id: str, revision: str, cache_dir: str | Path
 ) -> Callable[[str], Sequence[int]]:
     """Load a revision-pinned Gemma tokenizer and return raw-content encoding."""
 
@@ -602,11 +890,12 @@ def gemma_tokenizer(
         raise StagingError(
             "Transformers is unavailable; run `uv sync --extra data`"
         ) from error
+    local_view = materialize_gemma_tokenizer(tokenizer_id, revision, cache_dir)
     tokenizer = AutoTokenizer.from_pretrained(
-        tokenizer_id,
-        revision=revision,
-        token=os.environ.get("HF_TOKEN"),
+        str(local_view),
+        local_files_only=True,
     )
+    _verify_gemma_tokenizer_view(local_view)
     actual = (
         tokenizer.pad_token_id,
         tokenizer.eos_token_id,
@@ -635,7 +924,7 @@ def stage_c4_split(
     split: str,
     target_scientific_tokens: int,
     output_directory: str | Path,
-    tfds_data_dir: str | Path | None,
+    source_cache: str | Path | None,
     tokenizer_id: str,
     tokenizer_revision: str,
     records_per_shard: int = 4_096,
@@ -643,7 +932,7 @@ def stage_c4_split(
     process_count: int = DEFAULT_PROCESS_COUNT,
     texts: Iterable[Any] | None = None,
     tokenize: Callable[[str], Sequence[int]] | None = None,
-    source_info_sha256: str | None = None,
+    source_identity: Mapping[str, Any] | None = None,
 ) -> StagingResult:
     """Stage and seal one deterministic C4 split, resuming at shard boundaries."""
 
@@ -655,23 +944,23 @@ def stage_c4_split(
         raise ValueError("the v4-32 staging contract requires exactly four controllers")
     _validate_revision(tokenizer_revision, "tokenizer_revision")
     if texts is None:
-        if tfds_data_dir is None:
-            raise ValueError("tfds_data_dir is required for production C4 staging")
-        source, actual_source_sha256 = tfds_c4_stream(split, tfds_data_dir)
-        if source_info_sha256 is not None and source_info_sha256 != actual_source_sha256:
-            raise StagingError(
-                "supplied TFDS dataset-info hash does not match the prepared source"
-            )
-        source_info_sha256 = actual_source_sha256
+        if source_cache is None:
+            raise ValueError("source_cache is required for production C4 staging")
+        if source_identity is not None:
+            raise ValueError("production C4 source identity is fixed and cannot be supplied")
+        source, source_identity = allenai_c4_stream(split, source_cache)
     else:
         source = texts
-        if source_info_sha256 is None or not _SHA256.fullmatch(source_info_sha256):
-            raise ValueError("injected staging input requires a 64-character source_info_sha256")
+        if source_cache is not None:
+            raise ValueError("source_cache and injected texts are mutually exclusive")
+        if source_identity is None:
+            raise ValueError("injected staging input requires an immutable source_identity")
+        source_identity = _validated_source_identity(source_identity)
     root = Path(output_directory).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
     identity = _manifest_identity(
         split=split,
-        source_info_sha256=source_info_sha256,
+        source_identity=source_identity,
         tokenizer_id=tokenizer_id,
         tokenizer_revision=tokenizer_revision,
         sequence_length=sequence_length,
@@ -733,7 +1022,7 @@ def stage_c4_split(
             "next_record_index",
             "lane_scientific_tokens",
             "files",
-        } or state.get("schema_version") != "gemma4-c4-staging-state-v1":
+        } or state.get("schema_version") != "gemma4-c4-staging-state-v2":
             raise StagingError("existing staging state has incompatible fields")
         declared_target = state.get("target_scientific_tokens")
         if state.get("identity") != identity or (
@@ -762,11 +1051,14 @@ def stage_c4_split(
         record_index = 0
         resumed = False
 
-    encode = (
-        tokenize
-        if tokenize is not None
-        else gemma_tokenizer(tokenizer_id, tokenizer_revision)
-    )
+    if tokenize is None:
+        if source_cache is None:
+            raise ValueError(
+                "source_cache is required when the pinned Gemma tokenizer is used"
+            )
+        encode = gemma_tokenizer(tokenizer_id, tokenizer_revision, source_cache)
+    else:
+        encode = tokenize
     iterator = iter(_iter_text_values(source))
     for _ in itertools.islice(iterator, source_examples):
         pass
@@ -850,7 +1142,7 @@ def stage_c4_split(
         _atomic_write_json(
             state_path,
             {
-                "schema_version": "gemma4-c4-staging-state-v1",
+                "schema_version": "gemma4-c4-staging-state-v2",
                 "identity": identity,
                 "target_scientific_tokens": target_scientific_tokens,
                 "source_examples": source_examples,
@@ -1123,23 +1415,30 @@ def publish_staged_dataset(
 
 
 __all__ = [
+    "ALLENAI_C4_REPO_ID",
+    "ALLENAI_C4_REVISION",
+    "ALLENAI_C4_SOURCE_FILES",
     "BOS_ID",
     "DEFAULT_PROCESS_COUNT",
     "EOS_ID",
+    "GEMMA4_TOKENIZER_INVENTORY_SHA256",
+    "GEMMA4_TOKENIZER_SOURCE_FILES",
     "PACKED_DATASET_SCHEMA",
     "PACKED_RECORD_FORMAT",
     "PAD_ID",
     "PackedBatchIterable",
     "PackedRecord",
+    "SourceFile",
     "StagingError",
     "StagingResult",
     "build_maxtext_packed_iterator",
+    "allenai_c4_stream",
     "decode_packed_record",
     "encode_packed_record",
     "gemma_tokenizer",
     "lane_for_record",
     "publish_staged_dataset",
+    "materialize_gemma_tokenizer",
     "stage_c4_split",
-    "tfds_c4_stream",
     "verify_packed_source",
 ]

@@ -5,154 +5,634 @@ integrity, MFU, goodput, health, or exact-count gate. Production commands that
 initialize JAX must be launched collectively with the same arguments on all
 four v4-32 controllers; the snippets below show that per-controller command.
 
-## 1. Security and deployment variables
+## Stage 1 — prepare the immutable data and model inputs
 
-Revoke and replace any Hugging Face credential that appeared in notebook or
-terminal output. Authenticate through `HF_TOKEN` in the process environment;
-never pass it as a CLI argument. Preflight scans repository file contents for
-common token shapes without printing token values.
+Stage 1 happens before the TPU run. It is complete when the packed train and
+validation data are sealed in GCS, Gemma has been converted from one immutable
+Hugging Face commit, logit parity has passed, and you have recorded the six
+locations/digests needed by the TPU stages.
 
-Use one stable production layout. The artifact root must be below
-`artifacts/gemma4_v1/` and resolve to the same strongly consistent POSIX mount
-on every controller:
+Your v4-32 is covered by the TRC allocation. That removes TPU cost anxiety, but
+it does not change this preparation or any acceptance gate. Use the project,
+zone, service account, and provisioning process in the TRC award. Do not create
+a personal billed TPU. GCS and a temporary high-memory conversion VM may still
+count against separate TRC quotas.
+
+### 1.1 Check the repository and local tools
+
+On the machine where you will stage C4:
+
+```zsh
+cd /Users/abistras/Desktop/moe-sae
+
+# In zsh, make a failing command on the left of `| tee` fail the pipeline.
+setopt PIPE_FAIL
+
+git status --short
+export REPOSITORY_URL="$(git remote get-url origin)"
+export PROJECT_COMMIT="$(git rev-parse HEAD)"
+print -r -- "$REPOSITORY_URL"
+print -r -- "$PROJECT_COMMIT"
+uv --version
+gcloud --version
+jq --version
+```
+
+For a production run, `git status --short` should print nothing. Commit the
+implementation first so every later fingerprint refers to a stable tree. If
+`jq` is missing on the Mac, install it with `brew install jq`.
+
+Keep the large optional dependency sets separate. This prevents CPU Torch and
+data libraries from leaking into the TPU runtime:
+
+```zsh
+export DATA_ENV="$HOME/.virtualenvs/moe-sae-data"
+export CONVERSION_ENV="$HOME/.virtualenvs/moe-sae-conversion"
+
+UV_PROJECT_ENVIRONMENT="$DATA_ENV" \
+  uv sync --frozen --extra data
+```
+
+Create the conversion environment later on the Linux conversion host, not on
+the Mac. Every data command below explicitly selects `DATA_ENV`.
+
+### 1.2 Select the TRC project and authenticate both clients
+
+Set the project ID from the TRC award, then authenticate the `gcloud` CLI and
+Python Application Default Credentials. They are separate credential paths:
+
+```zsh
+export GCP_PROJECT="<TRC project ID>"
+
+gcloud auth login
+gcloud config set project "$GCP_PROJECT"
+gcloud auth application-default login
+gcloud auth application-default set-quota-project "$GCP_PROJECT"
+
+gcloud services enable \
+  compute.googleapis.com \
+  storage.googleapis.com \
+  tpu.googleapis.com
+```
+
+If enabling an API is denied, ask the TRC project administrator. Do not switch
+silently to a personal project.
+
+### 1.3 Select or create the GCS bucket
+
+If TRC supplied a bucket, use it and skip creation. Otherwise choose a globally
+unique name and ask the TRC administrator which location is permitted. A
+v4-32 is commonly provisioned in `us-central2-b`, but ordinary Cloud Storage
+does not offer `us-central2` as a regional bucket location. `US` or
+`us-central1` are reasonable examples only when the administrator approves
+them:
+
+```zsh
+export BUCKET="<globally-unique-bucket-name>"
+export BUCKET_LOCATION="<TRC-approved location, for example US>"
+
+gcloud storage buckets create "gs://$BUCKET" \
+  --project="$GCP_PROJECT" \
+  --location="$BUCKET_LOCATION" \
+  --default-storage-class=STANDARD \
+  --uniform-bucket-level-access \
+  --public-access-prevention \
+  --soft-delete-duration=0
+```
+
+This is a scratch/experiment bucket, so the command explicitly disables the
+otherwise-default seven-day soft-delete window. Deleted qualification and
+benchmark objects would remain billable during that window. If TRC requires
+recovery retention, omit this flag and accept the separate GCS cost. Do not
+change an existing shared bucket's policy without its owner. See Google's
+[bucket-location list](https://cloud.google.com/storage/docs/locations) and
+[soft-delete documentation](https://cloud.google.com/storage/docs/soft-delete)
+before choosing differently.
+
+Define the Stage 1 paths. The two source/model revisions are already pinned in
+`configs/gemma4_26b_a4b.yaml`; operators do not supply revision flags.
 
 ```zsh
 export ARTIFACT_ROOT="$PWD/artifacts/gemma4_v1/production"
-export TFDS_DATA_DIR="/path/to/prepared/tfds"
-export LOCAL_C4_STAGE="/path/to/cpu-local/c4-stage"
-export BULK_GCS_ROOT="gs://BUCKET/moe-sae/gemma4_v1"
+export C4_SOURCE_CACHE="$HOME/.cache/moe-sae/c4-source"
+export LOCAL_C4_STAGE="$HOME/moe-sae-work/c4-stage"
+# One 319 MB file is simpler and more reliable over ordinary HTTP than Xet.
+export HF_HUB_DISABLE_XET=1
+
+export BULK_GCS_ROOT="gs://$BUCKET/moe-sae/gemma4_v1"
+export MODEL_ROOT="$BULK_GCS_ROOT/model"
 export SAE_CHECKPOINT_ROOT="$BULK_GCS_ROOT/sae-checkpoints"
+
+mkdir -p \
+  "$ARTIFACT_ROOT/operator-results" \
+  "$C4_SOURCE_CACHE" \
+  "$LOCAL_C4_STAGE"
+```
+
+Check both GCS authentication paths:
+
+```zsh
+gcloud storage ls "gs://$BUCKET"
+
+UV_PROJECT_ENVIRONMENT="$DATA_ENV" \
+  uv run --frozen --extra data python -c \
+  'import os; from google.cloud import storage; b=storage.Client(project=os.environ["GCP_PROJECT"]).bucket(os.environ["BUCKET"]); print("bucket exists:", b.exists())'
+```
+
+The second command must print `bucket exists: True`.
+
+### 1.4 Understand the bounded C4 input
+
+The pipeline does not build the 806+ GiB TFDS corpus. It downloads and accepts
+only these two objects from the immutable `allenai/c4` revision
+`1588ec454efa1a09f29cd18ddd04fe05fc8653a2`:
+
+| Split | Exact source object | Bytes | SHA-256 |
+|---|---|---:|---|
+| train | `en/c4-train.00000-of-01024.json.gz` | 319,308,785 | `8ef8d75b0e045dec4aa5123a671b4564466b0707086a7ed1ba8721626dfffbc9` |
+| validation | `en/c4-validation.00000-of-00008.json.gz` | 40,471,190 | `1f25b6af12da84115301d4ee93ea5246c8fea5bb4a2008472794d95b917cc97f` |
+
+Those bounded shards contain more than the required 50,000,000 train and
+2,000,000 held-out Gemma tokens. The stager downloads them itself, verifies
+their byte size and SHA-256 before parsing, preserves line order, and fails if
+the inventory is exhausted. Do not download, rename, or edit them manually.
+
+The repositories are public at the pinned commits. First try without an HF
+token. If Hugging Face returns an authentication or rate-limit error, enter a
+read-only token without echoing it:
+
+```zsh
+read -s "HF_TOKEN?Hugging Face read token: "
+export HF_TOKEN
+echo
+```
+
+Never put the token in a command argument, file, notebook output, or Git.
+`HF_HUB_DISABLE_XET=1` changes only the C4 download transport; the verified
+source revision, byte size, and SHA-256 remain identical. It avoids a known
+failure mode where Xet establishes connections but does not assemble this
+single large gzip object on some laptops.
+
+### 1.5 Run a small staging smoke test
+
+This first command downloads and verifies the train source, then downloads only
+Gemma's `tokenizer.json` and `tokenizer_config.json` at the pinned model commit.
+Their exact 32 MB payload/file hashes are checked before Transformers loads a
+two-file, local-only view. It then writes a few ArrayRecords, seals a manifest,
+and exercises the same code used for production:
+
+```zsh
+UV_PROJECT_ENVIRONMENT="$DATA_ENV" \
+  uv run --frozen --extra data moe-sae stage-c4 \
+    --artifact-root "$ARTIFACT_ROOT" \
+    --split train \
+    --source-cache-dir "$C4_SOURCE_CACHE" \
+    --output-directory "$LOCAL_C4_STAGE/smoke/train" \
+    --target-tokens 65536 \
+    --records-per-shard 128 \
+    --local-smoke
+```
+
+The JSON result contains `manifest_location`, `grain_files`,
+`scientific_tokens`, `record_count`, `source_examples`, and `resumed`. The
+first run should normally say `"resumed": false`. Run the exact command again;
+it should return the identical inventory with `"resumed": true`.
+
+If this fails, stop here. The exception identifies whether source download,
+hashing, tokenizer loading, JSON decoding, packing, ArrayRecord reopening, or
+resume validation failed.
+
+### 1.6 Stage and publish the production splits
+
+Run train first:
+
+```zsh
+UV_PROJECT_ENVIRONMENT="$DATA_ENV" \
+  uv run --frozen --extra data moe-sae stage-c4 \
+    --artifact-root "$ARTIFACT_ROOT" \
+    --split train \
+    --source-cache-dir "$C4_SOURCE_CACHE" \
+    --output-directory "$LOCAL_C4_STAGE/train" \
+    --records-per-shard 4096 \
+    --publish-gcs "$BULK_GCS_ROOT/datasets/c4/train" \
+  | tee "$ARTIFACT_ROOT/operator-results/stage-train.json"
+```
+
+Then validation:
+
+```zsh
+UV_PROJECT_ENVIRONMENT="$DATA_ENV" \
+  uv run --frozen --extra data moe-sae stage-c4 \
+    --artifact-root "$ARTIFACT_ROOT" \
+    --split validation \
+    --source-cache-dir "$C4_SOURCE_CACHE" \
+    --output-directory "$LOCAL_C4_STAGE/validation" \
+    --records-per-shard 4096 \
+    --publish-gcs "$BULK_GCS_ROOT/datasets/c4/validation" \
+  | tee "$ARTIFACT_ROOT/operator-results/stage-validation.json"
+```
+
+These are safe to re-run after interruption. Resume is by sealed shard state,
+not by counting files. A completed staging inventory can be slightly larger
+than 50M/2M because records and four host lanes remain statically aligned;
+capture masks the tail to the exact scientific token totals.
+
+This is laptop CPU and disk work, not TPU work. Expect train to dominate and
+leave the terminal awake; validation is much smaller. The bounded C4 downloads
+total about 360 MB and the tokenizer adds about 32 MB once to the shared cache;
+the packed output is measured in GB rather than hundreds of GB. An interruption
+is inconvenient, not catastrophic: rerun the exact split command and let the
+immutable state decide what is complete.
+
+The manifest schema is `gemma4-c4-packed-arrayrecord-v2`. It binds the exact
+source repository, commit, file path, compressed size and SHA-256; the exact
+Gemma tokenizer commit plus the byte/Git identities of its two local files;
+packed record schema; scientific token counts; host lane counts; and the
+ordered content-addressed ArrayRecord inventory.
+
+Extract the four values needed by preflight and harvesting:
+
+```zsh
+export TRAIN_DATASET_MANIFEST="$(
+  jq -r '.manifest_location' \
+    "$ARTIFACT_ROOT/operator-results/stage-train.json"
+)"
+export TRAIN_GRAIN_FILES="$(
+  jq -r '.grain_files' \
+    "$ARTIFACT_ROOT/operator-results/stage-train.json"
+)"
+export EVAL_DATASET_MANIFEST="$(
+  jq -r '.manifest_location' \
+    "$ARTIFACT_ROOT/operator-results/stage-validation.json"
+)"
+export EVAL_GRAIN_FILES="$(
+  jq -r '.grain_files' \
+    "$ARTIFACT_ROOT/operator-results/stage-validation.json"
+)"
+
+print -r -- "$TRAIN_DATASET_MANIFEST"
+print -r -- "$TRAIN_GRAIN_FILES"
+print -r -- "$EVAL_DATASET_MANIFEST"
+print -r -- "$EVAL_GRAIN_FILES"
+```
+
+All four values must begin with `gs://`. Preserve them in your private operator
+notes; they are identities, not secrets. The staging CLI calls the held-out
+split `validation`; capture and SAE commands call that same data `eval`.
+
+Do not try to revoke write access on just this apparent "directory" unless the
+bucket was deliberately created with managed folders and a tested folder-level
+IAM policy. Ordinary bucket IAM is not prefix-scoped, and removing bucket-wide
+writes would also break later capture and checkpoint publication. The sealed
+manifest's object generations and hashes make accidental replacement fail
+closed. A dedicated read-only dataset bucket can be added later if the TRC
+administrator wants stronger separation.
+
+### 1.7 Prepare the high-memory Linux conversion host
+
+Do not attempt Gemma 26B conversion on the MacBook. The official parity check
+uses float32 and holds the Hugging Face and MaxText models concurrently. Require
+at least 384 GiB RAM; a 512 GiB host is the safer default. Also require at least
+200 GiB free on a fast local filesystem. The model snapshot alone is roughly
+52 GB. TPU quota does not automatically make this CPU VM or its disk free.
+
+If TRC gives you a suitable host, use it. If the administrator tells you to
+create one, the following is a concrete default. Run it on your Mac after
+replacing all three placeholders. `n2-highmem-64` supplies 512 GB of RAM; if
+that type or quota is unavailable, stop and ask the administrator rather than
+choosing a smaller machine:
+
+```zsh
+export CONVERSION_VM="gemma4-conversion"
+export CONVERSION_ZONE="<zone with approved N2 quota, for example us-central1-a>"
+export CONVERSION_SERVICE_ACCOUNT="<TRC service-account email>"
+
+gcloud compute instances create "$CONVERSION_VM" \
+  --project="$GCP_PROJECT" \
+  --zone="$CONVERSION_ZONE" \
+  --machine-type=n2-highmem-64 \
+  --boot-disk-size=300GB \
+  --boot-disk-type=pd-ssd \
+  --image-family=ubuntu-2404-lts-amd64 \
+  --image-project=ubuntu-os-cloud \
+  --service-account="$CONVERSION_SERVICE_ACCOUNT" \
+  --scopes=https://www.googleapis.com/auth/cloud-platform \
+  --labels=purpose=gemma4-conversion
+
+gcloud compute ssh "$CONVERSION_VM" \
+  --project="$GCP_PROJECT" \
+  --zone="$CONVERSION_ZONE"
+```
+
+That service account needs permission to list/read the bucket and create
+objects below the model and handoff prefixes. If VM creation or bucket access
+is denied, send the exact error to the TRC administrator; do not add a service
+account key file or switch projects.
+
+The remaining commands in this section run on the Linux host. Install the small
+operator toolset and enter zsh:
+
+```zsh
+sudo apt-get update
+sudo apt-get install -y apt-transport-https ca-certificates curl git gnupg jq zsh
+
+if ! command -v gcloud >/dev/null; then
+  curl -fsSLo /tmp/google-cloud-apt-key.gpg \
+    https://packages.cloud.google.com/apt/doc/apt-key.gpg
+  sudo gpg --batch --yes --dearmor \
+    --output /usr/share/keyrings/cloud.google.gpg \
+    /tmp/google-cloud-apt-key.gpg
+  echo 'deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main' \
+    | sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list >/dev/null
+  sudo apt-get update
+  sudo apt-get install -y google-cloud-cli
+fi
+
+if ! command -v uv >/dev/null; then
+  curl -LsSf -o /tmp/uv-install.sh https://astral.sh/uv/install.sh
+  sh /tmp/uv-install.sh
+fi
+export PATH="$HOME/.local/bin:$PATH"
+exec zsh
+```
+
+The `exec zsh` line starts a fresh shell. Re-establish the safety option and all
+cross-host values; paste the exact URL and 40-character commit printed in 1.1:
+
+```zsh
+setopt PIPE_FAIL
+
+export GCP_PROJECT="<same TRC project ID>"
+export BUCKET="<same bucket name>"
+export REPOSITORY_URL="<exact git remote URL from 1.1>"
+export PROJECT_COMMIT="<exact 40-character commit from 1.1>"
+
+gcloud config set project "$GCP_PROJECT"
+gcloud auth list
+curl -fsS \
+  -H 'Metadata-Flavor: Google' \
+  'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email'
+print
+gcloud storage ls "gs://$BUCKET"
+```
+
+The metadata command must print the intended service-account email and the
+storage command must succeed. A Compute Engine attached service account is
+automatically available to Python ADC; do not run `gcloud auth
+application-default login` on that VM. On a non-GCE TRC host, authenticate
+`gcloud` and ADC exactly as in 1.2 instead.
+
+Clone and verify this repository. If it is private, authenticate Git first;
+never place a GitHub token in `REPOSITORY_URL`:
+
+```zsh
+export PROJECT_ROOT="$HOME/src/moe-sae"
+mkdir -p "$HOME/src"
+
+git clone "$REPOSITORY_URL" "$PROJECT_ROOT"
+git -C "$PROJECT_ROOT" checkout --detach "$PROJECT_COMMIT"
+test "$(git -C "$PROJECT_ROOT" rev-parse HEAD)" = "$PROJECT_COMMIT"
+test -z "$(git -C "$PROJECT_ROOT" status --porcelain=v1 --untracked-files=all)"
+cd "$PROJECT_ROOT"
+```
+
+If `$PROJECT_ROOT` already exists, do not clone over it. Verify its remote,
+fetch, detach at `$PROJECT_COMMIT`, and require an empty status before
+continuing.
+
+Create the isolated conversion environment, then prove the host really has the
+required memory, disk, tools, Python ADC, and bucket permissions:
+
+```zsh
+export CONVERSION_ENV="$HOME/.virtualenvs/moe-sae-conversion"
+UV_PROJECT_ENVIRONMENT="$CONVERSION_ENV" \
+  uv sync --frozen --extra conversion
+
+export CHECKPOINT_WORK="$HOME/checkpoint-work"
+export HF_CACHE_DIR="$CHECKPOINT_WORK/huggingface"
+mkdir -p "$HF_CACHE_DIR"
+
+free -h
+df -h "$CHECKPOINT_WORK"
+export HOST_MEMORY_KIB="$(awk '/MemTotal/ {print $2}' /proc/meminfo)"
+export WORK_FREE_BYTES="$(df --output=avail -B1 "$CHECKPOINT_WORK" | tail -1)"
+(( HOST_MEMORY_KIB >= 384 * 1024 * 1024 ))
+(( WORK_FREE_BYTES >= 200 * 1024 * 1024 * 1024 ))
+
+git --version
+uv --version
+gcloud --version
+jq --version
+
+UV_PROJECT_ENVIRONMENT="$CONVERSION_ENV" \
+  uv run --frozen --extra conversion python -c \
+  'import os; from google.cloud import storage; c=storage.Client(project=os.environ["GCP_PROJECT"]); next(c.list_blobs(os.environ["BUCKET"], max_results=1), None); print("bucket object access: ok")'
+```
+
+Both arithmetic checks must return silently with exit status zero, and the last
+command must print `bucket object access: ok`. A failed check means stop; do not
+hope that swap or an assumed `/mnt/disks/...` mount will rescue parity.
+
+Prepare the exact MaxText checkout:
+
+```zsh
+export MAXTEXT_COMMIT="48c7da3e28e8f57fe36ddf09d00eec53072a2ea0"
+export MAXTEXT_ROOT="$HOME/src/maxtext-gemma4"
+
+git clone https://github.com/AI-Hypercomputer/maxtext.git "$MAXTEXT_ROOT"
+git -C "$MAXTEXT_ROOT" checkout --detach "$MAXTEXT_COMMIT"
+test "$(git -C "$MAXTEXT_ROOT" rev-parse HEAD)" = "$MAXTEXT_COMMIT"
+test -z "$(git -C "$MAXTEXT_ROOT" status --porcelain=v1 --untracked-files=all)"
+```
+
+If the checkout already exists, do not clone over it; fetch the commit, check
+it out detached, and run the same two tests.
+
+Finally define a unique, never-reused model output for this one conversion
+attempt:
+
+```zsh
+export ARTIFACT_ROOT="$PROJECT_ROOT/artifacts/gemma4_v1/production"
+export BULK_GCS_ROOT="gs://$BUCKET/moe-sae/gemma4_v1"
+export MODEL_ROOT="$BULK_GCS_ROOT/model"
+export MODEL_ATTEMPT_ID="$(date -u +%Y%m%dT%H%M%SZ)-$(print -r -- "$PROJECT_COMMIT" | cut -c1-12)"
+export MODEL_OUTPUT="$MODEL_ROOT/$MODEL_ATTEMPT_ID"
+
+mkdir -p "$ARTIFACT_ROOT/operator-results"
+print -r -- "$MODEL_OUTPUT"
+```
+
+The conversion CLI proves this path contains no GCS objects before downloading
+the model. If an attempt fails after it starts writing, generate a new
+`MODEL_ATTEMPT_ID`; never delete or reuse the partial prefix. It also refuses
+to run when `$ARTIFACT_ROOT/checkpoint/conversion.json` is already sealed. That
+means Stage 1 already has an authoritative conversion; do not overwrite it.
+
+### 1.8 Convert the exact Gemma snapshot and prove parity
+
+Make sure the `google/gemma-4-26B-A4B` license has been accepted by the account
+behind your Hugging Face token. Enter the read-only token in this new host's
+shell if it is not already present:
+
+```zsh
+if [[ -z "${HF_TOKEN:-}" ]]; then
+  read -s "HF_TOKEN?Hugging Face read token: "
+  export HF_TOKEN
+  echo
+fi
+```
+
+First validate the plan without downloading 52 GB:
+
+```zsh
+UV_PROJECT_ENVIRONMENT="$CONVERSION_ENV" \
+  uv run --frozen --extra conversion moe-sae convert-checkpoint \
+    --artifact-root "$ARTIFACT_ROOT" \
+    --maxtext-root "$MAXTEXT_ROOT" \
+    --hf-cache-dir "$HF_CACHE_DIR" \
+    --output "$MODEL_OUTPUT" \
+    --dry-run
+```
+
+The printed plan must name Gemma revision
+`24548b62aa021d562695c04aaf7758a1ea47990b`, print 64-character repository and
+snapshot inventory SHA-256 values, and show `max_kl_div_threshold: 0.03`. Then
+run it for real:
+
+```zsh
+UV_PROJECT_ENVIRONMENT="$CONVERSION_ENV" \
+  uv run --frozen --extra conversion moe-sae convert-checkpoint \
+    --artifact-root "$ARTIFACT_ROOT" \
+    --maxtext-root "$MAXTEXT_ROOT" \
+    --hf-cache-dir "$HF_CACHE_DIR" \
+    --output "$MODEL_OUTPUT"
+```
+
+The CLI downloads the exact commit into a commit-addressed local snapshot. It
+requires the exact ten-file repository tree pinned in code, verifies all three
+LFS payload SHA-256/size pairs, and verifies every ordinary file's Git blob
+identity and SHA-256. Missing, extra, corrupt, or locally modified cache files
+fail before conversion. Both MaxText conversion and the Hugging Face parity
+model/tokenizer consume that same local path. The Hub token is removed from
+both subprocess environments. The CLI re-hashes the complete 51.6 GB snapshot
+after parity and refuses to attest if anything changed.
+
+Success means conversion exits zero, parity exits zero at
+`max_kl_div <= 0.03`, `$MODEL_OUTPUT/0/items` exists, and
+`$ARTIFACT_ROOT/checkpoint/conversion.json` exists. Quiet periods while large
+weights load or hash are normal; do not interrupt solely because no new line
+has appeared. Reserve a several-hour window: download speed, two full snapshot
+hash passes, Orbax publication, and CPU parity all contribute. This Stage 1
+timing is not part of either harvester MFU or marginal SAE chip-seconds.
+
+The CLI removes the token from its child processes; remove it from the
+interactive shell as soon as the command finishes:
+
+```zsh
+unset HF_TOKEN
+```
+
+The attestation records the model ID and revision, expected repository-tree and
+byte-level snapshot inventory hashes, clean MaxText commit, checkpoint
+inventory hash, timings, parity threshold and result, and its own self-hash.
+Extract the two authoritative values:
+
+```zsh
+export MODEL_CHECKPOINT="$(
+  jq -r '.checkpoint' "$ARTIFACT_ROOT/checkpoint/conversion.json"
+)"
+export CHECKPOINT_SHA256="$(
+  jq -r '.checkpoint_sha256' "$ARTIFACT_ROOT/checkpoint/conversion.json"
+)"
+
+print -r -- "$MODEL_CHECKPOINT"
+print -r -- "$CHECKPOINT_SHA256"
+```
+
+`CHECKPOINT_SHA256` must be exactly 64 lowercase hexadecimal characters. Never
+shorten it or compute a replacement manually.
+
+If the conversion host does not mount the later shared POSIX control plane,
+preserve the exact self-hashed file at an attestation-addressed GCS object:
+
+```zsh
+export CONVERSION_ATTESTATION_SHA256="$(
+  jq -r '.attestation_sha256' "$ARTIFACT_ROOT/checkpoint/conversion.json"
+)"
+export CONVERSION_HANDOFF="$BULK_GCS_ROOT/control-handoff/conversion/$CONVERSION_ATTESTATION_SHA256/conversion.json"
+gcloud storage cp --if-generation-match=0 \
+  "$ARTIFACT_ROOT/checkpoint/conversion.json" \
+  "$CONVERSION_HANDOFF"
+```
+
+Before production preflight, copy those exact bytes to
+`$ARTIFACT_ROOT/checkpoint/conversion.json` on the shared control plane. Exact
+byte copying is useful audit discipline. The loader canonicalizes parsed JSON,
+so whitespace or key ordering alone does not change the self-hash, but changing
+any attested field does. Do not edit or regenerate the file manually.
+
+The TPU runtime does not install or import Torch. Every production model stage
+recomputes the Orbax inventory on every controller, requires controller
+agreement, and compares it with `CHECKPOINT_SHA256`.
+
+Once the handoff object and all extracted values are safely recorded, stop the
+temporary conversion VM from the Mac so it cannot accrue idle compute usage:
+
+```zsh
+gcloud compute instances stop "$CONVERSION_VM" \
+  --project="$GCP_PROJECT" \
+  --zone="$CONVERSION_ZONE"
+```
+
+After the shared-control-plane copy passes production preflight, delete the VM
+and its auto-delete boot disk if TRC policy permits. Stopped persistent disks
+can still be billed.
+
+### Stage 1 completion checklist
+
+- [ ] The implementation is committed and the production checkout is clean.
+- [ ] `gcloud` and Python ADC both access the TRC bucket.
+- [ ] The smoke stage succeeded twice, including deterministic resume.
+- [ ] Train and validation ArrayRecords and manifests are sealed in GCS.
+- [ ] `TRAIN_DATASET_MANIFEST`, `TRAIN_GRAIN_FILES`,
+  `EVAL_DATASET_MANIFEST`, and `EVAL_GRAIN_FILES` are saved.
+- [ ] MaxText is at the exact clean pinned commit.
+- [ ] Gemma conversion used the immutable pinned local snapshot.
+- [ ] Hugging Face/MaxText parity passed at `max_kl_div <= 0.03`.
+- [ ] `MODEL_CHECKPOINT` and the 64-character `CHECKPOINT_SHA256` are saved.
+- [ ] The exact `conversion.json` is preserved for the shared control plane.
+- [ ] No TFDS build, Dataflow job, full-C4 download, or TPU allocation was
+  needed for Stage 1.
+
+## Deployment storage roles after Stage 1
+
+On the v4-32, use one stable layout. `ARTIFACT_ROOT` must resolve to the same
+strongly consistent POSIX mount on all four controllers:
+
+```zsh
+export ARTIFACT_ROOT="$PWD/artifacts/gemma4_v1/production"
 export LOCAL_BUFFER_ROOT="/mnt/localssd/moe-sae"
-export TOKENIZER_REVISION="<40-character-gemma-tokenizer-commit>"
-export MAXTEXT_ROOT="/opt/maxtext"
-export MODEL_CHECKPOINT="gs://BUCKET/gemma4-26b-pt/0/items"
+export BULK_GCS_ROOT="gs://$BUCKET/moe-sae/gemma4_v1"
+export SAE_CHECKPOINT_ROOT="$BULK_GCS_ROOT/sae-checkpoints"
 ```
 
 The paths have deliberately different jobs:
 
-- `ARTIFACT_ROOT` is the small shared POSIX control plane. It contains locks,
-  attestations, identities, receipts, host ledgers, sealed manifests, timing
-  records, and checkpoint pointers. It must not contain activation or Orbax
-  payloads.
-- `LOCAL_BUFFER_ROOT` is per-controller local scratch. Capture shards are
-  serialized there before upload, and its `capture-cache/` holds verified GCS
-  shards for training and evaluation. The configured 100 GiB cache limit is
-  enforced independently on each controller; the cache is not shared POSIX
-  state.
-- `BULK_GCS_ROOT` is the durable bulk-data plane for immutable staged data and
+- `ARTIFACT_ROOT` is the small shared POSIX control plane for locks,
+  attestations, identities, receipts, ledgers, sealed manifests, timing records,
+  and checkpoint pointers. It must not hold activation or Orbax payloads.
+- `LOCAL_BUFFER_ROOT` is private scratch on each controller. It buffers capture
+  writes and hosts that controller's bounded, verified `capture-cache/`.
+- `BULK_GCS_ROOT` is the durable immutable data plane for staged inputs and
   activation shards.
-- `SAE_CHECKPOINT_ROOT` is the immutable Orbax payload plane. It must be in the
-  same bucket and lexically below `BULK_GCS_ROOT`.
+- `SAE_CHECKPOINT_ROOT` is the immutable Orbax payload plane below the same GCS
+  root.
 
-Install only the dependencies needed by each environment:
-
-```zsh
-# CPU staging host
-uv sync --extra data
-
-# Isolated CPU checkpoint-conversion environment
-uv sync --extra conversion
-
-# Every TPU controller
-uv sync --extra tpu
-```
-
-## 2. Stage and publish deterministic C4
-
-Do this before reserving the v4-32. The stager accepts only an already-prepared
-TFDS `c4/en:3.1.0`; it never downloads C4 or silently relabels another version.
-The tokenizer is pinned to the supplied 40-character revision. Packing is
-ordered, offline, and independent of TPU batch size.
-
-Stage and publish both TFDS splits from CPU-local scratch:
+Install only the TPU environment on every controller:
 
 ```zsh
-for split in train validation; do
-  uv run --extra data moe-sae stage-c4 \
-    --artifact-root "$ARTIFACT_ROOT" \
-    --split "$split" \
-    --tfds-data-dir "$TFDS_DATA_DIR" \
-    --tokenizer-revision "$TOKENIZER_REVISION" \
-    --output-directory "$LOCAL_C4_STAGE/$split" \
-    --records-per-shard 4096 \
-    --publish-gcs "$BULK_GCS_ROOT/datasets/c4/$split"
-done
+uv sync --frozen --extra tpu
 ```
-
-Production targets come from the configuration: 50,000,000 scientific train
-tokens and 2,000,000 scientific validation tokens. `--target-tokens` is only
-valid with `--local-smoke` when testing a reduced local input. Resume occurs
-only at a completely sealed shard boundary.
-
-The exact manifest schema is `gemma4-c4-packed-arrayrecord-v1`. Its top-level
-fields are:
-
-```text
-schema_version, dataset, source, tokenizer, sequence_length,
-record_format, packing, consumer, target_scientific_tokens,
-source_examples, scientific_tokens, record_count,
-lane_scientific_tokens, files
-```
-
-Each fixed record uses `moe-sae-packed-sequence-v1` and contains
-`token_ids:int32[1024]`, `positions:uint16[1024]`, and
-`segment_ids:uint16[1024]`. Padding, BOS, and EOS (IDs 0, 2, and 1) are excluded
-from scientific counts. Records are assigned by
-`record_index % 4`, every controller lane meets its token quota, and only the
-dataset tail is padded to the static 64-record multiple. A file entry contains
-`uri`, `sha256`, `size_bytes`, `first_record_index`, `record_count`, and
-`scientific_tokens`. A published GCS entry additionally records the exact
-object generation, CRC32C, size, and SHA-256 identity.
-
-Publication conditionally uploads full-SHA-256-named ArrayRecord objects, then
-publishes the content-addressed dataset manifest. Save each command's printed
-`manifest_location` and `grain_files`; the remote values look like:
-
-```zsh
-export TRAIN_DATASET_MANIFEST="gs://BUCKET/.../train/manifests/<sha256>.json"
-export TRAIN_GRAIN_FILES='gs://BUCKET/.../train/shards/*.array_record'
-export EVAL_DATASET_MANIFEST="gs://BUCKET/.../validation/manifests/<sha256>.json"
-export EVAL_GRAIN_FILES='gs://BUCKET/.../validation/shards/*.array_record'
-```
-
-The CLI calls the TFDS held-out split `validation`; capture and SAE commands
-call the same split `eval`. Preflight hashes the ordered objects, reopens their
-ArrayRecords, recomputes counts, verifies that the pinned generations stayed
-unchanged across the scan, and uses the canonical manifest hash as the dataset
-fingerprint.
-
-After publication, make the dataset prefix read-only to every campaign service
-account (no object update/delete permission) for the lifetime of the run.
-Generation pins detect drift; the IAM boundary prevents an authorized external
-writer from replacing an object between preflight and Grain consumption.
-
-## 3. Convert and validate the model checkpoint
-
-Run conversion in the isolated CPU environment. `--maxtext-root` must point at
-the clean checkout of commit
-`48c7da3e28e8f57fe36ddf09d00eec53072a2ea0`. The command converts unscanned,
-BF16, text-only base/PT weights and runs the MaxText/Hugging Face logit checker
-with `max_kl_div=0.03`:
-
-```zsh
-uv run --extra conversion moe-sae convert-checkpoint \
-  --artifact-root "$ARTIFACT_ROOT" \
-  --maxtext-root "$MAXTEXT_ROOT" \
-  --output gs://BUCKET/gemma4-26b-pt
-```
-
-The resulting items path is `OUTPUT/0/items`. The command inventories it and
-writes the self-hashed control record
-`$ARTIFACT_ROOT/checkpoint/conversion.json`. Set the exact 64-character
-`checkpoint_sha256` from that file; never invent or truncate it:
-
-```zsh
-export CHECKPOINT_SHA256="<64 lowercase hex characters from conversion.json>"
-```
-
-The TPU runtime does not install or import Torch. Every production model stage
-recomputes the checkpoint inventory on every controller, requires agreement,
-and compares it with `CHECKPOINT_SHA256`.
 
 ## 4. Qualify all three storage planes
 

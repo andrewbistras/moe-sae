@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import subprocess
 from types import SimpleNamespace
@@ -9,16 +10,88 @@ import pytest
 
 from moe_sae.model import (
     CaptureBatch,
+    GEMMA4_REPOSITORY_FILES,
     Gemma4PrefixAdapter,
+    HuggingFaceRepoFile,
+    HuggingFaceSnapshot,
     MaxTextUnavailableError,
+    assert_hf_snapshot_unchanged,
     build_checkpoint_conversion_command,
-    checkpoint_inventory_sha256,
     checkpoint_conversion_spec,
+    checkpoint_inventory_sha256,
+    checkpoint_validation_command,
+    expected_hf_repository_inventory_sha256,
+    expected_hf_snapshot_inventory_sha256,
+    materialize_hf_snapshot,
     maxtext_checkout_environment,
     require_maxtext,
     validate_capture_batch,
+    verify_hf_snapshot,
     verify_maxtext_checkout,
 )
+
+
+_MODEL_ID = "google/gemma-4-26B-A4B"
+_MODEL_REVISION = "24548b62aa021d562695c04aaf7758a1ea47990b"
+_FIXTURE_MODEL = b"immutable model weights"
+_FIXTURE_TOKENIZER = b'{"version": "fixture"}\n'
+
+
+def _git_blob_oid(payload: bytes) -> str:
+    digest = hashlib.sha1(  # noqa: S324 - the fixture checks Git blob identity
+        usedforsecurity=False
+    )
+    digest.update(f"blob {len(payload)}\0".encode("ascii"))
+    digest.update(payload)
+    return digest.hexdigest()
+
+
+def _lfs_pointer_oid(payload_sha256: str, size_bytes: int) -> str:
+    pointer = (
+        "version https://git-lfs.github.com/spec/v1\n"
+        f"oid sha256:{payload_sha256}\n"
+        f"size {size_bytes}\n"
+    ).encode("ascii")
+    return _git_blob_oid(pointer)
+
+
+_FIXTURE_MODEL_SHA256 = hashlib.sha256(_FIXTURE_MODEL).hexdigest()
+_FIXTURE_REPO_FILES = (
+    HuggingFaceRepoFile(
+        path="model.safetensors",
+        size_bytes=len(_FIXTURE_MODEL),
+        git_blob_oid=_lfs_pointer_oid(
+            _FIXTURE_MODEL_SHA256, len(_FIXTURE_MODEL)
+        ),
+        content_sha256=_FIXTURE_MODEL_SHA256,
+        lfs_sha256=_FIXTURE_MODEL_SHA256,
+    ),
+    HuggingFaceRepoFile(
+        path="tokenizer.json",
+        size_bytes=len(_FIXTURE_TOKENIZER),
+        git_blob_oid=_git_blob_oid(_FIXTURE_TOKENIZER),
+        content_sha256=hashlib.sha256(_FIXTURE_TOKENIZER).hexdigest(),
+    ),
+)
+
+
+def _snapshot_fixture(tmp_path):
+    blobs = tmp_path / "models--google--gemma-4-26B-A4B" / "blobs"
+    snapshot = blobs.parent / "snapshots" / _MODEL_REVISION
+    blobs.mkdir(parents=True)
+    snapshot.mkdir(parents=True)
+    blob = blobs / ("a" * 64)
+    blob.write_bytes(_FIXTURE_MODEL)
+    (snapshot / "model.safetensors").symlink_to(blob)
+    (snapshot / "tokenizer.json").write_text(
+        _FIXTURE_TOKENIZER.decode("utf-8"), encoding="utf-8"
+    )
+    return verify_hf_snapshot(
+        snapshot,
+        model_id=_MODEL_ID,
+        revision=_MODEL_REVISION,
+        expected_repo_files=_FIXTURE_REPO_FILES,
+    )
 
 
 class FakeParam:
@@ -323,8 +396,23 @@ def test_checkpoint_command_is_pinned_and_never_contains_token(tmp_path):
     base = tmp_path / "src" / "maxtext" / "configs"
     base.mkdir(parents=True)
     (base / "base.yml").write_text("# fake")
-    spec = checkpoint_conversion_spec(tmp_path, "gs://bucket/gemma4/converted")
+    fixture = _snapshot_fixture(tmp_path / "hub")
+    snapshot = HuggingFaceSnapshot(
+        model_id=fixture.model_id,
+        revision=fixture.revision,
+        path=fixture.path,
+        inventory_sha256=expected_hf_snapshot_inventory_sha256(),
+        repository_inventory_sha256=expected_hf_repository_inventory_sha256(),
+    )
+    spec = checkpoint_conversion_spec(
+        tmp_path,
+        "gs://bucket/gemma4/converted",
+        hf_snapshot=snapshot,
+    )
     argv = build_checkpoint_conversion_command(spec)
+    validation_argv = checkpoint_validation_command(
+        spec, "gs://bucket/gemma4/converted/0/items"
+    )
     joined = " ".join(argv)
     assert "maxtext.checkpoint_conversion.to_maxtext" in joined
     assert "model_name=gemma4-26b" in argv
@@ -334,6 +422,153 @@ def test_checkpoint_command_is_pinned_and_never_contains_token(tmp_path):
     assert not any(item.startswith("load_balance_loss_weight=") for item in argv)
     assert "--save_dtype=bfloat16" in argv
     assert "HF_TOKEN" not in joined and "hf_access_token" not in joined
+    assert f"--hf_model_path={snapshot.path}" in argv
+    assert f"--hf_model_path={snapshot.path}" in validation_argv
+    assert f"tokenizer_path={snapshot.path}" in validation_argv
+    assert "hardware=cpu" in validation_argv
+    assert "skip_jax_distributed_system=true" in validation_argv
+    assert "attention=dot_product" in validation_argv
+    assert "dtype=float32" in validation_argv
+    assert spec.hf_model_id == _MODEL_ID
+    assert spec.hf_revision == _MODEL_REVISION
+    assert spec.hf_snapshot_inventory_sha256 == snapshot.inventory_sha256
+    assert spec.hf_repository_inventory_sha256 == (
+        snapshot.repository_inventory_sha256
+    )
+
+
+def test_checkpoint_spec_rejects_an_unpinned_snapshot_inventory(tmp_path):
+    base = tmp_path / "src" / "maxtext" / "configs"
+    base.mkdir(parents=True)
+    (base / "base.yml").write_text("# fake")
+    snapshot = _snapshot_fixture(tmp_path / "hub")
+
+    with pytest.raises(ValueError, match="repository inventory"):
+        checkpoint_conversion_spec(
+            tmp_path,
+            "gs://bucket/gemma4/converted",
+            hf_snapshot=snapshot,
+        )
+
+
+def test_materialize_hf_snapshot_pins_exact_commit_and_hashes_content(
+    tmp_path, monkeypatch
+):
+    expected = _snapshot_fixture(tmp_path)
+    calls = []
+
+    def snapshot_download(**kwargs):
+        calls.append(kwargs)
+        return str(expected.path)
+
+    real_import = __import__("importlib").import_module
+
+    def import_fake_hub(name, *args, **kwargs):
+        if name == "huggingface_hub":
+            return SimpleNamespace(snapshot_download=snapshot_download)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("moe_sae.model.import_module", import_fake_hub)
+    result = materialize_hf_snapshot(
+        _MODEL_ID,
+        _MODEL_REVISION,
+        cache_dir=tmp_path / "cache",
+        token="secret-that-must-not-be-recorded",
+        expected_repo_files=_FIXTURE_REPO_FILES,
+    )
+
+    assert result == expected
+    assert calls == [
+        {
+            "repo_id": _MODEL_ID,
+            "repo_type": "model",
+            "revision": _MODEL_REVISION,
+            "token": "secret-that-must-not-be-recorded",
+            "local_files_only": False,
+            "cache_dir": str(tmp_path / "cache"),
+        }
+    ]
+    assert "secret" not in repr(result)
+
+
+def test_pinned_gemma_repository_inventory_is_complete_and_offline_digestible():
+    assert len(GEMMA4_REPOSITORY_FILES) == 10
+    assert sum(item.lfs_sha256 is not None for item in GEMMA4_REPOSITORY_FILES) == 3
+    assert expected_hf_repository_inventory_sha256() == (
+        "7e1512d2391671f81faeb2593775811436deab90ba1e3a3867d916213dea0f47"
+    )
+    assert expected_hf_snapshot_inventory_sha256() == (
+        "8660c5dee92018c74f36bf9b46686844c6e2f71890fe53d0cf6e008a3b1a7836"
+    )
+
+
+def test_hf_snapshot_rejects_missing_extra_and_wrong_ordinary_blob(tmp_path):
+    snapshot = _snapshot_fixture(tmp_path)
+    tokenizer = snapshot.path / "tokenizer.json"
+    tokenizer.unlink()
+    with pytest.raises(RuntimeError, match="file set differs"):
+        verify_hf_snapshot(
+            snapshot.path,
+            model_id=_MODEL_ID,
+            revision=_MODEL_REVISION,
+            expected_repo_files=_FIXTURE_REPO_FILES,
+        )
+
+    tokenizer.write_bytes(_FIXTURE_TOKENIZER)
+    (snapshot.path / "unexpected.json").write_text("{}\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="file set differs"):
+        verify_hf_snapshot(
+            snapshot.path,
+            model_id=_MODEL_ID,
+            revision=_MODEL_REVISION,
+            expected_repo_files=_FIXTURE_REPO_FILES,
+        )
+
+    (snapshot.path / "unexpected.json").unlink()
+    tokenizer.write_text('{"version":"same-size?"}', encoding="utf-8")
+    with pytest.raises(RuntimeError, match="content changed"):
+        verify_hf_snapshot(
+            snapshot.path,
+            model_id=_MODEL_ID,
+            revision=_MODEL_REVISION,
+            expected_repo_files=_FIXTURE_REPO_FILES,
+        )
+
+
+@pytest.mark.parametrize("revision", ["main", "A" * 40, "a" * 39, "g" * 40])
+def test_hf_snapshot_rejects_non_commit_revisions(tmp_path, revision):
+    with pytest.raises(ValueError, match="exact lowercase 40-character commit SHA"):
+        materialize_hf_snapshot(_MODEL_ID, revision, cache_dir=tmp_path)
+
+
+def test_hf_snapshot_inventory_detects_cache_mutation(tmp_path):
+    snapshot = _snapshot_fixture(tmp_path)
+    assert (
+        assert_hf_snapshot_unchanged(
+            snapshot, expected_repo_files=_FIXTURE_REPO_FILES
+        )
+        == snapshot.inventory_sha256
+    )
+
+    (snapshot.path / "tokenizer.json").write_text(
+        '{"version": "mutated"}\n', encoding="utf-8"
+    )
+    with pytest.raises(RuntimeError, match="content changed"):
+        assert_hf_snapshot_unchanged(
+            snapshot, expected_repo_files=_FIXTURE_REPO_FILES
+        )
+
+
+def test_hf_snapshot_path_must_be_commit_addressed(tmp_path):
+    snapshot = tmp_path / "model"
+    snapshot.mkdir()
+    (snapshot / "config.json").write_text("{}\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="commit-addressed directory"):
+        verify_hf_snapshot(
+            snapshot,
+            model_id=_MODEL_ID,
+            revision=_MODEL_REVISION,
+        )
 
 
 def test_maxtext_checkout_must_be_clean_and_controls_python_imports(

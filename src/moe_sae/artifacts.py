@@ -38,8 +38,13 @@ from safetensors import safe_open
 from safetensors.numpy import load_file, save_file
 
 from moe_sae.data import (
+    ALLENAI_C4_REPO_ID,
+    ALLENAI_C4_REVISION,
+    ALLENAI_C4_SOURCE_FILES,
     DEFAULT_PER_DEVICE_SEQUENCE_BATCHES,
     DEFAULT_PROCESS_COUNT,
+    GEMMA4_TOKENIZER_INVENTORY_SHA256,
+    GEMMA4_TOKENIZER_SOURCE_FILES,
     PACKED_DATASET_SCHEMA,
     PACKED_RECORD_FORMAT,
     verify_packed_source,
@@ -273,6 +278,7 @@ def verify_staged_dataset_manifest(
     expected_split: str,
     expected_tokens: int,
     tokenizer_id: str,
+    tokenizer_revision: str,
     sequence_length: int,
     verify_file_hashes: bool = True,
     verify_arrayrecord_count: bool = False,
@@ -305,35 +311,41 @@ def verify_staged_dataset_manifest(
     }
     if set(value) != required:
         raise IntegrityError(
-            "staged dataset manifest fields differ from the packed v1 contract"
+            "staged dataset manifest fields differ from the packed v2 contract"
         )
     if value.get("schema_version") != STAGED_DATASET_SCHEMA_VERSION:
         raise IntegrityError("unsupported staged dataset manifest schema")
     expected_dataset = {
-        "name": "c4",
+        "name": ALLENAI_C4_REPO_ID,
         "config": "en",
-        "version": "3.1.0",
+        "revision": ALLENAI_C4_REVISION,
         "split": expected_split,
     }
     if value.get("dataset") != expected_dataset:
         raise IntegrityError("staged dataset is not the required C4 English split")
     source = value.get("source")
-    if not isinstance(source, Mapping) or set(source) != {
-        "provider",
-        "full_name",
-        "dataset_info_sha256",
-    }:
+    if not isinstance(source, Mapping):
         raise IntegrityError("staged dataset source provenance is incomplete")
-    if (
-        source.get("provider") != "tensorflow_datasets"
-        or source.get("full_name") != "c4/en/3.1.0"
-        or not re.fullmatch(r"[0-9a-f]{64}", str(source.get("dataset_info_sha256", "")))
-    ):
-        raise IntegrityError("staged dataset is not a verified TFDS C4/en 3.1.0 preparation")
+    expected_source = {
+        "provider": "huggingface_hub",
+        "repo_type": "dataset",
+        "repo_id": ALLENAI_C4_REPO_ID,
+        "revision": ALLENAI_C4_REVISION,
+        "files": [
+            specification.as_dict()
+            for specification in ALLENAI_C4_SOURCE_FILES[expected_split]
+        ],
+    }
+    if dict(source) != expected_source:
+        raise IntegrityError(
+            "staged dataset is not the bounded immutable AllenAI C4 source"
+        )
     tokenizer = value.get("tokenizer")
     if not isinstance(tokenizer, Mapping) or set(tokenizer) != {
         "id",
         "revision",
+        "repository_inventory_sha256",
+        "files",
         "padding_id",
         "eos_id",
         "bos_id",
@@ -341,7 +353,11 @@ def verify_staged_dataset_manifest(
         raise IntegrityError("staged tokenizer provenance is incomplete")
     if (
         tokenizer.get("id") != tokenizer_id
-        or not re.fullmatch(r"[0-9a-f]{40}", str(tokenizer.get("revision", "")))
+        or tokenizer.get("revision") != tokenizer_revision
+        or tokenizer.get("repository_inventory_sha256")
+        != GEMMA4_TOKENIZER_INVENTORY_SHA256
+        or tokenizer.get("files")
+        != [entry.as_dict() for entry in GEMMA4_TOKENIZER_SOURCE_FILES]
         or (
             tokenizer.get("padding_id"),
             tokenizer.get("eos_id"),
@@ -745,7 +761,7 @@ class CaptureMetadata:
     storage_attestation_sha256: str | None = None
     object_prefix: str | None = None
     model_id: str = "google/gemma-4-26B-A4B"
-    dataset: str = "c4/en:3.1.0"
+    dataset: str = f"{ALLENAI_C4_REPO_ID}/en@{ALLENAI_C4_REVISION}"
     tokenizer_id: str = "google/gemma-4-26B-A4B"
     target_layer_one_indexed: int = TARGET_LAYER_ONE_INDEXED
     capture_site: str = DEFAULT_CAPTURE_SITE
@@ -858,7 +874,7 @@ def _metadata_dict(metadata: CaptureMetadata | Mapping[str, Any]) -> dict[str, A
     fixed = {
         "model_id": "google/gemma-4-26B-A4B",
         "maxtext_commit": "48c7da3e28e8f57fe36ddf09d00eec53072a2ea0",
-        "dataset": "c4/en:3.1.0",
+        "dataset": f"{ALLENAI_C4_REPO_ID}/en@{ALLENAI_C4_REVISION}",
         "tokenizer_id": "google/gemma-4-26B-A4B",
         "target_layer_one_indexed": TARGET_LAYER_ONE_INDEXED,
         "capture_site": DEFAULT_CAPTURE_SITE,

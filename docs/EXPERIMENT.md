@@ -7,15 +7,21 @@ reconstruction improvement can be recovered by exposing each token only to
 feature banks named by Gemma 4's router, and what that restriction saves in
 measured SAE training cost.
 
-The base/PT checkpoint is `google/gemma-4-26B-A4B`. The implementation is pinned
-to MaxText commit `48c7da3e28e8f57fe36ddf09d00eec53072a2ea0` and validates its
-30 blocks, hidden width 2,816, 128 routed experts, top-8 routing, and one shared
-expert before compilation.
+The base/PT checkpoint is `google/gemma-4-26B-A4B` at immutable revision
+`24548b62aa021d562695c04aaf7758a1ea47990b`. The implementation is pinned to
+an exact repository file/byte inventory, then to MaxText commit
+`48c7da3e28e8f57fe36ddf09d00eec53072a2ea0`, and validates its 30 blocks,
+hidden width 2,816, 128 routed experts, top-8 routing, and one shared expert
+before compilation.
 
 ## Capture target
 
-Sequences are deterministic C4 English 3.1.0 packs of length 1,024. Padding,
-BOS, and EOS are excluded from scientific token counts. The prefix adapter:
+Sequences are deterministic length-1,024 packs from a bounded `allenai/c4`
+snapshot at revision `1588ec454efa1a09f29cd18ddd04fe05fc8653a2`. The exact
+one-file train and validation source inventories are size- and SHA-256-pinned.
+The two-file Gemma tokenizer view is independently byte-pinned to the model
+revision. Padding, BOS, and EOS are excluded from scientific token counts. The
+prefix adapter:
 
 1. embeds tokens and executes blocks 1–14;
 2. executes block 15 attention and its residual;

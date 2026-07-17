@@ -13,7 +13,6 @@ import os
 from pathlib import Path
 import re
 import signal
-import shlex
 import subprocess
 import sys
 import time
@@ -37,14 +36,23 @@ from moe_sae.metrics import (
 )
 from moe_sae.model import (
     CaptureBatch,
+    assert_hf_snapshot_unchanged,
     build_checkpoint_conversion_command,
     checkpoint_inventory_sha256,
     checkpoint_conversion_spec,
     checkpoint_validation_command,
+    expected_hf_repository_inventory_sha256,
+    expected_hf_snapshot_inventory_sha256,
+    materialize_hf_snapshot,
     maxtext_checkout_environment,
     verify_maxtext_checkout,
 )
-from moe_sae.object_store import GCSObjectStore, ShardCache, join_gcs_uri
+from moe_sae.object_store import (
+    GCSObjectStore,
+    ShardCache,
+    join_gcs_uri,
+    parse_gcs_uri,
+)
 from moe_sae.runtime import (
     BenchmarkObservation,
     HARVEST_MESHES,
@@ -382,10 +390,16 @@ def _load_conversion_attestation(
     if (
         not re.fullmatch(r"[0-9a-f]{64}", claimed)
         or claimed != actual
-        or payload.get("schema_version") != "gemma4-checkpoint-conversion-v1"
+        or payload.get("schema_version") != "gemma4-checkpoint-conversion-v2"
         or payload.get("parity_passed") is not True
         or payload.get("config_sha256") != config.config_hash
         or payload.get("model_id") != config.model_id
+        or payload.get("model_revision") != config.model_revision
+        or payload.get("hf_source_mode") != "immutable-local-snapshot"
+        or payload.get("hf_repository_inventory_sha256")
+        != expected_hf_repository_inventory_sha256()
+        or payload.get("hf_snapshot_inventory_sha256")
+        != expected_hf_snapshot_inventory_sha256()
         or payload.get("maxtext_commit") != config.maxtext_commit
         or payload.get("maxtext_checkout_clean") is not True
         or payload.get("maxtext_import_mode") != "verified-checkout-source"
@@ -796,6 +810,7 @@ def _verified_dataset_provenance(
             expected_split=expected_split,
             expected_tokens=expected_tokens,
             tokenizer_id=config.tokenizer_path,
+            tokenizer_revision=config.model_revision,
             sequence_length=config.sequence_length,
             verify_file_hashes=True,
             verify_arrayrecord_count=verify_arrayrecord_count,
@@ -1046,7 +1061,7 @@ def _release_accelerator_state(label: str) -> None:
 
 
 def _command_stage_c4(args: argparse.Namespace) -> int:
-    """Stage one exact TFDS C4/en 3.1.0 split on a CPU coordinator."""
+    """Stage one bounded, immutable AllenAI C4 split on a CPU coordinator."""
 
     from moe_sae.data import publish_staged_dataset, stage_c4_split
 
@@ -1066,9 +1081,9 @@ def _command_stage_c4(args: argparse.Namespace) -> int:
         split=split,
         target_scientific_tokens=target,
         output_directory=output,
-        tfds_data_dir=args.tfds_data_dir,
+        source_cache=args.source_cache_dir,
         tokenizer_id=config.tokenizer_path,
-        tokenizer_revision=args.tokenizer_revision,
+        tokenizer_revision=config.model_revision,
         records_per_shard=args.records_per_shard,
         sequence_length=config.sequence_length,
     )
@@ -1254,20 +1269,63 @@ def _command_convert_checkpoint(args: argparse.Namespace) -> int:
     root = _artifact_root(config, args.artifact_root)
     _require_production_artifact_root(root)
     verify_maxtext_checkout(args.maxtext_root)
+    if args.dry_run:
+        print(
+            json.dumps(
+                {
+                    "action": "materialize-convert-validate",
+                    "model_id": config.model_id,
+                    "model_revision": config.model_revision,
+                    "hf_repository_inventory_sha256": (
+                        expected_hf_repository_inventory_sha256()
+                    ),
+                    "hf_snapshot_inventory_sha256": (
+                        expected_hf_snapshot_inventory_sha256()
+                    ),
+                    "hf_cache_dir": str(Path(args.hf_cache_dir).expanduser()),
+                    "maxtext_root": str(Path(args.maxtext_root).expanduser()),
+                    "output": args.output,
+                    "max_kl_div_threshold": 0.03,
+                    "note": (
+                        "dry-run does not download the roughly 52 GB snapshot; "
+                        "the real run passes one commit-addressed local snapshot "
+                        "to both conversion and parity checking"
+                    ),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+    attestation_path = _conversion_attestation_path(root)
+    if attestation_path.exists():
+        raise RuntimeError(
+            "a checkpoint conversion is already sealed at this artifact root; "
+            "refusing to overwrite its attestation"
+        )
+    _require_unused_conversion_output(args.output)
+    snapshot_started = time.perf_counter()
+    snapshot = materialize_hf_snapshot(
+        config.model_id,
+        config.model_revision,
+        cache_dir=args.hf_cache_dir,
+        token=os.environ.get("HF_TOKEN"),
+    )
+    snapshot_materialization_seconds = time.perf_counter() - snapshot_started
     spec = checkpoint_conversion_spec(
         args.maxtext_root,
         args.output,
-        hf_model_path=config.model_id,
+        hf_snapshot=snapshot,
         config=config,
     )
     conversion = build_checkpoint_conversion_command(spec)
     items = args.checkpoint_items or f"{args.output.rstrip('/')}/0/items"
     validation = checkpoint_validation_command(spec, items, max_kl_div=0.03)
-    if args.dry_run:
-        print(shlex.join(conversion))
-        print(shlex.join(validation))
-        return 0
     conversion_environment = maxtext_checkout_environment(args.maxtext_root)
+    # The snapshot is already local. Neither subprocess needs a Hub credential,
+    # so do not expose one to MaxText, Transformers, or imported test utilities.
+    for credential_name in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HF_API_TOKEN"):
+        conversion_environment.pop(credential_name, None)
     started = time.perf_counter()
     subprocess.run(
         conversion,
@@ -1284,6 +1342,11 @@ def _command_convert_checkpoint(args: argparse.Namespace) -> int:
         env=conversion_environment,
     )
     validation_seconds = time.perf_counter() - validation_started
+    snapshot_revalidation_started = time.perf_counter()
+    assert_hf_snapshot_unchanged(snapshot)
+    snapshot_revalidation_seconds = (
+        time.perf_counter() - snapshot_revalidation_started
+    )
     # Fail if either official subprocess modified or generated importable code
     # in the source checkout before the parity attestation is sealed.
     verify_maxtext_checkout(args.maxtext_root)
@@ -1291,14 +1354,22 @@ def _command_convert_checkpoint(args: argparse.Namespace) -> int:
     checkpoint_sha256 = checkpoint_inventory_sha256(items)
     digest_seconds = time.perf_counter() - digest_started
     payload = {
-        "schema_version": "gemma4-checkpoint-conversion-v1",
+        "schema_version": "gemma4-checkpoint-conversion-v2",
         "config_sha256": config.config_hash,
         "model_id": config.model_id,
+        "model_revision": config.model_revision,
+        "hf_source_mode": "immutable-local-snapshot",
+        "hf_repository_inventory_sha256": (
+            snapshot.repository_inventory_sha256
+        ),
+        "hf_snapshot_inventory_sha256": snapshot.inventory_sha256,
         "maxtext_commit": config.maxtext_commit,
         "maxtext_checkout_clean": True,
         "maxtext_import_mode": "verified-checkout-source",
         "checkpoint": items,
         "checkpoint_sha256": checkpoint_sha256,
+        "snapshot_materialization_seconds": snapshot_materialization_seconds,
+        "snapshot_revalidation_seconds": snapshot_revalidation_seconds,
         "conversion_seconds": conversion_seconds,
         "validation_seconds": validation_seconds,
         "digest_seconds": digest_seconds,
@@ -1307,9 +1378,48 @@ def _command_convert_checkpoint(args: argparse.Namespace) -> int:
         "environment": _coordinated_environment(),
     }
     payload["attestation_sha256"] = _conversion_attestation_digest(payload)
-    atomic_write_json(_conversion_attestation_path(root), payload)
+    atomic_write_json(attestation_path, payload)
     print(json.dumps(payload, indent=2, sort_keys=True))
     return 0
+
+
+def _require_unused_conversion_output(output_directory: str) -> None:
+    """Refuse to let a conversion attempt share an existing output prefix."""
+
+    normalized = str(output_directory).rstrip("/")
+    if not normalized:
+        raise ValueError("conversion output must not be empty")
+    if normalized.startswith("gs://"):
+        bucket_name, prefix = parse_gcs_uri(normalized)
+        try:
+            store = GCSObjectStore()
+            bucket = store.client.bucket(bucket_name)
+            exact_exists = bool(bucket.blob(prefix).exists())
+            descendants = iter(
+                store.client.list_blobs(
+                    bucket_name,
+                    prefix=prefix + "/",
+                    max_results=1,
+                )
+            )
+            descendant_exists = next(descendants, None) is not None
+        except Exception as error:
+            raise RuntimeError(
+                f"cannot prove conversion output prefix is unused: {normalized}"
+            ) from error
+        if exact_exists or descendant_exists:
+            raise RuntimeError(
+                "conversion output prefix already contains objects; choose a fresh "
+                "attempt-specific --output and never reuse a partial conversion"
+            )
+        return
+
+    path = Path(normalized).expanduser()
+    if path.exists():
+        raise RuntimeError(
+            "conversion output path already exists; choose a fresh attempt-specific "
+            "--output and never reuse a partial conversion"
+        )
 
 
 def _benchmark_output_directory(
@@ -3425,12 +3535,11 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     stage = subparsers.add_parser(
-        "stage-c4", help="offline-pack exact TFDS C4/en 3.1.0 into ArrayRecord"
+        "stage-c4", help="offline-pack the bounded immutable AllenAI C4 source"
     )
     _add_common(stage)
     stage.add_argument("--split", choices=("train", "validation"), required=True)
-    stage.add_argument("--tfds-data-dir", required=True)
-    stage.add_argument("--tokenizer-revision", required=True)
+    stage.add_argument("--source-cache-dir", required=True)
     stage.add_argument("--output-directory")
     stage.add_argument("--records-per-shard", type=int, default=4_096)
     stage.add_argument("--publish-gcs")
@@ -3480,6 +3589,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_common(convert)
     convert.add_argument("--maxtext-root", required=True)
+    convert.add_argument("--hf-cache-dir", required=True)
     convert.add_argument("--output", required=True)
     convert.add_argument("--checkpoint-items")
     convert.add_argument("--dry-run", action="store_true")

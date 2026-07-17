@@ -18,7 +18,10 @@ from typing import Any, Mapping
 
 
 MODEL_ID = "google/gemma-4-26B-A4B"
+MODEL_REVISION = "24548b62aa021d562695c04aaf7758a1ea47990b"
 MAXTEXT_COMMIT = "48c7da3e28e8f57fe36ddf09d00eec53072a2ea0"
+C4_REPOSITORY = "allenai/c4"
+C4_REVISION = "1588ec454efa1a09f29cd18ddd04fe05fc8653a2"
 CONDITIONS = ("A", "B", "F")
 
 
@@ -34,6 +37,7 @@ class Gemma4Config:
 
     # Model and capture site pins.
     model_id: str = MODEL_ID
+    model_revision: str = MODEL_REVISION
     tokenizer_path: str = MODEL_ID
     maxtext_commit: str = MAXTEXT_COMMIT
     maxtext_model_name: str = "gemma4-26b"
@@ -65,9 +69,9 @@ class Gemma4Config:
     float32_gate_logits: bool = False
 
     # Deterministic text corpus and artifact contract.
-    dataset_name: str = "c4"
+    dataset_name: str = C4_REPOSITORY
     dataset_config: str = "en"
-    dataset_version: str = "3.1.0"
+    dataset_revision: str = C4_REVISION
     train_split: str = "train"
     eval_split: str = "validation"
     train_tokens: int = 50_000_000
@@ -180,6 +184,7 @@ class Gemma4Config:
         pinned: dict[str, Any] = {
             "schema_version": "gemma4_v1",
             "model_id": MODEL_ID,
+            "model_revision": MODEL_REVISION,
             "tokenizer_path": MODEL_ID,
             "maxtext_commit": MAXTEXT_COMMIT,
             "maxtext_model_name": "gemma4-26b",
@@ -209,9 +214,9 @@ class Gemma4Config:
             "use_post_attn_norm": True,
             "use_post_ffw_norm": True,
             "float32_gate_logits": False,
-            "dataset_name": "c4",
+            "dataset_name": C4_REPOSITORY,
             "dataset_config": "en",
-            "dataset_version": "3.1.0",
+            "dataset_revision": C4_REVISION,
             "train_split": "train",
             "eval_split": "validation",
         }

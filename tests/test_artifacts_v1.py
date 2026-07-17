@@ -28,10 +28,16 @@ from moe_sae.artifacts import (
     verify_staged_dataset_manifest,
 )
 from moe_sae.data import (
+    ALLENAI_C4_REPO_ID,
+    ALLENAI_C4_REVISION,
+    ALLENAI_C4_SOURCE_FILES,
+    GEMMA4_TOKENIZER_INVENTORY_SHA256,
+    GEMMA4_TOKENIZER_SOURCE_FILES,
     PACKED_DATASET_SCHEMA,
     PACKED_RECORD_FORMAT,
     publish_staged_dataset,
 )
+from moe_sae.config import MODEL_REVISION
 from moe_sae.model import CaptureBatch as ModelCaptureBatch
 from moe_sae.object_store import LocalObjectStore, ShardCache
 
@@ -584,19 +590,30 @@ def _staging_manifest(tmp_path):
             {
                 "schema_version": PACKED_DATASET_SCHEMA,
                 "dataset": {
-                    "name": "c4",
+                    "name": ALLENAI_C4_REPO_ID,
                     "config": "en",
-                    "version": "3.1.0",
+                    "revision": ALLENAI_C4_REVISION,
                     "split": "train",
                 },
                 "source": {
-                    "provider": "tensorflow_datasets",
-                    "full_name": "c4/en/3.1.0",
-                    "dataset_info_sha256": "b" * 64,
+                    "provider": "huggingface_hub",
+                    "repo_type": "dataset",
+                    "repo_id": ALLENAI_C4_REPO_ID,
+                    "revision": ALLENAI_C4_REVISION,
+                    "files": [
+                        item.as_dict()
+                        for item in ALLENAI_C4_SOURCE_FILES["train"]
+                    ],
                 },
                 "tokenizer": {
                     "id": "google/gemma-4-26B-A4B",
-                    "revision": "a" * 40,
+                    "revision": MODEL_REVISION,
+                    "repository_inventory_sha256": (
+                        GEMMA4_TOKENIZER_INVENTORY_SHA256
+                    ),
+                    "files": [
+                        item.as_dict() for item in GEMMA4_TOKENIZER_SOURCE_FILES
+                    ],
                     "padding_id": 0,
                     "eos_id": 1,
                     "bos_id": 2,
@@ -640,11 +657,48 @@ def test_staged_dataset_fingerprint_is_derived_from_verified_inventory(tmp_path)
         expected_split="train",
         expected_tokens=121,
         tokenizer_id="google/gemma-4-26B-A4B",
+        tokenizer_revision=MODEL_REVISION,
         sequence_length=1024,
     )
     assert len(result.fingerprint_sha256) == 64
     assert result.files == (str(first.resolve()), str(second.resolve()))
     assert result.scientific_tokens == 121
+
+
+def test_staged_dataset_rejects_old_schema_and_alternate_tokenizer_revision(
+    tmp_path,
+):
+    manifest, _, _ = _staging_manifest(tmp_path)
+    value = json.loads(manifest.read_text(encoding="utf-8"))
+
+    value["schema_version"] = "gemma4-c4-packed-arrayrecord-v1"
+    manifest.write_text(json.dumps(value), encoding="utf-8")
+    with pytest.raises(IntegrityError, match="unsupported staged dataset"):
+        verify_staged_dataset_manifest(
+            str(manifest),
+            str(tmp_path / "part-*.array_record"),
+            expected_split="train",
+            expected_tokens=121,
+            tokenizer_id="google/gemma-4-26B-A4B",
+            tokenizer_revision=MODEL_REVISION,
+            sequence_length=1024,
+            verify_file_hashes=False,
+        )
+
+    value["schema_version"] = PACKED_DATASET_SCHEMA
+    value["tokenizer"]["revision"] = "a" * 40
+    manifest.write_text(json.dumps(value), encoding="utf-8")
+    with pytest.raises(IntegrityError, match="different tokenizer"):
+        verify_staged_dataset_manifest(
+            str(manifest),
+            str(tmp_path / "part-*.array_record"),
+            expected_split="train",
+            expected_tokens=121,
+            tokenizer_id="google/gemma-4-26B-A4B",
+            tokenizer_revision=MODEL_REVISION,
+            sequence_length=1024,
+            verify_file_hashes=False,
+        )
 
 
 def test_remote_staged_dataset_pins_and_reverifies_object_generations(
@@ -685,6 +739,7 @@ def test_remote_staged_dataset_pins_and_reverifies_object_generations(
         expected_split="train",
         expected_tokens=121,
         tokenizer_id="google/gemma-4-26B-A4B",
+        tokenizer_revision=MODEL_REVISION,
         sequence_length=1024,
         object_store=store,
     )
@@ -700,6 +755,7 @@ def test_remote_staged_dataset_pins_and_reverifies_object_generations(
             expected_split="train",
             expected_tokens=121,
             tokenizer_id="google/gemma-4-26B-A4B",
+            tokenizer_revision=MODEL_REVISION,
             sequence_length=1024,
             object_store=store,
         )
@@ -719,6 +775,7 @@ def test_production_staging_check_recomputes_arrayrecord_count(tmp_path, monkeyp
             expected_split="train",
             expected_tokens=121,
             tokenizer_id="google/gemma-4-26B-A4B",
+            tokenizer_revision=MODEL_REVISION,
             sequence_length=1024,
             verify_arrayrecord_count=True,
         )
@@ -734,6 +791,7 @@ def test_staged_dataset_verification_rejects_tampering_and_inventory_drift(tmp_p
             expected_split="train",
             expected_tokens=121,
             tokenizer_id="google/gemma-4-26B-A4B",
+            tokenizer_revision=MODEL_REVISION,
             sequence_length=1024,
         )
     first.unlink()
@@ -744,6 +802,7 @@ def test_staged_dataset_verification_rejects_tampering_and_inventory_drift(tmp_p
             expected_split="train",
             expected_tokens=121,
             tokenizer_id="google/gemma-4-26B-A4B",
+            tokenizer_revision=MODEL_REVISION,
             sequence_length=1024,
             verify_file_hashes=False,
         )

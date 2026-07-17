@@ -21,7 +21,7 @@ from urllib.parse import urlparse
 
 import numpy as np
 
-from moe_sae.config import MAXTEXT_COMMIT, Gemma4Config
+from moe_sae.config import MAXTEXT_COMMIT, MODEL_ID, MODEL_REVISION, Gemma4Config
 
 
 class MaxTextUnavailableError(ImportError):
@@ -57,15 +57,140 @@ class CaptureSummary:
 
 
 @dataclass(frozen=True, slots=True)
+class HuggingFaceRepoFile:
+    """One file in the immutable Hugging Face repository tree.
+
+    ``git_blob_oid`` is the ordinary Git blob identity returned by the Hub
+    tree API.  LFS snapshot files contain the resolved payload rather than the
+    pointer blob, so those entries additionally pin the payload SHA-256.
+    ``content_sha256`` also pins ordinary-file bytes, making the final snapshot
+    inventory independently comparable without trusting the local Hub cache.
+    """
+
+    path: str
+    size_bytes: int
+    git_blob_oid: str
+    content_sha256: str
+    lfs_sha256: str | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        value: dict[str, Any] = {
+            "path": self.path,
+            "size_bytes": self.size_bytes,
+            "git_blob_oid": self.git_blob_oid,
+            "content_sha256": self.content_sha256,
+            "storage": "lfs" if self.lfs_sha256 is not None else "git",
+        }
+        if self.lfs_sha256 is not None:
+            value["lfs_sha256"] = self.lfs_sha256
+        return value
+
+
+# Derived 2026-07-17 from
+# https://huggingface.co/api/models/google/gemma-4-26B-A4B/tree/
+# 24548b62aa021d562695c04aaf7758a1ea47990b?recursive=true&expand=true
+# (shown across two comment lines only for readability).  The three LFS
+# hashes/sizes are provider-published payload identities.  The seven ordinary
+# file SHA-256s were computed from their small revision-addressed blobs after
+# independently confirming each Git blob OID.
+GEMMA4_REPOSITORY_FILES: tuple[HuggingFaceRepoFile, ...] = (
+    HuggingFaceRepoFile(
+        path=".gitattributes",
+        size_bytes=1_570,
+        git_blob_oid="52373fe24473b1aa44333d318f578ae6bf04b49b",
+        content_sha256="34448b82c17d60fec9b65b1f093c115ddbaadc04beb1b0140b6bfed2e012a930",
+    ),
+    HuggingFaceRepoFile(
+        path="README.md",
+        size_bytes=27_830,
+        git_blob_oid="f6fa2c9771907998658ecf59378910300c474288",
+        content_sha256="2d87a2d936e3e03077589114bd1702cf480647fb145a41fe973eba49f934d0ce",
+    ),
+    HuggingFaceRepoFile(
+        path="config.json",
+        size_bytes=3_775,
+        git_blob_oid="29512a0d8108fc06ea4cec3cf2be250cfe0b960a",
+        content_sha256="0364256c5de7863a22b5dd666043d542d42b681c02fd83eb67dc7b483d859e96",
+    ),
+    HuggingFaceRepoFile(
+        path="generation_config.json",
+        size_bytes=181,
+        git_blob_oid="a07eb97486e34532ffd3cf64e44cba33af40127c",
+        content_sha256="de16fa1d777387d5fe6df54a9565d9c0f1213f7b31f2a2cf44805e27686d9c7c",
+    ),
+    HuggingFaceRepoFile(
+        path="model-00001-of-00002.safetensors",
+        size_bytes=49_907_246_508,
+        git_blob_oid="15df541ca6c85580c13b75290565817ba0783f1e",
+        content_sha256="a0e671c5e81ce9a8fd151e60676e7b3a7f2e9ec685a1e8b6b504de2082453f96",
+        lfs_sha256="a0e671c5e81ce9a8fd151e60676e7b3a7f2e9ec685a1e8b6b504de2082453f96",
+    ),
+    HuggingFaceRepoFile(
+        path="model-00002-of-00002.safetensors",
+        size_bytes=1_704_763_408,
+        git_blob_oid="2db4c35287ffa2aa85226dd53adb3ba3cee9010b",
+        content_sha256="dda6797de622b19c46320bb31073323d06a3444a149d4e0e028a3dbd682e0364",
+        lfs_sha256="dda6797de622b19c46320bb31073323d06a3444a149d4e0e028a3dbd682e0364",
+    ),
+    HuggingFaceRepoFile(
+        path="model.safetensors.index.json",
+        size_bytes=103_196,
+        git_blob_oid="889ab10e12aca96c43c9804a041fb1780de1e5ca",
+        content_sha256="907826a6e46ff454272bd6db1fee629d5531a2303be22986d825a0871d7dc7a7",
+    ),
+    HuggingFaceRepoFile(
+        path="processor_config.json",
+        size_bytes=1_689,
+        git_blob_oid="5465974d23e1eca2c46c2809b26c997946ce0d90",
+        content_sha256="32bdf45d2ad4cc29a0822ddd157a182de76644f0419a6228d151495256e9813c",
+    ),
+    HuggingFaceRepoFile(
+        path="tokenizer.json",
+        size_bytes=32_170_070,
+        git_blob_oid="890ddaefca8201dd023c4f013db5ce492d12e7e0",
+        content_sha256="12bac982b793c44b03d52a250a9f0d0b666813da566b910c24a6da0695fd11e6",
+        lfs_sha256="12bac982b793c44b03d52a250a9f0d0b666813da566b910c24a6da0695fd11e6",
+    ),
+    HuggingFaceRepoFile(
+        path="tokenizer_config.json",
+        size_bytes=881,
+        git_blob_oid="54a4569882af13f7bf57fdf459f2db243ff29680",
+        content_sha256="6a9383197f000d2723684efd2210f5bf217bc29fa2cf360ae1574201b47af060",
+    ),
+)
+
+
+@dataclass(frozen=True, slots=True)
+class HuggingFaceSnapshot:
+    """Content-attested, commit-addressed Hugging Face model snapshot."""
+
+    model_id: str
+    revision: str
+    path: Path
+    inventory_sha256: str
+    repository_inventory_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
 class CheckpointConversionSpec:
-    """Secret-free description of a Hugging Face -> Orbax conversion."""
+    """Secret-free description of a pinned Hugging Face -> Orbax conversion."""
 
     maxtext_root: Path
-    hf_model_path: str
+    hf_model_id: str
+    hf_revision: str
+    hf_snapshot_path: Path
+    hf_snapshot_inventory_sha256: str
+    hf_repository_inventory_sha256: str
     output_directory: str
     python_executable: str = sys.executable
     save_dtype: str = "bfloat16"
     lazy_load_tensors: bool = True
+
+    @property
+    def hf_model_path(self) -> str:
+        """Local model/tokenizer path consumed by MaxText and Transformers."""
+
+        return str(self.hf_snapshot_path)
 
     @property
     def base_config(self) -> Path:
@@ -166,11 +291,357 @@ def require_maxtext(maxtext_root: str | Path | None = None) -> tuple[Any, Any]:
     return maxtext, jax
 
 
+def _validate_hf_revision(revision: str) -> str:
+    normalized = str(revision).strip()
+    if (
+        len(normalized) != 40
+        or normalized != normalized.lower()
+        or any(character not in "0123456789abcdef" for character in normalized)
+    ):
+        raise ValueError(
+            "Hugging Face revision must be an exact lowercase 40-character commit SHA"
+        )
+    return normalized
+
+
+def _canonical_json_bytes(value: Any) -> bytes:
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+
+
+def _validate_repository_files(
+    files: Sequence[HuggingFaceRepoFile],
+) -> tuple[HuggingFaceRepoFile, ...]:
+    result = tuple(files)
+    if not result:
+        raise ValueError("Hugging Face repository inventory cannot be empty")
+    seen: set[str] = set()
+    for entry in result:
+        path = Path(entry.path)
+        if (
+            not entry.path
+            or path.is_absolute()
+            or ".." in path.parts
+            or entry.path in seen
+        ):
+            raise ValueError("Hugging Face repository inventory has an unsafe path")
+        if entry.size_bytes <= 0:
+            raise ValueError("Hugging Face repository inventory has an invalid size")
+        if len(entry.git_blob_oid) != 40 or any(
+            character not in "0123456789abcdef" for character in entry.git_blob_oid
+        ):
+            raise ValueError("Hugging Face repository inventory has an invalid Git OID")
+        if len(entry.content_sha256) != 64 or any(
+            character not in "0123456789abcdef"
+            for character in entry.content_sha256
+        ):
+            raise ValueError(
+                "Hugging Face repository inventory has an invalid content SHA-256"
+            )
+        if entry.lfs_sha256 is not None:
+            if entry.lfs_sha256 != entry.content_sha256:
+                raise ValueError("Hugging Face LFS and content SHA-256 values differ")
+            pointer = (
+                "version https://git-lfs.github.com/spec/v1\n"
+                f"oid sha256:{entry.lfs_sha256}\n"
+                f"size {entry.size_bytes}\n"
+            ).encode("ascii")
+            git_blob = hashlib.sha1(  # noqa: S324 - Git's specified blob identity
+                f"blob {len(pointer)}\0".encode("ascii") + pointer,
+                usedforsecurity=False,
+            ).hexdigest()
+            if git_blob != entry.git_blob_oid:
+                raise ValueError(
+                    "Hugging Face LFS pointer does not match its pinned Git blob OID"
+                )
+        seen.add(entry.path)
+    if tuple(sorted(seen)) != tuple(entry.path for entry in result):
+        raise ValueError("Hugging Face repository inventory must be path-sorted")
+    return result
+
+
+def expected_hf_repository_inventory_sha256(
+    files: Sequence[HuggingFaceRepoFile] = GEMMA4_REPOSITORY_FILES,
+) -> str:
+    """Return the pinned Hub tree-metadata inventory digest."""
+
+    validated = _validate_repository_files(files)
+    payload = {
+        "format": "huggingface-repository-file-inventory-v1",
+        "model_id": MODEL_ID,
+        "revision": MODEL_REVISION,
+        "files": [entry.as_dict() for entry in validated],
+    }
+    return hashlib.sha256(_canonical_json_bytes(payload)).hexdigest()
+
+
+def expected_hf_snapshot_inventory_sha256(
+    files: Sequence[HuggingFaceRepoFile] = GEMMA4_REPOSITORY_FILES,
+) -> str:
+    """Return the expected byte-level snapshot digest without reading weights."""
+
+    validated = _validate_repository_files(files)
+    payload = {
+        "format": "huggingface-snapshot-content-inventory-v1",
+        "files": [
+            {
+                "path": entry.path,
+                "size": entry.size_bytes,
+                "sha256": entry.content_sha256,
+            }
+            for entry in validated
+        ],
+    }
+    return hashlib.sha256(_canonical_json_bytes(payload)).hexdigest()
+
+
+def hf_snapshot_inventory_sha256(
+    snapshot_path: str | Path,
+    *,
+    expected_repo_files: Sequence[HuggingFaceRepoFile] | None = None,
+) -> str:
+    """Hash every file in a downloaded Hugging Face snapshot.
+
+    Hugging Face's cache normally represents snapshot files as symbolic links
+    to immutable blobs.  File links are followed deliberately, while directory
+    links and special files are rejected.  Byte-level hashes make the result
+    useful as both provenance and a before/after mutation check.
+    """
+
+    root = Path(snapshot_path).expanduser().resolve()
+    if not root.is_dir():
+        raise FileNotFoundError(f"Hugging Face snapshot is not a directory: {root}")
+
+    paths = sorted(
+        root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()
+    )
+    expected = (
+        None
+        if expected_repo_files is None
+        else _validate_repository_files(expected_repo_files)
+    )
+    expected_by_path = (
+        {} if expected is None else {entry.path: entry for entry in expected}
+    )
+    actual_file_paths: list[str] = []
+    for path in paths:
+        relative = path.relative_to(root).as_posix()
+        if path.is_symlink() and path.resolve().is_dir():
+            raise ValueError(
+                f"Hugging Face snapshot refuses symbolic-link directories: {relative}"
+            )
+        if path.is_dir():
+            continue
+        actual_file_paths.append(relative)
+    if expected is not None and tuple(actual_file_paths) != tuple(expected_by_path):
+        missing = sorted(set(expected_by_path) - set(actual_file_paths))
+        extra = sorted(set(actual_file_paths) - set(expected_by_path))
+        raise RuntimeError(
+            "Hugging Face snapshot file set differs from the pinned repository "
+            f"inventory (missing={missing}, extra={extra})"
+        )
+
+    entries: list[dict[str, Any]] = []
+    for path in paths:
+        relative = path.relative_to(root).as_posix()
+        if path.is_symlink() and path.resolve().is_dir():
+            raise ValueError(
+                f"Hugging Face snapshot refuses symbolic-link directories: {relative}"
+            )
+        if path.is_dir():
+            continue
+        if not path.is_file():
+            raise ValueError(
+                f"Hugging Face snapshot contains a non-regular file: {relative}"
+            )
+
+        link_target = os.readlink(path) if path.is_symlink() else None
+        resolved = path.resolve(strict=True)
+        before = resolved.stat()
+        expected_entry = expected_by_path.get(relative)
+        if expected_entry is not None and before.st_size != expected_entry.size_bytes:
+            raise RuntimeError(
+                f"Hugging Face snapshot content changed or has the wrong size: {relative}"
+            )
+        file_digest = hashlib.sha256()
+        git_blob_digest = None
+        if expected_entry is not None and expected_entry.lfs_sha256 is None:
+            git_blob_digest = hashlib.sha1(  # noqa: S324 - Git blob identity
+                usedforsecurity=False
+            )
+            git_blob_digest.update(f"blob {before.st_size}\0".encode("ascii"))
+        with resolved.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+                file_digest.update(chunk)
+                if git_blob_digest is not None:
+                    git_blob_digest.update(chunk)
+        after = resolved.stat()
+        if (
+            (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            or (path.is_symlink() and os.readlink(path) != link_target)
+        ):
+            raise RuntimeError(
+                f"Hugging Face snapshot changed while it was being hashed: {relative}"
+            )
+        content_digest = file_digest.hexdigest()
+        if expected_entry is not None and (
+            content_digest != expected_entry.content_sha256
+            or (
+                git_blob_digest is not None
+                and git_blob_digest.hexdigest() != expected_entry.git_blob_oid
+            )
+        ):
+            raise RuntimeError(
+                "Hugging Face snapshot content changed or differs from the pinned "
+                f"repository blob: {relative}"
+            )
+        entries.append(
+            {
+                "path": relative,
+                "size": int(after.st_size),
+                "sha256": content_digest,
+            }
+        )
+
+    if not entries:
+        raise FileNotFoundError(f"Hugging Face snapshot contains no files: {root}")
+    payload = {
+        "format": "huggingface-snapshot-content-inventory-v1",
+        "files": entries,
+    }
+    inventory = hashlib.sha256(_canonical_json_bytes(payload)).hexdigest()
+    if expected is not None:
+        expected_inventory = expected_hf_snapshot_inventory_sha256(expected)
+        if inventory != expected_inventory:
+            raise RuntimeError(
+                "Hugging Face snapshot aggregate differs from its pinned inventory"
+            )
+    return inventory
+
+
+def verify_hf_snapshot(
+    snapshot_path: str | Path,
+    *,
+    model_id: str,
+    revision: str,
+    expected_inventory_sha256: str | None = None,
+    expected_repo_files: Sequence[HuggingFaceRepoFile] | None = None,
+) -> HuggingFaceSnapshot:
+    """Verify a Hub-cache snapshot and return its complete source identity."""
+
+    if not model_id or model_id.strip() != model_id:
+        raise ValueError("Hugging Face model_id must be a non-empty canonical repo ID")
+    pinned_revision = _validate_hf_revision(revision)
+    path = Path(snapshot_path).expanduser().resolve()
+    if not path.is_dir():
+        raise FileNotFoundError(f"Hugging Face snapshot is not a directory: {path}")
+    expected_repo_directory = "models--" + model_id.replace("/", "--")
+    if (
+        path.parent.name != "snapshots"
+        or path.parent.parent.name != expected_repo_directory
+        or path.name != pinned_revision
+    ):
+        raise ValueError(
+            "Hugging Face snapshot must be the repo- and commit-addressed directory "
+            f"returned by snapshot_download({model_id!r}, revision={pinned_revision!r})"
+        )
+    repository_files = (
+        GEMMA4_REPOSITORY_FILES
+        if expected_repo_files is None
+        else tuple(expected_repo_files)
+    )
+    if expected_repo_files is None and (
+        model_id != MODEL_ID or pinned_revision != MODEL_REVISION
+    ):
+        raise ValueError(
+            "no pinned repository inventory exists for this Hugging Face model revision"
+        )
+    repository_inventory = expected_hf_repository_inventory_sha256(repository_files)
+    inventory = hf_snapshot_inventory_sha256(
+        path, expected_repo_files=repository_files
+    )
+    if expected_inventory_sha256 is not None:
+        expected = str(expected_inventory_sha256).lower()
+        if len(expected) != 64 or any(c not in "0123456789abcdef" for c in expected):
+            raise ValueError("expected snapshot inventory must be a SHA-256 hex digest")
+        if inventory != expected:
+            raise RuntimeError(
+                "Hugging Face snapshot content changed after it was materialized"
+            )
+    return HuggingFaceSnapshot(
+        model_id=model_id,
+        revision=pinned_revision,
+        path=path,
+        inventory_sha256=inventory,
+        repository_inventory_sha256=repository_inventory,
+    )
+
+
+def materialize_hf_snapshot(
+    model_id: str,
+    revision: str,
+    *,
+    cache_dir: str | Path | None = None,
+    token: str | bool | None = None,
+    local_files_only: bool = False,
+    expected_repo_files: Sequence[HuggingFaceRepoFile] | None = None,
+) -> HuggingFaceSnapshot:
+    """Download an exact model commit and content-attest its local snapshot."""
+
+    pinned_revision = _validate_hf_revision(revision)
+    try:
+        huggingface_hub = import_module("huggingface_hub")
+    except (ImportError, ModuleNotFoundError) as exc:
+        raise MaxTextUnavailableError(
+            "checkpoint conversion requires huggingface-hub in the conversion environment"
+        ) from exc
+    kwargs: dict[str, Any] = {
+        "repo_id": model_id,
+        "repo_type": "model",
+        "revision": pinned_revision,
+        "token": token,
+        "local_files_only": local_files_only,
+    }
+    if cache_dir is not None:
+        kwargs["cache_dir"] = str(Path(cache_dir).expanduser())
+    snapshot_path = huggingface_hub.snapshot_download(**kwargs)
+    return verify_hf_snapshot(
+        snapshot_path,
+        model_id=model_id,
+        revision=pinned_revision,
+        expected_repo_files=expected_repo_files,
+    )
+
+
+def assert_hf_snapshot_unchanged(
+    snapshot: HuggingFaceSnapshot,
+    *,
+    expected_repo_files: Sequence[HuggingFaceRepoFile] | None = None,
+) -> str:
+    """Re-hash a snapshot and fail if its contents changed; return the digest."""
+
+    verified = verify_hf_snapshot(
+        snapshot.path,
+        model_id=snapshot.model_id,
+        revision=snapshot.revision,
+        expected_inventory_sha256=snapshot.inventory_sha256,
+        expected_repo_files=expected_repo_files,
+    )
+    if (
+        verified.repository_inventory_sha256
+        != snapshot.repository_inventory_sha256
+    ):
+        raise RuntimeError("Hugging Face repository inventory identity changed")
+    return verified.inventory_sha256
+
+
 def checkpoint_conversion_spec(
     maxtext_root: str | Path,
     output_directory: str,
     *,
-    hf_model_path: str | None = None,
+    hf_snapshot: HuggingFaceSnapshot,
     python_executable: str = sys.executable,
     config: Gemma4Config | None = None,
 ) -> CheckpointConversionSpec:
@@ -178,9 +649,41 @@ def checkpoint_conversion_spec(
 
     cfg = config or Gemma4Config()
     cfg.validate()
+    configured_revision = cfg.model_revision
+    if hf_snapshot.model_id != cfg.model_id:
+        raise ValueError(
+            f"snapshot model ID must be {cfg.model_id}, got {hf_snapshot.model_id}"
+        )
+    if hf_snapshot.revision != configured_revision:
+        raise ValueError(
+            "snapshot revision does not match the configured Gemma model revision"
+        )
+    _validate_hf_revision(hf_snapshot.revision)
+    if len(hf_snapshot.inventory_sha256) != 64 or any(
+        character not in "0123456789abcdef"
+        for character in hf_snapshot.inventory_sha256
+    ):
+        raise ValueError("snapshot inventory must be a SHA-256 hex digest")
+    expected_repository_inventory = expected_hf_repository_inventory_sha256()
+    expected_snapshot_inventory = expected_hf_snapshot_inventory_sha256()
+    if hf_snapshot.repository_inventory_sha256 != expected_repository_inventory:
+        raise ValueError(
+            "snapshot repository inventory does not match the pinned Gemma revision"
+        )
+    if hf_snapshot.inventory_sha256 != expected_snapshot_inventory:
+        raise ValueError(
+            "snapshot content inventory does not match the pinned Gemma revision"
+        )
+    snapshot_path = Path(hf_snapshot.path).expanduser().resolve()
+    if not snapshot_path.is_dir():
+        raise FileNotFoundError(f"Hugging Face snapshot is missing: {snapshot_path}")
     return CheckpointConversionSpec(
         maxtext_root=Path(maxtext_root),
-        hf_model_path=hf_model_path or cfg.model_id,
+        hf_model_id=hf_snapshot.model_id,
+        hf_revision=hf_snapshot.revision,
+        hf_snapshot_path=snapshot_path,
+        hf_snapshot_inventory_sha256=hf_snapshot.inventory_sha256,
+        hf_repository_inventory_sha256=hf_snapshot.repository_inventory_sha256,
         output_directory=output_directory,
         python_executable=python_executable,
     )
@@ -191,9 +694,9 @@ def build_checkpoint_conversion_command(
 ) -> tuple[str, ...]:
     """Return argv for MaxText's official converter.
 
-    The Hugging Face token is intentionally absent.  Current MaxText reads
-    ``HF_TOKEN`` from the subprocess environment, which keeps credentials out
-    of argv, logs, manifests, and shell history.
+    The Hub download and authentication happen before this command is built.
+    MaxText receives only a local, content-attested snapshot path, keeping
+    credentials and mutable repository references out of argv and provenance.
     """
 
     if not spec.base_config.is_file():
@@ -230,12 +733,15 @@ def checkpoint_validation_command(
         "-m",
         "tests.utils.forward_pass_logit_checker",
         str(spec.base_config),
-        "tokenizer_path=google/gemma-4-26B-A4B",
+        f"tokenizer_path={spec.hf_model_path}",
         f"load_parameters_path={checkpoint_items_path}",
         "model_name=gemma4-26b",
         "use_multimodal=false",
         "scan_layers=false",
         "pure_nnx_decoder=true",
+        "hardware=cpu",
+        "skip_jax_distributed_system=true",
+        "attention=dot_product",
         "per_device_batch_size=1",
         "dtype=float32",
         "wi_tile_fwd_embed_dim=512",

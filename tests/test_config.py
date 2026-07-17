@@ -6,9 +6,12 @@ import json
 import pytest
 
 from moe_sae.config import (
+    C4_REPOSITORY,
+    C4_REVISION,
     CONDITIONS,
     MAXTEXT_COMMIT,
     MODEL_ID,
+    MODEL_REVISION,
     Gemma4Config,
     load_config,
     save_config,
@@ -19,7 +22,10 @@ def test_approved_defaults_and_derived_contract():
     cfg = Gemma4Config()
 
     assert cfg.model_id == MODEL_ID
+    assert cfg.model_revision == MODEL_REVISION
     assert cfg.maxtext_commit == MAXTEXT_COMMIT
+    assert cfg.dataset_name == C4_REPOSITORY
+    assert cfg.dataset_revision == C4_REVISION
     assert cfg.conditions == CONDITIONS
     assert cfg.target_layer_one_indexed == 15
     assert cfg.target_layer_index == 14
@@ -42,6 +48,8 @@ def test_approved_defaults_and_derived_contract():
     ("change", "message"),
     [
         ({"model_id": "wrong/model"}, "model_id is pinned"),
+        ({"model_revision": "a" * 40}, "model_revision is pinned"),
+        ({"dataset_revision": "b" * 40}, "dataset_revision is pinned"),
         ({"maxtext_commit": "deadbeef"}, "maxtext_commit is pinned"),
         ({"target_layer_one_indexed": 14}, "target_layer_one_indexed is pinned"),
         ({"scan_layers": True}, "scan_layers is pinned"),

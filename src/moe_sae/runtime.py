@@ -27,8 +27,8 @@ from typing import Any
 
 import numpy as np
 
+from moe_sae.config import MAXTEXT_COMMIT, MODEL_ID
 
-MAXTEXT_COMMIT = "48c7da3e28e8f57fe36ddf09d00eec53072a2ea0"
 V4_32_CHIPS = 16
 V4_32_BF16_PEAK_FLOPS = 4.4e15
 TARGET_SEQUENCE_LENGTH = 1_024
@@ -444,7 +444,9 @@ def build_maxtext_argv(
     settings: dict[str, Any] = {
         "model_name": "gemma4-26b",
         "override_model_config": "true",
-        "tokenizer_path": "google/gemma-4-26B-A4B",
+        # This path is inert for our custom pretokenized iterator and the
+        # synthetic benchmark, but keep it coupled to the single model pin.
+        "tokenizer_path": MODEL_ID,
         "tokenizer_type": "huggingface",
         "load_parameters_path": checkpoint_path,
         "use_multimodal": "false",

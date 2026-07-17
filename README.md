@@ -66,13 +66,19 @@ environment.
 
 ## Stage C4 before reserving the TPU
 
-The stager accepts only an already-prepared TFDS `c4/en:3.1.0` source; it never
-downloads data or silently substitutes another C4 version. It pins the Gemma
-tokenizer to a 40-character commit, packs documents in source order into fixed
-1,024-token records, and excludes padding, BOS, and EOS from scientific token
-counts. The sealed train and validation inventories target 50M and 2M tokens,
-respectively, balance the four controller lanes, and pad only the record tail
-to the supported static batch multiple.
+The stager accepts one explicit train object and one explicit validation object
+from `allenai/c4` revision
+`1588ec454efa1a09f29cd18ddd04fe05fc8653a2`. Their paths, compressed sizes,
+and SHA-256 hashes are pinned in code and verified before parsing. It does not
+build or download the full TFDS corpus. The Gemma tokenizer is a verified
+two-file local view from model revision
+`24548b62aa021d562695c04aaf7758a1ea47990b`; both files are hash/size checked
+before and after loading.
+
+Documents remain in source order, are packed into fixed 1,024-token records,
+and exclude padding, BOS, and EOS from scientific counts. The sealed train and
+validation inventories target 50M and 2M tokens, balance the four controller
+lanes, and pad only the record tail to a supported static batch multiple.
 
 Run both splits on a CPU staging machine with local scratch. Resume is allowed
 only from a completely sealed shard boundary. `--publish-gcs` conditionally
@@ -81,24 +87,23 @@ manifest last:
 
 ```zsh
 export ARTIFACT_ROOT="$PWD/artifacts/gemma4_v1/production"
-export TFDS_DATA_DIR="/path/to/prepared/tfds"
+export C4_SOURCE_CACHE="$HOME/.cache/moe-sae/c4-source"
 export LOCAL_C4_STAGE="/path/to/local/c4-stage"
 export BULK_GCS_ROOT="gs://BUCKET/moe-sae/gemma4_v1"
-export TOKENIZER_REVISION="<40-character-gemma-tokenizer-commit>"
+export HF_HUB_DISABLE_XET=1
 
 for split in train validation; do
-  uv run --extra data moe-sae stage-c4 \
+  uv run --frozen --extra data moe-sae stage-c4 \
     --artifact-root "$ARTIFACT_ROOT" \
     --split "$split" \
-    --tfds-data-dir "$TFDS_DATA_DIR" \
-    --tokenizer-revision "$TOKENIZER_REVISION" \
+    --source-cache-dir "$C4_SOURCE_CACHE" \
     --output-directory "$LOCAL_C4_STAGE/$split" \
     --publish-gcs "$BULK_GCS_ROOT/datasets/c4/$split"
 done
 ```
 
 Keep the printed `manifest_location` and `grain_files` values for `preflight`,
-`harvest`, or `run`. Staging calls the TFDS split `validation`; harvesting calls
+`harvest`, or `run`. Staging calls the held-out split `validation`; harvesting calls
 the same held-out input `eval`. Remote file entries pin GCS generation, size,
 CRC32C, and SHA-256; preflight verifies those identities before and after its
 full byte/count scan.

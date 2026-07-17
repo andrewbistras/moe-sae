@@ -1,6 +1,7 @@
 schema_version: gemma4_v1
 
 model_id: google/gemma-4-26B-A4B
+model_revision: 24548b62aa021d562695c04aaf7758a1ea47990b
 tokenizer_path: google/gemma-4-26B-A4B
 maxtext_commit: 48c7da3e28e8f57fe36ddf09d00eec53072a2ea0
 maxtext_model_name: gemma4-26b
@@ -31,9 +32,9 @@ use_post_attn_norm: true
 use_post_ffw_norm: true
 float32_gate_logits: false
 
-dataset_name: c4
+dataset_name: allenai/c4
 dataset_config: en
-dataset_version: 3.1.0
+dataset_revision: 1588ec454efa1a09f29cd18ddd04fe05fc8653a2
 train_split: train
 eval_split: validation
 train_tokens: 50000000

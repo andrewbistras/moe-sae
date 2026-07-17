@@ -1,30 +1,58 @@
+import gzip
+import hashlib
 import json
 from pathlib import Path
 import struct
+import sys
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
+import moe_sae.data as data_module
 from moe_sae.data import (
+    ALLENAI_C4_REPO_ID,
+    ALLENAI_C4_REVISION,
+    ALLENAI_C4_SOURCE_FILES,
     BOS_ID,
     EOS_ID,
+    GEMMA4_TOKENIZER_INVENTORY_SHA256,
+    GEMMA4_TOKENIZER_SOURCE_FILES,
     PACKED_DATASET_SCHEMA,
     PACKED_RECORD_FORMAT,
     OrderedPacker,
     PackedBatchIterable,
     StagingError,
+    SourceFile,
+    allenai_c4_stream,
     decode_packed_record,
     encode_packed_record,
+    gemma_tokenizer,
+    materialize_gemma_tokenizer,
     publish_staged_dataset,
     stage_c4_split,
     verify_packed_source,
 )
 from moe_sae.object_store import LocalObjectStore, parse_gcs_uri
+from moe_sae.model import HuggingFaceRepoFile
+from moe_sae.config import MODEL_ID, MODEL_REVISION
 
 
 TOKENIZER_ID = "google/gemma-4-26B-A4B"
 TOKENIZER_REVISION = "a" * 40
-SOURCE_INFO_SHA256 = "b" * 64
+SOURCE_IDENTITY = {
+    "provider": "test_fixture",
+    "repo_type": "dataset",
+    "repo_id": "tests/c4",
+    "revision": "b" * 40,
+    "files": [
+        {
+            "path": "fixtures/c4-train.json.gz",
+            "sha256": "c" * 64,
+            "size_bytes": 123,
+        }
+    ],
+}
 
 
 def _valid_arrays(length: int = 10):
@@ -72,15 +100,239 @@ def _stage(
         split="train",
         target_scientific_tokens=target,
         output_directory=output,
-        tfds_data_dir=None,
+        source_cache=None,
         tokenizer_id=TOKENIZER_ID,
         tokenizer_revision=TOKENIZER_REVISION,
         records_per_shard=records_per_shard,
         sequence_length=16,
         texts=[str(index) for index in range(document_count)],
         tokenize=tokenize,
-        source_info_sha256=SOURCE_INFO_SHA256,
+        source_identity=SOURCE_IDENTITY,
     )
+
+
+def _gzip_payload(path: Path, payload: bytes) -> SourceFile:
+    with gzip.open(path, "wb") as handle:
+        handle.write(payload)
+    content = path.read_bytes()
+    return SourceFile(
+        path="en/bounded-fixture.json.gz",
+        sha256=hashlib.sha256(content).hexdigest(),
+        size_bytes=len(content),
+    )
+
+
+def _install_source_fixture(monkeypatch, path: Path, specification: SourceFile) -> list:
+    calls = []
+
+    def download(**kwargs):
+        calls.append(kwargs)
+        return path
+
+    monkeypatch.setitem(
+        data_module.ALLENAI_C4_SOURCE_FILES, "train", (specification,)
+    )
+    monkeypatch.setattr(data_module, "_download_hf_source_file", download)
+    return calls
+
+
+def test_bounded_c4_inventory_is_exact_and_revision_pinned():
+    assert ALLENAI_C4_REPO_ID == "allenai/c4"
+    assert ALLENAI_C4_REVISION == "1588ec454efa1a09f29cd18ddd04fe05fc8653a2"
+    assert ALLENAI_C4_SOURCE_FILES == {
+        "train": (
+            SourceFile(
+                path="en/c4-train.00000-of-01024.json.gz",
+                sha256=(
+                    "8ef8d75b0e045dec4aa5123a671b4564"
+                    "466b0707086a7ed1ba8721626dfffbc9"
+                ),
+                size_bytes=319_308_785,
+            ),
+        ),
+        "validation": (
+            SourceFile(
+                path="en/c4-validation.00000-of-00008.json.gz",
+                sha256=(
+                    "1f25b6af12da84115301d4ee93ea5246"
+                    "c8fea5bb4a2008472794d95b917cc97f"
+                ),
+                size_bytes=40_471_190,
+            ),
+        ),
+    }
+
+
+def test_bounded_c4_stream_downloads_exact_revision_verifies_and_parses(
+    tmp_path, monkeypatch
+):
+    compressed = tmp_path / "source.json.gz"
+    specification = _gzip_payload(
+        compressed,
+        b'{"text":"alpha","url":"https://example.test/a"}\n'
+        b'{"text":"beta"}\n',
+    )
+    calls = _install_source_fixture(monkeypatch, compressed, specification)
+
+    values, identity = allenai_c4_stream("train", tmp_path / "cache")
+
+    assert list(values) == ["alpha", "beta"]
+    assert calls == [
+        {
+            "repo_id": ALLENAI_C4_REPO_ID,
+            "revision": ALLENAI_C4_REVISION,
+            "filename": specification.path,
+            "cache_dir": (tmp_path / "cache").resolve(),
+        }
+    ]
+    assert identity == {
+        "provider": "huggingface_hub",
+        "repo_type": "dataset",
+        "repo_id": ALLENAI_C4_REPO_ID,
+        "revision": ALLENAI_C4_REVISION,
+        "files": [specification.as_dict()],
+    }
+
+
+def test_bounded_c4_stream_fails_closed_on_content_mismatch(tmp_path, monkeypatch):
+    compressed = tmp_path / "source.json.gz"
+    actual = _gzip_payload(compressed, b'{"text":"alpha"}\n')
+    wrong = SourceFile(
+        path=actual.path,
+        sha256="0" * 64,
+        size_bytes=actual.size_bytes,
+    )
+    _install_source_fixture(monkeypatch, compressed, wrong)
+
+    with pytest.raises(StagingError, match="hash/size mismatch"):
+        allenai_c4_stream("train", tmp_path / "cache")
+
+
+def test_tokenizer_materializer_downloads_only_two_pinned_files_and_verifies_bytes(
+    tmp_path, monkeypatch
+):
+    payloads = {
+        "tokenizer.json": b'{"version":"fixture"}\n',
+        "tokenizer_config.json": b'{"tokenizer_class":"GemmaTokenizer"}\n',
+    }
+    specifications = tuple(
+        HuggingFaceRepoFile(
+            path=name,
+            size_bytes=len(payload),
+            git_blob_oid="a" * 40,
+            content_sha256=hashlib.sha256(payload).hexdigest(),
+        )
+        for name, payload in payloads.items()
+    )
+    sources = tmp_path / "downloads"
+    sources.mkdir()
+    for name, payload in payloads.items():
+        (sources / name).write_bytes(payload)
+    calls = []
+
+    def download(**kwargs):
+        calls.append(kwargs)
+        return sources / kwargs["filename"]
+
+    monkeypatch.setattr(
+        data_module, "GEMMA4_TOKENIZER_SOURCE_FILES", specifications
+    )
+    monkeypatch.setattr(data_module, "_download_hf_model_file", download)
+
+    view = materialize_gemma_tokenizer(MODEL_ID, MODEL_REVISION, tmp_path / "cache")
+
+    assert {path.name: path.read_bytes() for path in view.iterdir()} == payloads
+    assert calls == [
+        {
+            "repo_id": MODEL_ID,
+            "revision": MODEL_REVISION,
+            "filename": name,
+            "cache_dir": (tmp_path / "cache").resolve(),
+        }
+        for name in payloads
+    ]
+
+
+def test_tokenizer_materializer_rejects_cached_byte_mismatch(tmp_path, monkeypatch):
+    payload = b'{"version":"fixture"}\n'
+    specification = HuggingFaceRepoFile(
+        path="tokenizer.json",
+        size_bytes=len(payload),
+        git_blob_oid="a" * 40,
+        content_sha256=hashlib.sha256(payload).hexdigest(),
+    )
+    source = tmp_path / "tokenizer.json"
+    source.write_bytes(b"corrupt")
+    monkeypatch.setattr(
+        data_module, "GEMMA4_TOKENIZER_SOURCE_FILES", (specification,)
+    )
+    monkeypatch.setattr(
+        data_module, "_download_hf_model_file", lambda **_kwargs: source
+    )
+
+    with pytest.raises(StagingError, match="hash/size mismatch"):
+        materialize_gemma_tokenizer(MODEL_ID, MODEL_REVISION, tmp_path / "cache")
+
+
+def test_gemma_tokenizer_loads_verified_local_view_without_hub_credentials(
+    tmp_path, monkeypatch
+):
+    view = tmp_path / "view"
+    view.mkdir()
+    calls = []
+
+    class FakeTokenizer:
+        pad_token_id = 0
+        eos_token_id = 1
+        bos_token_id = 2
+
+        def encode(self, text, *, add_special_tokens):
+            assert add_special_tokens is False
+            return [len(text)]
+
+    class FakeAutoTokenizer:
+        @staticmethod
+        def from_pretrained(path, **kwargs):
+            calls.append((path, kwargs))
+            return FakeTokenizer()
+
+    monkeypatch.setattr(
+        data_module,
+        "materialize_gemma_tokenizer",
+        lambda *_args, **_kwargs: view,
+    )
+    monkeypatch.setattr(data_module, "_verify_gemma_tokenizer_view", lambda _path: None)
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        SimpleNamespace(AutoTokenizer=FakeAutoTokenizer),
+    )
+
+    encode = gemma_tokenizer(MODEL_ID, MODEL_REVISION, tmp_path / "cache")
+
+    assert encode("abc") == [3]
+    assert calls == [(str(view), {"local_files_only": True})]
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        (b"\n", "blank JSON line"),
+        (b"not-json\n", "invalid JSON"),
+        (b'{"url":"https://example.test"}\n', "string 'text' field"),
+        (b"\xff\n", "cannot decode immutable C4 source"),
+    ],
+)
+def test_bounded_c4_stream_rejects_malformed_rows(
+    tmp_path, monkeypatch, payload: bytes, message: str
+):
+    compressed = tmp_path / "source.json.gz"
+    specification = _gzip_payload(compressed, payload)
+    _install_source_fixture(monkeypatch, compressed, specification)
+
+    values, _ = allenai_c4_stream("train", tmp_path / "cache")
+    with pytest.raises(StagingError, match=message):
+        list(values)
 
 
 def test_packed_record_round_trip_preserves_exact_schema():
@@ -224,19 +476,17 @@ def test_manifest_binds_exact_c4_and_revision_pinned_tokenizer(tmp_path):
 
     assert manifest["schema_version"] == PACKED_DATASET_SCHEMA
     assert manifest["dataset"] == {
-        "name": "c4",
+        "name": "tests/c4",
         "config": "en",
-        "version": "3.1.0",
+        "revision": "b" * 40,
         "split": "train",
     }
-    assert manifest["source"] == {
-        "provider": "tensorflow_datasets",
-        "full_name": "c4/en/3.1.0",
-        "dataset_info_sha256": SOURCE_INFO_SHA256,
-    }
+    assert manifest["source"] == SOURCE_IDENTITY
     assert manifest["tokenizer"] == {
         "id": TOKENIZER_ID,
         "revision": TOKENIZER_REVISION,
+        "repository_inventory_sha256": GEMMA4_TOKENIZER_INVENTORY_SHA256,
+        "files": [entry.as_dict() for entry in GEMMA4_TOKENIZER_SOURCE_FILES],
         "padding_id": 0,
         "eos_id": 1,
         "bos_id": 2,
@@ -254,14 +504,14 @@ def test_manifest_binds_exact_c4_and_revision_pinned_tokenizer(tmp_path):
             split="train",
             target_scientific_tokens=40,
             output_directory=tmp_path,
-            tfds_data_dir=None,
+            source_cache=None,
             tokenizer_id=TOKENIZER_ID,
             tokenizer_revision="c" * 40,
             records_per_shard=1,
             sequence_length=16,
             texts=[str(index) for index in range(8)],
             tokenize=_tokenize_full_record,
-            source_info_sha256=SOURCE_INFO_SHA256,
+            source_identity=SOURCE_IDENTITY,
         )
 
 

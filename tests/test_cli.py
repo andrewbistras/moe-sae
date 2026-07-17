@@ -15,9 +15,22 @@ from moe_sae.cli import (
     build_parser,
     main,
 )
-from moe_sae.config import Gemma4Config
-from moe_sae.data import PACKED_DATASET_SCHEMA, PACKED_RECORD_FORMAT
+from moe_sae.config import Gemma4Config, MODEL_REVISION
+from moe_sae.data import (
+    ALLENAI_C4_REPO_ID,
+    ALLENAI_C4_REVISION,
+    ALLENAI_C4_SOURCE_FILES,
+    GEMMA4_TOKENIZER_INVENTORY_SHA256,
+    GEMMA4_TOKENIZER_SOURCE_FILES,
+    PACKED_DATASET_SCHEMA,
+    PACKED_RECORD_FORMAT,
+)
 from moe_sae.harvest import CampaignSummary
+from moe_sae.model import (
+    HuggingFaceSnapshot,
+    expected_hf_repository_inventory_sha256,
+    expected_hf_snapshot_inventory_sha256,
+)
 
 
 def campaign(split: str, tokens: int, chip_seconds: float) -> dict:
@@ -182,9 +195,15 @@ def test_conversion_attestation_is_self_hashed_and_parity_gated(tmp_path):
     path = cli_module._conversion_attestation_path(tmp_path)
     path.parent.mkdir(parents=True)
     payload = {
-        "schema_version": "gemma4-checkpoint-conversion-v1",
+        "schema_version": "gemma4-checkpoint-conversion-v2",
         "config_sha256": config.config_hash,
         "model_id": config.model_id,
+        "model_revision": config.model_revision,
+        "hf_source_mode": "immutable-local-snapshot",
+        "hf_repository_inventory_sha256": (
+            expected_hf_repository_inventory_sha256()
+        ),
+        "hf_snapshot_inventory_sha256": expected_hf_snapshot_inventory_sha256(),
         "maxtext_commit": config.maxtext_commit,
         "maxtext_checkout_clean": True,
         "maxtext_import_mode": "verified-checkout-source",
@@ -205,6 +224,221 @@ def test_conversion_attestation_is_self_hashed_and_parity_gated(tmp_path):
     path.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(RuntimeError, match="required parity"):
         cli_module._load_conversion_attestation(tmp_path, config, "a" * 64)
+
+    payload["parity_passed"] = True
+    payload["hf_snapshot_inventory_sha256"] = "f" * 64
+    payload["attestation_sha256"] = cli_module._conversion_attestation_digest(payload)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="required parity"):
+        cli_module._load_conversion_attestation(tmp_path, config, "a" * 64)
+
+
+def test_convert_checkpoint_uses_one_pinned_snapshot_and_seals_v2_attestation(
+    tmp_path, monkeypatch
+):
+    config = Gemma4Config()
+    root = tmp_path / "artifacts" / "gemma4_v1" / "production"
+    maxtext_root = tmp_path / "maxtext"
+    base = maxtext_root / "src" / "maxtext" / "configs" / "base.yml"
+    base.parent.mkdir(parents=True)
+    base.write_text("# fixture\n", encoding="utf-8")
+    snapshot_path = (
+        tmp_path
+        / "hub"
+        / "models--google--gemma-4-26B-A4B"
+        / "snapshots"
+        / config.model_revision
+    )
+    snapshot_path.mkdir(parents=True)
+    snapshot = HuggingFaceSnapshot(
+        model_id=config.model_id,
+        revision=config.model_revision,
+        path=snapshot_path,
+        inventory_sha256=expected_hf_snapshot_inventory_sha256(),
+        repository_inventory_sha256=expected_hf_repository_inventory_sha256(),
+    )
+    materialize_calls = []
+    commands = []
+
+    def materialize(*args, **kwargs):
+        materialize_calls.append((args, kwargs))
+        return snapshot
+
+    def run(command, **kwargs):
+        commands.append((tuple(command), kwargs))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(cli_module, "_artifact_root", lambda *_args: root)
+    monkeypatch.setattr(cli_module, "_require_production_artifact_root", lambda _root: None)
+    monkeypatch.setattr(cli_module, "verify_maxtext_checkout", lambda _root: config.maxtext_commit)
+    monkeypatch.setattr(cli_module, "materialize_hf_snapshot", materialize)
+    monkeypatch.setattr(cli_module, "_require_unused_conversion_output", lambda _output: None)
+    monkeypatch.setattr(
+        cli_module,
+        "maxtext_checkout_environment",
+        lambda _root: {
+            "HF_TOKEN": "must-not-leak",
+            "HUGGING_FACE_HUB_TOKEN": "must-not-leak",
+            "HF_API_TOKEN": "must-not-leak",
+            "GOOGLE_CLOUD_PROJECT": "kept",
+        },
+    )
+    monkeypatch.setattr(cli_module.subprocess, "run", run)
+    monkeypatch.setattr(
+        cli_module, "assert_hf_snapshot_unchanged", lambda value: value.inventory_sha256
+    )
+    monkeypatch.setattr(cli_module, "checkpoint_inventory_sha256", lambda _path: "c" * 64)
+    monkeypatch.setattr(cli_module, "_coordinated_environment", lambda: {"sha256": "d" * 64})
+
+    args = SimpleNamespace(
+        config=str(cli_module.DEFAULT_CONFIG),
+        artifact_root=None,
+        maxtext_root=str(maxtext_root),
+        hf_cache_dir=str(tmp_path / "hf-cache"),
+        output="gs://bucket/model",
+        checkpoint_items=None,
+        dry_run=False,
+    )
+    assert cli_module._command_convert_checkpoint(args) == 0
+
+    assert materialize_calls == [
+        (
+            (config.model_id, config.model_revision),
+            {"cache_dir": args.hf_cache_dir, "token": None},
+        )
+    ]
+    assert len(commands) == 2
+    for command, options in commands:
+        joined = " ".join(command)
+        assert str(snapshot_path) in joined
+        assert config.model_id not in joined
+        assert options["env"] == {"GOOGLE_CLOUD_PROJECT": "kept"}
+
+    payload = json.loads(
+        cli_module._conversion_attestation_path(root).read_text(encoding="utf-8")
+    )
+    assert payload["schema_version"] == "gemma4-checkpoint-conversion-v2"
+    assert payload["model_revision"] == config.model_revision
+    assert payload["hf_source_mode"] == "immutable-local-snapshot"
+    assert payload["hf_repository_inventory_sha256"] == (
+        expected_hf_repository_inventory_sha256()
+    )
+    assert payload["hf_snapshot_inventory_sha256"] == (
+        expected_hf_snapshot_inventory_sha256()
+    )
+    assert payload["checkpoint_sha256"] == "c" * 64
+    assert (
+        cli_module._load_conversion_attestation(root, config, "c" * 64)
+        == payload["attestation_sha256"]
+    )
+
+
+def test_convert_checkpoint_dry_run_never_downloads_model(tmp_path, monkeypatch, capsys):
+    config = Gemma4Config()
+    monkeypatch.setattr(cli_module, "_artifact_root", lambda *_args: tmp_path)
+    monkeypatch.setattr(cli_module, "_require_production_artifact_root", lambda _root: None)
+    monkeypatch.setattr(cli_module, "verify_maxtext_checkout", lambda _root: config.maxtext_commit)
+    monkeypatch.setattr(
+        cli_module,
+        "materialize_hf_snapshot",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("dry-run downloaded the model")
+        ),
+    )
+    args = SimpleNamespace(
+        config=str(cli_module.DEFAULT_CONFIG),
+        artifact_root=None,
+        maxtext_root=str(tmp_path / "maxtext"),
+        hf_cache_dir=str(tmp_path / "hf-cache"),
+        output="gs://bucket/model",
+        checkpoint_items=None,
+        dry_run=True,
+    )
+
+    assert cli_module._command_convert_checkpoint(args) == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["model_revision"] == config.model_revision
+    assert plan["max_kl_div_threshold"] == 0.03
+
+
+def test_conversion_output_must_be_a_fresh_local_path(tmp_path):
+    output = tmp_path / "attempt-1"
+    cli_module._require_unused_conversion_output(str(output))
+    output.mkdir()
+    with pytest.raises(RuntimeError, match="fresh attempt-specific"):
+        cli_module._require_unused_conversion_output(str(output))
+
+
+def test_convert_checkpoint_refuses_to_overwrite_a_sealed_attestation(
+    tmp_path, monkeypatch
+):
+    config = Gemma4Config()
+    root = tmp_path / "artifacts" / "gemma4_v1" / "production"
+    attestation = cli_module._conversion_attestation_path(root)
+    attestation.parent.mkdir(parents=True)
+    attestation.write_text("already sealed\n", encoding="utf-8")
+    monkeypatch.setattr(cli_module, "_artifact_root", lambda *_args: root)
+    monkeypatch.setattr(cli_module, "_require_production_artifact_root", lambda _root: None)
+    monkeypatch.setattr(cli_module, "verify_maxtext_checkout", lambda _root: config.maxtext_commit)
+    monkeypatch.setattr(
+        cli_module,
+        "_require_unused_conversion_output",
+        lambda _output: (_ for _ in ()).throw(
+            AssertionError("output probe ran after sealed-attestation gate")
+        ),
+    )
+    args = SimpleNamespace(
+        config=str(cli_module.DEFAULT_CONFIG),
+        artifact_root=None,
+        maxtext_root=str(tmp_path / "maxtext"),
+        hf_cache_dir=str(tmp_path / "hf-cache"),
+        output="gs://bucket/model/new-attempt",
+        checkpoint_items=None,
+        dry_run=False,
+    )
+    with pytest.raises(RuntimeError, match="already sealed"):
+        cli_module._command_convert_checkpoint(args)
+
+
+def test_conversion_output_must_be_an_empty_gcs_prefix(monkeypatch):
+    class FakeBlob:
+        def __init__(self, exists):
+            self._exists = exists
+
+        def exists(self):
+            return self._exists
+
+    class FakeBucket:
+        def __init__(self, exact_exists):
+            self._exact_exists = exact_exists
+
+        def blob(self, _name):
+            return FakeBlob(self._exact_exists)
+
+    class FakeClient:
+        def __init__(self, *, exact_exists=False, descendant_exists=False):
+            self.exact_exists = exact_exists
+            self.descendant_exists = descendant_exists
+
+        def bucket(self, _name):
+            return FakeBucket(self.exact_exists)
+
+        def list_blobs(self, _bucket, *, prefix, max_results):
+            assert prefix == "model/attempt-1/"
+            assert max_results == 1
+            return iter([object()] if self.descendant_exists else [])
+
+    class FakeStore:
+        client = FakeClient()
+
+    monkeypatch.setattr(cli_module, "GCSObjectStore", FakeStore)
+    cli_module._require_unused_conversion_output("gs://bucket/model/attempt-1")
+
+    FakeStore.client = FakeClient(descendant_exists=True)
+    with pytest.raises(RuntimeError, match="fresh attempt-specific"):
+        cli_module._require_unused_conversion_output(
+            "gs://bucket/model/attempt-1"
+        )
 
 
 def test_authoritative_cost_telemetry_is_recomputed_from_components():
@@ -256,19 +490,30 @@ def _write_staged_manifest(tmp_path, split: str, scientific_tokens: int):
             {
                 "schema_version": PACKED_DATASET_SCHEMA,
                 "dataset": {
-                    "name": "c4",
+                    "name": ALLENAI_C4_REPO_ID,
                     "config": "en",
-                    "version": "3.1.0",
+                    "revision": ALLENAI_C4_REVISION,
                     "split": split,
                 },
                 "source": {
-                    "provider": "tensorflow_datasets",
-                    "full_name": "c4/en/3.1.0",
-                    "dataset_info_sha256": "b" * 64,
+                    "provider": "huggingface_hub",
+                    "repo_type": "dataset",
+                    "repo_id": ALLENAI_C4_REPO_ID,
+                    "revision": ALLENAI_C4_REVISION,
+                    "files": [
+                        item.as_dict()
+                        for item in ALLENAI_C4_SOURCE_FILES[split]
+                    ],
                 },
                 "tokenizer": {
                     "id": "google/gemma-4-26B-A4B",
-                    "revision": "a" * 40,
+                    "revision": MODEL_REVISION,
+                    "repository_inventory_sha256": (
+                        GEMMA4_TOKENIZER_INVENTORY_SHA256
+                    ),
+                    "files": [
+                        item.as_dict() for item in GEMMA4_TOKENIZER_SOURCE_FILES
+                    ],
                     "padding_id": 0,
                     "eos_id": 1,
                     "bos_id": 2,
