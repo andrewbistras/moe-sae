@@ -1266,6 +1266,9 @@ def _command_preflight(args: argparse.Namespace) -> int:
 
 def _command_convert_checkpoint(args: argparse.Namespace) -> int:
     config = _config(args)
+    resume_validation = bool(getattr(args, "resume_validation", False))
+    if resume_validation and args.dry_run:
+        raise ValueError("--resume-validation cannot be combined with --dry-run")
     root = _artifact_root(config, args.artifact_root)
     _require_production_artifact_root(root)
     verify_maxtext_checkout(args.maxtext_root)
@@ -1303,13 +1306,31 @@ def _command_convert_checkpoint(args: argparse.Namespace) -> int:
             "a checkpoint conversion is already sealed at this artifact root; "
             "refusing to overwrite its attestation"
         )
-    _require_unused_conversion_output(args.output)
+    canonical_items = f"{str(args.output).rstrip('/')}/0/items"
+    if resume_validation:
+        if args.checkpoint_items is not None and (
+            str(args.checkpoint_items).rstrip("/") != canonical_items
+        ):
+            raise ValueError(
+                "--resume-validation requires the canonical checkpoint path "
+                f"{canonical_items}, got {args.checkpoint_items}"
+            )
+        items = canonical_items
+        # This both rejects a missing/empty prefix and captures every object's
+        # generation/checksum (or every local byte) before validation.  The
+        # MaxText restore below remains the authoritative completeness check.
+        prevalidation_checkpoint_sha256 = checkpoint_inventory_sha256(items)
+    else:
+        _require_unused_conversion_output(args.output)
+        items = args.checkpoint_items or canonical_items
+        prevalidation_checkpoint_sha256 = None
     snapshot_started = time.perf_counter()
     snapshot = materialize_hf_snapshot(
         config.model_id,
         config.model_revision,
         cache_dir=args.hf_cache_dir,
-        token=os.environ.get("HF_TOKEN"),
+        token=None if resume_validation else os.environ.get("HF_TOKEN"),
+        local_files_only=resume_validation,
     )
     snapshot_materialization_seconds = time.perf_counter() - snapshot_started
     spec = checkpoint_conversion_spec(
@@ -1318,22 +1339,26 @@ def _command_convert_checkpoint(args: argparse.Namespace) -> int:
         hf_snapshot=snapshot,
         config=config,
     )
-    conversion = build_checkpoint_conversion_command(spec)
-    items = args.checkpoint_items or f"{args.output.rstrip('/')}/0/items"
+    conversion = (
+        None if resume_validation else build_checkpoint_conversion_command(spec)
+    )
     validation = checkpoint_validation_command(spec, items, max_kl_div=0.03)
     conversion_environment = maxtext_checkout_environment(args.maxtext_root)
     # The snapshot is already local. Neither subprocess needs a Hub credential,
     # so do not expose one to MaxText, Transformers, or imported test utilities.
     for credential_name in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HF_API_TOKEN"):
         conversion_environment.pop(credential_name, None)
-    started = time.perf_counter()
-    subprocess.run(
-        conversion,
-        cwd=spec.maxtext_root,
-        check=True,
-        env=conversion_environment,
-    )
-    conversion_seconds = time.perf_counter() - started
+    conversion_seconds: float | None = None
+    if not resume_validation:
+        assert conversion is not None
+        started = time.perf_counter()
+        subprocess.run(
+            conversion,
+            cwd=spec.maxtext_root,
+            check=True,
+            env=conversion_environment,
+        )
+        conversion_seconds = time.perf_counter() - started
     validation_started = time.perf_counter()
     subprocess.run(
         validation,
@@ -1353,6 +1378,13 @@ def _command_convert_checkpoint(args: argparse.Namespace) -> int:
     digest_started = time.perf_counter()
     checkpoint_sha256 = checkpoint_inventory_sha256(items)
     digest_seconds = time.perf_counter() - digest_started
+    if (
+        prevalidation_checkpoint_sha256 is not None
+        and checkpoint_sha256 != prevalidation_checkpoint_sha256
+    ):
+        raise RuntimeError(
+            "checkpoint inventory changed during resumed parity validation"
+        )
     payload = {
         "schema_version": "gemma4-checkpoint-conversion-v2",
         "config_sha256": config.config_hash,
@@ -1370,13 +1402,21 @@ def _command_convert_checkpoint(args: argparse.Namespace) -> int:
         "checkpoint_sha256": checkpoint_sha256,
         "snapshot_materialization_seconds": snapshot_materialization_seconds,
         "snapshot_revalidation_seconds": snapshot_revalidation_seconds,
-        "conversion_seconds": conversion_seconds,
         "validation_seconds": validation_seconds,
         "digest_seconds": digest_seconds,
         "max_kl_div_threshold": 0.03,
         "parity_passed": True,
         "environment": _coordinated_environment(),
     }
+    if resume_validation:
+        payload["conversion_recovery"] = {
+            "mode": "resume-validation",
+            "converter_rerun": False,
+            "conversion_timing_available": False,
+            "prevalidation_checkpoint_sha256": prevalidation_checkpoint_sha256,
+        }
+    else:
+        payload["conversion_seconds"] = conversion_seconds
     payload["attestation_sha256"] = _conversion_attestation_digest(payload)
     atomic_write_json(attestation_path, payload)
     print(json.dumps(payload, indent=2, sort_keys=True))
@@ -3592,6 +3632,14 @@ def build_parser() -> argparse.ArgumentParser:
     convert.add_argument("--hf-cache-dir", required=True)
     convert.add_argument("--output", required=True)
     convert.add_argument("--checkpoint-items")
+    convert.add_argument(
+        "--resume-validation",
+        action="store_true",
+        help=(
+            "validate and seal the canonical existing output/0/items after an "
+            "interrupted post-conversion parity step; never reruns conversion"
+        ),
+    )
     convert.add_argument("--dry-run", action="store_true")
     convert.set_defaults(handler=_command_convert_checkpoint)
 

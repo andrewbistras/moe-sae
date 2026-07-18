@@ -427,6 +427,7 @@ def test_checkpoint_command_is_pinned_and_never_contains_token(tmp_path):
     assert f"tokenizer_path={snapshot.path}" in validation_argv
     assert "hardware=cpu" in validation_argv
     assert "skip_jax_distributed_system=true" in validation_argv
+    assert "megablox=false" in validation_argv
     assert "attention=dot_product" in validation_argv
     assert "dtype=float32" in validation_argv
     assert spec.hf_model_id == _MODEL_ID

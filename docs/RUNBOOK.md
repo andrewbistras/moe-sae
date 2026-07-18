@@ -517,6 +517,35 @@ model/tokenizer consume that same local path. The Hub token is removed from
 both subprocess environments. The CLI re-hashes the complete 51.6 GB snapshot
 after parity and refuses to attest if anything changed.
 
+The CPU parity subprocess explicitly disables MaxText's Pallas-backed
+MegaBlox GMM and retains sparse top-8 routing through the portable
+`jax.lax.ragged_dot` path. Do not remove the `megablox=false` override or
+replace it with a TPU-only kernel.
+
+Recovery is permitted only when the converter committed the canonical
+`$MODEL_OUTPUT/0/items` checkpoint but the same command then failed during
+parity, before `conversion.json` was sealed. In that case, do not delete the
+checkpoint, choose a new output, or rerun the converter. Keep `MODEL_OUTPUT`
+set to the failed attempt's exact prefix and run:
+
+```zsh
+UV_PROJECT_ENVIRONMENT="$CONVERSION_ENV" \
+  uv run --frozen --extra conversion moe-sae convert-checkpoint \
+    --artifact-root "$ARTIFACT_ROOT" \
+    --maxtext-root "$MAXTEXT_ROOT" \
+    --hf-cache-dir "$HF_CACHE_DIR" \
+    --output "$MODEL_OUTPUT" \
+    --resume-validation
+```
+
+Recovery uses the already-cached pinned Hugging Face snapshot without network
+access, never reruns conversion, requires the canonical checkpoint path, and
+hashes the checkpoint inventory both before and after parity. A missing,
+partial, or changing checkpoint fails without sealing an attestation. The
+result records that the original conversion duration is unavailable. Never use
+this mode for an output whose provenance is unknown or for a failure that
+occurred before Orbax wrote `commit_success.txt`.
+
 Success means conversion exits zero, parity exits zero at
 `max_kl_div <= 0.03`, `$MODEL_OUTPUT/0/items` exists, and
 `$ARTIFACT_ROOT/checkpoint/conversion.json` exists. Quiet periods while large

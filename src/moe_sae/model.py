@@ -741,6 +741,11 @@ def checkpoint_validation_command(
         "pure_nnx_decoder=true",
         "hardware=cpu",
         "skip_jax_distributed_system=true",
+        # Gemma 4's model config enables the Pallas-backed MegaBlox GMM.  JAX
+        # cannot lower that kernel on CPU outside Pallas interpret mode.  The
+        # portable MaxText branch uses jax.lax.ragged_dot and computes the same
+        # routed MoE function, which is what the CPU parity checker needs.
+        "megablox=false",
         "attention=dot_product",
         "per_device_batch_size=1",
         "dtype=float32",
