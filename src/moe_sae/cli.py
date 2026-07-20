@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Mapping, Sequence
+from contextlib import contextmanager
 import dataclasses
 import gc
 import hashlib
@@ -70,6 +71,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG = REPO_ROOT / "configs" / "gemma4_26b_a4b.yaml"
 _BENCHMARK_RENDEZVOUS_SECONDS = 300.0
 _BENCHMARK_KILL_GRACE_SECONDS = 15.0
+_ACTIVATION_CHILD_KILL_GRACE_SECONDS = 30.0
 
 
 def _sha256_argument(value: str) -> str:
@@ -1514,6 +1516,37 @@ def _wait_for_worker(process: Any, *, deadline: float) -> tuple[int, bool]:
         return _terminate_process_group(process), True
 
 
+def _inherited_activation_lease_fds() -> tuple[int, ...]:
+    raw = os.environ.get("MOE_SAE_ACTIVATION_LEASE_FD")
+    if raw is None:
+        return ()
+    try:
+        descriptor = int(raw)
+        os.fstat(descriptor)
+    except (OSError, TypeError, ValueError) as error:
+        raise RuntimeError("activation supervisor lease descriptor is invalid") from error
+    if descriptor < 0:
+        raise RuntimeError("activation supervisor lease descriptor is invalid")
+    return (descriptor,)
+
+
+@contextmanager
+def _cleanup_worker_on_sigterm(process: Any):
+    """Ensure an isolated benchmark worker cannot outlive its supervisor."""
+
+    previous = signal.getsignal(signal.SIGTERM)
+
+    def terminate(signum: int, _frame: Any) -> None:
+        _terminate_process_group(process)
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, terminate)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
 def _benchmark_worker_command(
     mode: str,
     args: argparse.Namespace,
@@ -1605,8 +1638,10 @@ def _bootstrap_benchmark_supervisor(
             stderr=subprocess.STDOUT,
             start_new_session=True,
             close_fds=True,
+            pass_fds=_inherited_activation_lease_fds(),
         )
-        returncode, timed_out = _wait_for_worker(process, deadline=deadline)
+        with _cleanup_worker_on_sigterm(process):
+            returncode, timed_out = _wait_for_worker(process, deadline=deadline)
     if timed_out or returncode != 0:
         raise RuntimeError(
             "benchmark bootstrap worker failed"
@@ -1763,8 +1798,10 @@ def _run_supervised_benchmark_candidate(
             stderr=subprocess.STDOUT,
             start_new_session=True,
             close_fds=True,
+            pass_fds=_inherited_activation_lease_fds(),
         )
-        returncode, timed_out = _wait_for_worker(process, deadline=deadline)
+        with _cleanup_worker_on_sigterm(process):
+            returncode, timed_out = _wait_for_worker(process, deadline=deadline)
     elapsed = max(time.perf_counter() - started, 1e-9)
     status_path = attempt_root / "status" / f"host-{process_index:05d}.json"
     atomic_write_json(
@@ -3565,6 +3602,648 @@ def _command_run(args: argparse.Namespace) -> int:
     return _command_report(report_args)
 
 
+def _activation_common_child_arguments(args: argparse.Namespace) -> list[str]:
+    return [
+        "--config",
+        str(Path(args.config).expanduser().resolve()),
+        "--artifact-root",
+        str(Path(args.artifact_root).expanduser().resolve()),
+        "--checkpoint",
+        str(args.checkpoint),
+        "--checkpoint-sha256",
+        str(args.checkpoint_sha256),
+        "--grain-train",
+        str(args.grain_train),
+        "--grain-eval",
+        str(args.grain_eval),
+        "--dataset-train-manifest",
+        str(args.dataset_train_manifest),
+        "--dataset-eval-manifest",
+        str(args.dataset_eval_manifest),
+    ]
+
+
+def _activation_child_command(
+    args: argparse.Namespace, phase: str
+) -> list[str]:
+    base = [sys.executable, "-m", "moe_sae.cli"]
+    common = _activation_common_child_arguments(args)
+    if phase == "preflight":
+        # Preflight does not accept or need the claimed checkpoint digest.
+        without_digest = common[:]
+        index = without_digest.index("--checkpoint-sha256")
+        del without_digest[index : index + 2]
+        return [*base, "preflight", *without_digest, "--json"]
+    if phase == "gate":
+        return [sys.executable, "-m", "moe_sae.activation_worker", *common]
+    if phase == "benchmark":
+        config = _config(args)
+        return [
+            *base,
+            "benchmark-harvest",
+            "--config",
+            common[1],
+            "--artifact-root",
+            common[3],
+            "--checkpoint",
+            str(args.checkpoint),
+            "--checkpoint-sha256",
+            str(args.checkpoint_sha256),
+            "--steps",
+            str(config.benchmark_steps),
+        ]
+    if phase not in {"canary", "train", "eval"}:
+        raise ValueError(f"unknown activation subprocess phase {phase!r}")
+    split = "train" if phase in {"canary", "train"} else "eval"
+    grain = args.grain_train if split == "train" else args.grain_eval
+    manifest = (
+        args.dataset_train_manifest
+        if split == "train"
+        else args.dataset_eval_manifest
+    )
+    command = [
+        *base,
+        "harvest",
+        "--config",
+        common[1],
+        "--artifact-root",
+        common[3],
+        "--split",
+        split,
+        "--checkpoint",
+        str(args.checkpoint),
+        "--checkpoint-sha256",
+        str(args.checkpoint_sha256),
+        "--grain-files",
+        str(grain),
+        "--dataset-manifest",
+        str(manifest),
+    ]
+    if phase == "canary":
+        command.append("--canary")
+    return command
+
+
+def _activation_gate_command(
+    args: argparse.Namespace, phase: str
+) -> list[str]:
+    return [
+        *_activation_child_command(args, "gate"),
+        "--phase",
+        phase,
+    ]
+
+
+def _activation_final_record(root: Path, phase: str) -> Path:
+    if phase == "benchmark":
+        return root / "benchmark" / "selected.json"
+    name = {
+        "canary": "train-canary.json",
+        "train": "train.json",
+        "eval": "eval.json",
+    }[phase]
+    return root / "harvest" / name
+
+
+def _matching_harvest_controls(
+    control: Any, phase: str
+) -> list[tuple[Path, str]]:
+    if phase not in {"canary", "train", "eval"}:
+        return []
+    result: list[tuple[Path, str]] = []
+    for item in control.status()["harvest_controls"]:
+        if item.get("valid") is not True or item.get("phase") != phase:
+            continue
+        split = str(item["split"])
+        result.append(
+            (
+                control.artifact_root / "captures" / split,
+                str(item["campaign_id"]),
+            )
+        )
+    return result
+
+
+def _mirror_activation_abort_to_harvest(
+    control: Any, phase: str, request: Mapping[str, Any]
+) -> list[str]:
+    """Mirror one coarse request into every matching in-phase safe-stop marker."""
+
+    from moe_sae.harvest_control import request_campaign_abort
+
+    mirrored: list[str] = []
+    for capture_root, campaign_id in _matching_harvest_controls(control, phase):
+        request_campaign_abort(
+            capture_root,
+            campaign_id,
+            reason=str(request["reason"]),
+            requested_by="activation-operator",
+        )
+        mirrored.append(campaign_id)
+    return mirrored
+
+
+def _run_activation_subprocess(
+    command: Sequence[str],
+    *,
+    label: str,
+    control: Any | None = None,
+    phase: str | None = None,
+    lease_fd: int | None = None,
+    supervisor: Any | None = None,
+) -> None:
+    """Run one fresh child; cooperative aborts never signal a live collective."""
+
+    if control is not None and supervisor is not None:
+        control.supervisor_rendezvous(supervisor, label)
+    child_environment = os.environ.copy()
+    if lease_fd is not None:
+        child_environment["MOE_SAE_ACTIVATION_LEASE_FD"] = str(lease_fd)
+    process = subprocess.Popen(
+        list(command),
+        pass_fds=(() if lease_fd is None else (lease_fd,)),
+        start_new_session=True,
+        env=child_environment,
+    )
+    if control is not None and supervisor is not None:
+        control.supervisor_heartbeat(supervisor, "running", step=label)
+    while True:
+        returncode = process.poll()
+        if returncode is not None:
+            break
+        if control is not None and supervisor is not None:
+            control.supervisor_heartbeat(supervisor, "running", step=label)
+            try:
+                control.require_supervisor_peers_healthy(supervisor, label)
+            except Exception:
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                deadline = time.time() + _ACTIVATION_CHILD_KILL_GRACE_SECONDS
+                while process.poll() is None and time.time() < deadline:
+                    time.sleep(0.25)
+                if process.poll() is None:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                process.wait()
+                raise
+        if control is not None and phase in {"canary", "train", "eval"}:
+            request = control.pending_abort()
+            if request is not None:
+                _mirror_activation_abort_to_harvest(control, str(phase), request)
+        time.sleep(2.0)
+    if control is not None and supervisor is not None:
+        local_state = (
+            "succeeded"
+            if returncode == 0
+            else (
+                "aborted"
+                if phase in {"canary", "train", "eval"}
+                and control.pending_abort() is not None
+                else "failed"
+            )
+        )
+        outcome = control.supervisor_wait_completion(
+            supervisor, label, local_state=local_state
+        )
+        if outcome == "aborted":
+            raise RuntimeError(f"{label} subprocess stopped cooperatively")
+    if returncode != 0:
+        raise RuntimeError(f"{label} subprocess exited with status {returncode}")
+
+
+def _activation_gate_payload(args: argparse.Namespace) -> dict[str, Any]:
+    """Collectively validate one final phase artifact without rerunning it."""
+
+    from moe_sae.harvest import (
+        CampaignSummary,
+        _validate_campaign_summary_identity,
+        capture_metadata,
+    )
+
+    require_v4_32_runtime()
+    config = _config(args)
+    config.validate_production()
+    root = _artifact_root(config, args.artifact_root).resolve()
+    _require_production_artifact_root(root)
+    _verify_checkpoint_inventory(args)
+    environment = _coordinated_environment()
+    storage_payload = _load_storage_attestation_payload(
+        root, config, environment=environment
+    )
+    storage = _storage_layout(storage_payload)
+    storage_sha256 = str(storage_payload["attestation_sha256"])
+    conversion_sha256 = _load_conversion_attestation(
+        root, config, args.checkpoint_sha256
+    )
+    benchmark_path = root / "benchmark" / "selected.json"
+    selected = _load_selected_benchmark(
+        benchmark_path,
+        config,
+        args.checkpoint_sha256,
+        conversion_sha256,
+        storage_sha256,
+    )
+    selected_mesh = selected.get("mesh")
+    mesh_name = (
+        selected_mesh.get("name")
+        if isinstance(selected_mesh, Mapping)
+        else str(selected_mesh)
+    )
+    sequence_batch = int(selected["per_device_sequence_batch"])
+    if args.phase == "benchmark":
+        return {
+            "phase": "benchmark",
+            "path": str(benchmark_path),
+            "mesh": mesh_name,
+            "per_device_sequence_batch": sequence_batch,
+            "useful_mfu": float(selected["useful_mfu"]),
+        }
+
+    split = "train" if args.phase in {"canary", "train"} else "eval"
+    grain_files = args.grain_train if split == "train" else args.grain_eval
+    dataset_manifest = (
+        args.dataset_train_manifest
+        if split == "train"
+        else args.dataset_eval_manifest
+    )
+    provenance = _verified_dataset_provenance(
+        args,
+        config,
+        split=split,
+        grain_files=grain_files,
+        manifest_location=dataset_manifest,
+    )
+    metadata = capture_metadata(
+        config,
+        checkpoint_sha256=args.checkpoint_sha256,
+        conversion_attestation_sha256=conversion_sha256,
+        dataset_fingerprint=provenance.fingerprint_sha256,
+        split=split,
+        storage_attestation_sha256=storage_sha256,
+        object_prefix=join_gcs_uri(
+            storage["bulk_gcs_root"],
+            "captures",
+            config.config_hash,
+            split,
+        ),
+        environment=environment,
+    )
+    summary_path = _activation_final_record(root, args.phase)
+    try:
+        raw_summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(
+            f"missing/invalid final {args.phase} record: {summary_path}"
+        ) from error
+    if not isinstance(raw_summary, Mapping):
+        raise RuntimeError(f"final {args.phase} record is not an object")
+    summary = CampaignSummary.from_mapping(raw_summary)
+    stop_after = config.canary_tokens if args.phase == "canary" else (
+        config.train_tokens if split == "train" else config.eval_tokens
+    )
+    internal_path = (
+        _capture_root(root, split)
+        / "telemetry"
+        / f"campaign-stop-{stop_after:012d}.json"
+    )
+    try:
+        internal_raw = json.loads(internal_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(
+            f"missing/invalid internal {args.phase} campaign: {internal_path}"
+        ) from error
+    if not isinstance(internal_raw, Mapping):
+        raise RuntimeError(f"internal {args.phase} campaign is not an object")
+    internal = CampaignSummary.from_mapping(internal_raw)
+    if internal != summary:
+        raise RuntimeError(
+            f"final and internal {args.phase} campaign records disagree"
+        )
+
+    _validate_campaign_summary_identity(
+        summary,
+        split=split,
+        stop_after_tokens=stop_after,
+        mesh=_mesh_by_name(mesh_name),
+        per_device_sequence_batch=sequence_batch,
+        capture_metadata=metadata.to_dict(),
+        capture_manifest_sha256=(
+            None if args.phase == "canary" else summary.capture_manifest_sha256
+        ),
+        benchmark={
+            "synthetic_goodput": selected["persisted_tokens_per_second"],
+            "useful_mfu": selected["useful_mfu"],
+            "dropped_routed_tokens": selected["dropped_routed_tokens"],
+            "recompilations": selected["recompilations"],
+            "instrumentation_equal": selected["instrumentation_equal"],
+        },
+    )
+    if args.phase == "canary":
+        if (
+            summary.phase != "canary"
+            or summary.total_tokens != config.train_tokens
+            or summary.captured_tokens != config.canary_tokens
+            or summary.canary_passed is not True
+            or summary.capture_manifest_sha256 is not None
+            or summary.manifest_path is not None
+            or summary.process_count != 4
+            or summary.global_chips != 16
+        ):
+            raise RuntimeError("final canary did not pass the exact production gate")
+    else:
+        capture = _sealed_dataset(_capture_root(root, split))
+        expected_tokens = (
+            config.train_tokens if split == "train" else config.eval_tokens
+        )
+        _require_exact_capture(capture, expected_tokens, split)
+        _require_capture_identity(
+            capture,
+            config,
+            split,
+            checkpoint_sha256=args.checkpoint_sha256,
+            conversion_attestation_sha256=conversion_sha256,
+            dataset_fingerprint=provenance.fingerprint_sha256,
+            environment_sha256=environment["sha256"],
+            storage_attestation_sha256=storage_sha256,
+            object_prefix=metadata.object_prefix,
+        )
+        if not _campaign_is_complete(
+            summary_path,
+            split=split,
+            tokens=expected_tokens,
+            mesh_name=mesh_name,
+            sequence_batch=sequence_batch,
+            config_sha256=config.config_hash,
+            checkpoint_sha256=args.checkpoint_sha256,
+            conversion_attestation_sha256=conversion_sha256,
+            dataset_fingerprint=provenance.fingerprint_sha256,
+            environment_sha256=environment["sha256"],
+            capture_manifest_sha256=capture.manifest_sha256,
+            benchmark=selected,
+        ):
+            raise RuntimeError(f"{args.phase} campaign is not complete")
+    return {
+        "phase": args.phase,
+        "path": str(summary_path),
+        "captured_tokens": summary.captured_tokens,
+        "campaign_environment_sha256": summary.environment_sha256,
+        "capture_manifest_sha256": summary.capture_manifest_sha256,
+    }
+
+
+def _command_activation_gate(args: argparse.Namespace) -> int:
+    payload = _activation_gate_payload(args)
+    if _process_context()[0] == 0:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    return 0
+
+
+def _activation_spec(args: argparse.Namespace, config: Gemma4Config) -> Any:
+    from moe_sae.activation_operator import ActivationRunSpec
+
+    return ActivationRunSpec(
+        config_sha256=config.config_hash,
+        checkpoint=str(args.checkpoint),
+        checkpoint_sha256=str(args.checkpoint_sha256),
+        grain_train=str(args.grain_train),
+        grain_eval=str(args.grain_eval),
+        dataset_train_manifest=str(args.dataset_train_manifest),
+        dataset_eval_manifest=str(args.dataset_eval_manifest),
+    )
+
+
+def _raise_if_activation_aborted(control: Any, phase: str) -> None:
+    from moe_sae.activation_operator import ActivationAbortRequested
+
+    request = control.pending_abort()
+    if request is None:
+        return
+    state = control.load_state()
+    running = (
+        []
+        if state is None
+        else [
+            candidate
+            for candidate in ("benchmark", "canary", "train", "eval")
+            if state["phases"][candidate]["status"] == "running"
+        ]
+    )
+    if len(running) > 1:
+        raise RuntimeError("activation state has multiple running phases")
+    acknowledged_phase = running[0] if running else phase
+    control.acknowledge_abort(acknowledged_phase)
+    raise ActivationAbortRequested(
+        f"activation farm stopped at the {acknowledged_phase} boundary: "
+        f"{request['reason']}; "
+        "clear the abort explicitly before resuming"
+    )
+
+
+def _require_activation_phase_commit(
+    state: Mapping[str, Any], phase: str, attempt_id: str
+) -> None:
+    record = state["phases"][phase]
+    if (
+        record.get("status") != "passed"
+        or record.get("attempt_id") != attempt_id
+    ):
+        raise RuntimeError(
+            f"activation phase {phase} did not commit globally for attempt "
+            f"{attempt_id}"
+        )
+
+
+def _command_activation_farm(args: argparse.Namespace) -> int:
+    """Run only benchmark/canary/train/eval in fresh, gated subprocesses."""
+
+    from moe_sae.activation_operator import (
+        ACTIVATION_PHASES,
+        ActivationAbortRequested,
+        ActivationControl,
+    )
+
+    config = _config(args)
+    config.validate_production()
+    root = _artifact_root(config, args.artifact_root).resolve()
+    _require_production_artifact_root(root)
+    args.artifact_root = str(root)
+    control = ActivationControl(root)
+    activation_spec = _activation_spec(args, config)
+    control.begin(activation_spec)
+    operation_sha256 = hashlib.sha256(
+        json.dumps(
+            {
+                "spec_sha256": activation_spec.sha256,
+                "phases": ACTIVATION_PHASES,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    with control.supervisor_lease(
+        operation_sha256=operation_sha256
+    ) as supervisor:
+        lease_fd = supervisor.descriptor
+        _raise_if_activation_aborted(control, "benchmark")
+        try:
+            _run_activation_subprocess(
+                _activation_child_command(args, "preflight"),
+                label="preflight",
+                control=control,
+                lease_fd=lease_fd,
+                supervisor=supervisor,
+            )
+        except Exception:
+            raise
+
+        for phase in ACTIVATION_PHASES:
+            _raise_if_activation_aborted(control, phase)
+            final_record = _activation_final_record(root, phase)
+            current = control.load_state()
+            if (
+                current is not None
+                and current["phases"][phase]["status"] == "passed"
+                and not final_record.exists()
+            ):
+                raise RuntimeError(
+                    f"activation state says {phase} passed but its final record is missing"
+                )
+            if final_record.exists():
+                phase_state = control.mark_running(phase)
+                attempt_id = str(phase_state["phases"][phase]["attempt_id"])
+                try:
+                    _run_activation_subprocess(
+                        _activation_gate_command(args, phase),
+                        label=f"existing {phase} gate",
+                        control=control,
+                        lease_fd=lease_fd,
+                        supervisor=supervisor,
+                    )
+                except Exception as error:
+                    control.mark_failed(phase, error, attempt_id=attempt_id)
+                    raise
+                committed = control.mark_passed(
+                    phase,
+                    {"validated_existing": True, "path": str(final_record)},
+                    attempt_id=attempt_id,
+                )
+                _require_activation_phase_commit(committed, phase, attempt_id)
+                continue
+            phase_state = control.mark_running(phase)
+            attempt_id = str(phase_state["phases"][phase]["attempt_id"])
+            phase_subprocess_completed = False
+            try:
+                _run_activation_subprocess(
+                    _activation_child_command(args, phase),
+                    label=phase,
+                    control=control,
+                    phase=phase,
+                    lease_fd=lease_fd,
+                    supervisor=supervisor,
+                )
+                phase_subprocess_completed = True
+                _run_activation_subprocess(
+                    _activation_gate_command(args, phase),
+                    label=f"{phase} completion gate",
+                    control=control,
+                    lease_fd=lease_fd,
+                    supervisor=supervisor,
+                )
+            except ActivationAbortRequested:
+                raise
+            except Exception as error:
+                request = control.pending_abort()
+                if request is not None and not phase_subprocess_completed:
+                    control.acknowledge_abort(phase)
+                    raise ActivationAbortRequested(
+                        f"activation farm stopped safely during {phase}: "
+                        f"{request['reason']}"
+                    ) from error
+                control.mark_failed(phase, error, attempt_id=attempt_id)
+                raise
+            committed = control.mark_passed(
+                phase,
+                {"validated_existing": False, "path": str(final_record)},
+                attempt_id=attempt_id,
+            )
+            _require_activation_phase_commit(committed, phase, attempt_id)
+            next_index = ACTIVATION_PHASES.index(phase) + 1
+            boundary_phase = (
+                ACTIVATION_PHASES[next_index]
+                if next_index < len(ACTIVATION_PHASES)
+                else phase
+            )
+            _raise_if_activation_aborted(control, boundary_phase)
+    print(json.dumps(control.status(), indent=2, sort_keys=True))
+    return 0
+
+
+def _command_activation_status(args: argparse.Namespace) -> int:
+    from moe_sae.activation_operator import ActivationControl
+
+    config = _config(args)
+    root = _artifact_root(config, args.artifact_root).resolve()
+    _require_production_artifact_root(root)
+    print(json.dumps(ActivationControl(root).status(), indent=2, sort_keys=True))
+    return 0
+
+
+def _command_activation_abort(args: argparse.Namespace) -> int:
+    from moe_sae.activation_operator import ACTIVATION_PHASES, ActivationControl
+    from moe_sae.harvest_control import clear_campaign_abort
+
+    config = _config(args)
+    root = _artifact_root(config, args.artifact_root).resolve()
+    _require_production_artifact_root(root)
+    control = ActivationControl(root)
+    state = control.load_state()
+    if state is None:
+        raise RuntimeError("no activation campaign exists at this artifact root")
+    if args.clear:
+        observed = control.status()["harvest_controls"]
+        boundary_cleared = control.clear_abort()
+        cleared_campaigns: list[str] = []
+        for item in observed:
+            if item.get("valid") is not True or item.get("abort_request") is None:
+                continue
+            split = str(item["split"])
+            campaign_id = str(item["campaign_id"])
+            if clear_campaign_abort(
+                root / "captures" / split, campaign_id
+            ):
+                cleared_campaigns.append(campaign_id)
+        payload = {
+            "boundary_abort_cleared": boundary_cleared,
+            "harvest_campaign_aborts_cleared": cleared_campaigns,
+        }
+    else:
+        request = control.request_abort(args.reason)
+        running = [
+            phase
+            for phase in ACTIVATION_PHASES
+            if state["phases"][phase]["status"] == "running"
+        ]
+        mirrored = (
+            _mirror_activation_abort_to_harvest(control, running[0], request)
+            if len(running) == 1
+            else []
+        )
+        payload = {
+            "boundary_abort_request": request,
+            "in_phase_harvest_campaigns": mirrored,
+            "note": (
+                "The request is cooperative. Do not kill one controller; wait "
+                "for all activation-farm commands to return."
+            ),
+        }
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    return 0
+
+
 def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
     parser.add_argument("--artifact-root")
@@ -3669,6 +4348,38 @@ def build_parser() -> argparse.ArgumentParser:
     )
     harvest.add_argument("--canary", action="store_true")
     harvest.set_defaults(handler=_command_harvest)
+
+    activation = subparsers.add_parser(
+        "activation-farm",
+        help="run only benchmark, canary, train capture, and eval capture",
+    )
+    _add_common(activation)
+    activation.add_argument("--checkpoint", required=True)
+    activation.add_argument(
+        "--checkpoint-sha256", type=_sha256_argument, required=True
+    )
+    activation.add_argument("--grain-train", required=True)
+    activation.add_argument("--grain-eval", required=True)
+    activation.add_argument("--dataset-train-manifest", required=True)
+    activation.add_argument("--dataset-eval-manifest", required=True)
+    activation.set_defaults(handler=_command_activation_farm)
+
+    activation_status = subparsers.add_parser(
+        "activation-status", help="inspect activation-farm state without JAX"
+    )
+    _add_common(activation_status)
+    activation_status.set_defaults(handler=_command_activation_status)
+
+    activation_abort = subparsers.add_parser(
+        "activation-abort", help="request or clear a cooperative activation stop"
+    )
+    _add_common(activation_abort)
+    activation_abort_action = activation_abort.add_mutually_exclusive_group(
+        required=True
+    )
+    activation_abort_action.add_argument("--reason")
+    activation_abort_action.add_argument("--clear", action="store_true")
+    activation_abort.set_defaults(handler=_command_activation_abort)
 
     train_parser = subparsers.add_parser("train", help="train or resume one A/B/F seed")
     _add_common(train_parser)

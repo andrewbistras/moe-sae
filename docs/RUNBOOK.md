@@ -80,12 +80,11 @@ silently to a personal project.
 
 ### 1.3 Select or create the GCS bucket
 
-If TRC supplied a bucket, use it and skip creation. Otherwise choose a globally
-unique name and ask the TRC administrator which location is permitted. A
-v4-32 is commonly provisioned in `us-central2-b`, but ordinary Cloud Storage
-does not offer `us-central2` as a regional bucket location. `US` or
-`us-central1` are reasonable examples only when the administrator approves
-them:
+If TRC supplied a bucket, use it and skip creation. The current campaign's
+existing `gs://moe-sae-bucket` is confirmed as regional `US-CENTRAL2`, matching
+the v4-32 region. Otherwise choose a globally unique name and ask the TRC
+administrator which currently available location is permitted; never infer a
+location from an old region list:
 
 ```zsh
 export BUCKET="<globally-unique-bucket-name>"
@@ -633,86 +632,584 @@ can still be billed.
 - [ ] No TFDS build, Dataflow job, full-C4 download, or TPU allocation was
   needed for Stage 1.
 
-## Deployment storage roles after Stage 1
+## Stage 2 — provision the v4-32 and its small POSIX control plane
 
-On the v4-32, use one stable layout. `ARTIFACT_ROOT` must resolve to the same
-strongly consistent POSIX mount on all four controllers:
+Run Stage 2 from the Mac/control terminal, not from the stopped conversion VM.
+The model and dataset identities below are confirmed for this campaign. The
+TPU allocation mode, TPU name, and TPU service account are intentionally *not*
+filled in: those must come from the TRC award or a TRC administrator.
+
+### 2.1 Load confirmed identities and fill the operator choices
+
+The following GCS values are copyable as written:
 
 ```zsh
-export ARTIFACT_ROOT="$PWD/artifacts/gemma4_v1/production"
-export LOCAL_BUFFER_ROOT="/mnt/localssd/moe-sae"
-export BULK_GCS_ROOT="gs://$BUCKET/moe-sae/gemma4_v1"
+setopt PIPE_FAIL
+
+export GCP_PROJECT="neural-dragnet"
+export TPU_ZONE="us-central2-b"
+export BUCKET="moe-sae-bucket"
+export TPU_NETWORK="default"
+
+export BULK_GCS_ROOT="gs://moe-sae-bucket/moe-sae/gemma4_v1"
+export SAE_CHECKPOINT_ROOT="$BULK_GCS_ROOT/sae-checkpoints"
+export MODEL_CHECKPOINT="gs://moe-sae-bucket/moe-sae/gemma4_v1/model/20260718T101406Z-0600f5d98d32/0/items"
+export CHECKPOINT_SHA256="fbb5e2fe394d8ca03a30e15247b7a4171461b913406b63005a29dc47c3ed8281"
+export CONVERSION_HANDOFF="gs://moe-sae-bucket/moe-sae/gemma4_v1/control-handoff/conversion/fddcde27083510fad4c3a32f51e760bf040a08bfe6b816202bd1dfd1542f9c9e/conversion.json"
+
+export TRAIN_DATASET_MANIFEST="gs://moe-sae-bucket/moe-sae/gemma4_v1/datasets/c4/train/manifests/8737195093e083fe1baf982e22e8c99d0b7e8be1e201e14d91e3c3cb37b5e22a.json"
+export TRAIN_GRAIN_FILES='gs://moe-sae-bucket/moe-sae/gemma4_v1/datasets/c4/train/shards/*.array_record'
+export EVAL_DATASET_MANIFEST="gs://moe-sae-bucket/moe-sae/gemma4_v1/datasets/c4/validation/manifests/a3c6da01b87ecac4076b5f123f62f8998905c4b12889ff1a1432645f59b4f630.json"
+export EVAL_GRAIN_FILES='gs://moe-sae-bucket/moe-sae/gemma4_v1/datasets/c4/validation/shards/*.array_record'
+
+export FILESTORE_NAME="gemma4-control"
+export FILESTORE_SHARE="moe_sae_control"
+```
+
+Now fill these values. Keep the angle-bracket placeholders quoted, and do not
+run a create command until every placeholder has been replaced:
+
+```zsh
+# Choose a new resource name; this is not a pre-existing confirmed name.
+export TPU_NAME="<new unique TPU node name, for example gemma4-harvest-01>"
+
+# One of: direct-on-demand, direct-reserved, queued-on-demand, queued-reserved.
+export TPU_ALLOCATION_MODE="<mode confirmed by the TRC award/admin>"
+
+# Required only for a queued mode; otherwise leave it empty.
+export QUEUED_RESOURCE_NAME="<new queued-resource name, or empty>"
+
+# The account TRC authorizes you to attach to the TPU workers.
+export TPU_SERVICE_ACCOUNT="<TRC-approved service-account email>"
+```
+
+The project default account observed during conversion was
+`655343590563-compute@developer.gserviceaccount.com`, and it could read the
+bucket. That observation does **not** prove that TRC wants it attached to this
+TPU. Use it only if the award or administrator confirms it.
+
+Finally, commit the exact operator implementation before deployment. The
+commit shown in an earlier Stage 1 handoff is not a substitute for the commit
+that contains the current activation supervisor and worker scripts:
+
+```zsh
+cd /Users/abistras/Desktop/moe-sae
+git status --short
+export PROJECT_COMMIT="$(git rev-parse HEAD)"
+test ${#PROJECT_COMMIT} -eq 40
+print -r -- "$PROJECT_COMMIT"
+```
+
+`git status --short` must print nothing. The worker deployer refuses a dirty
+checkout.
+
+### 2.2 Determine the TRC allocation mode before creating anything
+
+Do not infer this choice from the fact that the TPU is gratis to you. Look for
+the following exact ideas in the award email/console, or ask the administrator:
+
+| TRC wording | `TPU_ALLOCATION_MODE` | Creation behavior |
+|---|---|---|
+| On-demand quota; direct node creation approved | `direct-on-demand` | CreateNode, no special allocation flag |
+| A reservation is named; direct consumption approved | `direct-reserved` | CreateNode with `--reserved` |
+| On-demand quota; queued request requested/recommended | `queued-on-demand` | Non-preemptible queued resource |
+| A reservation is named and queued consumption requested | `queued-reserved` | Queued resource with `--reserved` |
+
+`--reserved` does not mean "use my free quota"; it means "consume a Cloud TPU
+reservation." Never add it unless TRC confirms a reservation. Never add
+`--spot` or `--preemptible` to this overnight production run. Google documents
+the distinction in its [TPU VM creation](https://docs.cloud.google.com/tpu/docs/create-tpu-vm)
+and [queued-resource](https://docs.cloud.google.com/tpu/docs/queued-resources)
+guides.
+
+The commands below use the default external worker addresses. If TRC requires
+internal-only workers, stop and obtain the approved bastion/IAP and Private
+Google Access procedure first; adding `--internal-ips` alone would make the
+Mac-side SSH/deployment steps unreachable.
+
+### 2.3 Run the non-destructive cloud inventory
+
+These API reads catch the common wrong-project, wrong-zone, wrong-runtime,
+wrong-network, and missing-input errors before allocation:
+
+```zsh
+gcloud config set project "$GCP_PROJECT"
+gcloud auth list
+
+gcloud compute tpus tpu-vm accelerator-types describe v4-32 \
+  --project="$GCP_PROJECT" \
+  --zone="$TPU_ZONE"
+
+gcloud compute tpus tpu-vm versions describe tpu-ubuntu2204-base \
+  --project="$GCP_PROJECT" \
+  --zone="$TPU_ZONE"
+
+gcloud compute networks describe "$TPU_NETWORK" \
+  --project="$GCP_PROJECT"
+
+gcloud iam service-accounts describe "$TPU_SERVICE_ACCOUNT" \
+  --project="$GCP_PROJECT"
+
+gcloud storage buckets describe "gs://$BUCKET" \
+  --project="$GCP_PROJECT"
+
+gcloud storage ls "$MODEL_CHECKPOINT/commit_success.txt"
+gcloud storage ls "$CONVERSION_HANDOFF"
+gcloud storage ls "$TRAIN_DATASET_MANIFEST"
+gcloud storage ls "$TRAIN_GRAIN_FILES"
+gcloud storage ls "$EVAL_DATASET_MANIFEST"
+gcloud storage ls "$EVAL_GRAIN_FILES"
+
+gcloud compute tpus tpu-vm list \
+  --project="$GCP_PROJECT" \
+  --zone="$TPU_ZONE"
+gcloud compute tpus queued-resources list \
+  --project="$GCP_PROJECT" \
+  --zone="$TPU_ZONE"
+gcloud filestore instances list \
+  --project="$GCP_PROJECT" \
+  --zone="$TPU_ZONE"
+```
+
+The two TPU capability descriptions must succeed, every GCS command must show
+at least one object, and your proposed names must not collide with an existing
+resource. These commands do not create cloud resources. Later `gcloud ... ssh`
+inspection is different: its remote inventory payload is non-mutating, but
+Google may create or update SSH authorization metadata as part of connecting.
+
+### 2.4 Create exactly the allocation type TRC approved
+
+First reject unfilled or inconsistent choices:
+
+```zsh
+[[ "$TPU_NAME" != *'<'* && -n "$TPU_NAME" ]]
+[[ "$TPU_SERVICE_ACCOUNT" != *'<'* && -n "$TPU_SERVICE_ACCOUNT" ]]
+
+case "$TPU_ALLOCATION_MODE" in
+  direct-on-demand|direct-reserved)
+    export QUEUED_RESOURCE_NAME=""
+    ;;
+  queued-on-demand|queued-reserved)
+    [[ "$QUEUED_RESOURCE_NAME" != *'<'* && -n "$QUEUED_RESOURCE_NAME" ]]
+    ;;
+  *)
+    print -u2 -- "Unrecognized or unfilled TPU_ALLOCATION_MODE"
+    false
+    ;;
+esac
+```
+
+Then run this one `case`. It selects one—and only one—Google creation command:
+
+```zsh
+case "$TPU_ALLOCATION_MODE" in
+  direct-on-demand)
+    gcloud compute tpus tpu-vm create "$TPU_NAME" \
+      --project="$GCP_PROJECT" \
+      --zone="$TPU_ZONE" \
+      --accelerator-type=v4-32 \
+      --version=tpu-ubuntu2204-base \
+      --network="$TPU_NETWORK" \
+      --service-account="$TPU_SERVICE_ACCOUNT" \
+      --scopes=https://www.googleapis.com/auth/cloud-platform \
+      --labels=purpose=gemma4-harvest
+    ;;
+  direct-reserved)
+    gcloud compute tpus tpu-vm create "$TPU_NAME" \
+      --project="$GCP_PROJECT" \
+      --zone="$TPU_ZONE" \
+      --accelerator-type=v4-32 \
+      --version=tpu-ubuntu2204-base \
+      --network="$TPU_NETWORK" \
+      --service-account="$TPU_SERVICE_ACCOUNT" \
+      --scopes=https://www.googleapis.com/auth/cloud-platform \
+      --labels=purpose=gemma4-harvest \
+      --reserved
+    ;;
+  queued-on-demand)
+    gcloud compute tpus queued-resources create "$QUEUED_RESOURCE_NAME" \
+      --project="$GCP_PROJECT" \
+      --zone="$TPU_ZONE" \
+      --node-id="$TPU_NAME" \
+      --accelerator-type=v4-32 \
+      --runtime-version=tpu-ubuntu2204-base \
+      --network="$TPU_NETWORK" \
+      --service-account="$TPU_SERVICE_ACCOUNT" \
+      --scopes=https://www.googleapis.com/auth/cloud-platform \
+      --labels=purpose=gemma4-harvest
+    ;;
+  queued-reserved)
+    gcloud compute tpus queued-resources create "$QUEUED_RESOURCE_NAME" \
+      --project="$GCP_PROJECT" \
+      --zone="$TPU_ZONE" \
+      --node-id="$TPU_NAME" \
+      --accelerator-type=v4-32 \
+      --runtime-version=tpu-ubuntu2204-base \
+      --network="$TPU_NETWORK" \
+      --service-account="$TPU_SERVICE_ACCOUNT" \
+      --scopes=https://www.googleapis.com/auth/cloud-platform \
+      --labels=purpose=gemma4-harvest \
+      --reserved
+    ;;
+esac
+```
+
+For a queued allocation, inspect rather than repeatedly recreating it:
+
+```zsh
+if [[ -n "$QUEUED_RESOURCE_NAME" ]]; then
+  gcloud compute tpus queued-resources describe "$QUEUED_RESOURCE_NAME" \
+    --project="$GCP_PROJECT" \
+    --zone="$TPU_ZONE"
+fi
+```
+
+Re-run that description after a few minutes until the resource is active and
+the node exists. Capacity delay is normal. Do not submit duplicate queued
+requests.
+
+For either allocation path, this is the authoritative ready check:
+
+```zsh
+gcloud compute tpus tpu-vm describe "$TPU_NAME" \
+  --project="$GCP_PROJECT" \
+  --zone="$TPU_ZONE" \
+  --format='yaml(name,state,acceleratorType,runtimeVersion,networkConfig,serviceAccount)'
+
+test "$(gcloud compute tpus tpu-vm describe "$TPU_NAME" \
+  --project="$GCP_PROJECT" --zone="$TPU_ZONE" \
+  --format='value(state)')" = "READY"
+test "$(gcloud compute tpus tpu-vm describe "$TPU_NAME" \
+  --project="$GCP_PROJECT" --zone="$TPU_ZONE" \
+  --format='value(acceleratorType)')" = "v4-32"
+test "$(gcloud compute tpus tpu-vm describe "$TPU_NAME" \
+  --project="$GCP_PROJECT" --zone="$TPU_ZONE" \
+  --format='value(runtimeVersion)')" = "tpu-ubuntu2204-base"
+```
+
+All three `test` commands must exit silently with status zero.
+
+### 2.5 Create the 1 TiB Filestore control plane
+
+Create Filestore only after the TPU is allocated, so a delayed TPU request does
+not leave an idle filesystem accruing cost. This volume stores small control
+records, not activations. Basic HDD's minimum is 1 TiB; see Google's
+[Filestore tiers](https://docs.cloud.google.com/filestore/docs/service-tiers).
+
+```zsh
+gcloud services enable file.googleapis.com \
+  --project="$GCP_PROJECT"
+
+gcloud filestore instances create "$FILESTORE_NAME" \
+  --project="$GCP_PROJECT" \
+  --zone="$TPU_ZONE" \
+  --tier=BASIC_HDD \
+  --file-share=name="$FILESTORE_SHARE",capacity=1TB \
+  --network=name="$TPU_NETWORK" \
+  --labels=purpose=gemma4-control
+
+gcloud filestore instances describe "$FILESTORE_NAME" \
+  --project="$GCP_PROJECT" \
+  --zone="$TPU_ZONE" \
+  --format='yaml(name,state,tier,fileShares,networks)'
+
+test "$(gcloud filestore instances describe "$FILESTORE_NAME" \
+  --project="$GCP_PROJECT" --zone="$TPU_ZONE" \
+  --format='value(state)')" = "READY"
+test "$(gcloud filestore instances describe "$FILESTORE_NAME" \
+  --project="$GCP_PROJECT" --zone="$TPU_ZONE" \
+  --format='value(tier)')" = "BASIC_HDD"
+
+export NFS_SERVER="$(gcloud filestore instances describe "$FILESTORE_NAME" \
+  --project="$GCP_PROJECT" --zone="$TPU_ZONE" \
+  --format='value(networks[0].ipAddresses[0])')"
+export NFS_EXPORT="/$FILESTORE_SHARE"
+print -r -- "$NFS_SERVER:$NFS_EXPORT"
+```
+
+Both Filestore checks must be silent and `NFS_SERVER` must print an RFC1918 address.
+The TPU and Filestore must use the same VPC. Do not expose NFS publicly.
+
+### Stage 2 completion checklist
+
+- [ ] TRC explicitly confirmed the allocation mode and attached service account.
+- [ ] No Spot or preemptible flag was used.
+- [ ] The node is `READY`, `v4-32`, and uses `tpu-ubuntu2204-base`.
+- [ ] The node can be described as `$TPU_NAME` in `us-central2-b`.
+- [ ] Basic HDD Filestore is `READY` on the same VPC.
+- [ ] `NFS_SERVER` and `NFS_EXPORT` are recorded.
+
+## Stage 3 — inspect, deploy, and bootstrap all four controllers
+
+Stage 3 deliberately separates inspection from mutation. The inspection
+script never chooses, partitions, formats, or mounts a scratch device. You read
+its output, select an already-mounted local filesystem with enough space, and
+give that exact choice to the fail-closed deployer.
+
+### 3.1 Inspect every worker before choosing scratch
+
+From the clean repository on the Mac:
+
+```zsh
+cd /Users/abistras/Desktop/moe-sae
+
+export GCP_PROJECT="neural-dragnet"
+export TPU_ZONE="us-central2-b"
+# Reuse the exact name chosen in Stage 2.
+export TPU_NAME="<the created TPU node name>"
+
+mkdir -p artifacts/gemma4_v1/production/operator-results
+scripts/tpu/inspect_workers.sh | tee \
+  "artifacts/gemma4_v1/production/operator-results/worker-inventory.txt"
+```
+
+If this first connection says no SSH agent is available, run the following and
+retry the inspection:
+
+```zsh
+eval "$(ssh-agent -s)"
+```
+
+The helper creates the gcloud key if necessary and adds it to that agent.
+
+Print the home path explicitly on all four workers:
+
+```zsh
+gcloud compute tpus tpu-vm ssh "$TPU_NAME" \
+  --project="$GCP_PROJECT" \
+  --zone="$TPU_ZONE" \
+  --worker=all \
+  --command='printf "HOME=%s HOST=%s\n" "$HOME" "$(hostname -s)"'
+```
+
+The script runs `lsblk`, `findmnt`, `df`, metadata identity reads, and `id` on
+all four workers. Its *remote inventory payload* does not write disks or
+filesystems. The SSH connection itself is not literally write-free: `gcloud`
+may create a local SSH key and may update authorized-key or OS Login metadata.
+
+Read all four sections. They must agree on the service-account email, numeric
+user ID/group ID, and an existing local `ext4` or `xfs` filesystem layout. Pick
+one absolute directory path beneath a private local filesystem which has at
+least `137438953472` free bytes (128 GiB) on **every** worker. Do not assume
+`/mnt/localssd` exists merely because that name appears in an example.
+
+For example, use `$HOME/moe-sae-local` only if `/home` is on a local `ext4` or
+`xfs` device and every worker shows at least 128 GiB free there. If no existing
+private filesystem passes, stop. The helpers intentionally will not improvise
+by formatting a device; provision suitable per-worker storage with the TRC
+administrator and inspect again.
+
+Record the identical worker home and your explicit choice:
+
+```zsh
+export TPU_HOME="<absolute home common to all four workers, for example /home/abistras>"
+export TPU_PROJECT_ROOT="$TPU_HOME/src/moe-sae"
+export LOCAL_BUFFER_ROOT="<chosen absolute private-scratch path>"
+
+[[ "$TPU_HOME" == /* && "$TPU_HOME" != *'<'* ]]
+[[ "$LOCAL_BUFFER_ROOT" == /* && "$LOCAL_BUFFER_ROOT" != *'<'* ]]
+```
+
+`LOCAL_BUFFER_ROOT` must be outside the repository and outside the NFS mount.
+It may have the same pathname on all four hosts; the later storage qualifier
+proves that the backing filesystems are actually private.
+
+### 3.2 Deploy one exact commit without a GitHub credential
+
+Set the remaining values on the Mac, then run the deployer:
+
+```zsh
+cd /Users/abistras/Desktop/moe-sae
+
+export PROJECT_COMMIT="$(git rev-parse HEAD)"
+export BULK_GCS_ROOT="gs://moe-sae-bucket/moe-sae/gemma4_v1"
+export TPU_SERVICE_ACCOUNT="<same approved email used in Stage 2>"
+export NFS_SERVER="$(gcloud filestore instances describe "$FILESTORE_NAME" \
+  --project="$GCP_PROJECT" --zone="$TPU_ZONE" \
+  --format='value(networks[0].ipAddresses[0])')"
+export NFS_EXPORT="/$FILESTORE_SHARE"
+
+git status --short
+scripts/tpu/deploy_workers.sh
+```
+
+If the script asks for an SSH agent, run this once and retry:
+
+```zsh
+eval "$(ssh-agent -s)"
+ssh-add "$HOME/.ssh/google_compute_engine"
+```
+
+The deployer refuses a dirty checkout, creates a self-contained Git bundle,
+hashes it, copies the bundle and a secret-free config to every worker, and
+checks out only `PROJECT_COMMIT`. No GitHub username, password, PAT, or HF token
+is sent to the TPU. On every worker, the bootstrap then:
+
+1. verifies the metadata service account and GCS access;
+2. installs only the small OS toolset, pinned `uv`, and Python 3.12;
+3. installs the frozen TPU dependency set and verifies the MaxText commit;
+4. mounts `$NFS_SERVER:$NFS_EXPORT` **directly** at
+   `$TPU_PROJECT_ROOT/artifacts/gemma4_v1/production`;
+5. validates, creates, and writes only the explicit `LOCAL_BUFFER_ROOT`.
+
+The artifact path must be the NFS mountpoint itself, not a symlink to some
+other mount. Production path validation resolves symlinks and rejects a mount
+outside the repository's `artifacts/gemma4_v1` namespace.
+
+### 3.3 Copy the exact conversion handoff onto the shared mount
+
+Connect to worker 0:
+
+```zsh
+gcloud compute tpus tpu-vm ssh "$TPU_NAME" \
+  --project="$GCP_PROJECT" \
+  --zone="$TPU_ZONE" \
+  --worker=0
+```
+
+After the prompt changes to the TPU worker, run this block there. It copies to
+a temporary file, compares an existing destination if present, and renames
+only after the download succeeds:
+
+```zsh
+set -euo pipefail
+
+export PROJECT_ROOT="$HOME/src/moe-sae"
+export ARTIFACT_ROOT="$PROJECT_ROOT/artifacts/gemma4_v1/production"
+export CONVERSION_HANDOFF="gs://moe-sae-bucket/moe-sae/gemma4_v1/control-handoff/conversion/fddcde27083510fad4c3a32f51e760bf040a08bfe6b816202bd1dfd1542f9c9e/conversion.json"
+export CONVERSION_DESTINATION="$ARTIFACT_ROOT/checkpoint/conversion.json"
+
+mkdir -p "$ARTIFACT_ROOT/checkpoint"
+temporary="$(mktemp "$ARTIFACT_ROOT/checkpoint/.conversion.json.XXXXXX")"
+gcloud storage cp "$CONVERSION_HANDOFF" "$temporary"
+
+test -s "$temporary"
+test "$(gcloud storage cat "$CONVERSION_HANDOFF" | sha256sum | awk '{print $1}')" = \
+  "$(sha256sum "$temporary" | awk '{print $1}')"
+
+if [[ -e "$CONVERSION_DESTINATION" ]]; then
+  cmp --silent "$temporary" "$CONVERSION_DESTINATION"
+  rm -- "$temporary"
+else
+  mv -- "$temporary" "$CONVERSION_DESTINATION"
+fi
+sync "$CONVERSION_DESTINATION"
+ls -l "$CONVERSION_DESTINATION"
+exit
+```
+
+Because `ARTIFACT_ROOT` is the shared NFS mount, one successful worker-0 copy
+is visible to all four controllers. Do not manually edit this self-hashed JSON.
+
+### 3.4 Define the collective-launch helpers on the Mac
+
+Every command that initializes JAX must begin on all four controllers with
+identical arguments. Define this zsh helper in the Mac terminal that will
+operate the run:
+
+```zsh
+tpu_all() {
+  local remote_command="$1"
+  gcloud compute tpus tpu-vm ssh "$TPU_NAME" \
+    --project="$GCP_PROJECT" \
+    --zone="$TPU_ZONE" \
+    --worker=all \
+    --command="$remote_command"
+}
+
+export ARTIFACT_ROOT="$TPU_PROJECT_ROOT/artifacts/gemma4_v1/production"
+export REMOTE_UV="$TPU_HOME/.local/bin/uv"
 export SAE_CHECKPOINT_ROOT="$BULK_GCS_ROOT/sae-checkpoints"
 ```
 
-The paths have deliberately different jobs:
+These locations have separate jobs:
 
-- `ARTIFACT_ROOT` is the small shared POSIX control plane for locks,
-  attestations, identities, receipts, ledgers, sealed manifests, timing records,
-  and checkpoint pointers. It must not hold activation or Orbax payloads.
-- `LOCAL_BUFFER_ROOT` is private scratch on each controller. It buffers capture
-  writes and hosts that controller's bounded, verified `capture-cache/`.
-- `BULK_GCS_ROOT` is the durable immutable data plane for staged inputs and
-  activation shards.
-- `SAE_CHECKPOINT_ROOT` is the immutable Orbax payload plane below the same GCS
-  root.
+- `ARTIFACT_ROOT` is the shared NFS control plane for locks, attestations,
+  identities, receipts, ledgers, sealed manifests, and timing records. It must
+  not contain activation or Orbax payloads.
+- `LOCAL_BUFFER_ROOT` is private scratch on each controller for bounded capture
+  writes and the verified capture cache.
+- `BULK_GCS_ROOT` is the immutable bulk plane for staged data and activations.
+- `SAE_CHECKPOINT_ROOT` is the immutable Orbax payload plane for later SAE
+  training.
 
-Install only the TPU environment on every controller:
+Prove the deployment is identical before starting JAX:
 
 ```zsh
-uv sync --frozen --extra tpu
+tpu_all "set -eu
+cd '$TPU_PROJECT_ROOT'
+test \"\$(git rev-parse HEAD)\" = '$PROJECT_COMMIT'
+test -z \"\$(git status --porcelain=v1 --untracked-files=all)\"
+test -x '$REMOTE_UV'
+test \"\$(findmnt -rn -o SOURCE --mountpoint '$ARTIFACT_ROOT')\" = '$NFS_SERVER:$NFS_EXPORT'
+test -d '$LOCAL_BUFFER_ROOT'
+printf 'READY %s %s\\n' \"\$(hostname -s)\" \"\$(git rev-parse HEAD)\""
 ```
 
-## 4. Qualify all three storage planes
+You need four `READY` lines with the same commit. Never launch a JAX stage on
+worker 0 alone, and never resume just the worker that failed. Re-run the exact
+same collective command on all four.
 
-Storage qualification must complete on the allocated v4-32 before production
-preflight. Launch this collectively on all four controllers:
+### Stage 3 completion checklist
+
+- [ ] All four inventory sections were inspected before scratch was selected.
+- [ ] The same service account and numeric user identity appear on all workers.
+- [ ] Every selected local filesystem has at least 128 GiB free.
+- [ ] The deployer finished successfully on all four controllers.
+- [ ] Every checkout is clean and at the same full `PROJECT_COMMIT`.
+- [ ] NFS is mounted directly at the production artifact root on all four.
+- [ ] The exact conversion handoff is present on the shared mount.
+
+## Stage 4 — qualify all three storage planes
+
+Run this from the Mac using the `tpu_all` helper. This is a foreground gate:
+leave the terminal connected and wait for all four remote commands to exit.
 
 ```zsh
-uv run --extra tpu moe-sae qualify-storage \
-  --artifact-root "$ARTIFACT_ROOT" \
-  --local-buffer-root "$LOCAL_BUFFER_ROOT" \
-  --bulk-gcs-root "$BULK_GCS_ROOT" \
-  --sae-checkpoint-root "$SAE_CHECKPOINT_ROOT"
+tpu_all "cd '$TPU_PROJECT_ROOT' && \
+  '$REMOTE_UV' run --frozen --extra tpu moe-sae qualify-storage \
+    --artifact-root '$ARTIFACT_ROOT' \
+    --local-buffer-root '$LOCAL_BUFFER_ROOT' \
+    --bulk-gcs-root '$BULK_GCS_ROOT' \
+    --sae-checkpoint-root '$SAE_CHECKPOINT_ROOT'"
 ```
 
-Production thresholds are pinned by the configuration and cannot be
-overridden: at least 10 GB free on the shared control volume, 128 GiB on each
-local buffer, an incompressible 8 GiB GCS probe per process in 8 MiB blocks,
-and at least 4 GB/s aggregate for both upload and generation-pinned download.
-The qualifier also proves cross-process control-plane visibility and `flock`,
-atomic rename, visibility of disjoint per-host control records, process-private
-local-buffer mounts using same-name/different-payload probes, conditional GCS
-creation, CRC32C and SHA-256 round trips, exact-generation reads, and exact-
-generation cleanup.
+This is equivalent to an explicit `gcloud compute tpus tpu-vm ssh ...
+--worker=all --command=...`; the helper does not run locally or only on worker
+0. Production thresholds are pinned: at least 10 GB free on the shared control
+volume, 128 GiB on each local buffer, an incompressible 8 GiB GCS probe per
+process in 8 MiB blocks, and at least 4 GB/s aggregate for both upload and
+generation-pinned download.
 
-It then performs an actual collective Orbax checkpoint probe below
-`$SAE_CHECKPOINT_ROOT/qualification/`: save a small globally sharded tree to a
-unique immutable URI, wait for Orbax finalization, round-trip its custom
-metadata, restore it on every process, and compare each process's restored
-shard digest. This finalized probe is retained as qualification evidence.
+The qualifier proves cross-process control-plane visibility and `flock`, atomic
+rename, disjoint per-host control records, genuinely private local-buffer
+mounts using same-name/different-payload probes, conditional GCS creation,
+CRC32C/SHA-256 round trips, and exact-generation reads and cleanup. It also
+performs a real collective Orbax save/restore below
+`$SAE_CHECKPOINT_ROOT/qualification/`, including finalized metadata and
+cross-process restored-shard digest checks.
 
-Only after all of those checks pass does the coordinator atomically write the
-self-hashed `$ARTIFACT_ROOT/preflight/storage.json`. Benchmark, harvest,
-training, evaluation, reporting, and `run` reject a changed config,
-environment, topology, control path, local-buffer layout, GCS root, cache
-limit, checkpoint root, or Orbax proof.
+Only after every check passes does the coordinator atomically write the
+self-hashed `$ARTIFACT_ROOT/preflight/storage.json`. Every later production
+command rejects a changed config, environment, topology, control path, local
+layout, GCS root, cache limit, checkpoint root, or Orbax proof.
 
-`qualify-storage --local` is a reduced single-process object-store smoke test;
-it does not produce the production attestation and cannot authorize a TPU run.
+`qualify-storage --local` is only a single-process smoke test. It cannot
+authorize production.
 
-## 5. Run production preflight
+## Stage 5 — run production preflight
 
-After storage qualification, launch preflight collectively:
+Launch preflight collectively from the Mac:
 
 ```zsh
-uv run --extra tpu moe-sae preflight \
-  --artifact-root "$ARTIFACT_ROOT" \
-  --checkpoint "$MODEL_CHECKPOINT" \
-  --grain-train "$TRAIN_GRAIN_FILES" \
-  --grain-eval "$EVAL_GRAIN_FILES" \
-  --dataset-train-manifest "$TRAIN_DATASET_MANIFEST" \
-  --dataset-eval-manifest "$EVAL_DATASET_MANIFEST"
+tpu_all "cd '$TPU_PROJECT_ROOT' && \
+  '$REMOTE_UV' run --frozen --extra tpu moe-sae preflight \
+    --artifact-root '$ARTIFACT_ROOT' \
+    --checkpoint '$MODEL_CHECKPOINT' \
+    --grain-train '$TRAIN_GRAIN_FILES' \
+    --grain-eval '$EVAL_GRAIN_FILES' \
+    --dataset-train-manifest '$TRAIN_DATASET_MANIFEST' \
+    --dataset-eval-manifest '$EVAL_DATASET_MANIFEST'"
 ```
 
 Preflight requires Python 3.12, the exact MaxText provenance, a 16-chip v4
@@ -720,113 +1217,240 @@ runtime, a clean secret scan, the qualified storage attestation, the explicit
 checkpoint, and exact train/eval staged-data inventories. A merely host-local
 artifact root fails the cross-process control-plane checks.
 
-Do not proceed unless every line is `PASS`. `--json` emits the same result as
-machine-readable JSON. `--local` skips TPU/MaxText and production-storage
-requirements and is not an authorization for production.
+Do not proceed unless every check is `PASS`. `--local` skips TPU/MaxText and
+production-storage requirements and is not production authorization.
 
-## 6. Benchmark capture
+The `activation-farm` supervisor reruns this preflight in a fresh subprocess at
+the start of every invocation. This explicit Stage 5 run is still valuable: it
+isolates deployment errors before the long benchmark begins.
 
-Run the required nine-candidate sweep:
+## Stage 6 — launch the one supervised activation campaign
 
-```zsh
-uv run --extra tpu moe-sae benchmark-harvest \
-  --artifact-root "$ARTIFACT_ROOT" \
-  --checkpoint "$MODEL_CHECKPOINT" \
-  --checkpoint-sha256 "$CHECKPOINT_SHA256" \
-  --steps 200
-```
+Production benchmark and harvesting must run under one lifetime lease and one
+four-controller supervisor. Do not run standalone `benchmark-harvest` or
+`harvest` commands for this campaign: they do not own the outer all-phase
+supervisor that detects a missing controller between child processes.
 
-The order is EP16/FSDP1/TP1, EP8/FSDP2/TP1, then EP8/FSDP1/TP2, each with
-per-device sequence batches 1, 2, and 4. Each candidate compiles once, runs
-five warmups, and executes at least 200 synchronized steps in a fresh process.
+`activation-farm` always walks the fixed sequence preflight, benchmark, canary,
+train, eval. There are intentionally no phase-selection flags. On resume it
+validates and skips any provenance-matching sealed phase, then continues at the
+first incomplete one.
 
-Selection maximizes persisted tokens/s among candidates with useful-prefix MFU
-at least 50%, no OOM, recompile, or dropped route, writer backlog below two
-batches, and identical instrumented output. Useful FLOPs count only blocks
-1--14 plus target attention/router/routed FFN; the denominator is 4.4 PFLOP/s
-times wall time. Benchmark persistence uses the same local-buffer-to-GCS path
-as production capture, and its temporary immutable objects are deleted by
-exact generation after the timed candidate completes.
-
-The selected, provenance-bound result is
-`$ARTIFACT_ROOT/benchmark/selected.json`. A failed or timed-out candidate keeps
-its supervisor telemetry but cannot poison a later candidate.
-
-## 7. Run the real-data canary and seal captures
-
-The train canary captures the first 2,000,000 production tokens. It uses the
-selected mesh and batch by default and resumes by immutable input-range ID:
+Build the exact all-phase command and shell-quote it once in local zsh:
 
 ```zsh
-uv run --extra tpu moe-sae harvest \
-  --artifact-root "$ARTIFACT_ROOT" \
-  --split train \
-  --canary \
-  --checkpoint "$MODEL_CHECKPOINT" \
-  --checkpoint-sha256 "$CHECKPOINT_SHA256" \
-  --dataset-manifest "$TRAIN_DATASET_MANIFEST" \
-  --grain-files "$TRAIN_GRAIN_FILES"
+activation_command() {
+  print -r -- "cd '$TPU_PROJECT_ROOT' && \
+'$REMOTE_UV' run --frozen --extra tpu moe-sae activation-farm \
+  --artifact-root '$ARTIFACT_ROOT' \
+  --checkpoint '$MODEL_CHECKPOINT' \
+  --checkpoint-sha256 '$CHECKPOINT_SHA256' \
+  --grain-train '$TRAIN_GRAIN_FILES' \
+  --grain-eval '$EVAL_GRAIN_FILES' \
+  --dataset-train-manifest '$TRAIN_DATASET_MANIFEST' \
+  --dataset-eval-manifest '$EVAL_DATASET_MANIFEST'"
+}
+
+export REMOTE_FARM_COMMAND="$(activation_command)"
+export REMOTE_FARM_QUOTED="$(printf '%q' "$REMOTE_FARM_COMMAND")"
+export REMOTE_FARM_LOG="$TPU_HOME/activation-farm.log"
+export REMOTE_FARM_PID="$TPU_HOME/activation-farm.pid"
+
+export REMOTE_FARM_LAUNCH="set -eu
+if test -s '$REMOTE_FARM_PID' && kill -0 \$(cat '$REMOTE_FARM_PID') 2>/dev/null; then
+  echo 'activation-farm is already running on this controller' >&2
+  exit 1
+fi
+nohup bash -lc $REMOTE_FARM_QUOTED >> '$REMOTE_FARM_LOG' 2>&1 < /dev/null &
+echo \$! > '$REMOTE_FARM_PID'
+echo \"started activation-farm pid=\$(cat '$REMOTE_FARM_PID') host=\$(hostname -s)\""
+
+tpu_all "$REMOTE_FARM_LAUNCH"
 ```
 
-Continue only when real-data goodput is at least 90% of synthetic, input wait
-is below 5%, persisted goodput is at least 90% of device-output goodput, and
-writer backlog stays below two batches. The canary's objects are already
-durable production objects; the subsequent train harvest adopts their receipts
-and continues rather than recomputing those ranges.
+This is the **one numerical launch** for Stages 6 and 7. You must see four
+`started activation-farm` lines. If fewer than four workers start, the
+supervisor rendezvous fails closed; do not manually start only the missing
+worker. Wait for the other processes to return, diagnose deployment, then
+relaunch the same command on all four.
 
-Complete and seal train, then capture and seal eval:
+`nohup` and complete stream redirection keep each supervisor alive if the Mac
+sleeps or the SSH session closes. The shared control state and per-harvest
+heartbeats—not the PID files—are authoritative.
+
+The first numerical phase is the nine-candidate benchmark. Its sweep order is
+EP16/FSDP1/TP1, EP8/FSDP2/TP1, then EP8/FSDP1/TP2, each with per-device sequence
+batches 1, 2, and 4. Each candidate compiles once, runs five warmups, and runs
+at least 200 synchronized steps in a fresh process.
+
+Selection requires useful-prefix MFU at least 50%, no OOM, recompilation, or
+dropped route, writer backlog below two batches, and identical instrumented
+output. Among passing candidates it maximizes persisted tokens/s. A failed or
+timed-out candidate keeps telemetry but cannot poison a later candidate. If no
+candidate passes, all four activation supervisors exit and canary never starts.
+
+## Stage 7 — pass the canary, then farm train and eval activations overnight
+
+### 7.1 Let the supervised 2M-token canary enforce its hard gate
+
+There is no second launch here. After benchmark selection passes, the same four
+supervisors collectively validate its record and run the 2,000,000-token train
+canary. The next phase cannot start unless all of these are true:
+
+- `canary_passed` is true and captured tokens equal 2,000,000;
+- real-data goodput is at least 90% of synthetic;
+- input wait is below 5%;
+- persisted goodput is at least 90% of device-output goodput;
+- writer backlog remains below two batches.
+
+The canary objects are already immutable production objects. If the gate
+passes, train capture adopts their receipts instead of recomputing them. If it
+fails, all four supervisors exit and train capture never starts. Do not bypass
+the gate with a standalone `harvest` invocation.
+
+### 7.2 Let the same supervisors seal train, then eval
+
+After the canary passes, the already-running campaign continues train capture
+to exactly 50,000,000 tokens, seals it, then captures and seals exactly
+2,000,000 held-out eval tokens. There is no second command to paste.
+
+**`activation-farm` stops after held-out capture. It never starts SAE training,
+SAE evaluation, or reporting.** Do not substitute `moe-sae run`; `run`
+continues into all nine A/B/F training runs.
+
+If the campaign stops safely or fails, resolve the cause and rerun the Stage 6
+detached launch on all four controllers. The supervisor revalidates and skips
+each complete benchmark/canary/capture record and resumes only the first
+incomplete phase. It never trusts filenames without provenance checks.
+
+### 7.3 Check status without disturbing the collective
+
+The shared status command is safe to run from worker 0 while capture is live:
 
 ```zsh
-uv run --extra tpu moe-sae harvest \
-  --artifact-root "$ARTIFACT_ROOT" \
-  --split train \
-  --checkpoint "$MODEL_CHECKPOINT" \
-  --checkpoint-sha256 "$CHECKPOINT_SHA256" \
-  --dataset-manifest "$TRAIN_DATASET_MANIFEST" \
-  --grain-files "$TRAIN_GRAIN_FILES"
-
-uv run --extra tpu moe-sae harvest \
-  --artifact-root "$ARTIFACT_ROOT" \
-  --split eval \
-  --checkpoint "$MODEL_CHECKPOINT" \
-  --checkpoint-sha256 "$CHECKPOINT_SHA256" \
-  --dataset-manifest "$EVAL_DATASET_MANIFEST" \
-  --grain-files "$EVAL_GRAIN_FILES"
+gcloud compute tpus tpu-vm ssh "$TPU_NAME" \
+  --project="$GCP_PROJECT" \
+  --zone="$TPU_ZONE" \
+  --worker=0 \
+  --command="cd '$TPU_PROJECT_ROOT' && \
+    '$REMOTE_UV' run --frozen --extra tpu moe-sae activation-status \
+      --artifact-root '$ARTIFACT_ROOT'"
 ```
 
-There is no post-seal bulk publication step and no `--publish-gcs` harvest
-option. For every capture range, the owning host:
+Inspect each controller's process and recent log without sending a signal:
 
-1. serializes one safetensors shard in its local buffer;
-2. conditionally uploads it directly to its immutable, content-addressed GCS
-   URI;
-3. verifies URI, generation, size, CRC32C, and SHA-256 identity;
-4. atomically writes a self-hashed upload receipt on the POSIX control plane;
-5. commits the identical entry to its host ledger.
+```zsh
+tpu_all "printf '\n===== %s =====\n' \"\$(hostname -s)\"
+if test -s '$REMOTE_FARM_PID' && kill -0 \$(cat '$REMOTE_FARM_PID') 2>/dev/null; then
+  echo \"supervisor running pid=\$(cat '$REMOTE_FARM_PID')\"
+else
+  echo 'supervisor not running'
+fi
+tail -n 40 '$REMOTE_FARM_LOG' 2>/dev/null || true"
+```
 
-If a host dies after the receipt but before the ledger update, resume verifies
-the remote object and adopts the receipt. It never infers progress by counting
-files. After the global harvest barrier, the coordinator validates every
-receipt and remote object identity, proves contiguous ranges with no gaps or
-duplicates, checks exact token counts, merges the shard FP64 statistics, and
-atomically seals the shared POSIX manifest. Training and evaluation consume
-only that sealed manifest. The required totals are exactly 50,000,000 train
-tokens and 2,000,000 eval tokens.
+Healthy status means one coherent phase is `running` (or has just become
+`passed`) and no phase is `failed`. During canary/train/eval, harvest-control
+heartbeats remain fresh, shard/receipt counts advance, and writer backlog stays
+bounded. During benchmark, use the four log tails and process checks. A quiet
+compile is not itself a failure; stale heartbeats or a dead supervisor are.
+
+Never `kill`, `pkill`, close only one worker, or restart one controller while a
+collective phase is active.
+
+### 7.4 Request a cooperative stop if needed
+
+From worker 0, write one durable abort request:
+
+```zsh
+gcloud compute tpus tpu-vm ssh "$TPU_NAME" \
+  --project="$GCP_PROJECT" \
+  --zone="$TPU_ZONE" \
+  --worker=0 \
+  --command="cd '$TPU_PROJECT_ROOT' && \
+    '$REMOTE_UV' run --frozen --extra tpu moe-sae activation-abort \
+      --artifact-root '$ARTIFACT_ROOT' \
+      --reason 'operator requested a safe stop'"
+```
+
+The request is cooperative. During harvesting it is mirrored into the active
+campaign, observed collectively at a safe batch boundary, and left latched so
+all four supervisors see it. Wait until the process/log check above says
+`supervisor not running` on all four. Only then clear the request:
+
+```zsh
+gcloud compute tpus tpu-vm ssh "$TPU_NAME" \
+  --project="$GCP_PROJECT" \
+  --zone="$TPU_ZONE" \
+  --worker=0 \
+  --command="cd '$TPU_PROJECT_ROOT' && \
+    '$REMOTE_UV' run --frozen --extra tpu moe-sae activation-abort \
+      --artifact-root '$ARTIFACT_ROOT' \
+      --clear"
+```
+
+This is not a force-kill mechanism. A process hard-hung inside an XLA compile,
+driver call, or collective that never returns to Python cannot observe the
+marker. If heartbeats go stale and none of the four supervisors exits, preserve
+`activation-status`, all four log tails, and the TPU description first. Do not
+kill one worker. The last-resort recovery is to stop/delete the **entire** TPU
+slice (delete the entire queued resource for a queued allocation), then resume
+later by launching the identical command on all four replacement controllers.
+Already verified immutable shards remain resumable. Do not clear the abort
+while any old supervisor or inherited child is still alive; the CLI also
+refuses that unsafe clear.
+
+Resume by rebuilding `REMOTE_FARM_COMMAND`, `REMOTE_FARM_QUOTED`, and
+`REMOTE_FARM_LAUNCH` from Stage 6 and launching it on all four again. Existing
+benchmark, canary, shards, receipts, and sealed outputs are reused only after
+their identities validate.
+
+### 7.5 Morning acceptance
+
+Do not release the TPU until all four supervisor processes have exited and
+`activation-status` reports all four phases `passed`. On worker 0, inspect:
+
+```zsh
+gcloud compute tpus tpu-vm ssh "$TPU_NAME" \
+  --project="$GCP_PROJECT" \
+  --zone="$TPU_ZONE" \
+  --worker=0 \
+  --command="jq '{phase,captured_tokens,total_tokens,capture_manifest_sha256,manifest_path}' \
+    '$ARTIFACT_ROOT/harvest/train.json' \
+    '$ARTIFACT_ROOT/harvest/eval.json'"
+```
+
+Train must report exactly 50,000,000 captured tokens and eval exactly 2,000,000,
+each with a nonempty sealed-manifest SHA/path. There is no later bulk upload:
+every safetensors shard was conditionally written directly to its immutable,
+content-addressed GCS URI, verified by generation, size, CRC32C, and SHA-256,
+then represented by a self-hashed POSIX receipt and ledger entry.
+
+If a worker dies after a receipt but before its ledger update, a collective
+resume verifies and adopts the remote object. Progress is never inferred by
+counting files. Final sealing proves contiguous ranges, no gaps/duplicates,
+exact counts, remote identities, and merged FP64 statistics.
 
 Capture hashing, manifest verification, and sealing are reported separately
-from device execution, while their reserved-cluster time remains part of the
-shared harvest cost used by end-to-end ratios. Campaign telemetry is bound to
-the sealed manifest SHA, config, checkpoint, conversion attestation, dataset
-fingerprint, environment, storage attestation, and selected benchmark.
+from device execution, while reserved-cluster time remains part of shared
+harvest cost. Campaign telemetry is bound to the sealed manifest SHA, config,
+checkpoint, conversion attestation, dataset fingerprint, environment, storage
+attestation, and selected benchmark.
 
-## 8. Train without quality peeking
+For a direct TPU node, stop or delete it according to TRC policy. A queued
+resource cannot be stopped; delete the queued resource when the allocation is
+no longer needed. Filestore accrues separately, so delete it after preserving
+the control records you need and after deciding you will not resume on this
+artifact root.
+
+## Stage 8 — train without quality peeking
 
 Train seed 1 for A, B, and F to the 5M health boundary without comparing
 relative quality:
 
 ```zsh
 for condition in A B F; do
-  uv run --extra tpu moe-sae train \
+  uv run --frozen --extra tpu moe-sae train \
     --artifact-root "$ARTIFACT_ROOT" \
     --condition "$condition" \
     --seed 1 \
@@ -841,7 +1465,7 @@ and then run seeds 2 and 3:
 
 ```zsh
 for condition in A B F; do
-  uv run --extra tpu moe-sae train \
+  uv run --frozen --extra tpu moe-sae train \
     --artifact-root "$ARTIFACT_ROOT" \
     --condition "$condition" \
     --seed 1
@@ -849,7 +1473,7 @@ done
 
 for seed in 2 3; do
   for condition in A B F; do
-    uv run --extra tpu moe-sae train \
+    uv run --frozen --extra tpu moe-sae train \
       --artifact-root "$ARTIFACT_ROOT" \
       --condition "$condition" \
       --seed "$seed"
@@ -879,17 +1503,17 @@ payload; a cleanup failure stops the run with the new pointer still safely
 resumable. No payload is deleted before its replacement is finalized and
 published, and the final/latest pointers share the one retained final payload.
 
-## 9. Evaluate and report
+## Stage 9 — evaluate and report
 
 Evaluate all nine final checkpoints against the same sealed held-out capture
 and common SST, then build the report:
 
 ```zsh
-uv run --extra tpu moe-sae eval \
+uv run --frozen --extra tpu moe-sae eval \
   --artifact-root "$ARTIFACT_ROOT" \
   --all
 
-uv run --extra tpu moe-sae report \
+uv run --frozen --extra tpu moe-sae report \
   --artifact-root "$ARTIFACT_ROOT" \
   --output "$ARTIFACT_ROOT/report.json"
 ```
@@ -905,14 +1529,14 @@ time.
 If F-minus-B is non-positive, G is undefined. If its paired interval includes
 zero, the report is marked unstable/exploratory rather than headline-ready.
 
-## 10. Gated orchestration
+## Stage 10 — full experiment orchestration (not activation-only)
 
 After C4 publication, checkpoint conversion, storage qualification, and the
 explicit production preflight above, `run` can execute or resume the remaining
 gated state machine:
 
 ```zsh
-uv run --extra tpu moe-sae run \
+uv run --frozen --extra tpu moe-sae run \
   --artifact-root "$ARTIFACT_ROOT" \
   --checkpoint "$MODEL_CHECKPOINT" \
   --checkpoint-sha256 "$CHECKPOINT_SHA256" \
@@ -927,3 +1551,6 @@ attestations, creates the benchmark if absent, runs the train canary, seals
 both captures, enforces the seed-1 health boundary before relative evaluation,
 finishes all nine runs, evaluates them, and writes the report. It reuses only
 provenance-matching sealed stages and stops at the first unmet gate.
+
+Do not use `run` for an activation-farming night. Use `activation-farm`, which
+stops after train and eval capture are sealed and cannot enter SAE training.

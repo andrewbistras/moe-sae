@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import json
 import time
 
 import numpy as np
@@ -23,6 +24,13 @@ from moe_sae.harvest import (
     make_sequence_ids,
     publish_completed_capture,
     run_harvest,
+)
+from moe_sae.harvest_control import (
+    HarvestAbortRequested,
+    HarvestControlError,
+    campaign_identity,
+    load_campaign_control,
+    request_campaign_abort,
 )
 from moe_sae.model import CaptureBatch
 from moe_sae.runtime import HARVEST_MESHES, BenchmarkObservation
@@ -130,6 +138,226 @@ def test_host_harvest_compacts_exact_fields_and_publishes(tmp_path):
     assert stored.position.tolist() == [1, 2, 1, 2, 3]
     assert np.all(stored.sequence_id >= 0)
     assert load_manifest(tmp_path)["total_tokens"] == 5
+    campaign_id = campaign_identity(
+        metadata().to_dict(),
+        split="train",
+        total_tokens=5,
+        stop_after_tokens=5,
+        process_count=1,
+    )
+    control = load_campaign_control(tmp_path, campaign_id)
+    assert control["hosts"][0]["state"] == "completed"
+    assert control["hosts"][0]["progress"]["durable_host_tokens"] == 5
+
+
+def test_abort_is_taken_before_device_execution_at_a_safe_batch_boundary(tmp_path):
+    campaign_id = campaign_identity(
+        metadata().to_dict(),
+        split="train",
+        total_tokens=2,
+        stop_after_tokens=2,
+        process_count=1,
+    )
+    request_campaign_abort(tmp_path, campaign_id, reason="test stop")
+    step = FakeStep()
+    with pytest.raises(HarvestAbortRequested, match="safe boundary"):
+        harvest_host(
+            [grain([[3, 4, 0, 0]], [[1, 1, 0, 0]])],
+            step,
+            artifact_root=tmp_path,
+            metadata=metadata(),
+            split="train",
+            total_tokens=2,
+            process_count=1,
+            process_index=0,
+            sequence_length=4,
+        )
+    assert step.calls == []
+    assert not (tmp_path / "manifest.json").exists()
+    assert load_campaign_control(tmp_path, campaign_id)["hosts"][0]["state"] == (
+        "aborted"
+    )
+
+
+def test_completed_multi_process_lane_replays_collectives_for_incomplete_peer(
+    tmp_path,
+):
+    raw = grain(
+        [[3, 4, 0, 0], [5, 6, 0, 0]],
+        [[1, 1, 0, 0], [1, 1, 0, 0]],
+    )
+    first_step = FakeStep()
+    harvest_host(
+        [raw],
+        first_step,
+        artifact_root=tmp_path,
+        metadata=metadata(),
+        split="train",
+        total_tokens=4,
+        process_count=2,
+        process_index=0,
+        sequence_length=4,
+        batch_collective=lambda complete, execute: (complete, execute),
+        abort_collective=lambda requested: requested,
+    )
+
+    decisions: list[tuple[bool, bool]] = []
+    aborts: list[bool] = []
+
+    def peer_decision(local_complete: bool, local_execute: bool) -> tuple[bool, bool]:
+        decisions.append((local_complete, local_execute))
+        # This lane is complete, but the simulated peer still needs the shared
+        # model collective for this batch and completes immediately afterward.
+        return True, True
+
+    def collective_abort(local_requested: bool) -> bool:
+        aborts.append(local_requested)
+        return local_requested
+
+    replay_step = FakeStep()
+    resumed = harvest_host(
+        [raw],
+        replay_step,
+        artifact_root=tmp_path,
+        metadata=metadata(),
+        split="train",
+        total_tokens=4,
+        process_count=2,
+        process_index=0,
+        sequence_length=4,
+        batch_collective=peer_decision,
+        abort_collective=collective_abort,
+    )
+
+    assert decisions == [(True, False)]
+    assert aborts == [False, False]
+    assert len(replay_step.calls) == 1
+    assert resumed.durable_host_tokens == 2
+    assert resumed.new_tokens == 2
+
+
+def test_multi_process_harvest_requires_collective_abort_coordination(tmp_path):
+    with pytest.raises(ValueError, match="batch collective"):
+        harvest_host(
+            [],
+            FakeStep(),
+            artifact_root=tmp_path,
+            metadata=metadata(),
+            split="train",
+            total_tokens=2,
+            process_count=2,
+            process_index=0,
+            sequence_length=4,
+        )
+    with pytest.raises(ValueError, match="abort collective"):
+        harvest_host(
+            [],
+            FakeStep(),
+            artifact_root=tmp_path,
+            metadata=metadata(),
+            split="train",
+            total_tokens=2,
+            process_count=2,
+            process_index=0,
+            sequence_length=4,
+            batch_collective=lambda complete, execute: (complete, execute),
+        )
+
+
+def test_collectively_observed_abort_controls_the_branch(tmp_path):
+    collective_inputs: list[bool] = []
+
+    def collective(local_requested: bool) -> bool:
+        collective_inputs.append(local_requested)
+        return True  # another controller observed the shared marker
+
+    step = FakeStep()
+    with pytest.raises(HarvestAbortRequested, match="safe boundary"):
+        harvest_host(
+            [grain([[3, 4, 0, 0]], [[1, 1, 0, 0]])],
+            step,
+            artifact_root=tmp_path,
+            metadata=metadata(),
+            split="train",
+            total_tokens=2,
+            process_count=1,
+            process_index=0,
+            sequence_length=4,
+            abort_collective=collective,
+        )
+    assert collective_inputs == [False]
+    assert step.calls == []
+
+
+def test_corrupt_abort_marker_still_enters_collective_before_failing(tmp_path):
+    campaign_id = campaign_identity(
+        metadata().to_dict(),
+        split="train",
+        total_tokens=2,
+        stop_after_tokens=2,
+        process_count=1,
+    )
+    abort_path = request_campaign_abort(tmp_path, campaign_id, reason="test stop")
+    payload = json.loads(abort_path.read_text(encoding="utf-8"))
+    payload["reason"] = "tampered"
+    abort_path.write_text(json.dumps(payload), encoding="utf-8")
+    collective_inputs: list[bool] = []
+
+    def collective(local_requested: bool) -> bool:
+        collective_inputs.append(local_requested)
+        return local_requested
+
+    step = FakeStep()
+    with pytest.raises(HarvestControlError, match="SHA-256 mismatch"):
+        harvest_host(
+            [grain([[3, 4, 0, 0]], [[1, 1, 0, 0]])],
+            step,
+            artifact_root=tmp_path,
+            metadata=metadata(),
+            split="train",
+            total_tokens=2,
+            process_count=1,
+            process_index=0,
+            sequence_length=4,
+            abort_collective=collective,
+        )
+    assert collective_inputs == [True]
+    assert step.calls == []
+
+
+def test_collective_abort_after_writer_drain_prevents_finalization(tmp_path):
+    collective_inputs: list[bool] = []
+
+    def collective(local_requested: bool) -> bool:
+        collective_inputs.append(local_requested)
+        # The first call admits the one model step.  The second represents a
+        # peer seeing the marker after every writer queue has drained but before
+        # any host seals its manifest.
+        return len(collective_inputs) == 2
+
+    step = FakeStep()
+    with pytest.raises(HarvestAbortRequested, match="safe boundary"):
+        harvest_host(
+            [grain([[3, 4, 0, 0]], [[1, 1, 0, 0]])],
+            step,
+            artifact_root=tmp_path,
+            metadata=metadata(),
+            split="train",
+            total_tokens=2,
+            process_count=1,
+            process_index=0,
+            sequence_length=4,
+            abort_collective=collective,
+        )
+
+    assert collective_inputs == [False, False]
+    assert len(step.calls) == 1
+    assert not (tmp_path / "manifest.json").exists()
+    host = json.loads(
+        (tmp_path / "hosts" / "host-p00000.json").read_text(encoding="utf-8")
+    )
+    assert host["complete"] is False
+    assert sum(int(shard["tokens"]) for shard in host["shards"]) == 2
 
 
 def test_canary_prefix_resumes_full_batches_and_partial_boundary(tmp_path):

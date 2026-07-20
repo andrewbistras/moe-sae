@@ -33,6 +33,7 @@ from moe_sae.artifacts import (
     publish_manifest,
 )
 from moe_sae.config import Gemma4Config
+from moe_sae.harvest_control import HarvestCampaignControl
 from moe_sae.model import CaptureBatch, Gemma4PrefixAdapter, validate_capture_batch
 from moe_sae.object_store import (
     GCSObjectStore,
@@ -787,7 +788,33 @@ class _PhaseTelemetryJournal:
             self._persist()
 
 
-def harvest_host(
+def _check_campaign_abort(
+    campaign_control: HarvestCampaignControl,
+    abort_collective: Callable[[bool], bool] | None,
+) -> None:
+    """Take one synchronized abort branch without stranding healthy peers.
+
+    A corrupt/unreadable marker is itself a local stop request.  The affected
+    controller still participates in the collective OR before surfacing its
+    integrity error, so every other live controller leaves the batch boundary
+    instead of entering the next model collective alone.
+    """
+
+    marker_error: Exception | None = None
+    try:
+        local_abort = campaign_control.abort_requested()
+    except Exception as error:
+        marker_error = error
+        local_abort = True
+    globally_aborted = (
+        abort_collective(local_abort) if abort_collective is not None else local_abort
+    )
+    if marker_error is not None:
+        raise marker_error
+    campaign_control.raise_if_aborted(globally_requested=globally_aborted)
+
+
+def _harvest_host_impl(
     batches: Iterable[Mapping[str, Any]],
     adapter_step: Callable[[Any, Any, Any, Any], CaptureBatch],
     *,
@@ -805,6 +832,8 @@ def harvest_host(
     local_buffer_root: str | Path | None = None,
     object_prefix: str | None = None,
     object_store: ImmutableObjectStore | None = None,
+    campaign_control: HarvestCampaignControl,
+    abort_collective: Callable[[bool], bool] | None = None,
     clock: Callable[[], float] = time.perf_counter,
 ) -> HarvestResult:
     """Harvest one process's deterministic quota and durably finalize its host.
@@ -861,6 +890,16 @@ def harvest_host(
         existing_tokens=existing_tokens,
         attempt_compile_seconds=compile_seconds,
     )
+    campaign_control.heartbeat(
+        "running",
+        progress={
+            "durable_host_tokens": existing_tokens,
+            "host_quota": quota,
+            "batches_scanned": int(journal.counters()["batches_scanned"]),
+            "batches_executed": int(journal.counters()["batches_executed"]),
+        },
+        force=True,
+    )
     if journal.state.get("complete") is True:
         if existing_tokens != quota:
             raise HarvestError(
@@ -870,27 +909,36 @@ def harvest_host(
             raise HarvestError(
                 "completed production journal has an unfinalized host manifest"
             )
-        counters = journal.counters()
-        return HarvestResult(
-            split=split,
-            process_count=process_count,
-            process_index=process_index,
-            host_id=host_id,
-            total_tokens=total_tokens,
-            stop_after_tokens=stop,
-            host_quota=quota,
-            new_tokens=journal.durable_new_tokens,
-            resumed_tokens=baseline_resumed_tokens,
-            durable_host_tokens=existing_tokens,
-            batches_scanned=int(counters["batches_scanned"]),
-            batches_executed=int(counters["batches_executed"]),
-            elapsed_seconds=float(counters["elapsed_seconds"]),
-            device_seconds=float(counters["device_seconds"]),
-            input_wait_seconds=float(counters["input_wait_seconds"]),
-            max_writer_backlog=1 if journal.durable_new_tokens else 0,
-            executed_scientific_tokens=int(counters["executed_scientific_tokens"]),
-            compile_seconds=journal.compile_seconds,
-        )
+        if process_count == 1:
+            counters = journal.counters()
+            return HarvestResult(
+                split=split,
+                process_count=process_count,
+                process_index=process_index,
+                host_id=host_id,
+                total_tokens=total_tokens,
+                stop_after_tokens=stop,
+                host_quota=quota,
+                new_tokens=journal.durable_new_tokens,
+                resumed_tokens=baseline_resumed_tokens,
+                durable_host_tokens=existing_tokens,
+                batches_scanned=int(counters["batches_scanned"]),
+                batches_executed=int(counters["batches_executed"]),
+                elapsed_seconds=float(counters["elapsed_seconds"]),
+                device_seconds=float(counters["device_seconds"]),
+                input_wait_seconds=float(counters["input_wait_seconds"]),
+                max_writer_backlog=1 if journal.durable_new_tokens else 0,
+                executed_scientific_tokens=int(
+                    counters["executed_scientific_tokens"]
+                ),
+                compile_seconds=journal.compile_seconds,
+            )
+        # A completed lane cannot skip directly to the caller's global barrier:
+        # another lane may have crashed before finishing this same prefix. Replay
+        # the immutable committed prefix from local_tokens=0 so every controller
+        # takes the same abort, batch-decision, and (when any peer needs it) model
+        # collectives. No range is rewritten because every local part is already
+        # present and validated below.
     iterator = iter(batches)
     local_tokens = 0
     prior = journal.counters()
@@ -934,6 +982,7 @@ def harvest_host(
             input_wait += clock() - wait_started
             grain = extract_grain_batch(raw, expected_sequence_length=sequence_length)
             batches_scanned += 1
+            _check_campaign_abort(campaign_control, abort_collective)
             if static_shape is None:
                 static_shape = grain.shape
             elif grain.shape != static_shape:
@@ -1062,9 +1111,34 @@ def harvest_host(
 
             local_tokens += desired
             journal.checkpoint(telemetry_snapshot())
+            campaign_control.heartbeat(
+                "running",
+                progress={
+                    "durable_host_tokens": (
+                        baseline_resumed_tokens + journal.durable_new_tokens
+                    ),
+                    "planned_host_tokens": local_tokens,
+                    "host_quota": quota,
+                    "batches_scanned": batches_scanned,
+                    "batches_executed": batches_executed,
+                    "max_writer_backlog": sink.max_observed_backlog,
+                },
+            )
             if all_complete:
                 break
 
+    _check_campaign_abort(campaign_control, abort_collective)
+    campaign_control.heartbeat(
+        "finalizing",
+        progress={
+            "durable_host_tokens": baseline_resumed_tokens + journal.durable_new_tokens,
+            "host_quota": quota,
+            "batches_scanned": batches_scanned,
+            "batches_executed": batches_executed,
+            "max_writer_backlog": sink.max_observed_backlog,
+        },
+        force=True,
+    )
     if stop == total_tokens:
         host_manifest = writer.finalize_host()
     else:
@@ -1120,6 +1194,86 @@ def harvest_host(
         executed_scientific_tokens=executed_scientific_tokens,
         compile_seconds=journal.compile_seconds,
     )
+
+
+def harvest_host(
+    batches: Iterable[Mapping[str, Any]],
+    adapter_step: Callable[[Any, Any, Any, Any], CaptureBatch],
+    *,
+    artifact_root: str | Path,
+    metadata: CaptureMetadata,
+    split: str,
+    total_tokens: int,
+    process_count: int,
+    process_index: int,
+    stop_after_tokens: int | None = None,
+    sequence_length: int = DEFAULT_SEQUENCE_LENGTH,
+    batch_collective: Callable[[bool, bool], tuple[bool, bool]] | None = None,
+    abort_collective: Callable[[bool], bool] | None = None,
+    baseline_resumed_tokens: int = 0,
+    compile_seconds: float = 0.0,
+    local_buffer_root: str | Path | None = None,
+    object_prefix: str | None = None,
+    object_store: ImmutableObjectStore | None = None,
+    clock: Callable[[], float] = time.perf_counter,
+) -> HarvestResult:
+    """Harvest one lane under a lifetime lease with durable operator status.
+
+    The lease is process-specific, so all controllers can work concurrently
+    while a duplicate launch for the same process index fails immediately.
+    Abort markers are observed only at batch boundaries.  Multi-controller
+    callers supply ``abort_collective`` so every controller takes the same
+    branch before another collective model step.
+    """
+
+    if process_count > 1 and batch_collective is None:
+        raise ValueError("multi-process harvest requires a batch collective")
+    if process_count > 1 and abort_collective is None:
+        raise ValueError("multi-process harvest requires an abort collective")
+    stop = total_tokens if stop_after_tokens is None else stop_after_tokens
+    control = HarvestCampaignControl(
+        artifact_root,
+        metadata.to_dict(),
+        split=split,
+        total_tokens=total_tokens,
+        stop_after_tokens=stop,
+        process_count=process_count,
+        process_index=process_index,
+    )
+    with control:
+        result = _harvest_host_impl(
+            batches,
+            adapter_step,
+            artifact_root=artifact_root,
+            metadata=metadata,
+            split=split,
+            total_tokens=total_tokens,
+            process_count=process_count,
+            process_index=process_index,
+            stop_after_tokens=stop_after_tokens,
+            sequence_length=sequence_length,
+            batch_collective=batch_collective,
+            baseline_resumed_tokens=baseline_resumed_tokens,
+            compile_seconds=compile_seconds,
+            local_buffer_root=local_buffer_root,
+            object_prefix=object_prefix,
+            object_store=object_store,
+            campaign_control=control,
+            abort_collective=abort_collective,
+            clock=clock,
+        )
+        control.complete(
+            {
+                "durable_host_tokens": result.durable_host_tokens,
+                "host_quota": result.host_quota,
+                "new_tokens": result.new_tokens,
+                "resumed_tokens": result.resumed_tokens,
+                "batches_scanned": result.batches_scanned,
+                "batches_executed": result.batches_executed,
+                "max_writer_backlog": result.max_writer_backlog,
+            }
+        )
+        return result
 
 
 def publish_completed_capture(
@@ -1269,6 +1423,7 @@ def run_harvest(
     sequence_length: int = DEFAULT_SEQUENCE_LENGTH,
     barrier: Callable[[str], None] | None = None,
     batch_collective: Callable[[bool, bool], tuple[bool, bool]] | None = None,
+    abort_collective: Callable[[bool], bool] | None = None,
     baseline_resumed_tokens: int = 0,
     compile_seconds: float = 0.0,
     publish: bool = True,
@@ -1295,6 +1450,7 @@ def run_harvest(
         stop_after_tokens=stop,
         sequence_length=sequence_length,
         batch_collective=batch_collective,
+        abort_collective=abort_collective,
         baseline_resumed_tokens=baseline_resumed_tokens,
         compile_seconds=compile_seconds,
         local_buffer_root=local_buffer_root,
@@ -1724,6 +1880,7 @@ def run_production_harvest(
             sequence_length=config.sequence_length,
             barrier=multihost_barrier if process_count > 1 else None,
             batch_collective=(_jax_batch_collective if process_count > 1 else None),
+            abort_collective=(_jax_abort_collective if process_count > 1 else None),
             baseline_resumed_tokens=baseline_resumed_tokens,
             compile_seconds=compile_seconds,
             # High-level orchestration publishes only after every host's
@@ -2878,6 +3035,24 @@ def _jax_batch_collective(
     )
     values = gathered.reshape((-1, 2))
     return bool(np.all(values[:, 0])), bool(np.any(values[:, 1]))
+
+
+def _jax_abort_collective(local_abort_requested: bool) -> bool:
+    """Make an operator abort decision identical on every live controller."""
+
+    try:
+        multihost = import_module("jax.experimental.multihost_utils")
+    except (ImportError, ModuleNotFoundError) as exc:
+        raise HarvestDependencyError(
+            "multi-host abort coordination requires JAX"
+        ) from exc
+    gathered = np.asarray(
+        multihost.process_allgather(
+            np.asarray(local_abort_requested, dtype=np.uint8), tiled=False
+        ),
+        dtype=np.uint8,
+    )
+    return bool(np.any(gathered))
 
 
 def _validate_campaign(

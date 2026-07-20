@@ -20,13 +20,18 @@ the active tree. It is preserved at Git tag
 - [`configs/gemma4_26b_a4b.yaml`](configs/gemma4_26b_a4b.yaml) — the single
   production configuration.
 - `moe-sae` — the single CLI, with `stage-c4`, `qualify-storage`, `preflight`,
-  `convert-checkpoint`, `benchmark-harvest`, `harvest`, `train`, `eval`,
-  `report`, and `run`.
+  `convert-checkpoint`, `benchmark-harvest`, `harvest`, `activation-farm`,
+  `activation-status`, `activation-abort`, `train`, `eval`, `report`, and
+  `run`.
 - [`src/moe_sae/data.py`](src/moe_sae/data.py) — deterministic C4 packing and
   the fixed-record Grain/ArrayRecord reader.
 - [`src/moe_sae/model.py`](src/moe_sae/model.py) — pinned MaxText prefix adapter.
 - [`src/moe_sae/artifacts.py`](src/moe_sae/artifacts.py) — content-addressed
   capture shards, atomic manifests, and range-identity resume.
+- [`src/moe_sae/activation_operator.py`](src/moe_sae/activation_operator.py)
+  and [`src/moe_sae/harvest_control.py`](src/moe_sae/harvest_control.py) — the
+  four-controller activation-only supervisor, lifetime leases, durable status,
+  and cooperative safe-stop records.
 - [`src/moe_sae/storage.py`](src/moe_sae/storage.py) and
   [`src/moe_sae/object_store.py`](src/moe_sae/object_store.py) — storage-plane
   qualification, immutable GCS publication, and the bounded local cache.
@@ -165,8 +170,11 @@ attestation.
 
 The first-run order is therefore: stage and publish both C4 splits and convert
 the model checkpoint off-cluster; qualify the three storage planes on the
-v4-32; run `preflight`; then benchmark, canary/harvest, train, evaluate, and
-report. `run` resumes only provenance-matching sealed stages. The converter's
+v4-32; run `preflight`; then use `activation-farm` for the supervised
+benchmark, canary, train capture, and held-out capture. It stops before SAE
+training. The later `train`, `eval`, and `report` stages consume only the sealed
+captures; `run` is the full experiment orchestrator and resumes only
+provenance-matching sealed stages. The converter's
 self-hashed parity attestation, checkpoint inventory digest, storage
 attestation, and C4 manifest fingerprints are bound through the resulting
 benchmark, capture, campaign, checkpoint, and report metadata.

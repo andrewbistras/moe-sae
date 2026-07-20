@@ -44,7 +44,7 @@ def _passing(mesh, batch: int) -> BenchmarkObservation:
     )
 
 
-def test_public_cli_import_is_jax_cold_and_keeps_eight_commands():
+def test_public_cli_import_is_jax_cold_and_exposes_expected_commands():
     completed = subprocess.run(
         [
             sys.executable,
@@ -65,6 +65,9 @@ def test_public_cli_import_is_jax_cold_and_keeps_eight_commands():
         "convert-checkpoint",
         "benchmark-harvest",
         "harvest",
+        "activation-farm",
+        "activation-status",
+        "activation-abort",
         "train",
         "eval",
         "report",
