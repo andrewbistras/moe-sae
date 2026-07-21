@@ -885,6 +885,7 @@ def test_production_benchmark_cleans_persistence_and_scratch_on_worker_failure(
 ):
     class Runtime:
         model = object()
+        mesh = object()
         train_iterator = iter([grain([list(range(1_024))], [[1] * 1_024])])
 
     class AdapterFactory:
@@ -928,7 +929,10 @@ def test_production_benchmark_cleans_persistence_and_scratch_on_worker_failure(
     monkeypatch.setattr(harvest_module, "create_maxtext_runtime", lambda argv: runtime)
     monkeypatch.setattr(harvest_module, "Gemma4PrefixAdapter", AdapterFactory)
     monkeypatch.setattr(
-        harvest_module, "compile_adapter_step", lambda adapter: object()
+        harvest_module, "_capture_output_shardings", lambda mesh: None
+    )
+    monkeypatch.setattr(
+        harvest_module, "compile_adapter_step", lambda adapter, **kwargs: object()
     )
     monkeypatch.setattr(
         harvest_module, "maxtext_mesh_context", lambda value: NoopContext()
@@ -985,6 +989,7 @@ def test_production_benchmark_surfaces_cleanup_failure_after_success(
 ):
     class Runtime:
         model = object()
+        mesh = object()
         train_iterator = iter([grain([list(range(1_024))], [[1] * 1_024])])
 
     class AdapterFactory:
@@ -1026,7 +1031,10 @@ def test_production_benchmark_surfaces_cleanup_failure_after_success(
     monkeypatch.setattr(harvest_module, "create_maxtext_runtime", lambda argv: runtime)
     monkeypatch.setattr(harvest_module, "Gemma4PrefixAdapter", AdapterFactory)
     monkeypatch.setattr(
-        harvest_module, "compile_adapter_step", lambda adapter: object()
+        harvest_module, "_capture_output_shardings", lambda mesh: None
+    )
+    monkeypatch.setattr(
+        harvest_module, "compile_adapter_step", lambda adapter, **kwargs: object()
     )
     monkeypatch.setattr(
         harvest_module, "maxtext_mesh_context", lambda value: NoopContext()
@@ -1171,10 +1179,45 @@ def test_compile_adapter_step_is_injectable_without_tpu_dependencies():
     assert calls[0][1] == {"model_mode": "train"}
 
 
+def test_compile_adapter_step_forwards_explicit_capture_shardings():
+    sentinel = object()
+    transformed = []
+
+    def fake_jit(function, **kwargs):
+        transformed.append(kwargs)
+        return function
+
+    step = compile_adapter_step(
+        lambda *args, **kwargs: (args, kwargs),
+        jit=fake_jit,
+        out_shardings=sentinel,  # type: ignore[arg-type]
+    )
+
+    step(1, 2, 3, 4)
+    assert transformed == [{"out_shardings": sentinel}]
+
+
+def test_capture_output_shardings_use_every_mesh_axis_for_rows():
+    import jax
+    from jax.sharding import Mesh, PartitionSpec as P
+
+    axis_names = ("data", "fsdp", "tensor", "expert")
+    mesh = Mesh(np.asarray(jax.devices()).reshape((1, 1, 1, 1)), axis_names)
+    shardings = harvest_module._capture_output_shardings(mesh)
+
+    assert shardings.activation.spec == P(axis_names, None)
+    assert shardings.expert_ids.spec == P(axis_names, None)
+    assert shardings.router_weights.spec == P(axis_names, None)
+    assert shardings.sequence_id.spec == P(axis_names)
+    assert shardings.position.spec == P(axis_names)
+
+
 def test_nnx_model_is_an_explicit_jit_argument():
     model = object()
     config = object()
+    sentinel = object()
     transformed_calls = []
+    transformed_options = []
 
     class Adapter:
         def __init__(self, dynamic_model, static_config):
@@ -1184,16 +1227,23 @@ def test_nnx_model_is_an_explicit_jit_argument():
         def __call__(self, *args, **kwargs):
             return self.model, self.config, args, kwargs
 
-    def fake_jit(function):
+    def fake_jit(function, **kwargs):
+        transformed_options.append(kwargs)
+
         def compiled(*args):
             transformed_calls.append(args)
             return function(*args)
 
         return compiled
 
-    step = compile_adapter_step(Adapter(model, config), jit=fake_jit)
+    step = compile_adapter_step(
+        Adapter(model, config),
+        jit=fake_jit,
+        out_shardings=sentinel,  # type: ignore[arg-type]
+    )
     result = step(1, 2, 3, 4)
     assert transformed_calls == [(model, 1, 2, 3, 4)]
+    assert transformed_options == [{"out_shardings": sentinel}]
     assert result[:2] == (model, config)
     assert result[3] == {"model_mode": "train"}
 
@@ -1404,6 +1454,40 @@ def test_process_local_array_matches_v4_32_interleaved_process_geometry():
         )
 
         assert np.array_equal(assembled, full[slots])
+
+
+def test_capture_row_ownership_rejects_tp2_grain_output_mismatch():
+    output = _GlobalArray(
+        (16, 4),
+        [
+            _Shard((slice(0, 2), slice(0, 4)), np.zeros((2, 4))),
+            _Shard((slice(8, 10), slice(0, 4)), np.zeros((2, 4))),
+        ],
+    )
+    grain_coverage = ((0, 1), (4, 5), (8, 9), (12, 13))
+
+    with pytest.raises(HarvestError, match="process-owned rows"):
+        harvest_module._require_leading_coverage(
+            output,
+            "activation",
+            grain_coverage,
+        )
+
+
+def test_capture_row_ownership_accepts_forced_input_layout():
+    output = _GlobalArray(
+        (16, 4),
+        [
+            _Shard((slice(slot, slot + 1), slice(0, 4)), np.zeros((1, 4)))
+            for slot in (0, 4, 8, 12)
+        ],
+    )
+
+    harvest_module._require_leading_coverage(
+        output,
+        "activation",
+        ((0, 1), (4, 5), (8, 9), (12, 13)),
+    )
 
 
 @pytest.mark.parametrize(

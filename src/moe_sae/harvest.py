@@ -343,10 +343,10 @@ def make_sequence_ids(
 def compile_adapter_step(
     adapter: Callable[..., CaptureBatch],
     *,
-    jit: Callable[[Callable[..., CaptureBatch]], Callable[..., CaptureBatch]]
-    | None = None,
+    jit: Callable[..., Callable[..., CaptureBatch]] | None = None,
+    out_shardings: CaptureBatch | None = None,
 ) -> Callable[..., CaptureBatch]:
-    """Compile a full-shape adapter call, importing Flax NNX only on demand."""
+    """Compile a full-shape adapter call with an explicit capture layout."""
 
     if jit is None:
         try:
@@ -380,7 +380,11 @@ def compile_adapter_step(
                 model_mode="train",
             )
 
-        compiled = jit(explicit_model_step)
+        compiled = (
+            jit(explicit_model_step, out_shardings=out_shardings)
+            if out_shardings is not None
+            else jit(explicit_model_step)
+        )
 
         def bound_step(
             token_ids: Any,
@@ -403,12 +407,35 @@ def compile_adapter_step(
             token_ids, positions, segment_ids, sequence_ids, model_mode="train"
         )
 
-    compiled = jit(injected_step)
+    compiled = (
+        jit(injected_step, out_shardings=out_shardings)
+        if out_shardings is not None
+        else jit(injected_step)
+    )
     try:
         setattr(compiled, "_compiled_step", compiled)
     except (AttributeError, TypeError):
         pass
     return compiled
+
+
+def _capture_output_shardings(mesh: Any) -> CaptureBatch:
+    """Shard every capture field on the same logical rows as MaxText input."""
+
+    try:
+        sharding = import_module("jax.sharding")
+    except (ImportError, ModuleNotFoundError) as exc:
+        raise HarvestDependencyError(
+            "capture output sharding requires the pinned JAX runtime"
+        ) from exc
+    row_axes = tuple(mesh.axis_names)
+    if not row_axes:
+        raise HarvestError("MaxText capture mesh has no named axes")
+    matrix = sharding.NamedSharding(
+        mesh, sharding.PartitionSpec(row_axes, None)
+    )
+    vector = sharding.NamedSharding(mesh, sharding.PartitionSpec(row_axes))
+    return CaptureBatch(matrix, matrix, matrix, vector, vector)
 
 
 def _close_maxtext_runtime(runtime: Any) -> None:
@@ -1123,6 +1150,18 @@ def _harvest_host_impl(
                     f"static Grain shape changed from {static_shape} to {grain.shape}"
                 )
 
+            grain_coverage = _local_leading_coverage(grain.token_ids, "inputs")
+            _require_leading_coverage(
+                grain.positions,
+                "inputs_position",
+                grain_coverage,
+            )
+            _require_leading_coverage(
+                grain.segment_ids,
+                "inputs_segmentation",
+                grain_coverage,
+            )
+
             host_tokens = _process_local_array(
                 grain.token_ids,
                 "inputs",
@@ -1212,6 +1251,14 @@ def _harvest_host_impl(
                     process_count=process_count,
                     process_index=process_index,
                     sequence_length=sequence_length,
+                    expected_leading_coverage=(
+                        None
+                        if grain_coverage is None
+                        else tuple(
+                            (start * sequence_length, stop * sequence_length)
+                            for start, stop in grain_coverage
+                        )
+                    ),
                 )
                 range_start = global_start + local_tokens + existing
                 appended = 0
@@ -1668,7 +1715,10 @@ def benchmark_production_candidate(
     body_error: BaseException | None = None
     try:
         adapter = Gemma4PrefixAdapter.from_maxtext(runtime.model, config)
-        step = compile_adapter_step(adapter)
+        step = compile_adapter_step(
+            adapter,
+            out_shardings=_capture_output_shardings(runtime.mesh),
+        )
         try:
             jax = import_module("jax")
             process_index = int(jax.process_index())
@@ -2001,7 +2051,10 @@ def run_production_harvest(
         packed_eval_files=tuple(staged_files),
     )
     adapter = Gemma4PrefixAdapter.from_maxtext(runtime.model, config)
-    step = compile_adapter_step(adapter)
+    step = compile_adapter_step(
+        adapter,
+        out_shardings=_capture_output_shardings(runtime.mesh),
+    )
     iterator = runtime.train_iterator if split == "train" else runtime.eval_iterator
     if iterator is None:
         raise HarvestError(f"MaxText did not construct the {split} Grain iterator")
@@ -2200,6 +2253,29 @@ class _ProductionBenchmarkPersist:
     def __call__(self, output: CaptureBatch) -> int:
         if self._closed:
             raise HarvestError("benchmark persistence was already closed")
+        activation_coverage = _local_leading_coverage(
+            output.activation, "benchmark activation"
+        )
+        _require_leading_coverage(
+            output.expert_ids,
+            "benchmark expert_ids",
+            activation_coverage,
+        )
+        _require_leading_coverage(
+            output.router_weights,
+            "benchmark router_weights",
+            activation_coverage,
+        )
+        _require_leading_coverage(
+            output.sequence_id,
+            "benchmark sequence_id",
+            activation_coverage,
+        )
+        _require_leading_coverage(
+            output.position,
+            "benchmark position",
+            activation_coverage,
+        )
         activation = _process_local_array(
             output.activation,
             "benchmark activation",
@@ -3323,8 +3399,34 @@ def _compact_adapter_output(
     process_count: int,
     process_index: int,
     sequence_length: int,
+    expected_leading_coverage: tuple[tuple[int, int], ...] | None,
 ) -> CaptureBatch:
     rows = token_shape[0] * token_shape[1]
+    _require_leading_coverage(
+        capture.activation,
+        "activation",
+        expected_leading_coverage,
+    )
+    _require_leading_coverage(
+        capture.expert_ids,
+        "expert_ids",
+        expected_leading_coverage,
+    )
+    _require_leading_coverage(
+        capture.router_weights,
+        "router_weights",
+        expected_leading_coverage,
+    )
+    _require_leading_coverage(
+        capture.sequence_id,
+        "sequence_id",
+        expected_leading_coverage,
+    )
+    _require_leading_coverage(
+        capture.position,
+        "position",
+        expected_leading_coverage,
+    )
     activation = _process_local_array(
         capture.activation,
         "activation",
@@ -3363,6 +3465,51 @@ def _compact_adapter_output(
         sequence_id=flat_sequence_ids[valid_indices].astype(np.int64, copy=False),
         position=flat_positions[valid_indices].astype(np.uint16, copy=False),
     )
+
+
+def _local_leading_coverage(
+    value: Any, name: str
+) -> tuple[tuple[int, int], ...] | None:
+    """Return the merged global leading-axis intervals addressable here."""
+
+    shards = getattr(value, "addressable_shards", None)
+    if shards is None:
+        return None
+    intervals: set[tuple[int, int]] = set()
+    leading_size = int(value.shape[0])
+    for shard in shards:
+        index = tuple(shard.index)
+        if len(index) != len(value.shape) or not isinstance(index[0], slice):
+            raise HarvestError(f"{name} has an invalid addressable shard index")
+        item = index[0]
+        start = 0 if item.start is None else int(item.start)
+        stop = leading_size if item.stop is None else int(item.stop)
+        step = 1 if item.step is None else int(item.step)
+        if step != 1 or start < 0 or stop <= start or stop > leading_size:
+            raise HarvestError(f"{name} has an unsupported leading shard slice {item}")
+        intervals.add((start, stop))
+    if not intervals:
+        raise HarvestError(f"{name} has no addressable leading-axis interval")
+    merged: list[tuple[int, int]] = []
+    for start, stop in sorted(intervals):
+        if merged and start <= merged[-1][1]:
+            prior_start, prior_stop = merged[-1]
+            merged[-1] = (prior_start, max(prior_stop, stop))
+        else:
+            merged.append((start, stop))
+    return tuple(merged)
+
+
+def _require_leading_coverage(
+    value: Any,
+    name: str,
+    expected: tuple[tuple[int, int], ...] | None,
+) -> None:
+    actual = _local_leading_coverage(value, name)
+    if actual != expected:
+        raise HarvestError(
+            f"{name} process-owned rows {actual} do not match {expected}"
+        )
 
 
 def _host_array(value: Any, name: str) -> np.ndarray:
