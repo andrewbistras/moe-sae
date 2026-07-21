@@ -54,6 +54,20 @@ def test_capture_validation_stays_device_side_and_fails_duplicate_routes():
         )
 
 
+def test_parameter_sharding_summary_accepts_typed_prng_keys():
+    from flax import nnx
+    import jax
+
+    class Module(nnx.Module):
+        def __init__(self):
+            self.key = nnx.Variable(jax.random.key(0))
+
+    summary = profile_worker._parameter_sharding_summary(Module())
+    assert summary["arrays"] == 1
+    assert summary["elements"] == 1
+    assert summary["bytes"] == 8
+
+
 def test_short_profile_writes_nonselectable_schema(monkeypatch, tmp_path):
     config = Gemma4Config()
     raw = {

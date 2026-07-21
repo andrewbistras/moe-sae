@@ -347,19 +347,28 @@ def compile_adapter_step(
     jit: Callable[..., Callable[..., CaptureBatch]] | None = None,
     out_shardings: CaptureBatch | None = None,
 ) -> Callable[..., CaptureBatch]:
-    """Compile a full-shape adapter call with an explicit capture layout."""
+    """Compile a full-shape, inference-pure adapter call.
 
-    if jit is None:
-        try:
-            jit = import_module("flax.nnx").jit
-        except (ImportError, ModuleNotFoundError) as exc:
-            raise HarvestDependencyError(
-                "compiling the Gemma 4 adapter requires the pinned MaxText/Flax TPU environment"
-            ) from exc
+    The production adapter owns a large NNX graph, but reads only the prefix
+    through block 15.  Pre-binding that graph with ``nnx.jit_partial`` and
+    disabling graph updates lets JAX prune every unused parameter and prevents
+    unchanged model state from becoming an implicit output of every harvest
+    step.  ``jit`` remains injectable so this boundary can be tested without a
+    TPU runtime; for a model-backed adapter it must implement the pinned
+    ``nnx.jit_partial`` calling convention.
+    """
 
     model = getattr(adapter, "model", None)
     config = getattr(adapter, "config", None)
     if model is not None and config is not None:
+        if jit is None:
+            try:
+                jit = import_module("flax.nnx").jit_partial
+            except (ImportError, ModuleNotFoundError) as exc:
+                raise HarvestDependencyError(
+                    "compiling the Gemma 4 adapter requires the pinned "
+                    "MaxText/Flax TPU environment"
+                ) from exc
         adapter_type = type(adapter)
 
         def explicit_model_step(
@@ -381,11 +390,13 @@ def compile_adapter_step(
                 model_mode="train",
             )
 
-        compiled = (
-            jit(explicit_model_step, out_shardings=out_shardings)
-            if out_shardings is not None
-            else jit(explicit_model_step)
-        )
+        transform_options: dict[str, Any] = {
+            "graph": True,
+            "graph_updates": False,
+        }
+        if out_shardings is not None:
+            transform_options["out_shardings"] = out_shardings
+        compiled = jit(explicit_model_step, model, **transform_options)
 
         def bound_step(
             token_ids: Any,
@@ -393,10 +404,19 @@ def compile_adapter_step(
             segment_ids: Any,
             sequence_ids: Any,
         ) -> CaptureBatch:
-            return compiled(model, token_ids, positions, segment_ids, sequence_ids)
+            return compiled(token_ids, positions, segment_ids, sequence_ids)
 
         setattr(bound_step, "_compiled_step", compiled)
         return bound_step
+
+    if jit is None:
+        try:
+            jit = import_module("flax.nnx").jit
+        except (ImportError, ModuleNotFoundError) as exc:
+            raise HarvestDependencyError(
+                "compiling the Gemma 4 adapter requires the pinned "
+                "MaxText/Flax TPU environment"
+            ) from exc
 
     def injected_step(
         token_ids: Any,

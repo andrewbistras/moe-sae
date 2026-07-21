@@ -203,8 +203,10 @@ def _parameter_sharding_summary(model: Any) -> dict[str, Any]:
             continue
         arrays += 1
         size = int(math.prod(int(axis) for axis in leaf.shape))
-        itemsize = int(np.dtype(leaf.dtype).itemsize)
-        nbytes = size * itemsize
+        # JAX typed PRNG keys use an extended dtype such as ``key<fry>`` that
+        # NumPy deliberately cannot interpret.  JAX arrays expose the correct
+        # logical byte count directly for both ordinary and extended dtypes.
+        nbytes = int(leaf.nbytes)
         elements += size
         total_bytes += nbytes
         descriptor = _sharding_descriptor(leaf)

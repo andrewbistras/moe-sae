@@ -1357,10 +1357,11 @@ def test_capture_output_shardings_use_every_mesh_axis_for_rows():
     assert shardings.position.spec == P(axis_names)
 
 
-def test_nnx_model_is_an_explicit_jit_argument():
+def test_nnx_model_is_prebound_to_inference_pure_jit():
     model = object()
     config = object()
     sentinel = object()
+    partial_arguments = []
     transformed_calls = []
     transformed_options = []
 
@@ -1372,12 +1373,13 @@ def test_nnx_model_is_an_explicit_jit_argument():
         def __call__(self, *args, **kwargs):
             return self.model, self.config, args, kwargs
 
-    def fake_jit(function, **kwargs):
+    def fake_jit(function, *partial_args, **kwargs):
+        partial_arguments.append(partial_args)
         transformed_options.append(kwargs)
 
         def compiled(*args):
             transformed_calls.append(args)
-            return function(*args)
+            return function(*partial_args, *args)
 
         return compiled
 
@@ -1387,10 +1389,65 @@ def test_nnx_model_is_an_explicit_jit_argument():
         out_shardings=sentinel,  # type: ignore[arg-type]
     )
     result = step(1, 2, 3, 4)
-    assert transformed_calls == [(model, 1, 2, 3, 4)]
-    assert transformed_options == [{"out_shardings": sentinel}]
+    assert partial_arguments == [(model,)]
+    assert transformed_calls == [(1, 2, 3, 4)]
+    assert transformed_options == [
+        {
+            "graph": True,
+            "graph_updates": False,
+            "out_shardings": sentinel,
+        }
+    ]
     assert result[:2] == (model, config)
     assert result[3] == {"model_mode": "train"}
+
+
+def test_nnx_partial_adapter_preserves_output_and_prunes_unused_state():
+    nnx = pytest.importorskip("flax.nnx")
+    jnp = pytest.importorskip("jax.numpy")
+
+    class TinyModel(nnx.Module):
+        def __init__(self):
+            self.used = nnx.Linear(2, 2, rngs=nnx.Rngs(0))
+            self.unused = nnx.Param(jnp.ones((19, 23), dtype=jnp.float32))
+
+    class TinyAdapter:
+        def __init__(self, model, config):
+            self.model = model
+            self.config = config
+
+        def __call__(
+            self,
+            token_ids,
+            positions,
+            segment_ids,
+            sequence_ids,
+            *,
+            model_mode,
+        ):
+            assert model_mode == "train"
+            return (
+                self.model.used(token_ids)
+                + positions
+                + segment_ids
+                + sequence_ids
+            )
+
+    adapter = TinyAdapter(TinyModel(), object())
+    token_ids = jnp.asarray([[1.0, 2.0]], dtype=jnp.float32)
+    zeros = jnp.zeros((1, 2), dtype=jnp.float32)
+    expected = adapter(token_ids, zeros, zeros, zeros, model_mode="train")
+
+    step = compile_adapter_step(adapter)
+    actual = step(token_ids, zeros, zeros, zeros)
+    np.testing.assert_allclose(np.asarray(actual), np.asarray(expected))
+
+    # jit_partial has already bound the graph, so lowering accepts only the
+    # four runtime arrays.  The intentionally distinctive unused parameter
+    # shape must not survive JAX's unused-input pruning.
+    compiled = getattr(step, "_compiled_step")
+    lowered_text = compiled.lower(token_ids, zeros, zeros, zeros).as_text()
+    assert "19x23xf32" not in lowered_text
 
 
 def test_instrumentation_parity_is_required_and_fail_closed():
