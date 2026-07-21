@@ -2198,6 +2198,7 @@ class _ProductionBenchmarkPersist:
             object_store=object_store,
         )
         self.sink = BoundedArtifactSink(self.writer.write_range, max_pending=1)
+        self.accumulator = _CaptureShardAccumulator(config.shard_tokens)
         self.offset = 0
         self.calls = 0
         self.validated_calls = 0
@@ -2328,18 +2329,35 @@ class _ProductionBenchmarkPersist:
             position=position,
         )
         validate_capture_batch(capture, self.config, require_storage_dtypes=True)
-        range_id = f"benchmark-p{self.process_index:05d}-b{self.calls:012d}"
-        start, end = self.offset, self.offset + rows
-        self.sink.submit(range_id, start, end, capture)
-        self.offset = end
+        batch_start = self.offset
+        appended = 0
+        while appended < rows:
+            appended += self.accumulator.append(
+                capture,
+                offset=appended,
+                start=batch_start,
+            )
+            if self.accumulator.full:
+                self._submit_accumulator()
+        self.offset += rows
         self.calls += 1
         self.validated_calls += 1
         # Every process performs and validates its addressable fraction.  The
         # global benchmark row count is the union of those fractions.
         return _capture_rows(output)
 
+    def _submit_accumulator(self) -> None:
+        start, end, capture = self.accumulator.take()
+        range_id = (
+            f"benchmark-p{self.process_index:05d}-r{start:012d}"
+            f"-n{end - start:09d}"
+        )
+        self.sink.submit(range_id, start, end, capture)
+
     def flush(self) -> None:
         if not self._closed:
+            if self.accumulator.rows:
+                self._submit_accumulator()
             self.sink.close()
             self._closed = True
         if not self._finalized:

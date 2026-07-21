@@ -880,6 +880,61 @@ def test_production_benchmark_abort_does_not_finalize_empty_writer(tmp_path):
     assert not (tmp_path / "hosts" / "host-p00000.json").exists()
 
 
+def test_production_benchmark_coalesces_steps_to_production_shard_size(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    import ml_dtypes
+
+    writes = []
+
+    class Writer:
+        def __init__(self, *args, **kwargs):
+            del args, kwargs
+            self.finalized = False
+
+        def write_range(self, range_id, start, end, capture):
+            writes.append((range_id, start, end, capture.activation.shape[0]))
+
+        def finalize_host(self):
+            self.finalized = True
+
+    writer = Writer()
+    monkeypatch.setattr(
+        harvest_module,
+        "ArtifactWriter",
+        lambda *args, **kwargs: writer,
+    )
+    config = replace(Gemma4Config(), shard_tokens=2_048)
+    persistence = harvest_module._ProductionBenchmarkPersist(
+        tmp_path,
+        metadata=metadata(),
+        config=config,
+        process_count=1,
+        process_index=0,
+        reference_instrumentation_equal=True,
+    )
+    capture = CaptureBatch(
+        activation=np.zeros((1_024, HIDDEN), dtype=ml_dtypes.bfloat16),
+        expert_ids=np.tile(np.arange(8, dtype=np.uint8), (1_024, 1)),
+        router_weights=np.full((1_024, 8), 0.125, dtype=ml_dtypes.bfloat16),
+        sequence_id=np.arange(1_024, dtype=np.int64),
+        position=np.arange(1_024, dtype=np.uint16),
+    )
+
+    assert persistence(capture) == 1_024
+    assert persistence(capture) == 1_024
+    assert persistence(capture) == 1_024
+    persistence.flush()
+
+    assert [(start, end, rows) for _, start, end, rows in writes] == [
+        (0, 2_048, 2_048),
+        (2_048, 3_072, 1_024),
+    ]
+    assert persistence.local_persisted_rows == 3_072
+    assert persistence.calls == persistence.validated_calls == 3
+    assert writer.finalized
+
+
 def test_production_benchmark_cleans_persistence_and_scratch_on_worker_failure(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ):
