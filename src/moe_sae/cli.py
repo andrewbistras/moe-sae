@@ -833,7 +833,10 @@ def _verified_dataset_provenance(
 
     expected_split = config.train_split if split == "train" else config.eval_split
     expected_tokens = config.train_tokens if split == "train" else config.eval_tokens
-    verify_arrayrecord_count = not bool(getattr(args, "local", False))
+    verify_arrayrecord_count = not (
+        bool(getattr(args, "local", False))
+        or bool(getattr(args, "reuse_verified_dataset", False))
+    )
     key = (split, grain_files, manifest_location, verify_arrayrecord_count)
     cache = getattr(args, "_verified_dataset_provenance", None)
     if cache is None:
@@ -3653,7 +3656,7 @@ def _command_run(args: argparse.Namespace) -> int:
 
 
 def _activation_common_child_arguments(args: argparse.Namespace) -> list[str]:
-    return [
+    arguments = [
         "--config",
         str(Path(args.config).expanduser().resolve()),
         "--artifact-root",
@@ -3671,6 +3674,9 @@ def _activation_common_child_arguments(args: argparse.Namespace) -> list[str]:
         "--dataset-eval-manifest",
         str(args.dataset_eval_manifest),
     ]
+    if bool(getattr(args, "reuse_verified_dataset", False)):
+        arguments.append("--reuse-verified-dataset")
+    return arguments
 
 
 def _activation_child_command(
@@ -3731,6 +3737,8 @@ def _activation_child_command(
     ]
     if phase == "canary":
         command.append("--canary")
+    if bool(getattr(args, "reuse_verified_dataset", False)):
+        command.append("--reuse-verified-dataset")
     return command
 
 
@@ -4129,6 +4137,10 @@ def _command_activation_farm(args: argparse.Namespace) -> int:
             {
                 "spec_sha256": activation_spec.sha256,
                 "phases": ACTIVATION_PHASES,
+                "skip_preflight": bool(getattr(args, "skip_preflight", False)),
+                "reuse_verified_dataset": bool(
+                    getattr(args, "reuse_verified_dataset", False)
+                ),
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -4139,7 +4151,22 @@ def _command_activation_farm(args: argparse.Namespace) -> int:
     ) as supervisor:
         lease_fd = supervisor.descriptor
         _raise_if_activation_aborted(control, "benchmark")
-        try:
+        if bool(getattr(args, "skip_preflight", False)):
+            print(
+                json.dumps(
+                    {
+                        "event": "activation_preflight_bypassed",
+                        "run_id": supervisor.run_id,
+                        "operation_sha256": operation_sha256,
+                        "reuse_verified_dataset": bool(
+                            getattr(args, "reuse_verified_dataset", False)
+                        ),
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+        else:
             _run_activation_subprocess(
                 _activation_child_command(args, "preflight"),
                 label="preflight",
@@ -4147,8 +4174,6 @@ def _command_activation_farm(args: argparse.Namespace) -> int:
                 lease_fd=lease_fd,
                 supervisor=supervisor,
             )
-        except Exception:
-            raise
 
         for phase in ACTIVATION_PHASES:
             _raise_if_activation_aborted(control, phase)
@@ -4350,6 +4375,11 @@ def build_parser() -> argparse.ArgumentParser:
     preflight.add_argument(
         "--local", action="store_true", help="skip TPU/MaxText checks"
     )
+    preflight.add_argument(
+        "--reuse-verified-dataset",
+        action="store_true",
+        help="reuse a prior semantic ArrayRecord validation while rechecking manifest objects",
+    )
     preflight.add_argument("--json", action="store_true")
     preflight.set_defaults(handler=_command_preflight)
 
@@ -4397,6 +4427,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--per-device-sequence-batch", type=int, choices=PER_DEVICE_SEQUENCE_BATCHES
     )
     harvest.add_argument("--canary", action="store_true")
+    harvest.add_argument(
+        "--reuse-verified-dataset",
+        action="store_true",
+        help="reuse a prior semantic ArrayRecord validation while rechecking manifest objects",
+    )
     harvest.set_defaults(handler=_command_harvest)
 
     activation = subparsers.add_parser(
@@ -4412,6 +4447,16 @@ def build_parser() -> argparse.ArgumentParser:
     activation.add_argument("--grain-eval", required=True)
     activation.add_argument("--dataset-train-manifest", required=True)
     activation.add_argument("--dataset-eval-manifest", required=True)
+    activation.add_argument(
+        "--skip-preflight",
+        action="store_true",
+        help="operator-authorized resume that bypasses activation-farm's fresh preflight",
+    )
+    activation.add_argument(
+        "--reuse-verified-dataset",
+        action="store_true",
+        help="reuse prior semantic ArrayRecord validation in capture subprocesses",
+    )
     activation.set_defaults(handler=_command_activation_farm)
 
     activation_status = subparsers.add_parser(

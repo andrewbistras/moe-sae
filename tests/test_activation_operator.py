@@ -346,6 +346,37 @@ def test_activation_farm_uses_fresh_preflight_phase_and_gate_children(
     ] * 4
 
 
+def test_activation_farm_explicitly_bypasses_fresh_preflight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    args = farm_args(tmp_path)
+    args.skip_preflight = True
+    args.reuse_verified_dataset = True
+    calls: list[str] = []
+    monkeypatch.setattr(cli, "_config", lambda _args: _Config())
+    monkeypatch.setattr(cli, "_require_production_artifact_root", lambda _root: None)
+    monkeypatch.setattr(
+        cli,
+        "_run_activation_subprocess",
+        lambda _command, *, label, **_kwargs: calls.append(label),
+    )
+
+    assert cli._command_activation_farm(args) == 0
+    assert calls == [
+        "benchmark",
+        "benchmark completion gate",
+        "canary",
+        "canary completion gate",
+        "train",
+        "train completion gate",
+        "eval",
+        "eval completion gate",
+    ]
+    bypass = json.loads(capsys.readouterr().out.splitlines()[0])
+    assert bypass["event"] == "activation_preflight_bypassed"
+    assert bypass["reuse_verified_dataset"] is True
+
+
 def test_activation_farm_gates_and_skips_existing_final_records(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -382,6 +413,8 @@ def test_public_activation_commands_are_parseable() -> None:
     farm = parser.parse_args(
         [
             "activation-farm",
+            "--artifact-root",
+            "/tmp/gemma4-activation-test",
             "--checkpoint",
             "/checkpoint",
             "--checkpoint-sha256",
@@ -394,6 +427,12 @@ def test_public_activation_commands_are_parseable() -> None:
             "train.json",
             "--dataset-eval-manifest",
             "eval.json",
+            "--skip-preflight",
+            "--reuse-verified-dataset",
         ]
     )
     assert farm.handler is cli._command_activation_farm
+    assert farm.skip_preflight is True
+    assert farm.reuse_verified_dataset is True
+    for phase in ("preflight", "canary", "gate"):
+        assert "--reuse-verified-dataset" in cli._activation_child_command(farm, phase)

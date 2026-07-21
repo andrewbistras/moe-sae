@@ -1,3 +1,4 @@
+import argparse
 import dataclasses
 import json
 import hashlib
@@ -1134,6 +1135,34 @@ def _selected_benchmark(config):
             "useful_mfu": 0.55,
         },
     }
+
+
+def test_dataset_reuse_skips_only_semantic_arrayrecord_recount(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = Gemma4Config()
+    observed = {}
+    provenance = SimpleNamespace(fingerprint_sha256="5" * 64)
+
+    def verify(*args, **kwargs):
+        observed.update(kwargs)
+        return provenance
+
+    monkeypatch.setattr(cli_module, "verify_staged_dataset_manifest", verify)
+    monkeypatch.setattr(cli_module, "_coordinated_sha256", lambda *args, **kwargs: None)
+    args = argparse.Namespace(local=False, reuse_verified_dataset=True)
+
+    result = cli_module._verified_dataset_provenance(
+        args,
+        config,
+        split="train",
+        grain_files="gs://bucket/train/*.array_record",
+        manifest_location="gs://bucket/train/manifest.json",
+    )
+
+    assert result is provenance
+    assert observed["verify_file_hashes"] is True
+    assert observed["verify_arrayrecord_count"] is False
 
 
 def _sae_storage_attestation() -> dict:

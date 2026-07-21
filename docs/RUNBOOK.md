@@ -1290,6 +1290,24 @@ echo \"started activation-farm pid=\$(cat '$REMOTE_FARM_PID') host=\$(hostname -
 tpu_all "$REMOTE_FARM_LAUNCH"
 ```
 
+For an operator-authorized code-only retry after a complete production
+preflight has already passed against the same checkpoint and immutable dataset
+manifests, append both of these flags to `REMOTE_FARM_COMMAND`:
+
+```text
+--skip-preflight --reuse-verified-dataset
+```
+
+`--skip-preflight` bypasses only the fresh preflight subprocess.
+`--reuse-verified-dataset` omits the slow scalar decode/recount of every packed
+ArrayRecord in later capture subprocesses; manifest schema, ordered inventory,
+GCS object generations, sizes, and content hashes are still verified.  The
+bypass values are part of the four-controller operation identity and are
+written to the activation log.  Never use this path for a first launch or
+after changing a checkpoint, dataset manifest, staging implementation, or
+packed-record validator.  A code change still requires deployment and a new
+environment-bound storage attestation before this retry.
+
 This is the **one numerical launch** for Stages 6 and 7. You must see four
 `started activation-farm` lines. If fewer than four workers start, the
 supervisor rendezvous fails closed; do not manually start only the missing

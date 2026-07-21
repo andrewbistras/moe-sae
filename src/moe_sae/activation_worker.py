@@ -30,6 +30,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--grain-eval", required=True)
     parser.add_argument("--dataset-train-manifest", required=True)
     parser.add_argument("--dataset-eval-manifest", required=True)
+    parser.add_argument("--reuse-verified-dataset", action="store_true")
     parser.set_defaults(handler=_command_activation_gate)
     return parser
 
