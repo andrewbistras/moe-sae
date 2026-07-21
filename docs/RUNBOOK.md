@@ -1189,13 +1189,17 @@ tiny packed-C4 input and does not read activation shards back. The configured
 4 GB/s download requirement remains sealed in the attestation for the later,
 separate SAE-cache qualification.
 
-The probe and `ArtifactWriter` use the same large-object transport: the TPU
-process execs a JAX-cold helper, which uploads 16 MiB parts with 32 worker
-processes, then the parent conditionally copies the unique temporary object
-into its content-addressed final name. Generation-pinned probe downloads use
-32 MiB ranges with 16 workers. The helper boundary is deliberate: only the
-fresh JAX-cold helper creates a process pool. Transfers get a 30-minute helper
-deadline plus a 60-second parent grace period for cancellation and cleanup.
+The probe and `ArtifactWriter` use the same large-object transport. Each
+producer computes SHA-256 and whole-object CRC32C in its existing generation or
+serialization pass, binds both digests to the file's device/inode/size/times,
+and the store checks that state before and after transfer. It does not rescan
+each large file on the timed upload path. The TPU process then execs a JAX-cold
+helper, which uploads 16 MiB parts with 32 worker processes, and the parent
+conditionally copies the unique temporary object into its content-addressed
+final name. Generation-pinned probe downloads use 32 MiB ranges with 16
+workers. The helper boundary is deliberate: only the fresh JAX-cold helper
+creates a process pool. Transfers get a 30-minute helper deadline plus a
+60-second parent grace period for cancellation and cleanup.
 
 The qualifier proves cross-process control-plane visibility and `flock`, atomic
 rename, disjoint per-host control records, genuinely private local-buffer

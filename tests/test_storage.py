@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 
 import moe_sae.storage as storage_module
-from moe_sae.object_store import LocalObjectStore
+from moe_sae.object_store import LocalObjectStore, fingerprint_file
 from moe_sae.storage import (
     ACTIVATION_CAPTURE_SCOPE,
     CoordinationHooks,
@@ -285,6 +285,56 @@ def test_gcs_throughput_thresholds_are_hard_gates(tmp_path: Path) -> None:
     assert result.gcs.download is not None
     assert any("GCS upload throughput below threshold" in item for item in result.failures)
     assert any("GCS download throughput below threshold" in item for item in result.failures)
+
+
+def test_probe_fingerprint_matches_independent_file_digest(tmp_path: Path) -> None:
+    path = tmp_path / "probe.bin"
+    produced = storage_module._write_incompressible_probe(
+        path,
+        size=128 * 1024,
+        block_bytes=4096,
+        seed=b"fingerprint-test",
+    )
+    independent = fingerprint_file(path)
+
+    assert produced == independent
+
+
+def test_cleanup_attempts_every_resource_after_local_unlink_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    original_unlink = Path.unlink
+
+    def fail_source_unlink(path: Path, *args: Any, **kwargs: Any) -> None:
+        if path.name.endswith(".source") and path.name.startswith(
+            ".moe-sae-gcs-qualification-"
+        ):
+            raise OSError("injected source cleanup failure")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_source_unlink)
+    object_root = tmp_path / "objects"
+    local_root = tmp_path / "local"
+    result = qualify_storage_planes(
+        tmp_path / "control",
+        local_root,
+        "gs://qualification-test/prefix",
+        LocalObjectStore(object_root),
+        config=StoragePlanesQualificationConfig(
+            minimum_control_free_bytes=1,
+            minimum_local_buffer_free_bytes=1,
+            gcs_probe_bytes_per_process=4096,
+            gcs_probe_block_bytes=1024,
+            minimum_aggregate_upload_bytes_per_second=0,
+            minimum_aggregate_download_bytes_per_second=0,
+        ),
+    )
+
+    assert not result.passed
+    assert any("GCS probe cleanup failed" in item for item in result.failures)
+    assert list(local_root.glob("*.source"))
+    assert not list(local_root.glob("*.download"))
+    assert not [path for path in object_root.rglob("*") if path.is_file()]
 
 
 def test_activation_download_throughput_is_diagnostic_but_integrity_is_recorded(

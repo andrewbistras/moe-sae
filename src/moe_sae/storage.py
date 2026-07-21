@@ -12,6 +12,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+import base64
 import errno
 import fcntl
 import hashlib
@@ -28,6 +29,8 @@ import uuid
 from moe_sae.object_store import (
     ImmutableObjectStore,
     ObjectIdentity,
+    SourceFingerprint,
+    _fingerprint_from_components,
     join_gcs_uri,
     object_identity_from_mapping,
     sha256_file,
@@ -904,14 +907,18 @@ def _qualify_object_plane(
     )
     generation_error = ""
     digest = ""
+    source_fingerprint: SourceFingerprint | None = None
     try:
-        digest = _write_incompressible_probe(
+        source_fingerprint = _write_incompressible_probe(
             source,
             size=config.gcs_probe_bytes_per_process,
             block_bytes=config.gcs_probe_block_bytes,
             seed=f"{run_id}:{process_index}".encode("ascii"),
         )
-    except (OSError, ValueError) as exc:
+        digest = source_fingerprint.sha256
+    except Exception as exc:
+        # Every host must reach the same gather even if one local producer or
+        # fingerprint operation fails; the coordinated result then fails shut.
         generation_error = _format_error(exc)
     generated = _gather_records(
         hooks,
@@ -937,7 +944,12 @@ def _qualify_object_plane(
             f"{digest}.bin",
         )
         try:
-            identity = store.put_if_absent(source, uri, sha256=digest)
+            identity = store.put_if_absent(
+                source,
+                uri,
+                sha256=digest,
+                source_fingerprint=source_fingerprint,
+            )
             store.verify(identity)
             if identity.size_bytes != config.gcs_probe_bytes_per_process:
                 raise StorageQualificationError(
@@ -1029,13 +1041,18 @@ def _qualify_object_plane(
 
     cleanup_error = ""
     if config.cleanup:
-        try:
-            source.unlink(missing_ok=True)
-            destination.unlink(missing_ok=True)
-            if identity is not None:
+        cleanup_failures: list[str] = []
+        for label, path in (("source", source), ("destination", destination)):
+            try:
+                path.unlink(missing_ok=True)
+            except Exception as exc:
+                cleanup_failures.append(f"{label}: {_format_error(exc)}")
+        if identity is not None:
+            try:
                 store.delete(identity)
-        except Exception as exc:
-            cleanup_error = _format_error(exc)
+            except Exception as exc:
+                cleanup_failures.append(f"object: {_format_error(exc)}")
+        cleanup_error = "; ".join(cleanup_failures)
     cleanup_records = _gather_records(
         hooks,
         process_count,
@@ -1576,10 +1593,17 @@ def _qualify_disjoint_files(
 
 def _write_incompressible_probe(
     path: Path, *, size: int, block_bytes: int, seed: bytes
-) -> str:
+) -> SourceFingerprint:
     """Write deterministic pseudorandom blocks without a repeating pattern."""
 
+    try:
+        import google_crc32c
+    except ImportError as error:  # pragma: no cover - required core dependency
+        raise StorageQualificationError(
+            "whole-object probe verification requires google-crc32c"
+        ) from error
     digest = hashlib.sha256()
+    crc32c = google_crc32c.Checksum()
     remaining = size
     counter = 0
     with path.open("xb", buffering=0) as handle:
@@ -1590,10 +1614,16 @@ def _write_incompressible_probe(
             ).digest(portion)
             _write_all(handle.fileno(), block)
             digest.update(block)
+            crc32c.update(block)
             remaining -= portion
             counter += 1
         os.fsync(handle.fileno())
-    return digest.hexdigest()
+    return _fingerprint_from_components(
+        path,
+        sha256=digest.hexdigest(),
+        crc32c=base64.b64encode(crc32c.digest()).decode("ascii"),
+        size_bytes=size,
+    )
 
 
 def _transfer_measurement(

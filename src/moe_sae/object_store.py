@@ -20,6 +20,7 @@ import uuid
 
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
+_CRC32C = re.compile(r"[A-Za-z0-9+/]{6}==")
 _ISOLATED_TRANSFER_EXIT_GRACE_SECONDS = 60.0
 
 
@@ -44,6 +45,34 @@ def _file_state(value: os.stat_result) -> _FileState:
         mtime_ns=int(value.st_mtime_ns),
         ctime_ns=int(value.st_ctime_ns),
     )
+
+
+@dataclass(frozen=True, slots=True)
+class SourceFingerprint:
+    """One content digest bound to an exact immutable local file state.
+
+    Producers that already scan or generate a file can carry this fingerprint
+    into object publication.  The store still compares the device, inode,
+    size, mtime, and ctime before and after transfer, while avoiding a second
+    full-file digest pass on the critical upload path.
+    """
+
+    sha256: str
+    crc32c: str
+    size_bytes: int
+    state: _FileState
+
+    def __post_init__(self) -> None:
+        if (
+            not _SHA256.fullmatch(self.sha256)
+            or not _CRC32C.fullmatch(self.crc32c)
+            or isinstance(self.size_bytes, bool)
+            or not isinstance(self.size_bytes, int)
+            or self.size_bytes <= 0
+            or not isinstance(self.state, _FileState)
+            or self.state.size != self.size_bytes
+        ):
+            raise ValueError("source fingerprint is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,7 +114,12 @@ class ObjectIdentity:
 
 class ImmutableObjectStore(Protocol):
     def put_if_absent(
-        self, source: Path, uri: str, *, sha256: str
+        self,
+        source: Path,
+        uri: str,
+        *,
+        sha256: str,
+        source_fingerprint: SourceFingerprint | None = None,
     ) -> ObjectIdentity: ...
 
     def download(self, identity: ObjectIdentity, destination: Path) -> None: ...
@@ -105,9 +139,9 @@ def sha256_file(path: Path, chunk_bytes: int = 8 << 20) -> tuple[str, int]:
     return digest.hexdigest(), size
 
 
-def _sha256_crc32c_file(
+def fingerprint_file(
     path: Path, chunk_bytes: int = 8 << 20
-) -> tuple[str, str, int, _FileState]:
+) -> SourceFingerprint:
     """Hash one stable source pass with SHA-256 and whole-file CRC32C."""
 
     try:
@@ -130,7 +164,54 @@ def _sha256_crc32c_file(
     if before != after or after != current or size != current.size or size <= 0:
         raise ObjectStoreError("local upload source changed while it was hashed")
     encoded_crc32c = base64.b64encode(crc32c.digest()).decode("ascii")
-    return sha256.hexdigest(), encoded_crc32c, size, current
+    return SourceFingerprint(
+        sha256=sha256.hexdigest(),
+        crc32c=encoded_crc32c,
+        size_bytes=size,
+        state=current,
+    )
+
+
+def _fingerprint_from_components(
+    path: Path,
+    *,
+    sha256: str,
+    crc32c: str,
+    size_bytes: int,
+) -> SourceFingerprint:
+    """Bind exclusive-writer digests to the file the producer finalized."""
+
+    try:
+        state = _file_state(path.stat())
+    except OSError as error:
+        raise ObjectStoreError("cannot stat fingerprinted upload source") from error
+    try:
+        fingerprint = SourceFingerprint(
+            sha256=sha256,
+            crc32c=crc32c,
+            size_bytes=size_bytes,
+            state=state,
+        )
+    except ValueError as error:
+        raise ObjectStoreError("producer supplied an invalid source fingerprint") from error
+    return fingerprint
+
+
+def _resolve_source_fingerprint(
+    source: Path,
+    claimed_sha256: str,
+    supplied: SourceFingerprint | None,
+) -> SourceFingerprint:
+    fingerprint = fingerprint_file(source) if supplied is None else supplied
+    if fingerprint.sha256 != claimed_sha256:
+        raise ObjectStoreError("local upload source does not match its claimed SHA-256")
+    try:
+        current = _file_state(source.stat())
+    except OSError as error:
+        raise ObjectStoreError("cannot stat fingerprinted upload source") from error
+    if current != fingerprint.state:
+        raise ObjectStoreError("local upload source changed after it was fingerprinted")
+    return fingerprint
 
 
 def parse_gcs_uri(uri: str) -> tuple[str, str]:
@@ -270,13 +351,21 @@ class GCSObjectStore:
         return ObjectIdentity(uri, generation, size, crc32c, expected_sha256)
 
     def put_if_absent(
-        self, source: Path, uri: str, *, sha256: str
+        self,
+        source: Path,
+        uri: str,
+        *,
+        sha256: str,
+        source_fingerprint: SourceFingerprint | None = None,
     ) -> ObjectIdentity:
         if not _SHA256.fullmatch(sha256):
             raise ValueError("sha256 must be lowercase 64-character hex")
-        actual_sha, crc32c, size, source_state = _sha256_crc32c_file(source)
-        if actual_sha != sha256 or size <= 0:
-            raise ObjectStoreError("local upload source does not match its claimed SHA-256")
+        fingerprint = _resolve_source_fingerprint(
+            source, sha256, source_fingerprint
+        )
+        crc32c = fingerprint.crc32c
+        size = fingerprint.size_bytes
+        source_state = fingerprint.state
         blob = self._blob(uri)
         # Resume avoids retransmitting a content-addressed object that already
         # has the exact expected metadata and size.
@@ -320,6 +409,8 @@ class GCSObjectStore:
                 raise ObjectStoreError(f"cannot publish immutable GCS object {uri}") from error
         else:
             identity = self._identity(blob, uri, sha256)
+        if _file_state(source.stat()) != source_state:
+            raise ObjectStoreError("local upload source changed during transfer")
         if identity.size_bytes != size or identity.crc32c != crc32c:
             raise ObjectStoreError(
                 f"GCS object content identity differs after upload: {uri}"
@@ -647,11 +738,17 @@ class LocalObjectStore:
         return path
 
     def put_if_absent(
-        self, source: Path, uri: str, *, sha256: str
+        self,
+        source: Path,
+        uri: str,
+        *,
+        sha256: str,
+        source_fingerprint: SourceFingerprint | None = None,
     ) -> ObjectIdentity:
-        actual, size = sha256_file(source)
-        if actual != sha256 or size <= 0:
-            raise ObjectStoreError("local object source hash mismatch")
+        fingerprint = _resolve_source_fingerprint(
+            source, sha256, source_fingerprint
+        )
+        size = fingerprint.size_bytes
         path = self._path(uri)
         path.parent.mkdir(parents=True, exist_ok=True)
         if not path.exists():
@@ -675,6 +772,8 @@ class LocalObjectStore:
                     _fsync_directory(path.parent)
             finally:
                 temporary.unlink(missing_ok=True)
+        if _file_state(source.stat()) != fingerprint.state:
+            raise ObjectStoreError("local object source changed during transfer")
         existing, existing_size = sha256_file(path)
         if (existing, existing_size) != (sha256, size):
             raise ObjectStoreError(f"immutable local object collision: {uri}")
@@ -818,6 +917,8 @@ __all__ = [
     "ObjectIdentity",
     "ObjectStoreError",
     "ShardCache",
+    "SourceFingerprint",
+    "fingerprint_file",
     "join_gcs_uri",
     "object_identity_from_mapping",
     "parse_gcs_uri",

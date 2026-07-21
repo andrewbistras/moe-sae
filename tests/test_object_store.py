@@ -11,6 +11,7 @@ import uuid
 import google_crc32c
 import pytest
 import moe_sae._gcs_transfer as gcs_transfer_module
+import moe_sae.object_store as object_store_module
 
 from moe_sae.object_store import (
     GCSObjectStore,
@@ -18,6 +19,7 @@ from moe_sae.object_store import (
     ObjectIdentity,
     ObjectStoreError,
     ShardCache,
+    fingerprint_file,
     join_gcs_uri,
     object_identity_from_mapping,
     parse_gcs_uri,
@@ -222,6 +224,52 @@ def test_gcs_store_uses_preconditions_checksums_and_pinned_reads(
     store.verify(identity)
     store.delete(identity)
     assert ("delete", {"if_generation_match": 41}) in client.calls
+
+
+def test_precomputed_source_fingerprint_skips_rehash_and_is_state_bound(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "source.bin"
+    digest = _write(source, b"preverified immutable payload")
+    fingerprint = fingerprint_file(source)
+    client = _FakeClient()
+    transfer_manager = _FakeTransferManager(client.calls)
+    store = GCSObjectStore(
+        client,
+        parallel_upload_threshold_bytes=1,
+        transfer_manager_module=transfer_manager,
+    )
+    uri = f"gs://bucket/capture/{digest}.bin"
+
+    def unexpected_rehash(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("fingerprinted source was redundantly rehashed")
+
+    monkeypatch.setattr(object_store_module, "fingerprint_file", unexpected_rehash)
+    identity = store.put_if_absent(
+        source,
+        uri,
+        sha256=digest,
+        source_fingerprint=fingerprint,
+    )
+    assert identity.sha256 == digest
+    assert any(call[0] == "multipart" for call in client.calls)
+
+    changed = tmp_path / "changed.bin"
+    changed.write_bytes(b"first")
+    stale = object_store_module._fingerprint_from_components(
+        changed,
+        sha256=hashlib.sha256(b"first").hexdigest(),
+        crc32c=_crc32c(b"first"),
+        size_bytes=5,
+    )
+    changed.write_bytes(b"other")
+    with pytest.raises(ObjectStoreError, match="changed after it was fingerprinted"):
+        store.put_if_absent(
+            changed,
+            "gs://bucket/capture/changed.bin",
+            sha256=stale.sha256,
+            source_fingerprint=stale,
+        )
 
 
 def test_gcs_large_upload_multipart_commits_conditionally_and_cleans_temp(

@@ -55,6 +55,7 @@ from moe_sae.object_store import (
     ImmutableObjectStore,
     ObjectStoreError,
     ShardCache,
+    fingerprint_file,
     join_gcs_uri,
     object_identity_from_mapping,
     parse_gcs_uri,
@@ -1266,7 +1267,8 @@ class ArtifactWriter:
             )
             with tmp.open("rb") as handle:
                 os.fsync(handle.fileno())
-            digest = _sha256_file(tmp)
+            source_fingerprint = fingerprint_file(tmp)
+            digest = source_fingerprint.sha256
             relative = Path("shards") / f"host-{self.host_id}" / f"{digest}.safetensors"
             destination = self.root / relative
             entry = {
@@ -1288,7 +1290,10 @@ class ArtifactWriter:
                     f"{digest}.safetensors",
                 )
                 entry["object"] = self.object_store.put_if_absent(
-                    tmp, uri, sha256=digest
+                    tmp,
+                    uri,
+                    sha256=digest,
+                    source_fingerprint=source_fingerprint,
                 ).as_dict()
                 receipt: dict[str, Any] = {
                     "schema_version": "gemma4-capture-upload-receipt-v1",
