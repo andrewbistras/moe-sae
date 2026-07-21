@@ -990,12 +990,16 @@ may create a local SSH key and may update authorized-key or OS Login metadata.
 Read all four sections. They must agree on the service-account email, numeric
 user ID/group ID, and an existing local `ext4` or `xfs` filesystem layout. Pick
 one absolute directory path beneath a private local filesystem which has at
-least `137438953472` free bytes (128 GiB) on **every** worker. Do not assume
-`/mnt/localssd` exists merely because that name appears in an example.
+least `25769803776` free bytes (24 GiB) on **every** worker. This is the
+activation-capture requirement: two simultaneous 8 GiB qualification files
+plus an 8 GiB reserve for the rolling safetensor buffer and runtime overhead.
+Do not assume `/mnt/localssd` exists merely because that name appears in an
+example.
 
 For example, use `$HOME/moe-sae-local` only if `/home` is on a local `ext4` or
-`xfs` device and every worker shows at least 128 GiB free there. If no existing
-private filesystem passes, stop. The helpers intentionally will not improvise
+`xfs` device and every worker shows at least 24 GiB free there. The fixed
+100 GiB TPU boot disk is acceptable when it passes this post-install check.
+If no existing private filesystem passes, stop. The helpers intentionally will not improvise
 by formatting a device; provision suitable per-worker storage with the TRC
 administrator and inspect again.
 
@@ -1128,7 +1132,7 @@ These locations have separate jobs:
   identities, receipts, ledgers, sealed manifests, and timing records. It must
   not contain activation or Orbax payloads.
 - `LOCAL_BUFFER_ROOT` is private scratch on each controller for bounded capture
-  writes and the verified capture cache.
+  writes. The later SAE capture cache is deliberately not qualified yet.
 - `BULK_GCS_ROOT` is the immutable bulk plane for staged data and activations.
 - `SAE_CHECKPOINT_ROOT` is the immutable Orbax payload plane for later SAE
   training.
@@ -1154,7 +1158,7 @@ same collective command on all four.
 
 - [ ] All four inventory sections were inspected before scratch was selected.
 - [ ] The same service account and numeric user identity appear on all workers.
-- [ ] Every selected local filesystem has at least 128 GiB free.
+- [ ] Every selected local filesystem has at least 24 GiB free after bootstrap.
 - [ ] The deployer finished successfully on all four controllers.
 - [ ] Every checkout is clean and at the same full `PROJECT_COMMIT`.
 - [ ] NFS is mounted directly at the production artifact root on all four.
@@ -1177,7 +1181,7 @@ tpu_all "cd '$TPU_PROJECT_ROOT' && \
 This is equivalent to an explicit `gcloud compute tpus tpu-vm ssh ...
 --worker=all --command=...`; the helper does not run locally or only on worker
 0. Production thresholds are pinned: at least 10 GB free on the shared control
-volume, 128 GiB on each local buffer, an incompressible 8 GiB GCS probe per
+volume, 24 GiB on each activation buffer, an incompressible 8 GiB GCS probe per
 process in 8 MiB blocks, and at least 4 GB/s aggregate for both upload and
 generation-pinned download.
 
@@ -1192,7 +1196,9 @@ cross-process restored-shard digest checks.
 Only after every check passes does the coordinator atomically write the
 self-hashed `$ARTIFACT_ROOT/preflight/storage.json`. Every later production
 command rejects a changed config, environment, topology, control path, local
-layout, GCS root, cache limit, checkpoint root, or Orbax proof.
+layout, GCS root, checkpoint root, or Orbax proof. This record is explicitly
+scoped to `activation-capture`; it does not claim that the 100 GiB SAE cache is
+available.
 
 `qualify-storage --local` is only a single-process smoke test. It cannot
 authorize production.
@@ -1444,6 +1450,20 @@ the control records you need and after deciding you will not resume on this
 artifact root.
 
 ## Stage 8 — train without quality peeking
+
+**Stop here with the current operator stack.** The immutable
+`preflight/storage.json` produced in Stage 4 is scoped to activation capture.
+`train`, `eval`, `report`, and the full `run` command intentionally reject it:
+the 100 GiB configured capture cache was not proven on the fixed 100 GiB TPU
+boot disks. Do not overwrite `preflight/storage.json`; its hash is already
+bound into every activation shard and campaign record.
+
+Before Stage 8 can be authorized, implement and test either a bounded streaming
+cache or a separate SAE-cache qualification. Publish that qualification at a
+new immutable path and make SAE consumers require both records. This follow-up
+must preserve the activation attestation and capture identities. The commands
+below are the intended scientific sequence **after** that separate gate exists;
+they are not runnable under the activation-only attestation.
 
 Train seed 1 for A, B, and F to the 5M health boundary without comparing
 relative quality:

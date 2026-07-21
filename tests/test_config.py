@@ -90,7 +90,12 @@ def test_small_scale_configuration_remains_possible():
 
 
 def test_default_configuration_is_the_exact_authoritative_contract():
-    Gemma4Config().validate_production()
+    config = Gemma4Config()
+    config.validate_production()
+    assert (
+        config.config_hash
+        == "337e5e127c106772ba3606e640d51e6309fd4ddc5c96647e0455bfacc548bd95"
+    )
 
 
 def test_unknown_keys_are_rejected(tmp_path):

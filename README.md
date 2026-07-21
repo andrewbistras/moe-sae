@@ -154,8 +154,8 @@ uv run --extra tpu moe-sae qualify-storage \
   --sae-checkpoint-root "$SAE_CHECKPOINT_ROOT"
 ```
 
-The production thresholds are pinned by the configuration and cannot be
-overridden: at least 10GB free on the control volume, 128GiB per local buffer,
+The activation-capture thresholds are pinned and cannot be overridden: at
+least 10GB free on the control volume, 24GiB per local rolling buffer,
 an incompressible 8GiB GCS probe per process, and at least 4GB/s aggregate for
 both generation-pinned upload and download. Qualification also proves
 that equal local-buffer paths resolve to process-private storage, cross-process
@@ -163,8 +163,10 @@ that equal local-buffer paths resolve to process-private storage, cross-process
 fsync, end-to-end object hashes, and exact-generation cleanup. It then performs
 a tiny collective Orbax save, finalization check, and
 fresh-checkpointer restore at the exact checkpoint prefix; that immutable probe
-and its timings are sealed into the self-hashed `preflight/storage.json`.
-Later benchmark, harvest, train, eval, report, and `run` commands reject a
+and its timings are sealed into the self-hashed, `activation-capture`-scoped
+`preflight/storage.json`. Benchmark and harvest accept that scope. Train, eval,
+report, and the full `run` command reject it until a separate immutable SAE
+cache qualification or streaming-cache design is implemented. All commands reject a
 different config, environment, topology, path layout, Orbax proof, or storage
 attestation.
 

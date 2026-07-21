@@ -11,7 +11,9 @@ import pytest
 import moe_sae.storage as storage_module
 from moe_sae.object_store import LocalObjectStore
 from moe_sae.storage import (
+    ACTIVATION_CAPTURE_SCOPE,
     CoordinationHooks,
+    MINIMUM_ACTIVATION_LOCAL_FREE_BYTES,
     StoragePlanesQualificationConfig,
     StorageQualificationError,
     build_storage_attestation,
@@ -284,7 +286,9 @@ def test_gcs_throughput_thresholds_are_hard_gates(tmp_path: Path) -> None:
     assert any("GCS download throughput below threshold" in item for item in result.failures)
 
 
-def test_v3_attestation_is_self_hashed_and_bound(tmp_path: Path) -> None:
+def test_v4_activation_attestation_is_self_hashed_scoped_and_bound(
+    tmp_path: Path,
+) -> None:
     config = StoragePlanesQualificationConfig(
         minimum_control_free_bytes=1,
         minimum_local_buffer_free_bytes=1,
@@ -318,8 +322,10 @@ def test_v3_attestation_is_self_hashed_and_bound(tmp_path: Path) -> None:
         expected_control_directory=control,
         expected_local_directories=[local],
         expected_object_prefix="gs://qualification-test/prefix/",
+        expected_scope=ACTIVATION_CAPTURE_SCOPE,
     )
     assert digest == payload["attestation_sha256"]
+    assert payload["scope"] == ACTIVATION_CAPTURE_SCOPE
     tampered = copy.deepcopy(payload)
     tampered["contract"]["gcs_probe_bytes_per_process"] += 1
     with pytest.raises(StorageQualificationError, match="self-hash mismatch"):
@@ -334,6 +340,53 @@ def test_v3_attestation_is_self_hashed_and_bound(tmp_path: Path) -> None:
     )
     with pytest.raises(StorageQualificationError, match="host-local buffer isolation"):
         validate_storage_attestation(isolation_tampered)
+
+    scope_tampered = copy.deepcopy(payload)
+    scope_tampered["scope"] = "sae-training"
+    scope_tampered["attestation_sha256"] = storage_module.storage_attestation_digest(
+        scope_tampered
+    )
+    with pytest.raises(StorageQualificationError, match="scope is incompatible"):
+        validate_storage_attestation(scope_tampered)
+
+
+@pytest.mark.parametrize(
+    ("free_bytes", "passes"),
+    [
+        (MINIMUM_ACTIVATION_LOCAL_FREE_BYTES, True),
+        (MINIMUM_ACTIVATION_LOCAL_FREE_BYTES - 1, False),
+    ],
+)
+def test_activation_local_capacity_boundary(
+    free_bytes: int,
+    passes: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    disk_usage = shutil._ntuple_diskusage(
+        total=MINIMUM_ACTIVATION_LOCAL_FREE_BYTES * 2,
+        used=0,
+        free=free_bytes,
+    )
+    monkeypatch.setattr(storage_module.shutil, "disk_usage", lambda _path: disk_usage)
+    config = StoragePlanesQualificationConfig(
+        minimum_control_free_bytes=1,
+        minimum_local_buffer_free_bytes=MINIMUM_ACTIVATION_LOCAL_FREE_BYTES,
+        gcs_probe_bytes_per_process=1,
+        gcs_probe_block_bytes=1,
+        minimum_aggregate_upload_bytes_per_second=0,
+        minimum_aggregate_download_bytes_per_second=0,
+    )
+
+    result = qualify_storage_planes(
+        tmp_path / "control",
+        tmp_path / "local",
+        "gs://qualification-test/prefix",
+        LocalObjectStore(tmp_path / "objects"),
+        config=config,
+    )
+
+    assert result.passed is passes
 
 
 @pytest.mark.parametrize(

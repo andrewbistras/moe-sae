@@ -26,6 +26,7 @@ import numpy as np
 
 from moe_sae.artifacts import (
     MANIFEST_NAME,
+    MAX_SHARD_TOKENS,
     ArtifactDataset,
     ArtifactWriter,
     CaptureMetadata,
@@ -51,7 +52,6 @@ from moe_sae.runtime import (
     create_maxtext_runtime,
     estimate_useful_prefix_flops,
     environment_fingerprint,
-    immutable_range_id,
     maxtext_mesh_context,
     scientific_token_mask,
     token_quota,
@@ -61,9 +61,9 @@ from moe_sae.runtime import (
 EXCLUDED_TOKEN_IDS = (0, 1, 2)
 DEFAULT_SEQUENCE_LENGTH = 1_024
 DEFAULT_CANARY_TOKENS = 2_000_000
-_PART_RE = re.compile(
-    r"^(?P<split>train|eval)-p(?P<process>\d{5})-b(?P<batch>\d{12})"
-    r"-o(?P<offset>\d{9})-n(?P<count>\d{9})$"
+_SHARD_RANGE_RE = re.compile(
+    r"^(?P<split>train|eval)-p(?P<process>\d{5})-r(?P<start>\d{12})"
+    r"-n(?P<count>\d{9})$"
 )
 
 
@@ -593,6 +593,83 @@ _JOURNAL_COUNTERS = (
     "batches_executed",
     "executed_scientific_tokens",
 )
+_PHASE_JOURNAL_SCHEMA = "gemma4-harvest-phase-journal-v2"
+
+
+class _CaptureShardAccumulator:
+    """Own at most one in-memory shard while batches continue to execute.
+
+    Buffers are transferred, never reused, when a shard is taken.  The writer
+    thread may therefore own one completed shard while this object fills the
+    next one without either aliasing or an unbounded queue.
+    """
+
+    def __init__(self, max_tokens: int) -> None:
+        if not 0 < max_tokens <= MAX_SHARD_TOKENS:
+            raise ValueError(
+                f"shard_tokens must lie in [1,{MAX_SHARD_TOKENS}]"
+            )
+        self.max_tokens = int(max_tokens)
+        self._start: int | None = None
+        self._rows = 0
+        self._buffers: CaptureBatch | None = None
+
+    @property
+    def rows(self) -> int:
+        return self._rows
+
+    @property
+    def full(self) -> bool:
+        return self._rows == self.max_tokens
+
+    def append(self, batch: CaptureBatch, *, offset: int, start: int) -> int:
+        arrays = tuple(np.asarray(field) for field in batch)
+        rows = int(arrays[0].shape[0])
+        if any(array.ndim < 1 or int(array.shape[0]) != rows for array in arrays):
+            raise HarvestError("capture fields do not share a common row axis")
+        if not 0 <= offset < rows:
+            raise HarvestError("capture accumulator offset is outside the batch")
+        if self.full:
+            raise HarvestError("cannot append to a full capture accumulator")
+        expected_start = start + offset
+        if self._start is None:
+            self._start = expected_start
+            self._buffers = CaptureBatch(
+                *(
+                    np.empty((self.max_tokens, *array.shape[1:]), dtype=array.dtype)
+                    for array in arrays
+                )
+            )
+        elif self._start + self._rows != expected_start:
+            raise HarvestError(
+                "capture accumulator received a non-contiguous token range"
+            )
+        assert self._buffers is not None
+        count = min(rows - offset, self.max_tokens - self._rows)
+        for destination, source in zip(self._buffers, arrays, strict=True):
+            if (
+                destination.shape[1:] != source.shape[1:]
+                or destination.dtype != source.dtype
+            ):
+                raise HarvestError(
+                    "capture field shape or dtype changed between batches"
+                )
+            destination[self._rows : self._rows + count] = source[
+                offset : offset + count
+            ]
+        self._rows += count
+        return count
+
+    def take(self) -> tuple[int, int, CaptureBatch]:
+        if self._start is None or self._buffers is None or self._rows <= 0:
+            raise HarvestError("cannot take an empty capture accumulator")
+        start = self._start
+        rows = self._rows
+        batch = CaptureBatch(*(field[:rows] for field in self._buffers))
+        self._start = None
+        self._rows = 0
+        self._buffers = None
+        return start, start + rows, batch
 
 
 class _PhaseTelemetryJournal:
@@ -632,7 +709,7 @@ class _PhaseTelemetryJournal:
         if self.path.exists():
             state = _read_json_mapping(self.path)
             expected = {
-                "schema_version": "gemma4-harvest-phase-journal-v1",
+                "schema_version": _PHASE_JOURNAL_SCHEMA,
                 "identity_sha256": identity,
                 "split": split,
                 "stop_after_tokens": stop_after_tokens,
@@ -649,7 +726,7 @@ class _PhaseTelemetryJournal:
                     "refusing to invent performance counters"
                 )
             state = {
-                "schema_version": "gemma4-harvest-phase-journal-v1",
+                "schema_version": _PHASE_JOURNAL_SCHEMA,
                 "identity_sha256": identity,
                 "split": split,
                 "stop_after_tokens": stop_after_tokens,
@@ -669,10 +746,21 @@ class _PhaseTelemetryJournal:
         accounted = int(self.state["baseline_resumed_tokens"]) + int(
             self.state["durable_new_tokens"]
         )
-        if accounted != existing_tokens:
+        host_path = self.writer.root / "hosts" / f"host-{self.writer.host_id}.json"
+        reconciled_existing_tokens = (
+            sum(
+                int(entry["tokens"])
+                for entry in _read_host_manifest(
+                    self.writer.root, self.writer.host_id
+                ).get("shards", ())
+            )
+            if host_path.exists()
+            else 0
+        )
+        if accounted != reconciled_existing_tokens:
             raise HarvestError(
                 f"phase journal accounts for {accounted} durable tokens, "
-                f"host has {existing_tokens}"
+                f"host has {reconciled_existing_tokens}"
             )
         if attempt_compile_seconds < 0.0 or not math.isfinite(attempt_compile_seconds):
             raise ValueError("attempt_compile_seconds must be finite and nonnegative")
@@ -826,6 +914,7 @@ def _harvest_host_impl(
     process_index: int,
     stop_after_tokens: int | None = None,
     sequence_length: int = DEFAULT_SEQUENCE_LENGTH,
+    shard_tokens: int = MAX_SHARD_TOKENS,
     batch_collective: Callable[[bool, bool], tuple[bool, bool]] | None = None,
     baseline_resumed_tokens: int = 0,
     compile_seconds: float = 0.0,
@@ -866,11 +955,11 @@ def _harvest_host_impl(
         root,
         host_id,
         metadata,
+        max_tokens=shard_tokens,
         local_buffer_root=local_buffer_root,
         object_prefix=object_prefix,
         object_store=object_store,
     )
-    committed = _committed_parts(root, host_id, split, process_index)
     existing_manifest = (
         _read_host_manifest(root, host_id)
         if (root / "hosts" / f"host-{host_id}.json").exists()
@@ -890,6 +979,29 @@ def _harvest_host_impl(
         existing_tokens=existing_tokens,
         attempt_compile_seconds=compile_seconds,
     )
+    # Re-read after journal reconciliation: a crash may have left a durable
+    # object receipt which the journal just adopted into the host manifest.
+    existing_manifest = (
+        _read_host_manifest(root, host_id)
+        if (root / "hosts" / f"host-{host_id}.json").exists()
+        else {"shards": []}
+    )
+    existing_tokens = _validate_committed_shards(
+        existing_manifest.get("shards", ()),
+        split=split,
+        process_index=process_index,
+        expected_global_start=global_start,
+        max_tokens=shard_tokens,
+        allowed_partial_ends={
+            global_start + baseline_resumed_tokens,
+            global_start + quota,
+        },
+        writer=writer,
+    )
+    if existing_tokens > quota:
+        raise HarvestError(
+            f"durable host prefix {existing_tokens} exceeds phase quota {quota}"
+        )
     campaign_control.heartbeat(
         "running",
         progress={
@@ -961,7 +1073,28 @@ def _harvest_host_impl(
             "executed_scientific_tokens": executed_scientific_tokens,
         }
 
+    accumulator = _CaptureShardAccumulator(shard_tokens)
     with BoundedArtifactSink(journal.write_range, max_pending=1) as sink:
+        def submit_accumulator() -> None:
+            range_start, range_end, capture = accumulator.take()
+            range_id = _capture_range_id(
+                split,
+                process_index,
+                range_start,
+                range_end - range_start,
+            )
+            if writer.has_range(range_id, range_start, range_end):
+                raise HarvestError(
+                    "new coalesced shard unexpectedly appeared after resume validation"
+                )
+            sink.submit(
+                range_id,
+                range_start,
+                range_end,
+                capture,
+                telemetry_snapshot(),
+            )
+
         for batch_index in range(2**32):
             local_complete = local_tokens >= quota
             if local_complete and batch_collective is None:
@@ -1018,19 +1151,11 @@ def _harvest_host_impl(
             )
             valid_indices = np.flatnonzero(mask.reshape(-1))
             valid_count = int(valid_indices.size)
-            if valid_count == 0 and committed.get(batch_index):
-                raise HarvestError(
-                    f"batch {batch_index} became empty after it was committed"
-                )
 
             desired = 0 if local_complete else min(valid_count, quota - local_tokens)
-            parts = committed.get(batch_index, ())
-            existing = _validate_committed_prefix(
-                parts,
-                batch_index=batch_index,
-                expected_global_start=global_start + local_tokens,
-                valid_count=valid_count,
-                writer=writer,
+            existing = min(
+                desired,
+                max(existing_tokens - local_tokens, 0),
             )
             needs_execution = existing < desired
             local_complete_after_batch = (
@@ -1089,25 +1214,15 @@ def _harvest_host_impl(
                     sequence_length=sequence_length,
                 )
                 range_start = global_start + local_tokens + existing
-                range_end = range_start + addition
-                range_id = _part_range_id(
-                    split,
-                    process_index,
-                    batch_index,
-                    existing,
-                    addition,
-                )
-                if writer.has_range(range_id, range_start, range_end):
-                    raise HarvestError(
-                        "new suffix unexpectedly appeared after resume validation"
+                appended = 0
+                while appended < addition:
+                    appended += accumulator.append(
+                        compacted,
+                        offset=appended,
+                        start=range_start,
                     )
-                sink.submit(
-                    range_id,
-                    range_start,
-                    range_end,
-                    compacted,
-                    telemetry_snapshot(),
-                )
+                    if accumulator.full:
+                        submit_accumulator()
 
             local_tokens += desired
             journal.checkpoint(telemetry_snapshot())
@@ -1125,6 +1240,11 @@ def _harvest_host_impl(
                 },
             )
             if all_complete:
+                # Canary and production are immutable phases.  Their exact
+                # final partial shard is durable before any host finalizes;
+                # production starts a fresh accumulator after the canary.
+                if accumulator.rows:
+                    submit_accumulator()
                 break
 
     _check_campaign_abort(campaign_control, abort_collective)
@@ -1208,6 +1328,7 @@ def harvest_host(
     process_index: int,
     stop_after_tokens: int | None = None,
     sequence_length: int = DEFAULT_SEQUENCE_LENGTH,
+    shard_tokens: int = MAX_SHARD_TOKENS,
     batch_collective: Callable[[bool, bool], tuple[bool, bool]] | None = None,
     abort_collective: Callable[[bool], bool] | None = None,
     baseline_resumed_tokens: int = 0,
@@ -1252,6 +1373,7 @@ def harvest_host(
             process_index=process_index,
             stop_after_tokens=stop_after_tokens,
             sequence_length=sequence_length,
+            shard_tokens=shard_tokens,
             batch_collective=batch_collective,
             baseline_resumed_tokens=baseline_resumed_tokens,
             compile_seconds=compile_seconds,
@@ -1421,6 +1543,7 @@ def run_harvest(
     process_index: int,
     stop_after_tokens: int | None = None,
     sequence_length: int = DEFAULT_SEQUENCE_LENGTH,
+    shard_tokens: int = MAX_SHARD_TOKENS,
     barrier: Callable[[str], None] | None = None,
     batch_collective: Callable[[bool, bool], tuple[bool, bool]] | None = None,
     abort_collective: Callable[[bool], bool] | None = None,
@@ -1449,6 +1572,7 @@ def run_harvest(
         process_index=process_index,
         stop_after_tokens=stop,
         sequence_length=sequence_length,
+        shard_tokens=shard_tokens,
         batch_collective=batch_collective,
         abort_collective=abort_collective,
         baseline_resumed_tokens=baseline_resumed_tokens,
@@ -1878,6 +2002,7 @@ def run_production_harvest(
             process_index=process_index,
             stop_after_tokens=stop,
             sequence_length=config.sequence_length,
+            shard_tokens=config.shard_tokens,
             barrier=multihost_barrier if process_count > 1 else None,
             batch_collective=(_jax_batch_collective if process_count > 1 else None),
             abort_collective=(_jax_abort_collective if process_count > 1 else None),
@@ -3074,31 +3199,46 @@ def _validate_campaign(
         raise ValueError("stop_after_tokens must lie in (0, total_tokens]")
 
 
-def _part_range_id(
+def _capture_range_id(
     split: str,
     process_index: int,
-    batch_index: int,
-    offset: int,
+    start: int,
     count: int,
 ) -> str:
-    if offset < 0 or not 0 < count < 10**9:
-        raise ValueError("invalid within-batch range")
-    return f"{immutable_range_id(split, process_index, batch_index)}-o{offset:09d}-n{count:09d}"
+    if split not in {"train", "eval"} or not 0 <= process_index < 10**5:
+        raise ValueError("invalid capture range owner")
+    if not 0 <= start < 10**12 or not 0 < count < 10**9:
+        raise ValueError("invalid capture token range")
+    return f"{split}-p{process_index:05d}-r{start:012d}-n{count:09d}"
 
 
-def _committed_parts(
-    root: Path,
-    host_id: str,
+def _validate_committed_shards(
+    entries: Sequence[Mapping[str, Any]],
+    *,
     split: str,
     process_index: int,
-) -> dict[int, tuple[dict[str, Any], ...]]:
-    path = root / "hosts" / f"host-{host_id}.json"
-    if not path.exists():
-        return {}
-    manifest = _read_host_manifest(root, host_id)
-    grouped: dict[int, list[dict[str, Any]]] = {}
-    for entry in manifest.get("shards", ()):
-        match = _PART_RE.fullmatch(str(entry.get("range_id", "")))
+    expected_global_start: int,
+    max_tokens: int,
+    allowed_partial_ends: set[int],
+    writer: ArtifactWriter,
+) -> int:
+    """Validate and return the one durable token prefix for this host.
+
+    Fixed token-range identities decouple shard boundaries from model batches.
+    A partial shard is legal only at a known immutable phase boundary (canary
+    or the current exact quota), preventing accidental crash-time fragments.
+    """
+
+    next_start = expected_global_start
+    ordered = sorted(
+        entries,
+        key=lambda entry: (
+            int(entry.get("range_start", -1)),
+            str(entry.get("range_id", "")),
+        ),
+    )
+    for entry in ordered:
+        match = _SHARD_RANGE_RE.fullmatch(str(entry.get("range_id", "")))
         if match is None:
             raise HarvestError(
                 f"host manifest contains an unsupported range ID: {entry.get('range_id')!r}"
@@ -3107,14 +3247,27 @@ def _committed_parts(
             raise HarvestError(
                 "host manifest range identity does not match this process/split"
             )
-        copied = dict(entry)
-        copied["part_offset"] = int(match["offset"])
-        copied["part_count"] = int(match["count"])
-        grouped.setdefault(int(match["batch"]), []).append(copied)
-    return {
-        batch_index: tuple(sorted(parts, key=lambda entry: entry["part_offset"]))
-        for batch_index, parts in grouped.items()
-    }
+        start = int(entry.get("range_start", -1))
+        end = int(entry.get("range_end", -1))
+        count = end - start
+        if (
+            start != next_start
+            or int(match["start"]) != start
+            or int(match["count"]) != count
+            or int(entry.get("tokens", -1)) != count
+            or not 0 < count <= max_tokens
+        ):
+            raise HarvestError(
+                "host manifest is not one canonical contiguous shard prefix"
+            )
+        if count < max_tokens and end not in allowed_partial_ends:
+            raise HarvestError(
+                f"partial shard ending at {end} is not a phase boundary"
+            )
+        if not writer.has_range(str(entry["range_id"]), start, end):
+            raise HarvestError("committed capture shard disappeared during resume")
+        next_start = end
+    return next_start - expected_global_start
 
 
 def _read_host_manifest(root: Path, host_id: str) -> dict[str, Any]:
@@ -3126,45 +3279,6 @@ def _read_host_manifest(root: Path, host_id: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise HarvestError(f"host manifest must be an object: {path}")
     return value
-
-
-def _validate_committed_prefix(
-    parts: Sequence[Mapping[str, Any]],
-    *,
-    batch_index: int,
-    expected_global_start: int,
-    valid_count: int,
-    writer: ArtifactWriter,
-) -> int:
-    offset = 0
-    for entry in parts:
-        part_offset = int(entry["part_offset"])
-        part_count = int(entry["part_count"])
-        if part_offset != offset or part_count <= 0:
-            raise HarvestError(
-                f"committed parts for batch {batch_index} are not a contiguous prefix"
-            )
-        if int(entry.get("tokens", -1)) != part_count:
-            raise HarvestError(
-                f"committed batch {batch_index} part token count changed"
-            )
-        start = expected_global_start + part_offset
-        end = start + part_count
-        if (
-            int(entry.get("range_start", -1)) != start
-            or int(entry.get("range_end", -1)) != end
-        ):
-            raise HarvestError(f"committed batch {batch_index} global range changed")
-        if not writer.has_range(str(entry["range_id"]), start, end):
-            raise HarvestError(
-                f"committed batch {batch_index} disappeared during resume"
-            )
-        offset += part_count
-    if offset > valid_count:
-        raise HarvestError(
-            f"batch {batch_index} now has {valid_count} valid tokens but {offset} were committed"
-        )
-    return offset
 
 
 def _compact_adapter_output(

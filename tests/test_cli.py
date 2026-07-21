@@ -112,7 +112,6 @@ def test_storage_roots_and_orbax_probe_are_fail_closed():
         cli_module._validate_gcs_storage_roots(
             "gs://bucket/experiment", "gs://bucket/other"
         )
-
     run_id = "qualification-run"
     digest = "a" * 64
     record = {
@@ -149,6 +148,18 @@ def test_storage_roots_and_orbax_probe_are_fail_closed():
             process_count=1,
             global_device_count=16,
         )
+
+
+def test_activation_storage_attestation_cannot_authorize_sae_consumers() -> None:
+    payload = {
+        "scope": "activation-capture",
+        "metadata": {
+            "sae_cache_qualified": False,
+            "configured_sae_capture_cache_max_bytes": 100 * 1024**3,
+        },
+    }
+    with pytest.raises(RuntimeError, match="activation-capture only"):
+        cli_module._require_sae_cache_qualification(payload)
 
 
 def test_checkpoint_claim_is_verified_against_actual_inventory(tmp_path):
@@ -1016,6 +1027,14 @@ def _selected_benchmark(config):
     }
 
 
+def _sae_storage_attestation() -> dict:
+    return {
+        "attestation_sha256": "8" * 64,
+        "scope": "sae-training",
+        "metadata": {"sae_cache_qualified": True},
+    }
+
+
 def test_run_fresh_state_orders_canary_health_production_and_eval(
     tmp_path, monkeypatch
 ):
@@ -1052,7 +1071,12 @@ def test_run_fresh_state_orders_canary_health_production_and_eval(
     monkeypatch.setattr(
         cli_module,
         "_load_storage_attestation_payload",
-        lambda *args, **kwargs: {"attestation_sha256": "8" * 64},
+        lambda *args, **kwargs: _sae_storage_attestation(),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_read_storage_attestation_payload",
+        lambda *args, **kwargs: _sae_storage_attestation(),
     )
     monkeypatch.setattr(
         cli_module,
@@ -1177,7 +1201,12 @@ def test_run_resume_skips_every_matching_sealed_stage(tmp_path, monkeypatch):
     monkeypatch.setattr(
         cli_module,
         "_load_storage_attestation_payload",
-        lambda *args, **kwargs: {"attestation_sha256": "8" * 64},
+        lambda *args, **kwargs: _sae_storage_attestation(),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_read_storage_attestation_payload",
+        lambda *args, **kwargs: _sae_storage_attestation(),
     )
     monkeypatch.setattr(
         cli_module,

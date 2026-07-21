@@ -84,6 +84,14 @@ def test_run_launches_missing_benchmark_before_tpu_preflight(tmp_path, monkeypat
     monkeypatch.setattr(cli, "_require_production_artifact_root", lambda root: None)
     monkeypatch.setattr(
         cli,
+        "_read_storage_attestation_payload",
+        lambda root: {
+            "scope": "sae-training",
+            "metadata": {"sae_cache_qualified": True},
+        },
+    )
+    monkeypatch.setattr(
+        cli,
         "_command_benchmark_harvest",
         lambda args: events.append("benchmark") or 0,
     )
@@ -96,6 +104,30 @@ def test_run_launches_missing_benchmark_before_tpu_preflight(tmp_path, monkeypat
     with pytest.raises(RuntimeError, match="ordering assertion"):
         cli._command_run(args)
     assert events == ["benchmark", "preflight"]
+
+
+def test_run_rejects_activation_scope_before_benchmark(tmp_path, monkeypatch):
+    args = _args(tmp_path)
+    config = Gemma4Config()
+    monkeypatch.setattr(cli, "_config", lambda args: config)
+    monkeypatch.setattr(cli, "_artifact_root", lambda config, override: tmp_path)
+    monkeypatch.setattr(cli, "_require_production_artifact_root", lambda root: None)
+    monkeypatch.setattr(
+        cli,
+        "_read_storage_attestation_payload",
+        lambda root: {
+            "scope": "activation-capture",
+            "metadata": {"sae_cache_qualified": False},
+        },
+    )
+    monkeypatch.setattr(
+        cli,
+        "_command_benchmark_harvest",
+        lambda args: (_ for _ in ()).throw(AssertionError("benchmark launched")),
+    )
+
+    with pytest.raises(RuntimeError, match="activation-capture only"):
+        cli._command_run(args)
 
 
 def test_worker_timeout_terminates_the_fresh_process_group(monkeypatch):

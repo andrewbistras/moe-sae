@@ -34,8 +34,10 @@ from moe_sae.object_store import (
 )
 
 
-STORAGE_ATTESTATION_SCHEMA = "gemma4-storage-planes-qualification-v3"
+STORAGE_ATTESTATION_SCHEMA = "gemma4-storage-planes-qualification-v4"
 ORBAX_QUALIFICATION_SCHEMA = "gemma4-orbax-storage-qualification-v1"
+ACTIVATION_CAPTURE_SCOPE = "activation-capture"
+MINIMUM_ACTIVATION_LOCAL_FREE_BYTES = 24 * 1024**3
 DEFAULT_MINIMUM_CONTROL_FREE_BYTES = 10_000_000_000
 DEFAULT_MINIMUM_LOCAL_BUFFER_FREE_BYTES = 128 * 1024**3
 DEFAULT_GCS_PROBE_BYTES_PER_PROCESS = 8 * 1024**3
@@ -472,9 +474,15 @@ def build_storage_attestation(
     config_sha256: str,
     environment_sha256: str,
     global_device_count: int,
+    scope: str = ACTIVATION_CAPTURE_SCOPE,
     metadata: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build a canonical, self-hashed v3 production attestation."""
+    """Build a canonical, self-hashed production storage attestation.
+
+    The current production qualifier proves only the rolling local buffer used
+    while farming activations.  It deliberately does not authorize the much
+    larger local cache required by SAE training and evaluation.
+    """
 
     result.require_pass()
     for label, digest in (
@@ -489,8 +497,13 @@ def build_storage_attestation(
         or global_device_count <= 0
     ):
         raise ValueError("global_device_count must be a positive integer")
+    if scope != ACTIVATION_CAPTURE_SCOPE:
+        raise ValueError(
+            f"storage attestation scope must be {ACTIVATION_CAPTURE_SCOPE!r}"
+        )
     payload: dict[str, Any] = {
         "schema_version": STORAGE_ATTESTATION_SCHEMA,
+        "scope": scope,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "config_sha256": config_sha256,
         "environment_sha256": environment_sha256,
@@ -525,11 +538,17 @@ def validate_storage_attestation(
     expected_control_directory: str | os.PathLike[str] | None = None,
     expected_local_directories: Sequence[str | os.PathLike[str]] | None = None,
     expected_object_prefix: str | None = None,
+    expected_scope: str | None = None,
 ) -> str:
     """Validate the self-hash, pass state, and optional invocation bindings."""
 
     if payload.get("schema_version") != STORAGE_ATTESTATION_SCHEMA:
         raise StorageQualificationError("storage attestation schema is incompatible")
+    scope = payload.get("scope")
+    if scope != ACTIVATION_CAPTURE_SCOPE:
+        raise StorageQualificationError("storage attestation scope is incompatible")
+    if expected_scope is not None and scope != expected_scope:
+        raise StorageQualificationError("storage attestation scope mismatch")
     claimed = payload.get("attestation_sha256")
     if not isinstance(claimed, str) or not _SHA256_RE.fullmatch(claimed):
         raise StorageQualificationError("storage attestation has no valid self-hash")
@@ -1643,9 +1662,11 @@ def _error_suffix(errors: Sequence[str]) -> str:
 
 
 __all__ = [
+    "ACTIVATION_CAPTURE_SCOPE",
     "ControlPlaneQualification",
     "CoordinationHooks",
     "LocalBufferQualification",
+    "MINIMUM_ACTIVATION_LOCAL_FREE_BYTES",
     "ObjectPlaneQualification",
     "OrbaxCheckpointQualification",
     "ORBAX_QUALIFICATION_SCHEMA",

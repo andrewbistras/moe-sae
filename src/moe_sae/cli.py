@@ -65,6 +65,10 @@ from moe_sae.runtime import (
     require_v4_32_runtime,
     run_preflight,
 )
+from moe_sae.storage import (
+    ACTIVATION_CAPTURE_SCOPE,
+    MINIMUM_ACTIVATION_LOCAL_FREE_BYTES,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -237,7 +241,7 @@ def _validate_storage_attestation_payload(
     expected_contract = dataclasses.asdict(
         StoragePlanesQualificationConfig(
             minimum_control_free_bytes=config.min_control_free_bytes,
-            minimum_local_buffer_free_bytes=config.min_local_buffer_free_bytes,
+            minimum_local_buffer_free_bytes=MINIMUM_ACTIVATION_LOCAL_FREE_BYTES,
             gcs_probe_bytes_per_process=config.gcs_probe_bytes_per_process,
             gcs_probe_block_bytes=config.gcs_probe_block_bytes,
             minimum_aggregate_upload_bytes_per_second=(
@@ -267,12 +271,15 @@ def _validate_storage_attestation_payload(
     bulk_gcs_root = metadata.get("bulk_gcs_root")
     checkpoint_root = metadata.get("sae_checkpoint_root")
     if (
-        not isinstance(control, Mapping)
+        payload.get("scope") != ACTIVATION_CAPTURE_SCOPE
+        or metadata.get("sae_cache_qualified") is not False
+        or metadata.get("configured_sae_capture_cache_max_bytes")
+        != config.capture_cache_max_bytes
+        or not isinstance(control, Mapping)
         or not isinstance(local, Mapping)
         or not isinstance(gcs, Mapping)
         or not isinstance(bulk_gcs_root, str)
         or not isinstance(checkpoint_root, str)
-        or metadata.get("capture_cache_max_bytes") != config.capture_cache_max_bytes
     ):
         raise RuntimeError("storage attestation deployment layout is incomplete")
     bulk_gcs_root, checkpoint_root = _validate_gcs_storage_roots(
@@ -305,9 +312,23 @@ def _validate_storage_attestation_payload(
             expected_control_directory=root,
             expected_local_directories=local_directories,
             expected_object_prefix=str(gcs.get("prefix", "")),
+            expected_scope=ACTIVATION_CAPTURE_SCOPE,
         )
     except RuntimeError as error:
         raise RuntimeError("storage attestation validation failed") from error
+
+
+def _read_storage_attestation_payload(root: Path) -> dict[str, Any]:
+    """Read the storage record without initializing a JAX backend."""
+
+    path = _storage_attestation_path(root)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"missing/invalid storage attestation: {path}") from error
+    if not isinstance(payload, dict):
+        raise RuntimeError("storage attestation must be an object")
+    return payload
 
 
 def _load_storage_attestation_payload(
@@ -318,13 +339,7 @@ def _load_storage_attestation_payload(
 ) -> dict[str, Any]:
     """Load and bind the sealed three-plane deployment record."""
 
-    path = _storage_attestation_path(root)
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise RuntimeError(f"missing/invalid storage attestation: {path}") from error
-    if not isinstance(payload, dict):
-        raise RuntimeError("storage attestation must be an object")
+    payload = _read_storage_attestation_payload(root)
     current_environment = dict(environment or _coordinated_environment())
     _, process_count = _process_context()
     try:
@@ -373,6 +388,22 @@ def _storage_layout(payload: Mapping[str, Any]) -> dict[str, Any]:
         "sae_checkpoint_root": str(metadata["sae_checkpoint_root"]).rstrip("/"),
         "attestation_sha256": str(payload["attestation_sha256"]),
     }
+
+
+def _require_sae_cache_qualification(payload: Mapping[str, Any]) -> None:
+    """Reject activation-only storage evidence on SAE consumer paths."""
+
+    metadata = payload.get("metadata")
+    if (
+        payload.get("scope") != "sae-training"
+        or not isinstance(metadata, Mapping)
+        or metadata.get("sae_cache_qualified") is not True
+    ):
+        raise RuntimeError(
+            "storage attestation is scoped to activation-capture only; "
+            "SAE training/evaluation requires a separate cache qualification "
+            "or streaming-cache redesign"
+        )
 
 
 def _load_conversion_attestation(
@@ -1100,6 +1131,8 @@ def _command_qualify_storage(args: argparse.Namespace) -> int:
 
     from moe_sae.object_store import GCSObjectStore, LocalObjectStore
     from moe_sae.storage import (
+        ACTIVATION_CAPTURE_SCOPE,
+        MINIMUM_ACTIVATION_LOCAL_FREE_BYTES,
         StoragePlanesQualificationConfig,
         build_storage_attestation,
         jax_coordination_hooks,
@@ -1151,7 +1184,7 @@ def _command_qualify_storage(args: argparse.Namespace) -> int:
         hooks = jax_coordination_hooks()
         qualification_config = StoragePlanesQualificationConfig(
             minimum_control_free_bytes=config.min_control_free_bytes,
-            minimum_local_buffer_free_bytes=config.min_local_buffer_free_bytes,
+            minimum_local_buffer_free_bytes=MINIMUM_ACTIVATION_LOCAL_FREE_BYTES,
             gcs_probe_bytes_per_process=config.gcs_probe_bytes_per_process,
             gcs_probe_block_bytes=config.gcs_probe_block_bytes,
             minimum_aggregate_upload_bytes_per_second=(
@@ -1191,10 +1224,12 @@ def _command_qualify_storage(args: argparse.Namespace) -> int:
         config_sha256=config.config_hash,
         environment_sha256=str(environment["sha256"]),
         global_device_count=global_device_count,
+        scope=ACTIVATION_CAPTURE_SCOPE,
         metadata={
             "bulk_gcs_root": bulk_gcs_root,
             "sae_checkpoint_root": sae_checkpoint_root,
-            "capture_cache_max_bytes": config.capture_cache_max_bytes,
+            "sae_cache_qualified": False,
+            "configured_sae_capture_cache_max_bytes": config.capture_cache_max_bytes,
             "orbax_checkpoint_qualification": dataclasses.asdict(
                 orbax_qualification
             ),
@@ -2146,6 +2181,7 @@ def _command_train(args: argparse.Namespace) -> int:
         storage_payload = _load_storage_attestation_payload(
             root, config, environment=current_environment
         )
+        _require_sae_cache_qualification(storage_payload)
         storage_layout = _storage_layout(storage_payload)
         storage_attestation_sha256 = str(storage_payload["attestation_sha256"])
         checkpoint_payload_root = str(storage_layout["sae_checkpoint_root"])
@@ -2410,6 +2446,7 @@ def _command_eval_one(
         storage_payload = _load_storage_attestation_payload(
             root, config, environment=current_environment
         )
+        _require_sae_cache_qualification(storage_payload)
         storage_layout = _storage_layout(storage_payload)
         storage_attestation_sha256 = str(storage_payload["attestation_sha256"])
         checkpoint_payload_root = str(storage_layout["sae_checkpoint_root"])
@@ -2932,6 +2969,7 @@ def _command_report(args: argparse.Namespace) -> int:
     storage_payload = _load_storage_attestation_payload(
         root, config, environment=current_environment
     )
+    _require_sae_cache_qualification(storage_payload)
     storage_layout = _storage_layout(storage_payload)
     storage_attestation_sha256 = str(storage_payload["attestation_sha256"])
     pairs = [
@@ -3352,6 +3390,10 @@ def _command_run(args: argparse.Namespace) -> int:
     config.validate_production()
     root = _artifact_root(config, args.artifact_root)
     _require_production_artifact_root(root)
+    # `run` includes SAE training and evaluation. Check its distinct storage
+    # capability before launching even the subprocess benchmark; operators who
+    # only qualified the 24 GiB rolling capture buffer must use activation-farm.
+    _require_sae_cache_qualification(_read_storage_attestation_payload(root))
     benchmark = root / "benchmark" / "selected.json"
     if not benchmark.exists():
         # The supervisor and all candidate processes must run before this
@@ -3389,6 +3431,7 @@ def _command_run(args: argparse.Namespace) -> int:
     storage_payload = _load_storage_attestation_payload(
         root, config, environment=current_environment
     )
+    _require_sae_cache_qualification(storage_payload)
     storage_layout = _storage_layout(storage_payload)
     storage_attestation_sha256 = str(storage_payload["attestation_sha256"])
     conversion_attestation_sha256 = _load_conversion_attestation(

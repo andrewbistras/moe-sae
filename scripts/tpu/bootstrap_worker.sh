@@ -11,7 +11,10 @@ IFS=$'\n\t'
 umask 077
 
 readonly MIN_CONTROL_FREE_BYTES=10000000000
-readonly MIN_LOCAL_FREE_BYTES=137438953472
+# Activation farming needs two simultaneous 8 GiB qualification probes plus
+# an 8 GiB reserve. SAE training's capture cache is a separate, unqualified
+# capability and is deliberately not authorized by this bootstrap.
+readonly MIN_LOCAL_FREE_BYTES=25769803776
 readonly METADATA_ROOT="http://metadata.google.internal/computeMetadata/v1"
 
 usage() {

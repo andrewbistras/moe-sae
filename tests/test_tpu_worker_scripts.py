@@ -60,3 +60,17 @@ def test_bootstrap_contains_no_disk_mutation_or_secret_inputs() -> None:
     assert "source \"$config_file\"" not in bootstrap
     assert "TOKEN" not in deploy
     assert "PASSWORD" not in deploy
+
+
+def test_bootstrap_gates_activation_capacity_before_and_after_dependencies() -> None:
+    bootstrap = (SCRIPT_ROOT / "bootstrap_worker.sh").read_text()
+    assert "readonly MIN_LOCAL_FREE_BYTES=25769803776" in bootstrap
+    assert "137438953472" not in bootstrap
+    main_body = bootstrap[bootstrap.index("main() {") :]
+    before = main_body.index("prepare_local_buffer")
+    install = main_body.index("install_python_environment", before)
+    after = main_body.index(
+        'require_free_bytes "$LOCAL_BUFFER_ROOT" "$MIN_LOCAL_FREE_BYTES"',
+        install,
+    )
+    assert before < install < after

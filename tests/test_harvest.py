@@ -377,6 +377,7 @@ def test_canary_prefix_resumes_full_batches_and_partial_boundary(tmp_path):
         process_count=1,
         process_index=0,
         sequence_length=4,
+        shard_tokens=2,
     )
     assert canary.new_tokens == 3
     assert canary.batches_executed == 2
@@ -392,6 +393,7 @@ def test_canary_prefix_resumes_full_batches_and_partial_boundary(tmp_path):
         process_count=1,
         process_index=0,
         sequence_length=4,
+        shard_tokens=2,
         baseline_resumed_tokens=3,
     )
     assert production.resumed_tokens == 3
@@ -402,8 +404,222 @@ def test_canary_prefix_resumes_full_batches_and_partial_boundary(tmp_path):
     publish_completed_capture(tmp_path, metadata(), process_count=1, total_tokens=6)
     manifest = load_manifest(tmp_path)
     assert manifest["total_tokens"] == 6
-    assert len(manifest["shards"]) == 3
-    assert [entry["range_start"] for entry in manifest["shards"]] == [0, 2, 3]
+    assert len(manifest["shards"]) == 4
+    assert [entry["range_start"] for entry in manifest["shards"]] == [0, 2, 3, 5]
+    assert [entry["tokens"] for entry in manifest["shards"]] == [2, 1, 2, 1]
+
+
+def test_harvest_coalesces_model_batches_into_canonical_bounded_shards(tmp_path):
+    batches = [
+        grain([[3, 4, 0, 0]], [[1, 1, 0, 0]]),
+        grain([[5, 6, 7, 0]], [[1, 1, 1, 0]]),
+        grain([[8, 9, 10, 11]], [[1, 1, 1, 1]]),
+    ]
+    result = harvest_host(
+        batches,
+        FakeStep(),
+        artifact_root=tmp_path,
+        metadata=metadata(),
+        split="train",
+        total_tokens=9,
+        process_count=1,
+        process_index=0,
+        sequence_length=4,
+        shard_tokens=5,
+    )
+    assert result.new_tokens == 9
+    assert result.max_writer_backlog == 1
+
+    host = json.loads(
+        (tmp_path / "hosts" / "host-p00000.json").read_text(encoding="utf-8")
+    )
+    assert [entry["tokens"] for entry in host["shards"]] == [5, 4]
+    assert [entry["range_id"] for entry in host["shards"]] == [
+        "train-p00000-r000000000000-n000000005",
+        "train-p00000-r000000000005-n000000004",
+    ]
+
+    publish_completed_capture(tmp_path, metadata(), process_count=1, total_tokens=9)
+    manifest = load_manifest(tmp_path)
+    expected = np.arange(3, 12, dtype=np.float64)
+    assert manifest["statistics"]["count"] == 9
+    assert manifest["statistics"]["sum"][0] == pytest.approx(expected.sum())
+    assert manifest["statistics"]["squared_norm"] == pytest.approx(
+        HIDDEN * np.square(expected).sum()
+    )
+    stored = list(ArtifactDataset(tmp_path).iter_batches())
+    assert [batch.rows for batch in stored] == [5, 4]
+    assert np.concatenate([batch.activation[:, 0] for batch in stored]).tolist() == (
+        expected.tolist()
+    )
+
+
+def test_harvest_skips_empty_scientific_batches_before_coalescing(tmp_path):
+    batches = [
+        grain([[0, 1, 2, 0]], [[0, 0, 0, 0]]),
+        grain([[3, 4, 0, 0]], [[1, 1, 0, 0]]),
+    ]
+    step = FakeStep()
+
+    result = harvest_host(
+        batches,
+        step,
+        artifact_root=tmp_path,
+        metadata=metadata(),
+        split="train",
+        total_tokens=2,
+        process_count=1,
+        process_index=0,
+        sequence_length=4,
+        shard_tokens=2,
+    )
+
+    assert result.batches_scanned == 2
+    assert result.batches_executed == 1
+    assert len(step.calls) == 1
+    publish_completed_capture(tmp_path, metadata(), process_count=1, total_tokens=2)
+    stored = next(ArtifactDataset(tmp_path).iter_batches())
+    assert stored.activation[:, 0].tolist() == [3.0, 4.0]
+
+
+def test_resume_reconciles_crash_after_partial_boundary_commit(tmp_path, monkeypatch):
+    batches = [grain([[3, 4, 5, 0]], [[1, 1, 1, 0]])]
+    original = harvest_module.ArtifactWriter.write_range
+    crashed = False
+
+    def commit_then_crash(self, *args, **kwargs):
+        nonlocal crashed
+        result = original(self, *args, **kwargs)
+        if not crashed:
+            crashed = True
+            raise RuntimeError("crash after immutable commit")
+        return result
+
+    monkeypatch.setattr(
+        harvest_module.ArtifactWriter, "write_range", commit_then_crash
+    )
+    with pytest.raises(RuntimeError, match="crash after immutable commit"):
+        harvest_host(
+            batches,
+            FakeStep(),
+            artifact_root=tmp_path,
+            metadata=metadata(),
+            split="train",
+            total_tokens=3,
+            process_count=1,
+            process_index=0,
+            sequence_length=4,
+            shard_tokens=5,
+        )
+    state = harvest_module._read_json_mapping(
+        tmp_path / "telemetry" / "journal-p00000-stop-000000000003.json"
+    )
+    assert state["pending"]["range_end"] == 3
+
+    monkeypatch.setattr(harvest_module.ArtifactWriter, "write_range", original)
+    resumed_step = FakeStep()
+    resumed = harvest_host(
+        batches,
+        resumed_step,
+        artifact_root=tmp_path,
+        metadata=metadata(),
+        split="train",
+        total_tokens=3,
+        process_count=1,
+        process_index=0,
+        sequence_length=4,
+        shard_tokens=5,
+    )
+    assert resumed.durable_host_tokens == 3
+    assert resumed_step.calls == []
+    final = harvest_module._read_json_mapping(
+        tmp_path / "telemetry" / "journal-p00000-stop-000000000003.json"
+    )
+    assert final["pending"] is None and final["complete"] is True
+
+
+@pytest.mark.parametrize(
+    ("entries", "message"),
+    [
+        (
+            [
+                {
+                    "range_id": "train-p00000-r000000000001-n000000002",
+                    "range_start": 1,
+                    "range_end": 3,
+                    "tokens": 2,
+                }
+            ],
+            "canonical contiguous",
+        ),
+        (
+            [
+                {
+                    "range_id": "train-p00000-r000000000000-n000000002",
+                    "range_start": 0,
+                    "range_end": 2,
+                    "tokens": 2,
+                },
+                {
+                    "range_id": "train-p00000-r000000000001-n000000002",
+                    "range_start": 1,
+                    "range_end": 3,
+                    "tokens": 2,
+                },
+            ],
+            "canonical contiguous",
+        ),
+        (
+            [
+                {
+                    "range_id": "train-p00000-b000000000000-o000000000-n000000002",
+                    "range_start": 0,
+                    "range_end": 2,
+                    "tokens": 2,
+                }
+            ],
+            "unsupported range ID",
+        ),
+        (
+            [
+                {
+                    "range_id": "train-p00000-r000000000000-n000000005",
+                    "range_start": 0,
+                    "range_end": 5,
+                    "tokens": 5,
+                }
+            ],
+            "canonical contiguous",
+        ),
+        (
+            [
+                {
+                    "range_id": "train-p00000-r000000000000-n000000003",
+                    "range_start": 0,
+                    "range_end": 3,
+                    "tokens": 3,
+                }
+            ],
+            "not a phase boundary",
+        ),
+    ],
+)
+def test_resume_rejects_noncanonical_coalesced_ledgers(entries, message):
+    class PresentWriter:
+        def has_range(self, range_id, start, end):
+            del range_id, start, end
+            return True
+
+    with pytest.raises(HarvestError, match=message):
+        harvest_module._validate_committed_shards(
+            entries,
+            split="train",
+            process_index=0,
+            expected_global_start=0,
+            max_tokens=4,
+            allowed_partial_ends={2, 10},
+            writer=PresentWriter(),
+        )
 
 
 def test_interrupted_phase_restores_durable_tokens_and_cumulative_telemetry(tmp_path):
@@ -426,6 +642,7 @@ def test_interrupted_phase_restores_durable_tokens_and_cumulative_telemetry(tmp_
             process_count=1,
             process_index=0,
             sequence_length=4,
+            shard_tokens=2,
             compile_seconds=1.5,
         )
     journal_path = tmp_path / "telemetry" / "journal-p00000-stop-000000000004.json"
@@ -443,6 +660,7 @@ def test_interrupted_phase_restores_durable_tokens_and_cumulative_telemetry(tmp_
         process_count=1,
         process_index=0,
         sequence_length=4,
+        shard_tokens=2,
         compile_seconds=2.0,
     )
     assert resumed.new_tokens == 4
@@ -454,6 +672,11 @@ def test_interrupted_phase_restores_durable_tokens_and_cumulative_telemetry(tmp_
     final_state = harvest_module._read_json_mapping(journal_path)
     assert final_state["durable_new_tokens"] == 4
     assert final_state["complete"] is True
+    publish_completed_capture(tmp_path, metadata(), process_count=1, total_tokens=4)
+    restored = np.concatenate(
+        [batch.activation[:, 0] for batch in ArtifactDataset(tmp_path).iter_batches()]
+    )
+    assert restored.tolist() == [3.0, 4.0, 5.0, 6.0]
     observation = canary_observation(
         [resumed], synthetic_goodput=1.0, expected_tokens=4
     )
@@ -478,6 +701,7 @@ def test_interrupted_suffix_preserves_canary_baseline_and_prior_suffix_work(tmp_
         process_count=1,
         process_index=0,
         sequence_length=4,
+        shard_tokens=2,
     )
     assert canary.new_tokens == 2 and canary.resumed_tokens == 0
 
@@ -497,6 +721,7 @@ def test_interrupted_suffix_preserves_canary_baseline_and_prior_suffix_work(tmp_
             process_count=1,
             process_index=0,
             sequence_length=4,
+            shard_tokens=2,
             baseline_resumed_tokens=2,
         )
     interrupted_state = harvest_module._read_json_mapping(
@@ -515,6 +740,7 @@ def test_interrupted_suffix_preserves_canary_baseline_and_prior_suffix_work(tmp_
         process_count=1,
         process_index=0,
         sequence_length=4,
+        shard_tokens=2,
         baseline_resumed_tokens=2,
     )
     assert production.new_tokens == 4
