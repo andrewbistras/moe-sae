@@ -473,6 +473,13 @@ def build_maxtext_argv(
         "pure_nnx_decoder": "true",
         "enable_dropout": "false",
         "load_balance_loss_weight": 0,
+        # Dropless EP uses a worst-case receive buffer (16x the balanced
+        # assignment count for Gemma 4 at EP16).  Restrict the local
+        # gather/unsort work to its valid prefix while retaining that
+        # worst-case allocation, so this changes neither routing nor overflow
+        # semantics.  Without it MaxText repeatedly processes the padded
+        # 131,072-row buffer in every routed layer.
+        "use_ragged_sort": "true",
         "dtype": "bfloat16",
         "weight_dtype": "bfloat16",
         "max_target_length": TARGET_SEQUENCE_LENGTH,

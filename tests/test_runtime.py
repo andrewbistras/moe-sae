@@ -88,6 +88,7 @@ def test_maxtext_argv_locks_scientific_capture_settings():
     assert "scan_layers=false" in joined
     assert "use_multimodal=false" in joined
     assert "load_balance_loss_weight=0" in joined
+    assert "use_ragged_sort=true" in joined
     assert "ici_expert_parallelism=16" in joined
 
 

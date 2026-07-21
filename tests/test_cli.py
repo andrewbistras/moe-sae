@@ -2,6 +2,7 @@ import argparse
 import dataclasses
 import json
 import hashlib
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -40,6 +41,176 @@ from moe_sae.storage import (
     StoragePlanesQualificationConfig,
     storage_attestation_digest,
 )
+
+
+def test_coordinator_json_wait_retries_stale_malformed_and_wrong_identity(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    payload = {
+        "schema_version": "test-result-v1",
+        "sweep_id": "correct-sweep",
+        "attempt_id": "correct-attempt",
+    }
+    observations: list[str | BaseException] = [
+        FileNotFoundError("not visible yet"),
+        "{malformed",
+        json.dumps({"schema_version": "stale-result-v0"}),
+        json.dumps(
+            {
+                "schema_version": "test-result-v1",
+                "sweep_id": "correct-sweep",
+                "attempt_id": "wrong-attempt",
+            }
+        ),
+        json.dumps(payload),
+    ]
+
+    def read_text(_path: Path, **_kwargs) -> str:
+        observation = observations.pop(0)
+        if isinstance(observation, BaseException):
+            raise observation
+        return observation
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(Path, "read_text", read_text)
+    monkeypatch.setattr(cli_module.time, "sleep", sleeps.append)
+    monkeypatch.setattr(
+        cli_module, "_COORDINATOR_JSON_VISIBILITY_TIMEOUT_SECONDS", 1.0
+    )
+
+    cli_module._wait_for_coordinator_json(tmp_path / "result.json", payload)
+
+    assert not observations
+    assert len(sleeps) == 4
+
+
+@pytest.mark.parametrize(
+    ("observed", "last_observation"),
+    [
+        (FileNotFoundError("missing"), "file is absent"),
+        ("{malformed", "malformed JSON"),
+        (
+            json.dumps({"schema_version": "stale-result-v0"}),
+            "does not match expected identity",
+        ),
+        (
+            json.dumps(
+                {
+                    "schema_version": "test-result-v1",
+                    "attempt_id": "wrong-attempt",
+                }
+            ),
+            "does not match expected identity",
+        ),
+    ],
+)
+def test_coordinator_json_wait_fails_closed_at_timeout(
+    observed: str | BaseException,
+    last_observation: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    payload = {
+        "schema_version": "test-result-v1",
+        "attempt_id": "correct-attempt",
+    }
+
+    def read_text(_path: Path, **_kwargs) -> str:
+        if isinstance(observed, BaseException):
+            raise observed
+        return observed
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    monkeypatch.setattr(
+        cli_module, "_COORDINATOR_JSON_VISIBILITY_TIMEOUT_SECONDS", 0.0
+    )
+
+    with pytest.raises(RuntimeError, match=last_observation):
+        cli_module._wait_for_coordinator_json(tmp_path / "result.json", payload)
+
+
+def test_coordinator_write_json_validates_after_global_barrier(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    events: list[str] = []
+    path = tmp_path / "result.json"
+    payload = {"schema_version": "test-result-v1", "attempt_id": "a"}
+
+    monkeypatch.setattr(cli_module, "_process_context", lambda: (0, 4))
+    monkeypatch.setattr(
+        cli_module, "_global_barrier", lambda label: events.append(label)
+    )
+
+    assert cli_module._coordinator_write_json(
+        path, payload, barrier="publication-visible"
+    )
+    assert events == ["publication-visible"]
+    assert json.loads(path.read_text(encoding="utf-8")) == payload
+
+
+def test_noncoordinator_validates_publication_without_writing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = tmp_path / "result.json"
+    payload = {"schema_version": "test-result-v1", "attempt_id": "a"}
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    barriers: list[str] = []
+
+    monkeypatch.setattr(cli_module, "_process_context", lambda: (3, 4))
+    monkeypatch.setattr(
+        cli_module,
+        "atomic_write_json",
+        lambda *_args, **_kwargs: pytest.fail("noncoordinator attempted a write"),
+    )
+    monkeypatch.setattr(cli_module, "_global_barrier", barriers.append)
+
+    assert not cli_module._coordinator_write_json(
+        path, payload, barrier="publication-visible"
+    )
+    assert barriers == ["publication-visible"]
+
+
+def test_coordinator_json_wait_allows_only_declared_coordinator_owned_values(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "storage.json"
+    expected = {
+        "schema_version": "storage-v1",
+        "run_id": "same-run",
+        "created_at_utc": "local-controller-time",
+        "attestation_sha256": "a" * 64,
+    }
+    path.write_text(
+        json.dumps(
+            {
+                **expected,
+                "created_at_utc": "coordinator-time",
+                "attestation_sha256": "b" * 64,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    cli_module._wait_for_coordinator_json(
+        path,
+        expected,
+        coordinator_owned_fields=("created_at_utc", "attestation_sha256"),
+    )
+
+    changed_identity = dict(expected, run_id="wrong-run")
+    monkeypatch.setattr(
+        cli_module, "_COORDINATOR_JSON_VISIBILITY_TIMEOUT_SECONDS", 0.0
+    )
+    with pytest.raises(RuntimeError, match="does not match expected identity"):
+        cli_module._wait_for_coordinator_json(
+            path,
+            changed_identity,
+            coordinator_owned_fields=(
+                "created_at_utc",
+                "attestation_sha256",
+            ),
+        )
 
 
 def campaign(split: str, tokens: int, chip_seconds: float) -> dict:

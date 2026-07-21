@@ -79,6 +79,8 @@ DEFAULT_CONFIG = REPO_ROOT / "configs" / "gemma4_26b_a4b.yaml"
 _BENCHMARK_RENDEZVOUS_SECONDS = 300.0
 _BENCHMARK_KILL_GRACE_SECONDS = 15.0
 _ACTIVATION_CHILD_KILL_GRACE_SECONDS = 30.0
+_COORDINATOR_JSON_VISIBILITY_TIMEOUT_SECONDS = 15.0
+_COORDINATOR_JSON_VISIBILITY_POLL_SECONDS = 0.05
 
 
 def _sha256_argument(value: str) -> str:
@@ -1086,15 +1088,111 @@ def _aggregate_benchmark_observation(
     )
 
 
-def _coordinator_write_json(path: Path, payload: Any, *, barrier: str) -> bool:
-    """Write one shared JSON file on process zero, then make it globally visible."""
+def _canonical_coordinator_json(payload: Any) -> str:
+    """Canonicalize a shared JSON value while rejecting non-finite numbers."""
+
+    return json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    )
+
+
+def _wait_for_coordinator_json(
+    path: Path,
+    payload: Any,
+    *,
+    coordinator_owned_fields: Sequence[str] = (),
+) -> None:
+    """Boundedly wait until this controller reads the exact published value."""
+
+    expected_keys: frozenset[str] | None = None
+    if coordinator_owned_fields:
+        if not isinstance(payload, Mapping):
+            raise TypeError(
+                "coordinator-owned JSON fields require an object payload"
+            )
+        missing = set(coordinator_owned_fields) - payload.keys()
+        if missing:
+            raise ValueError(
+                "coordinator-owned JSON fields are absent from the expected payload: "
+                + ", ".join(sorted(missing))
+            )
+        expected_keys = frozenset(str(key) for key in payload)
+        expected_payload = {
+            key: value
+            for key, value in payload.items()
+            if key not in coordinator_owned_fields
+        }
+    else:
+        expected_payload = payload
+    expected = _canonical_coordinator_json(expected_payload)
+    deadline = time.monotonic() + _COORDINATOR_JSON_VISIBILITY_TIMEOUT_SECONDS
+    last_observation = "file is absent"
+    while True:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            last_observation = "file is absent"
+        except OSError as error:
+            last_observation = f"read failed: {type(error).__name__}: {error}"
+        else:
+            try:
+                observed = json.loads(text)
+                if coordinator_owned_fields:
+                    if not isinstance(observed, Mapping):
+                        raise TypeError("published JSON is not an object")
+                    if frozenset(str(key) for key in observed) != expected_keys:
+                        raise ValueError("published JSON fields changed")
+                    observed = {
+                        key: value
+                        for key, value in observed.items()
+                        if key not in coordinator_owned_fields
+                    }
+                actual = _canonical_coordinator_json(observed)
+            except (json.JSONDecodeError, TypeError, ValueError) as error:
+                last_observation = (
+                    f"malformed JSON: {type(error).__name__}: {error}"
+                )
+            else:
+                if actual == expected:
+                    return
+                last_observation = "JSON payload does not match expected identity"
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            raise RuntimeError(
+                "coordinator output did not become visible and valid within "
+                f"{_COORDINATOR_JSON_VISIBILITY_TIMEOUT_SECONDS:.3f}s: {path}; "
+                f"last observation: {last_observation}"
+            )
+        time.sleep(
+            min(_COORDINATOR_JSON_VISIBILITY_POLL_SECONDS, remaining)
+        )
+
+
+def _coordinator_write_json(
+    path: Path,
+    payload: Any,
+    *,
+    barrier: str,
+    coordinator_owned_fields: Sequence[str] = (),
+) -> bool:
+    """Publish shared JSON and make every controller validate its exact value."""
 
     process_index, _ = _process_context()
     if process_index == 0:
         atomic_write_json(path, payload)
     _global_barrier(barrier)
-    if not path.exists():
-        raise RuntimeError(f"coordinator output is not visible after barrier: {path}")
+    _wait_for_coordinator_json(
+        path,
+        payload,
+        coordinator_owned_fields=(
+            coordinator_owned_fields if process_index != 0 else ()
+        ),
+    )
     return process_index == 0
 
 
@@ -1269,6 +1367,7 @@ def _command_qualify_storage(args: argparse.Namespace) -> int:
         _storage_attestation_path(root),
         payload,
         barrier="gemma4-storage-qualification-attested",
+        coordinator_owned_fields=("created_at_utc", "attestation_sha256"),
     )
     if coordinator:
         print(json.dumps(payload, indent=2, sort_keys=True))
