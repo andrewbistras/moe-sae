@@ -3384,9 +3384,10 @@ def _process_local_array(
 ) -> np.ndarray:
     """Assemble this process's addressable JAX shards without an all-gather.
 
-    Replicated global arrays are partitioned deterministically on axis zero so
-    multiple controllers never persist duplicate rows.  NumPy/test arrays are
-    assumed to be process-local already.
+    Distributed arrays must expose one unambiguous process-owned row partition;
+    fully replicated multi-process outputs are rejected because their logical
+    data-lane ownership cannot be recovered from the value alone. NumPy/test
+    arrays are assumed to be process-local already.
     """
 
     shards = getattr(value, "addressable_shards", None)
@@ -3396,9 +3397,23 @@ def _process_local_array(
     if not shards:
         raise HarvestError(f"{name} has no addressable shard on this process")
 
-    unique: dict[tuple[tuple[int, int], ...], tuple[tuple[slice, ...], np.ndarray]] = {}
-    for shard in shards:
-        index = tuple(shard.index)
+    global_shape = tuple(int(size) for size in value.shape)
+    if (
+        replicated_partition_unit <= 0
+        or global_shape[0] % replicated_partition_unit
+    ):
+        raise HarvestError(
+            f"{name} leading axis cannot be partitioned into complete units"
+        )
+
+    def normalize_index(
+        raw_index: Any,
+    ) -> tuple[tuple[tuple[int, int], ...], tuple[slice, ...]]:
+        index = tuple(raw_index)
+        if len(index) != len(value.shape):
+            raise HarvestError(
+                f"{name} shard rank {len(index)} != global rank {len(value.shape)}"
+            )
         normalized: list[tuple[int, int]] = []
         normalized_slices: list[slice] = []
         for axis, item in enumerate(index):
@@ -3407,50 +3422,167 @@ def _process_local_array(
             start = 0 if item.start is None else int(item.start)
             stop = int(value.shape[axis]) if item.stop is None else int(item.stop)
             step = 1 if item.step is None else int(item.step)
-            if step != 1 or stop <= start:
+            if (
+                step != 1
+                or start < 0
+                or stop <= start
+                or stop > int(value.shape[axis])
+            ):
                 raise HarvestError(f"{name} has an unsupported shard slice {item}")
             normalized.append((start, stop))
             normalized_slices.append(slice(start, stop))
-        key = tuple(normalized)
+        return tuple(normalized), tuple(normalized_slices)
+
+    unique: dict[
+        tuple[tuple[int, int], ...], tuple[tuple[slice, ...], np.ndarray]
+    ] = {}
+    for shard in shards:
+        key, normalized_slices = normalize_index(shard.index)
         if key not in unique:
-            unique[key] = (tuple(normalized_slices), _host_array(shard.data, name))
+            unique[key] = (normalized_slices, _host_array(shard.data, name))
 
-    minima = [min(key[axis][0] for key in unique) for axis in range(len(value.shape))]
-    maxima = [max(key[axis][1] for key in unique) for axis in range(len(value.shape))]
-    local_shape = tuple(maximum - minimum for minimum, maximum in zip(minima, maxima))
-    first = next(iter(unique.values()))[1]
-    local = np.empty(local_shape, dtype=first.dtype)
-    covered = 0
-    for slices, data in unique.values():
-        relative = tuple(
-            slice(item.start - minima[axis], item.stop - minima[axis])
-            for axis, item in enumerate(slices)
+    def rectangles_overlap(
+        left: tuple[tuple[int, int], ...], right: tuple[tuple[int, int], ...]
+    ) -> bool:
+        return all(
+            max(left_axis[0], right_axis[0])
+            < min(left_axis[1], right_axis[1])
+            for left_axis, right_axis in zip(left, right, strict=True)
         )
-        expected = tuple(item.stop - item.start for item in slices)
-        if data.shape != expected:
-            raise HarvestError(
-                f"{name} shard data shape {data.shape} != index shape {expected}"
-            )
-        local[relative] = data
-        covered += int(data.size)
-    if covered != int(local.size):
+
+    # NamedSharding exposes the complete global device map without moving any
+    # remote data.  Use it to prove that partial replicas never make two hosts
+    # persist the same rows and that every global element has one owner.
+    devices_indices_map = getattr(
+        getattr(value, "sharding", None), "devices_indices_map", None
+    )
+    if process_count > 1 and not callable(devices_indices_map):
         raise HarvestError(
-            f"{name} addressable shards are not one contiguous local rectangle"
+            f"{name} global sharding map is required for multi-process capture"
         )
-
-    global_shape = tuple(int(size) for size in value.shape)
-    if process_count > 1 and local.shape == global_shape:
-        if replicated_partition_unit <= 0 or local.shape[0] % replicated_partition_unit:
-            raise HarvestError(
-                f"{name} replicated axis cannot be partitioned by sequence"
+    if callable(devices_indices_map):
+        try:
+            device_map = devices_indices_map(global_shape)
+        except (TypeError, ValueError, RuntimeError) as exc:
+            raise HarvestError(f"{name} global sharding map is unavailable") from exc
+        owners: dict[tuple[tuple[int, int], ...], set[int]] = {}
+        for device, raw_index in device_map.items():
+            key, _ = normalize_index(raw_index)
+            owner = int(device.process_index)
+            if not 0 <= owner < process_count:
+                raise HarvestError(f"{name} sharding map has an invalid process owner")
+            owners.setdefault(key, set()).add(owner)
+        full_key = tuple((0, size) for size in global_shape)
+        if set(owners) == {full_key}:
+            if owners[full_key] != set(range(process_count)):
+                raise HarvestError(
+                    f"{name} full replication does not reach every process"
+                )
+            if process_count > 1:
+                raise HarvestError(
+                    f"{name} is fully replicated across processes; "
+                    "data-lane ownership is ambiguous"
+                )
+            expected_local = {full_key}
+        else:
+            if any(len(key_owners) != 1 for key_owners in owners.values()):
+                raise HarvestError(
+                    f"{name} partial shards are replicated across processes"
+                )
+            global_keys = list(owners)
+            for offset, left in enumerate(global_keys):
+                for right in global_keys[offset + 1 :]:
+                    if rectangles_overlap(left, right):
+                        raise HarvestError(f"{name} global shard rectangles overlap")
+            covered = sum(
+                math.prod(stop - start for start, stop in key)
+                for key in global_keys
             )
-        units = local.shape[0] // replicated_partition_unit
-        start = host_token_offset(units, process_count, process_index)
-        count = token_quota(units, process_count, process_index)
-        local = local[
-            start * replicated_partition_unit : (start + count)
-            * replicated_partition_unit
+            if covered != math.prod(global_shape):
+                raise HarvestError(f"{name} shards do not tile the global shape")
+            expected_local = {
+                key
+                for key, key_owners in owners.items()
+                if process_index in key_owners
+            }
+        if set(unique) != expected_local:
+            raise HarvestError(
+                f"{name} addressable shards disagree with the global process map"
+            )
+
+    # A TPU process may own several interleaved global batch slices.  Assemble
+    # elementary leading-axis slab independently, requiring the addressable
+    # trailing rectangles to tile its complete feature shape exactly, then
+    # concatenate owned slabs in global row order.  Gaps between slabs are
+    # valid process-ownership gaps; holes or overlaps inside a slab are not.
+    boundaries = sorted(
+        {
+            boundary
+            for key in unique
+            for boundary in (key[0][0], key[0][1])
+        }
+    )
+    assembled: list[np.ndarray] = []
+    dtype: np.dtype[Any] | None = None
+    for start, stop in zip(boundaries, boundaries[1:]):
+        parts = [
+            (slices, data)
+            for slices, data in unique.values()
+            if int(slices[0].start) <= start and int(slices[0].stop) >= stop
         ]
+        if not parts:
+            continue
+        if start % replicated_partition_unit or stop % replicated_partition_unit:
+            raise HarvestError(
+                f"{name} addressable row slab splits a partition unit"
+            )
+        slab_shape = (stop - start, *global_shape[1:])
+        if dtype is None:
+            dtype = parts[0][1].dtype
+        slab = np.empty(slab_shape, dtype=dtype)
+        trailing_rectangles: list[tuple[tuple[int, int], ...]] = []
+        covered = 0
+        for slices, data in parts:
+            expected = tuple(item.stop - item.start for item in slices)
+            if data.shape != expected:
+                raise HarvestError(
+                    f"{name} shard data shape {data.shape} != index shape {expected}"
+                )
+            if data.dtype != dtype:
+                raise HarvestError(f"{name} addressable shards have mixed dtypes")
+            trailing = tuple(
+                (int(item.start), int(item.stop)) for item in slices[1:]
+            )
+            for prior in trailing_rectangles:
+                if rectangles_overlap(trailing, prior):
+                    raise HarvestError(
+                        f"{name} addressable feature rectangles overlap"
+                    )
+            trailing_rectangles.append(trailing)
+            data_start = start - int(slices[0].start)
+            data_stop = stop - int(slices[0].start)
+            piece = data[data_start:data_stop]
+            slab[(slice(0, stop - start), *slices[1:])] = piece
+            covered += int(piece.size)
+        if covered != int(slab.size):
+            raise HarvestError(
+                f"{name} addressable shards do not tile complete local rows"
+            )
+        assembled.append(slab)
+
+    if not assembled:
+        raise HarvestError(f"{name} has no complete process-owned row slab")
+    local = assembled[0] if len(assembled) == 1 else np.concatenate(assembled, axis=0)
+
+    if process_count > 1:
+        units = local.shape[0] // replicated_partition_unit
+        global_units = global_shape[0] // replicated_partition_unit
+        expected_units = token_quota(global_units, process_count, process_index)
+        if units != expected_units:
+            raise HarvestError(
+                f"{name} process owns {units} partition units; "
+                f"expected {expected_units}"
+            )
     return local
 
 

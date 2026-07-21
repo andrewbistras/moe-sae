@@ -1289,12 +1289,27 @@ class _Shard:
 
 
 class _GlobalArray:
-    def __init__(self, shape, shards):
+    def __init__(self, shape, shards, sharding=None):
         self.shape = shape
         self.addressable_shards = shards
+        self.sharding = sharding
 
 
-def test_process_local_array_assembles_feature_shards_and_partitions_replication():
+class _Device:
+    def __init__(self, process_index):
+        self.process_index = process_index
+
+
+class _Sharding:
+    def __init__(self, device_map):
+        self.device_map = device_map
+
+    def devices_indices_map(self, shape):
+        del shape
+        return self.device_map
+
+
+def test_process_local_array_assembles_feature_shards_and_rejects_replication():
     full = np.arange(16, dtype=np.int32).reshape(4, 4)
     sharded = _GlobalArray(
         full.shape,
@@ -1314,14 +1329,200 @@ def test_process_local_array_assembles_feature_shards_and_partitions_replication
     replicated = _GlobalArray(
         full.shape,
         [_Shard((slice(0, 4), slice(0, 4)), full)],
+        _Sharding(
+            {
+                _Device(0): (slice(0, 4), slice(0, 4)),
+                _Device(1): (slice(0, 4), slice(0, 4)),
+            }
+        ),
     )
-    process_one = harvest_module._process_local_array(
-        replicated,
+    with pytest.raises(HarvestError, match="data-lane ownership is ambiguous"):
+        harvest_module._process_local_array(
+            replicated,
+            "test",
+            process_count=2,
+            process_index=1,
+        )
+
+
+def test_process_local_array_concatenates_noncontiguous_complete_row_slabs():
+    full = np.arange(32, dtype=np.int32).reshape(8, 4)
+    interleaved = _GlobalArray(
+        full.shape,
+        [
+            _Shard((slice(0, 2), slice(0, 2)), full[0:2, :2]),
+            _Shard((slice(0, 1), slice(2, 4)), full[0:1, 2:]),
+            _Shard((slice(1, 2), slice(2, 4)), full[1:2, 2:]),
+            _Shard((slice(6, 8), slice(0, 4)), full[6:8]),
+        ],
+        _Sharding(
+            {
+                _Device(0): (slice(0, 2), slice(0, 2)),
+                _Device(0): (slice(0, 1), slice(2, 4)),
+                _Device(0): (slice(1, 2), slice(2, 4)),
+                _Device(1): (slice(2, 6), slice(0, 4)),
+                _Device(0): (slice(6, 8), slice(0, 4)),
+            }
+        ),
+    )
+
+    assembled = harvest_module._process_local_array(
+        interleaved,
         "test",
         process_count=2,
-        process_index=1,
+        process_index=0,
     )
-    assert np.array_equal(process_one, full[2:])
+
+    assert np.array_equal(assembled, np.concatenate((full[0:2], full[6:8])))
+
+
+def test_process_local_array_matches_v4_32_interleaved_process_geometry():
+    full = np.arange(64, dtype=np.int32).reshape(16, 4)
+    devices = [_Device(slot % 4) for slot in range(16)]
+    device_map = {
+        device: (slice(slot, slot + 1), slice(0, 4))
+        for slot, device in enumerate(devices)
+    }
+    sharding = _Sharding(device_map)
+
+    for process_index in range(4):
+        slots = list(range(process_index, 16, 4))
+        value = _GlobalArray(
+            full.shape,
+            [
+                _Shard((slice(slot, slot + 1), slice(0, 4)), full[slot : slot + 1])
+                for slot in slots
+            ],
+            sharding,
+        )
+
+        assembled = harvest_module._process_local_array(
+            value,
+            "test",
+            process_count=4,
+            process_index=process_index,
+        )
+
+        assert np.array_equal(assembled, full[slots])
+
+
+@pytest.mark.parametrize(
+    ("value", "unit", "message"),
+    [
+        (
+            _GlobalArray(
+                (4, 4),
+                [_Shard((slice(0, 2), slice(0, 4)), np.zeros((2, 4)))],
+                _Sharding(
+                    {
+                        _Device(0): (slice(0, 2), slice(0, 4)),
+                        _Device(1): (slice(0, 2), slice(0, 4)),
+                        _Device(0): (slice(2, 4), slice(0, 4)),
+                    }
+                ),
+            ),
+            1,
+            "partial shards are replicated across processes",
+        ),
+        (
+            _GlobalArray(
+                (4, 4),
+                [_Shard((slice(0, 1), slice(0, 4)), np.zeros((1, 4)))],
+                _Sharding(
+                    {
+                        _Device(0): (slice(0, 1), slice(0, 4)),
+                        _Device(1): (slice(2, 4), slice(0, 4)),
+                    }
+                ),
+            ),
+            1,
+            "shards do not tile the global shape",
+        ),
+        (
+            _GlobalArray(
+                (8, 4),
+                [_Shard((slice(1, 3), slice(0, 4)), np.zeros((2, 4)))],
+                _Sharding(
+                    {
+                        _Device(1): (slice(0, 1), slice(0, 4)),
+                        _Device(0): (slice(1, 3), slice(0, 4)),
+                        _Device(1): (slice(3, 8), slice(0, 4)),
+                    }
+                ),
+            ),
+            2,
+            "row slab splits a partition unit",
+        ),
+    ],
+)
+def test_process_local_array_rejects_unsafe_global_or_unit_geometry(
+    value, unit, message
+):
+    with pytest.raises(HarvestError, match=message):
+        harvest_module._process_local_array(
+            value,
+            "test",
+            process_count=2,
+            process_index=0,
+            replicated_partition_unit=unit,
+        )
+
+
+@pytest.mark.parametrize(
+    ("shards", "message"),
+    [
+        (
+            [
+                _Shard(
+                    (slice(0, 2), slice(0, 3)),
+                    np.arange(6, dtype=np.int32).reshape(2, 3),
+                )
+            ],
+            "do not tile complete local rows",
+        ),
+        (
+            [
+                _Shard(
+                    (slice(0, 2), slice(0, 3)),
+                    np.arange(6, dtype=np.int32).reshape(2, 3),
+                ),
+                _Shard(
+                    (slice(0, 2), slice(2, 4)),
+                    np.arange(4, dtype=np.int32).reshape(2, 2),
+                ),
+            ],
+            "feature rectangles overlap",
+        ),
+    ],
+)
+def test_process_local_array_rejects_incomplete_or_overlapping_feature_tiles(
+    shards, message
+):
+    value = _GlobalArray((2, 4), shards)
+
+    with pytest.raises(HarvestError, match=message):
+        harvest_module._process_local_array(
+            value,
+            "test",
+            process_count=1,
+            process_index=0,
+        )
+
+
+def test_process_local_array_requires_global_map_for_multi_process_arrays():
+    full = np.arange(16, dtype=np.int32).reshape(4, 4)
+    value = _GlobalArray(
+        full.shape,
+        [_Shard((slice(0, 2), slice(0, 4)), full[:2])],
+    )
+
+    with pytest.raises(HarvestError, match="global sharding map is required"):
+        harvest_module._process_local_array(
+            value,
+            "test",
+            process_count=2,
+            process_index=0,
+        )
 
 
 def test_capture_metadata_records_config_and_coordinated_environment_hashes():
