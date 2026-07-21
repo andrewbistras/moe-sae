@@ -156,8 +156,10 @@ uv run --extra tpu moe-sae qualify-storage \
 
 The activation-capture thresholds are pinned and cannot be overridden: at
 least 10GB free on the control volume, 24GiB per local rolling buffer,
-an incompressible 8GiB GCS probe per process, and at least 4GB/s aggregate for
-both generation-pinned upload and download. Qualification also proves
+an incompressible 8GiB GCS probe per process, and at least 4GB/s aggregate
+generation-pinned upload. Download integrity is mandatory and its throughput
+is recorded diagnostically; the configured 4GB/s download requirement is
+sealed for the later SAE-cache qualification. Qualification also proves
 that equal local-buffer paths resolve to process-private storage, cross-process
 `flock`, atomic rename and visibility, disjoint host files, durable directory
 fsync, end-to-end object hashes, and exact-generation cleanup. It then performs

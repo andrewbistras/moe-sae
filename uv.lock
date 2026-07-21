@@ -2076,6 +2076,7 @@ name = "moe-sae"
 version = "0.2.0"
 source = { editable = "." }
 dependencies = [
+    { name = "google-crc32c" },
     { name = "jax" },
     { name = "numpy" },
     { name = "pyyaml" },
@@ -2114,6 +2115,7 @@ requires-dist = [
     { name = "google-cloud-storage", marker = "extra == 'conversion'", specifier = "==3.13.0" },
     { name = "google-cloud-storage", marker = "extra == 'data'", specifier = "==3.13.0" },
     { name = "google-cloud-storage", marker = "extra == 'tpu'", specifier = "==3.13.0" },
+    { name = "google-crc32c", specifier = "==1.8.0" },
     { name = "grain", marker = "extra == 'data'", specifier = "==0.2.18" },
     { name = "huggingface-hub", marker = "extra == 'conversion'", specifier = "==1.23.0" },
     { name = "huggingface-hub", marker = "extra == 'data'", specifier = "==1.23.0" },

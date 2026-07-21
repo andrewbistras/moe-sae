@@ -1182,8 +1182,20 @@ This is equivalent to an explicit `gcloud compute tpus tpu-vm ssh ...
 --worker=all --command=...`; the helper does not run locally or only on worker
 0. Production thresholds are pinned: at least 10 GB free on the shared control
 volume, 24 GiB on each activation buffer, an incompressible 8 GiB GCS probe per
-process in 8 MiB blocks, and at least 4 GB/s aggregate for both upload and
-generation-pinned download.
+process in 8 MiB blocks, and at least 4 GB/s aggregate upload. The
+generation-pinned download must pass CRC32C and SHA-256 integrity checks, but
+its throughput is diagnostic for activation capture: capture consumes the
+tiny packed-C4 input and does not read activation shards back. The configured
+4 GB/s download requirement remains sealed in the attestation for the later,
+separate SAE-cache qualification.
+
+The probe and `ArtifactWriter` use the same large-object transport: the TPU
+process execs a JAX-cold helper, which uploads 16 MiB parts with 32 worker
+processes, then the parent conditionally copies the unique temporary object
+into its content-addressed final name. Generation-pinned probe downloads use
+32 MiB ranges with 16 workers. The helper boundary is deliberate: only the
+fresh JAX-cold helper creates a process pool. Transfers get a 30-minute helper
+deadline plus a 60-second parent grace period for cancellation and cleanup.
 
 The qualifier proves cross-process control-plane visibility and `flock`, atomic
 rename, disjoint per-host control records, genuinely private local-buffer

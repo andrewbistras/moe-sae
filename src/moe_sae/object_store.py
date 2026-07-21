@@ -6,10 +6,13 @@ from dataclasses import dataclass
 import base64
 import fcntl
 import hashlib
+import math
 import os
 from pathlib import Path
 import re
 import shutil
+import subprocess
+import sys
 import tempfile
 import threading
 from typing import Any, Protocol
@@ -17,10 +20,30 @@ import uuid
 
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
+_ISOLATED_TRANSFER_EXIT_GRACE_SECONDS = 60.0
 
 
 class ObjectStoreError(RuntimeError):
     """An immutable object could not be published or materialized safely."""
+
+
+@dataclass(frozen=True, slots=True)
+class _FileState:
+    device: int
+    inode: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
+
+
+def _file_state(value: os.stat_result) -> _FileState:
+    return _FileState(
+        device=int(value.st_dev),
+        inode=int(value.st_ino),
+        size=int(value.st_size),
+        mtime_ns=int(value.st_mtime_ns),
+        ctime_ns=int(value.st_ctime_ns),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,6 +105,34 @@ def sha256_file(path: Path, chunk_bytes: int = 8 << 20) -> tuple[str, int]:
     return digest.hexdigest(), size
 
 
+def _sha256_crc32c_file(
+    path: Path, chunk_bytes: int = 8 << 20
+) -> tuple[str, str, int, _FileState]:
+    """Hash one stable source pass with SHA-256 and whole-file CRC32C."""
+
+    try:
+        import google_crc32c
+    except ImportError as error:  # pragma: no cover - installed by GCS extra
+        raise ObjectStoreError(
+            "whole-object GCS verification requires google-crc32c"
+        ) from error
+    sha256 = hashlib.sha256()
+    crc32c = google_crc32c.Checksum()
+    size = 0
+    with path.open("rb") as handle:
+        before = _file_state(os.fstat(handle.fileno()))
+        while chunk := handle.read(chunk_bytes):
+            sha256.update(chunk)
+            crc32c.update(chunk)
+            size += len(chunk)
+        after = _file_state(os.fstat(handle.fileno()))
+    current = _file_state(path.stat())
+    if before != after or after != current or size != current.size or size <= 0:
+        raise ObjectStoreError("local upload source changed while it was hashed")
+    encoded_crc32c = base64.b64encode(crc32c.digest()).decode("ascii")
+    return sha256.hexdigest(), encoded_crc32c, size, current
+
+
 def parse_gcs_uri(uri: str) -> tuple[str, str]:
     if not uri.startswith("gs://"):
         raise ValueError("object URI must start with gs://")
@@ -141,10 +192,17 @@ class GCSObjectStore:
         client: Any | None = None,
         *,
         parallel_upload_threshold_bytes: int = 32 * 1024**2,
-        parallel_upload_chunk_bytes: int = 8 * 1024**2,
-        parallel_upload_workers: int = 8,
+        parallel_upload_chunk_bytes: int = 16 * 1024**2,
+        parallel_upload_workers: int = 32,
+        parallel_download_threshold_bytes: int = 32 * 1024**2,
+        parallel_download_chunk_bytes: int = 32 * 1024**2,
+        parallel_download_workers: int = 16,
+        transfer_timeout_seconds: float = 30 * 60.0,
+        isolated_large_transfers: bool | None = None,
+        parallel_worker_type: str = "thread",
         transfer_manager_module: Any | None = None,
     ):
+        supplied_client = client is not None
         if client is None:
             try:
                 from google.cloud import storage
@@ -159,13 +217,35 @@ class GCSObjectStore:
         )
         self.parallel_upload_chunk_bytes = int(parallel_upload_chunk_bytes)
         self.parallel_upload_workers = int(parallel_upload_workers)
+        self.parallel_download_threshold_bytes = int(
+            parallel_download_threshold_bytes
+        )
+        self.parallel_download_chunk_bytes = int(parallel_download_chunk_bytes)
+        self.parallel_download_workers = int(parallel_download_workers)
+        self.transfer_timeout_seconds = float(transfer_timeout_seconds)
+        self.isolated_large_transfers = (
+            not supplied_client and transfer_manager_module is None
+            if isolated_large_transfers is None
+            else bool(isolated_large_transfers)
+        )
+        self.parallel_worker_type = str(parallel_worker_type).lower()
         self._transfer_manager_module = transfer_manager_module
         if (
             self.parallel_upload_threshold_bytes <= 0
             or self.parallel_upload_chunk_bytes <= 0
             or self.parallel_upload_workers <= 0
+            or self.parallel_download_threshold_bytes <= 0
+            or self.parallel_download_chunk_bytes <= 0
+            or self.parallel_download_workers <= 0
         ):
-            raise ValueError("parallel GCS upload settings must be positive")
+            raise ValueError("parallel GCS transfer settings must be positive")
+        if (
+            not math.isfinite(self.transfer_timeout_seconds)
+            or self.transfer_timeout_seconds <= 0
+        ):
+            raise ValueError("transfer_timeout_seconds must be finite and positive")
+        if self.parallel_worker_type not in {"thread", "process"}:
+            raise ValueError("parallel_worker_type must be 'thread' or 'process'")
 
     def _blob(self, uri: str) -> Any:
         bucket, name = parse_gcs_uri(uri)
@@ -194,7 +274,7 @@ class GCSObjectStore:
     ) -> ObjectIdentity:
         if not _SHA256.fullmatch(sha256):
             raise ValueError("sha256 must be lowercase 64-character hex")
-        actual_sha, size = sha256_file(source)
+        actual_sha, crc32c, size, source_state = _sha256_crc32c_file(source)
         if actual_sha != sha256 or size <= 0:
             raise ObjectStoreError("local upload source does not match its claimed SHA-256")
         blob = self._blob(uri)
@@ -205,16 +285,25 @@ class GCSObjectStore:
         except Exception:
             existing = None
         if existing is not None:
-            if existing.size_bytes != size:
-                raise ObjectStoreError(f"existing GCS object size differs: {uri}")
+            if existing.size_bytes != size or existing.crc32c != crc32c:
+                raise ObjectStoreError(
+                    f"existing GCS object content identity differs: {uri}"
+                )
             return existing
         blob.metadata = {"sha256": sha256}
         if size >= self.parallel_upload_threshold_bytes:
             identity = self._put_parallel_conditional(
-                source, blob, uri=uri, sha256=sha256
+                source,
+                blob,
+                uri=uri,
+                sha256=sha256,
+                crc32c=crc32c,
+                source_state=source_state,
             )
-            if identity.size_bytes != size:
-                raise ObjectStoreError(f"GCS object size differs after upload: {uri}")
+            if identity.size_bytes != size or identity.crc32c != crc32c:
+                raise ObjectStoreError(
+                    f"GCS object content identity differs after upload: {uri}"
+                )
             return identity
         try:
             blob.upload_from_filename(
@@ -231,46 +320,83 @@ class GCSObjectStore:
                 raise ObjectStoreError(f"cannot publish immutable GCS object {uri}") from error
         else:
             identity = self._identity(blob, uri, sha256)
-        if identity.size_bytes != size:
-            raise ObjectStoreError(f"GCS object size differs after upload: {uri}")
+        if identity.size_bytes != size or identity.crc32c != crc32c:
+            raise ObjectStoreError(
+                f"GCS object content identity differs after upload: {uri}"
+            )
         return identity
 
     def _put_parallel_conditional(
-        self, source: Path, final_blob: Any, *, uri: str, sha256: str
+        self,
+        source: Path,
+        final_blob: Any,
+        *,
+        uri: str,
+        sha256: str,
+        crc32c: str,
+        source_state: _FileState,
     ) -> ObjectIdentity:
         """Multipart-upload to a unique temporary, then conditionally copy.
 
         GCS XML multipart uploads do not support create-only preconditions.
         The temporary name is therefore unpredictable, and the server-side
         copy into the content-addressed final name is the sole commit point
-        with ``if_generation_match=0``.  Threads are deliberate: forking a
-        process pool after JAX initialized a TPU runtime is unsafe.
+        with ``if_generation_match=0``.  Production launches the multipart
+        transfer in a fresh, JAX-cold interpreter.  The process pool is
+        created only inside that helper, never inside the live TPU process.
         """
 
-        transfer_manager = self._transfer_manager_module
-        if transfer_manager is None:
-            try:
-                from google.cloud.storage import transfer_manager
-            except ImportError as error:  # pragma: no cover - same optional package
-                raise ObjectStoreError("parallel GCS uploader is unavailable") from error
         temporary = final_blob.bucket.blob(
             f"{final_blob.name}.multipart-{uuid.uuid4().hex}"
         )
         temporary.metadata = {"sha256": sha256}
         temporary_generation = 0
         try:
-            transfer_manager.upload_chunks_concurrently(
-                str(source),
-                temporary,
-                chunk_size=self.parallel_upload_chunk_bytes,
-                worker_type=transfer_manager.THREAD,
-                max_workers=self.parallel_upload_workers,
-                checksum="crc32c",
-            )
+            if self.isolated_large_transfers:
+                bucket_name, _ = parse_gcs_uri(uri)
+                self._run_isolated_transfer(
+                    "upload-temp",
+                    "--source",
+                    str(source),
+                    "--uri",
+                    f"gs://{bucket_name}/{temporary.name}",
+                    "--sha256",
+                    sha256,
+                    "--crc32c",
+                    crc32c,
+                    "--chunk-bytes",
+                    str(self.parallel_upload_chunk_bytes),
+                    "--workers",
+                    str(self.parallel_upload_workers),
+                    "--deadline-seconds",
+                    str(self.transfer_timeout_seconds),
+                )
+            else:
+                transfer_manager = self._transfer_manager()
+                transfer_manager.upload_chunks_concurrently(
+                    str(source),
+                    temporary,
+                    chunk_size=self.parallel_upload_chunk_bytes,
+                    worker_type=self._worker_type(transfer_manager),
+                    max_workers=self.parallel_upload_workers,
+                    checksum="crc32c",
+                    deadline=self.transfer_timeout_seconds,
+                )
+            if _file_state(source.stat()) != source_state:
+                raise ObjectStoreError(
+                    "local upload source changed during multipart transfer"
+                )
             temporary.reload()
             temporary_generation = int(temporary.generation or 0)
-            if temporary_generation <= 0:
-                raise ObjectStoreError("multipart upload has no GCS generation")
+            if (
+                temporary_generation <= 0
+                or int(temporary.size or 0) != source_state.size
+                or dict(temporary.metadata or {}).get("sha256") != sha256
+                or str(temporary.crc32c or "") != crc32c
+            ):
+                raise ObjectStoreError(
+                    "multipart upload has no valid temporary GCS identity"
+                )
             try:
                 final_blob.bucket.copy_blob(
                     temporary,
@@ -284,13 +410,31 @@ class GCSObjectStore:
                 # A racing writer is successful only if its final immutable
                 # identity is byte-for-byte compatible with ours.
                 try:
-                    return self._identity(final_blob, uri, sha256)
+                    identity = self._identity(final_blob, uri, sha256)
+                    self._require_content_identity(
+                        identity,
+                        size_bytes=source_state.size,
+                        crc32c=crc32c,
+                    )
+                    return identity
                 except Exception:
                     raise ObjectStoreError(
                         f"cannot conditionally commit multipart object {uri}"
                     ) from error
-            return self._identity(final_blob, uri, sha256)
+            identity = self._identity(final_blob, uri, sha256)
+            self._require_content_identity(
+                identity,
+                size_bytes=source_state.size,
+                crc32c=crc32c,
+            )
+            return identity
         finally:
+            if temporary_generation <= 0:
+                try:
+                    temporary.reload()
+                    temporary_generation = int(temporary.generation or 0)
+                except Exception:
+                    temporary_generation = 0
             if temporary_generation > 0:
                 try:
                     temporary.delete(if_generation_match=temporary_generation)
@@ -298,6 +442,74 @@ class GCSObjectStore:
                     raise ObjectStoreError(
                         f"cannot remove multipart temporary for {uri}"
                     ) from error
+
+    @staticmethod
+    def _require_content_identity(
+        identity: ObjectIdentity, *, size_bytes: int, crc32c: str
+    ) -> None:
+        if identity.size_bytes != size_bytes or identity.crc32c != crc32c:
+            raise ObjectStoreError(
+                f"GCS object content identity differs: {identity.uri}"
+            )
+
+    def _transfer_manager(self) -> Any:
+        transfer_manager = self._transfer_manager_module
+        if transfer_manager is None:
+            try:
+                from google.cloud.storage import transfer_manager
+            except ImportError as error:  # pragma: no cover - optional package
+                raise ObjectStoreError(
+                    "parallel GCS transfer support is unavailable"
+                ) from error
+        return transfer_manager
+
+    def _worker_type(self, transfer_manager: Any) -> Any:
+        attribute = self.parallel_worker_type.upper()
+        try:
+            return getattr(transfer_manager, attribute)
+        except AttributeError as error:
+            raise ObjectStoreError(
+                f"parallel GCS transfer manager has no {attribute} worker type"
+            ) from error
+
+    def _run_isolated_transfer(self, operation: str, *arguments: str) -> None:
+        command = [
+            sys.executable,
+            "-m",
+            "moe_sae._gcs_transfer",
+            operation,
+            *arguments,
+        ]
+        outer_timeout = (
+            self.transfer_timeout_seconds
+            + _ISOLATED_TRANSFER_EXIT_GRACE_SECONDS
+        )
+        try:
+            completed = subprocess.run(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                timeout=outer_timeout,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise ObjectStoreError(
+                f"isolated GCS {operation} helper exceeded "
+                f"its {outer_timeout:.0f}-second hard deadline"
+            ) from error
+        except OSError as error:
+            raise ObjectStoreError(
+                f"cannot launch isolated GCS {operation} helper"
+            ) from error
+        if completed.returncode != 0:
+            detail = completed.stderr.strip().splitlines()
+            suffix = f": {detail[-1]}" if detail else ""
+            raise ObjectStoreError(
+                f"isolated GCS {operation} helper failed "
+                f"with exit code {completed.returncode}{suffix}"
+            )
 
     def download(self, identity: ObjectIdentity, destination: Path) -> None:
         blob = self._blob(identity.uri)
@@ -312,11 +524,53 @@ class GCSObjectStore:
                 f"GCS object generation/metadata changed: {identity.uri}"
             )
         destination.parent.mkdir(parents=True, exist_ok=True)
-        blob.download_to_filename(
-            str(destination),
-            if_generation_match=identity.generation,
-            checksum="auto",
-        )
+        if identity.size_bytes >= self.parallel_download_threshold_bytes:
+            try:
+                if self.isolated_large_transfers:
+                    self._run_isolated_transfer(
+                        "download",
+                        "--uri",
+                        identity.uri,
+                        "--generation",
+                        str(identity.generation),
+                        "--size-bytes",
+                        str(identity.size_bytes),
+                        "--crc32c",
+                        identity.crc32c,
+                        "--sha256",
+                        identity.sha256,
+                        "--destination",
+                        str(destination),
+                        "--chunk-bytes",
+                        str(self.parallel_download_chunk_bytes),
+                        "--workers",
+                        str(self.parallel_download_workers),
+                        "--deadline-seconds",
+                        str(self.transfer_timeout_seconds),
+                    )
+                else:
+                    transfer_manager = self._transfer_manager()
+                    transfer_manager.download_chunks_concurrently(
+                        blob,
+                        str(destination),
+                        chunk_size=self.parallel_download_chunk_bytes,
+                        download_kwargs={
+                            "if_generation_match": identity.generation
+                        },
+                        worker_type=self._worker_type(transfer_manager),
+                        max_workers=self.parallel_download_workers,
+                        crc32c_checksum=True,
+                        deadline=self.transfer_timeout_seconds,
+                    )
+            except Exception:
+                destination.unlink(missing_ok=True)
+                raise
+        else:
+            blob.download_to_filename(
+                str(destination),
+                if_generation_match=identity.generation,
+                checksum="auto",
+            )
 
     def verify(self, identity: ObjectIdentity) -> None:
         blob = self._blob(identity.uri)

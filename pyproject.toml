@@ -4,6 +4,7 @@ version = "0.2.0"
 description = "Router-conditioned sparse autoencoders for Gemma 4 MoE activations"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "google-crc32c==1.8.0",
     "jax>=0.8.0,<0.11",
     "numpy>=2.0",
     "pyyaml>=6.0",

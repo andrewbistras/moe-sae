@@ -67,6 +67,7 @@ from moe_sae.runtime import (
 )
 from moe_sae.storage import (
     ACTIVATION_CAPTURE_SCOPE,
+    MINIMUM_ACTIVATION_GCS_DOWNLOAD_BYTES_PER_SECOND,
     MINIMUM_ACTIVATION_LOCAL_FREE_BYTES,
 )
 
@@ -248,7 +249,7 @@ def _validate_storage_attestation_payload(
                 config.min_gcs_upload_bytes_per_second
             ),
             minimum_aggregate_download_bytes_per_second=(
-                config.min_gcs_download_bytes_per_second
+                MINIMUM_ACTIVATION_GCS_DOWNLOAD_BYTES_PER_SECOND
             ),
             cleanup=True,
         )
@@ -275,6 +276,8 @@ def _validate_storage_attestation_payload(
         or metadata.get("sae_cache_qualified") is not False
         or metadata.get("configured_sae_capture_cache_max_bytes")
         != config.capture_cache_max_bytes
+        or metadata.get("configured_sae_min_gcs_download_bytes_per_second")
+        != config.min_gcs_download_bytes_per_second
         or not isinstance(control, Mapping)
         or not isinstance(local, Mapping)
         or not isinstance(gcs, Mapping)
@@ -1132,6 +1135,7 @@ def _command_qualify_storage(args: argparse.Namespace) -> int:
     from moe_sae.object_store import GCSObjectStore, LocalObjectStore
     from moe_sae.storage import (
         ACTIVATION_CAPTURE_SCOPE,
+        MINIMUM_ACTIVATION_GCS_DOWNLOAD_BYTES_PER_SECOND,
         MINIMUM_ACTIVATION_LOCAL_FREE_BYTES,
         StoragePlanesQualificationConfig,
         build_storage_attestation,
@@ -1191,7 +1195,7 @@ def _command_qualify_storage(args: argparse.Namespace) -> int:
                 config.min_gcs_upload_bytes_per_second
             ),
             minimum_aggregate_download_bytes_per_second=(
-                config.min_gcs_download_bytes_per_second
+                MINIMUM_ACTIVATION_GCS_DOWNLOAD_BYTES_PER_SECOND
             ),
         )
         object_store = GCSObjectStore()
@@ -1230,6 +1234,9 @@ def _command_qualify_storage(args: argparse.Namespace) -> int:
             "sae_checkpoint_root": sae_checkpoint_root,
             "sae_cache_qualified": False,
             "configured_sae_capture_cache_max_bytes": config.capture_cache_max_bytes,
+            "configured_sae_min_gcs_download_bytes_per_second": (
+                config.min_gcs_download_bytes_per_second
+            ),
             "orbax_checkpoint_qualification": dataclasses.asdict(
                 orbax_qualification
             ),

@@ -13,6 +13,7 @@ from moe_sae.object_store import LocalObjectStore
 from moe_sae.storage import (
     ACTIVATION_CAPTURE_SCOPE,
     CoordinationHooks,
+    MINIMUM_ACTIVATION_GCS_DOWNLOAD_BYTES_PER_SECOND,
     MINIMUM_ACTIVATION_LOCAL_FREE_BYTES,
     StoragePlanesQualificationConfig,
     StorageQualificationError,
@@ -286,7 +287,70 @@ def test_gcs_throughput_thresholds_are_hard_gates(tmp_path: Path) -> None:
     assert any("GCS download throughput below threshold" in item for item in result.failures)
 
 
-def test_v4_activation_attestation_is_self_hashed_scoped_and_bound(
+def test_activation_download_throughput_is_diagnostic_but_integrity_is_recorded(
+    tmp_path: Path,
+) -> None:
+    config = StoragePlanesQualificationConfig(
+        minimum_control_free_bytes=1,
+        minimum_local_buffer_free_bytes=1,
+        gcs_probe_bytes_per_process=4096,
+        gcs_probe_block_bytes=1024,
+        minimum_aggregate_upload_bytes_per_second=0,
+        minimum_aggregate_download_bytes_per_second=(
+            MINIMUM_ACTIVATION_GCS_DOWNLOAD_BYTES_PER_SECOND
+        ),
+    )
+
+    result = qualify_storage_planes(
+        tmp_path / "control",
+        tmp_path / "local",
+        "gs://qualification-test/prefix",
+        LocalObjectStore(tmp_path / "objects"),
+        config=config,
+    )
+
+    assert MINIMUM_ACTIVATION_GCS_DOWNLOAD_BYTES_PER_SECOND == 0.0
+    assert result.passed
+    assert result.gcs.download is not None
+    assert result.gcs.download.total_bytes == config.gcs_probe_bytes_per_process
+
+
+def test_activation_download_integrity_failure_remains_a_hard_gate(
+    tmp_path: Path,
+) -> None:
+    class _CorruptingStore(LocalObjectStore):
+        def download(self, identity, destination):
+            super().download(identity, destination)
+            destination.write_bytes(b"corrupt")
+
+    config = StoragePlanesQualificationConfig(
+        minimum_control_free_bytes=1,
+        minimum_local_buffer_free_bytes=1,
+        gcs_probe_bytes_per_process=4096,
+        gcs_probe_block_bytes=1024,
+        minimum_aggregate_upload_bytes_per_second=0,
+        minimum_aggregate_download_bytes_per_second=(
+            MINIMUM_ACTIVATION_GCS_DOWNLOAD_BYTES_PER_SECOND
+        ),
+    )
+
+    result = qualify_storage_planes(
+        tmp_path / "control",
+        tmp_path / "local",
+        "gs://qualification-test/prefix",
+        _CorruptingStore(tmp_path / "objects"),
+        config=config,
+    )
+
+    assert not result.passed
+    assert result.gcs.download is not None
+    assert any(
+        "generation-pinned GCS download failed" in failure
+        for failure in result.failures
+    )
+
+
+def test_v5_activation_attestation_is_self_hashed_scoped_and_bound(
     tmp_path: Path,
 ) -> None:
     config = StoragePlanesQualificationConfig(

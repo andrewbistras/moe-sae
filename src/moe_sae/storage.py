@@ -34,10 +34,11 @@ from moe_sae.object_store import (
 )
 
 
-STORAGE_ATTESTATION_SCHEMA = "gemma4-storage-planes-qualification-v4"
+STORAGE_ATTESTATION_SCHEMA = "gemma4-storage-planes-qualification-v5"
 ORBAX_QUALIFICATION_SCHEMA = "gemma4-orbax-storage-qualification-v1"
 ACTIVATION_CAPTURE_SCOPE = "activation-capture"
 MINIMUM_ACTIVATION_LOCAL_FREE_BYTES = 24 * 1024**3
+MINIMUM_ACTIVATION_GCS_DOWNLOAD_BYTES_PER_SECOND = 0.0
 DEFAULT_MINIMUM_CONTROL_FREE_BYTES = 10_000_000_000
 DEFAULT_MINIMUM_LOCAL_BUFFER_FREE_BYTES = 128 * 1024**3
 DEFAULT_GCS_PROBE_BYTES_PER_PROCESS = 8 * 1024**3
@@ -1666,6 +1667,7 @@ __all__ = [
     "ControlPlaneQualification",
     "CoordinationHooks",
     "LocalBufferQualification",
+    "MINIMUM_ACTIVATION_GCS_DOWNLOAD_BYTES_PER_SECOND",
     "MINIMUM_ACTIVATION_LOCAL_FREE_BYTES",
     "ObjectPlaneQualification",
     "OrbaxCheckpointQualification",

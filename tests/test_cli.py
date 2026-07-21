@@ -1,3 +1,4 @@
+import dataclasses
 import json
 import hashlib
 from types import SimpleNamespace
@@ -30,6 +31,12 @@ from moe_sae.model import (
     HuggingFaceSnapshot,
     expected_hf_repository_inventory_sha256,
     expected_hf_snapshot_inventory_sha256,
+)
+from moe_sae.storage import (
+    MINIMUM_ACTIVATION_GCS_DOWNLOAD_BYTES_PER_SECOND,
+    STORAGE_ATTESTATION_SCHEMA,
+    StoragePlanesQualificationConfig,
+    storage_attestation_digest,
 )
 
 
@@ -160,6 +167,108 @@ def test_activation_storage_attestation_cannot_authorize_sae_consumers() -> None
     }
     with pytest.raises(RuntimeError, match="activation-capture only"):
         cli_module._require_sae_cache_qualification(payload)
+
+
+def test_activation_storage_attestation_seals_future_download_gate(
+    tmp_path,
+) -> None:
+    config = Gemma4Config()
+    root = tmp_path.resolve()
+    local = (tmp_path / "local").resolve()
+    digest = "a" * 64
+    run_id = "qualification-run"
+    bulk_root = "gs://bucket/experiment"
+    checkpoint_root = f"{bulk_root}/checkpoints"
+    contract = dataclasses.asdict(
+        StoragePlanesQualificationConfig(
+            minimum_control_free_bytes=config.min_control_free_bytes,
+            minimum_local_buffer_free_bytes=(
+                cli_module.MINIMUM_ACTIVATION_LOCAL_FREE_BYTES
+            ),
+            gcs_probe_bytes_per_process=config.gcs_probe_bytes_per_process,
+            gcs_probe_block_bytes=config.gcs_probe_block_bytes,
+            minimum_aggregate_upload_bytes_per_second=(
+                config.min_gcs_upload_bytes_per_second
+            ),
+            minimum_aggregate_download_bytes_per_second=(
+                MINIMUM_ACTIVATION_GCS_DOWNLOAD_BYTES_PER_SECOND
+            ),
+        )
+    )
+    payload = {
+        "schema_version": STORAGE_ATTESTATION_SCHEMA,
+        "scope": "activation-capture",
+        "created_at_utc": "2026-07-21T00:00:00+00:00",
+        "config_sha256": config.config_hash,
+        "environment_sha256": "b" * 64,
+        "topology": {"process_count": 1, "global_device_count": 16},
+        "contract": contract,
+        "qualification": {
+            "run_id": run_id,
+            "process_count": 1,
+            "failures": [],
+            "control": {"directory": str(root)},
+            "local_buffer": {
+                "directories": [str(local)],
+                "host_isolation_proven": True,
+                "expected_probe_sha256_by_process": [digest],
+                "observed_probe_sha256_by_process": [digest],
+            },
+            "gcs": {"prefix": bulk_root},
+        },
+        "metadata": {
+            "bulk_gcs_root": bulk_root,
+            "sae_checkpoint_root": checkpoint_root,
+            "sae_cache_qualified": False,
+            "configured_sae_capture_cache_max_bytes": config.capture_cache_max_bytes,
+            "configured_sae_min_gcs_download_bytes_per_second": (
+                config.min_gcs_download_bytes_per_second
+            ),
+            "orbax_checkpoint_qualification": {
+                "schema_version": "gemma4-orbax-storage-qualification-v1",
+                "payload_uri": (
+                    f"{checkpoint_root}/qualification/orbax-{run_id}"
+                ),
+                "process_count": 1,
+                "global_device_count": 16,
+                "expected_local_sha256_by_process": [digest],
+                "restored_local_sha256_by_process": [digest],
+                "save_seconds_by_process": [1.0],
+                "restore_seconds_by_process": [2.0],
+                "max_save_seconds": 1.0,
+                "max_restore_seconds": 2.0,
+                "finalized": True,
+                "metadata_round_trip": True,
+                "failures": [],
+            },
+        },
+    }
+    payload["attestation_sha256"] = storage_attestation_digest(payload)
+
+    assert (
+        cli_module._validate_storage_attestation_payload(
+            payload,
+            root=root,
+            config=config,
+            environment_sha256="b" * 64,
+            process_count=1,
+            global_device_count=16,
+        )
+        == payload["attestation_sha256"]
+    )
+    payload["metadata"].pop(
+        "configured_sae_min_gcs_download_bytes_per_second"
+    )
+    payload["attestation_sha256"] = storage_attestation_digest(payload)
+    with pytest.raises(RuntimeError, match="deployment layout is incomplete"):
+        cli_module._validate_storage_attestation_payload(
+            payload,
+            root=root,
+            config=config,
+            environment_sha256="b" * 64,
+            process_count=1,
+            global_device_count=16,
+        )
 
 
 def test_checkpoint_claim_is_verified_against_actual_inventory(tmp_path):

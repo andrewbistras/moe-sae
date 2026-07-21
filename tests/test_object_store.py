@@ -4,9 +4,13 @@ import base64
 import hashlib
 import os
 from pathlib import Path
+import subprocess
+from types import SimpleNamespace
 import uuid
 
+import google_crc32c
 import pytest
+import moe_sae._gcs_transfer as gcs_transfer_module
 
 from moe_sae.object_store import (
     GCSObjectStore,
@@ -19,6 +23,12 @@ from moe_sae.object_store import (
     parse_gcs_uri,
     sha256_file,
 )
+
+
+def _crc32c(payload: bytes) -> str:
+    return base64.b64encode(
+        google_crc32c.value(payload).to_bytes(4, "big")
+    ).decode("ascii")
 
 
 class _FakeBlob:
@@ -50,11 +60,12 @@ class _FakeBlob:
         self._calls.append(("upload", kwargs))
         if "content" in self._state:
             raise RuntimeError("precondition failed")
+        content = Path(filename).read_bytes()
         self._state.update(
-            content=Path(filename).read_bytes(),
+            content=content,
             metadata=dict(self.metadata or {}),
             generation=41,
-            crc32c="AAAAAA==",
+            crc32c=_crc32c(content),
         )
         self._refresh()
 
@@ -124,6 +135,7 @@ class _FakeClient:
 
 class _FakeTransferManager:
     THREAD = "thread"
+    PROCESS = "process"
 
     def __init__(self, calls: list[tuple[object, ...]]):
         self.calls = calls
@@ -134,13 +146,21 @@ class _FakeTransferManager:
         self.calls.append(("multipart", kwargs))
         if "content" in blob._state:
             raise RuntimeError("temporary collision")
+        content = Path(filename).read_bytes()
         blob._state.update(
-            content=Path(filename).read_bytes(),
+            content=content,
             metadata=dict(blob.metadata or {}),
             generation=59,
-            crc32c="AAAAAA==",
+            crc32c=_crc32c(content),
         )
         blob._refresh()
+
+    def download_chunks_concurrently(
+        self, blob: _FakeBlob, filename: str, **kwargs: object
+    ) -> None:
+        self.calls.append(("multipart-download", kwargs))
+        blob._refresh()
+        Path(filename).write_bytes(blob._state["content"])
 
 
 def _write(path: Path, payload: bytes) -> str:
@@ -231,6 +251,7 @@ def test_gcs_large_upload_multipart_commits_conditionally_and_cleans_temp(
             "worker_type": transfer_manager.THREAD,
             "max_workers": 3,
             "checksum": "crc32c",
+            "deadline": 1800.0,
         },
     ) in client.calls
     assert (
@@ -248,6 +269,246 @@ def test_gcs_large_upload_multipart_commits_conditionally_and_cleans_temp(
     ]
     assert temporary_states and all("content" not in state for state in temporary_states)
     assert client.states[f"bucket/capture/{digest}.bin"]["content"] == source.read_bytes()
+
+
+def test_gcs_rejects_wrong_local_sha_before_upload(tmp_path: Path) -> None:
+    source = tmp_path / "source.bin"
+    _write(source, b"local identity")
+    client = _FakeClient()
+    store = GCSObjectStore(client)
+
+    with pytest.raises(ObjectStoreError, match="claimed SHA-256"):
+        store.put_if_absent(
+            source,
+            "gs://bucket/capture/wrong.bin",
+            sha256="0" * 64,
+        )
+
+    assert client.calls == []
+
+
+def test_isolated_upload_helper_rejects_whole_object_crc_and_cleans_temp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.bin"
+    digest = _write(source, b"whole object checksum")
+    client = _FakeClient()
+    blob = client.bucket("bucket").blob("temporary")
+
+    class _BadCRCTransferManager(_FakeTransferManager):
+        def upload_chunks_concurrently(
+            self, filename: str, target: _FakeBlob, **kwargs: object
+        ) -> None:
+            super().upload_chunks_concurrently(filename, target, **kwargs)
+            target._state["crc32c"] = "AAAAAA=="
+            target._refresh()
+
+    manager = _BadCRCTransferManager(client.calls)
+    monkeypatch.setattr(
+        gcs_transfer_module,
+        "_client_and_blob",
+        lambda _uri: (client, blob),
+    )
+    monkeypatch.setattr(
+        gcs_transfer_module,
+        "_transfer_manager",
+        lambda: manager,
+    )
+    args = SimpleNamespace(
+        source=str(source),
+        uri="gs://bucket/temporary",
+        sha256=digest,
+        crc32c=_crc32c(source.read_bytes()),
+        chunk_bytes=7,
+        workers=3,
+        deadline_seconds=30.0,
+    )
+
+    with pytest.raises(RuntimeError, match="invalid GCS identity"):
+        gcs_transfer_module._upload_temporary(args)
+
+    assert "content" not in client.states["bucket/temporary"]
+    assert (
+        "delete",
+        {"if_generation_match": 59},
+    ) in client.calls
+
+
+def test_parent_rejects_bad_multipart_crc_before_conditional_commit(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.bin"
+    digest = _write(source, b"bad multipart checksum")
+    client = _FakeClient()
+
+    class _BadCRCTransferManager(_FakeTransferManager):
+        def upload_chunks_concurrently(
+            self, filename: str, target: _FakeBlob, **kwargs: object
+        ) -> None:
+            super().upload_chunks_concurrently(filename, target, **kwargs)
+            target._state["crc32c"] = "AAAAAA=="
+            target._refresh()
+
+    store = GCSObjectStore(
+        client,
+        parallel_upload_threshold_bytes=1,
+        transfer_manager_module=_BadCRCTransferManager(client.calls),
+    )
+    uri = f"gs://bucket/capture/{digest}.bin"
+
+    with pytest.raises(ObjectStoreError, match="temporary GCS identity"):
+        store.put_if_absent(source, uri, sha256=digest)
+
+    assert not any(call[0] == "copy" for call in client.calls)
+    assert all(
+        "content" not in state
+        for name, state in client.states.items()
+        if ".multipart-" in name
+    )
+
+
+def test_gcs_large_download_uses_parallel_generation_pinned_ranges(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.bin"
+    digest = _write(source, b"parallel immutable download")
+    client = _FakeClient()
+    transfer_manager = _FakeTransferManager(client.calls)
+    upload_store = GCSObjectStore(client)
+    uri = f"gs://bucket/capture/{digest}.bin"
+    identity = upload_store.put_if_absent(source, uri, sha256=digest)
+    store = GCSObjectStore(
+        client,
+        parallel_download_threshold_bytes=1,
+        parallel_download_chunk_bytes=11,
+        parallel_download_workers=5,
+        parallel_worker_type="process",
+        transfer_manager_module=transfer_manager,
+    )
+
+    destination = tmp_path / "download.bin"
+    store.download(identity, destination)
+
+    assert destination.read_bytes() == source.read_bytes()
+    assert (
+        "multipart-download",
+        {
+            "chunk_size": 11,
+            "download_kwargs": {"if_generation_match": 41},
+            "worker_type": transfer_manager.PROCESS,
+            "max_workers": 5,
+            "crc32c_checksum": True,
+            "deadline": 1800.0,
+        },
+    ) in client.calls
+
+
+def test_gcs_isolated_large_upload_keeps_conditional_commit_in_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.bin"
+    digest = _write(source, b"isolated immutable upload")
+    client = _FakeClient()
+    commands: list[list[str]] = []
+
+    def run(command: list[str], **_kwargs: object):
+        commands.append(command)
+        uri = command[command.index("--uri") + 1]
+        bucket, name = parse_gcs_uri(uri)
+        state = client.states.setdefault(f"{bucket}/{name}", {})
+        state.update(
+            content=source.read_bytes(),
+            metadata={"sha256": digest},
+            generation=59,
+            crc32c=_crc32c(source.read_bytes()),
+        )
+        return type("Completed", (), {"returncode": 0, "stderr": ""})()
+
+    monkeypatch.setattr("moe_sae.object_store.subprocess.run", run)
+    store = GCSObjectStore(
+        client,
+        parallel_upload_threshold_bytes=1,
+        isolated_large_transfers=True,
+    )
+    uri = f"gs://bucket/capture/{digest}.bin"
+
+    identity = store.put_if_absent(source, uri, sha256=digest)
+
+    assert identity.generation == 73
+    assert commands and commands[0][3] == "upload-temp"
+    assert commands[0][commands[0].index("--chunk-bytes") + 1] == str(16 * 1024**2)
+    assert commands[0][commands[0].index("--workers") + 1] == "32"
+    assert any(call[0] == "copy" for call in client.calls)
+    assert all(
+        "content" not in state
+        for name, state in client.states.items()
+        if ".multipart-" in name
+    )
+
+
+def test_gcs_isolated_large_download_is_generation_pinned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.bin"
+    digest = _write(source, b"isolated immutable download")
+    client = _FakeClient()
+    upload_store = GCSObjectStore(client)
+    uri = f"gs://bucket/capture/{digest}.bin"
+    identity = upload_store.put_if_absent(source, uri, sha256=digest)
+    commands: list[list[str]] = []
+
+    def run(command: list[str], **_kwargs: object):
+        commands.append(command)
+        destination = Path(command[command.index("--destination") + 1])
+        destination.write_bytes(source.read_bytes())
+        return type("Completed", (), {"returncode": 0, "stderr": ""})()
+
+    monkeypatch.setattr("moe_sae.object_store.subprocess.run", run)
+    store = GCSObjectStore(
+        client,
+        parallel_download_threshold_bytes=1,
+        isolated_large_transfers=True,
+    )
+    destination = tmp_path / "download.bin"
+
+    store.download(identity, destination)
+
+    assert destination.read_bytes() == source.read_bytes()
+    assert commands and commands[0][3] == "download"
+    assert commands[0][commands[0].index("--generation") + 1] == "41"
+    assert commands[0][commands[0].index("--chunk-bytes") + 1] == str(32 * 1024**2)
+    assert commands[0][commands[0].index("--workers") + 1] == "16"
+
+
+def test_gcs_isolated_transfer_timeout_is_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.bin"
+    digest = _write(source, b"bounded helper")
+    client = _FakeClient()
+    observed: dict[str, float] = {}
+
+    def run(command: list[str], **kwargs: object):
+        observed["timeout"] = float(kwargs["timeout"])
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr("moe_sae.object_store.subprocess.run", run)
+    store = GCSObjectStore(
+        client,
+        parallel_upload_threshold_bytes=1,
+        transfer_timeout_seconds=30.0,
+        isolated_large_transfers=True,
+    )
+
+    with pytest.raises(ObjectStoreError, match="90-second hard deadline"):
+        store.put_if_absent(
+            source,
+            f"gs://bucket/capture/{digest}.bin",
+            sha256=digest,
+        )
+
+    assert observed == {"timeout": 90.0}
+    assert not any(call[0] == "copy" for call in client.calls)
 
 
 def test_store_detects_corruption_and_generation_pinned_delete(tmp_path: Path) -> None:
@@ -340,7 +601,10 @@ def test_real_gcs_round_trip_is_explicitly_opt_in(tmp_path: Path) -> None:
     source = tmp_path / "real-gcs-probe.bin"
     digest = _write(source, os.urandom(10 * 1024**2))
     uri = join_gcs_uri(prefix, "pytest", f"{uuid.uuid4().hex}-{digest}.bin")
-    store = GCSObjectStore(parallel_upload_threshold_bytes=1)
+    store = GCSObjectStore(
+        parallel_upload_threshold_bytes=1,
+        parallel_download_threshold_bytes=1,
+    )
     identity = store.put_if_absent(source, uri, sha256=digest)
     try:
         destination = tmp_path / "download.bin"
