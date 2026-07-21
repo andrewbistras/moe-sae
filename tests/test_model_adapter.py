@@ -163,7 +163,11 @@ class FakeMLP:
 
 class FakeLayer:
     def __init__(self, index, calls):
-        self.layer_idx = index
+        self.index = index
+        # Pinned MaxText leaves this constructor metadata at its default for
+        # every unscanned Gemma 4 layer.  Layer order is represented by the
+        # decoder collection and its layers_{index} aliases instead.
+        self.layer_idx = 0
         self.attention_type = "local_sliding" if (index + 1) % 6 else "global"
         self.calls = calls
         self.pre_self_attention_norm = IdentityNorm()
@@ -179,8 +183,8 @@ class FakeLayer:
         self, hidden, segment_ids, positions, deterministic, model_mode, **kwargs
     ):
         del segment_ids, positions, deterministic, model_mode, kwargs
-        self.calls.append(self.layer_idx)
-        if self.layer_idx == 14:
+        self.calls.append(self.index)
+        if self.index == 14:
             residual = hidden * 2.0
             routed, _, _ = self.mlp.moe_block.routed_moe(
                 residual,
@@ -201,6 +205,8 @@ class FakeLayer:
 class FakeDecoder:
     def __init__(self, calls):
         self.layers = [FakeLayer(index, calls) for index in range(30)]
+        for index, layer in enumerate(self.layers):
+            setattr(self, f"layers_{index}", layer)
 
     def _apply_embedding(
         self, token_embedder, token_ids, positions, deterministic, model_mode
@@ -319,6 +325,44 @@ def test_model_architecture_drift_fails_before_forward():
     model.decoder.layers = model.decoder.layers[:15]
     with pytest.raises(ValueError, match="expected 30 unscanned decoder layers"):
         Gemma4PrefixAdapter(model)
+
+    model = FakeModel()
+    model.decoder.layers[1], model.decoder.layers[2] = (
+        model.decoder.layers[2],
+        model.decoder.layers[1],
+    )
+    with pytest.raises(ValueError, match="decoder layer order drift at block 2"):
+        Gemma4PrefixAdapter(model)
+
+
+def test_pinned_maxtext_gemma4_builder_uses_default_layer_index_metadata():
+    nnx_decoders = pytest.importorskip("maxtext.layers.nnx_decoders")
+    common_types = pytest.importorskip("maxtext.common.common_types")
+    observed = []
+
+    def register(layer_cls, rngs, prefix, index, **kwargs):
+        observed.append((layer_cls, rngs, prefix, index, kwargs))
+
+    layer_cls = object()
+    rngs = object()
+    decoder = SimpleNamespace(
+        config=SimpleNamespace(
+            decoder_block=common_types.DecoderBlockType.GEMMA4,
+            num_decoder_layers=2,
+        ),
+        _create_and_register_layer=register,
+    )
+
+    nnx_decoders.NNXDecoder._init_sequential_generic(
+        decoder,
+        [layer_cls],
+        rngs,
+    )
+
+    assert [item[3] for item in observed] == [0, 1]
+    assert all(item[0] is layer_cls and item[1] is rngs for item in observed)
+    assert all(item[2] == "layers" for item in observed)
+    assert all("layer_idx" not in item[4] for item in observed)
 
 
 @pytest.mark.parametrize(

@@ -1215,6 +1215,16 @@ def validate_model_architecture(
         )
 
     for index, layer in enumerate(resolved_layers):
+        named_layer = _require_attribute(
+            decoder,
+            f"layers_{index}",
+            "pure NNX decoder",
+        )
+        if named_layer is not layer:
+            raise ValueError(
+                f"decoder layer order drift at block {index + 1}: "
+                f"decoder.layers[{index}] does not match decoder.layers_{index}"
+            )
         actual_attention = str(getattr(layer, "attention_type", "")).lower()
         expected_attention = "global" if (index + 1) % 6 == 0 else "local"
         if expected_attention not in actual_attention:
@@ -1222,9 +1232,6 @@ def validate_model_architecture(
                 f"block {index + 1} must use {expected_attention} attention, "
                 f"got {getattr(layer, 'attention_type', None)!r}"
             )
-        layer_index = getattr(layer, "layer_idx", index)
-        if int(layer_index) != index:
-            raise ValueError(f"decoder layer index drift at block {index + 1}")
 
     target = resolved_layers[config.target_layer_index]
     if "local" not in str(getattr(target, "attention_type", "")).lower():
