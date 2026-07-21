@@ -862,6 +862,24 @@ def test_production_benchmark_closes_runtime_on_adapter_setup_failure(
     assert closed == [runtime]
 
 
+def test_production_benchmark_abort_does_not_finalize_empty_writer(tmp_path):
+    persistence = harvest_module._ProductionBenchmarkPersist(
+        tmp_path,
+        metadata=metadata(),
+        config=Gemma4Config(),
+        process_count=4,
+        process_index=0,
+        reference_instrumentation_equal=True,
+    )
+
+    persistence.abort()
+    persistence.abort()
+
+    assert persistence._closed
+    assert not persistence._finalized
+    assert not (tmp_path / "hosts" / "host-p00000.json").exists()
+
+
 def test_production_benchmark_cleans_persistence_and_scratch_on_worker_failure(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ):
@@ -886,9 +904,19 @@ def test_production_benchmark_cleans_persistence_and_scratch_on_worker_failure(
     class Persistence:
         def __init__(self):
             self.closed = False
+            self.aborted = False
+            self.remote_cleaned = False
 
         def close(self):
             self.closed = True
+            raise RuntimeError("host has committed no ranges")
+
+        def abort(self):
+            self.aborted = True
+            raise RuntimeError("abort failed")
+
+        def cleanup_remote_objects(self):
+            self.remote_cleaned = True
 
         def diagnostics(self):
             return BenchmarkDiagnostics()
@@ -933,7 +961,102 @@ def test_production_benchmark_cleans_persistence_and_scratch_on_worker_failure(
         harvest_module, "_close_maxtext_runtime", lambda value: closed.append(value)
     )
 
-    with pytest.raises(HarvestError, match="worker failed"):
+    with pytest.raises(HarvestError, match="worker failed") as raised:
+        harvest_module.benchmark_production_candidate(
+            checkpoint_path="/checkpoint",
+            mesh_candidate=HARVEST_MESHES[0],
+            per_device_sequence_batch=1,
+            config=Gemma4Config(),
+            output_directory=tmp_path,
+        )
+
+    assert persistence.aborted
+    assert not persistence.closed
+    assert persistence.remote_cleaned
+    assert raised.value.__notes__ == [
+        "suppressed benchmark persistence error: RuntimeError: abort failed"
+    ]
+    assert closed == [runtime]
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_production_benchmark_surfaces_cleanup_failure_after_success(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    class Runtime:
+        model = object()
+        train_iterator = iter([grain([list(range(1_024))], [[1] * 1_024])])
+
+    class AdapterFactory:
+        @staticmethod
+        def from_maxtext(model, config):
+            del model, config
+            return object()
+
+    class NoopContext:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            del exc_type, exc, traceback
+            return False
+
+    class Persistence:
+        def __init__(self):
+            self.closed = False
+            self.remote_cleaned = False
+
+        def close(self):
+            self.closed = True
+            raise RuntimeError("successful cleanup failed")
+
+        def abort(self):
+            raise AssertionError("successful benchmark must not abort persistence")
+
+        def cleanup_remote_objects(self):
+            self.remote_cleaned = True
+
+        def diagnostics(self):
+            return BenchmarkDiagnostics()
+
+    runtime = Runtime()
+    persistence = Persistence()
+    closed: list[object] = []
+    monkeypatch.setattr(harvest_module, "build_maxtext_argv", lambda **kwargs: [])
+    monkeypatch.setattr(harvest_module, "create_maxtext_runtime", lambda argv: runtime)
+    monkeypatch.setattr(harvest_module, "Gemma4PrefixAdapter", AdapterFactory)
+    monkeypatch.setattr(
+        harvest_module, "compile_adapter_step", lambda adapter: object()
+    )
+    monkeypatch.setattr(
+        harvest_module, "maxtext_mesh_context", lambda value: NoopContext()
+    )
+    monkeypatch.setattr(
+        harvest_module, "_run_instrumentation_parity", lambda *args, **kwargs: True
+    )
+    monkeypatch.setattr(
+        harvest_module,
+        "environment_fingerprint",
+        lambda root: {"sha256": "d" * 64},
+    )
+    monkeypatch.setattr(
+        harvest_module,
+        "_ProductionBenchmarkPersist",
+        lambda *args, **kwargs: persistence,
+    )
+    monkeypatch.setattr(
+        harvest_module,
+        "compile_warm_and_replay",
+        lambda *args, **kwargs: (iter(()), 0.0),
+    )
+    monkeypatch.setattr(
+        harvest_module, "benchmark_worker", lambda *args, **kwargs: object()
+    )
+    monkeypatch.setattr(
+        harvest_module, "_close_maxtext_runtime", lambda value: closed.append(value)
+    )
+
+    with pytest.raises(RuntimeError, match="successful cleanup failed"):
         harvest_module.benchmark_production_candidate(
             checkpoint_path="/checkpoint",
             mesh_candidate=HARVEST_MESHES[0],
@@ -943,6 +1066,7 @@ def test_production_benchmark_cleans_persistence_and_scratch_on_worker_failure(
         )
 
     assert persistence.closed
+    assert persistence.remote_cleaned
     assert closed == [runtime]
     assert list(tmp_path.iterdir()) == []
 

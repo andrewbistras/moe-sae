@@ -1665,6 +1665,7 @@ def benchmark_production_candidate(
     runtime = create_maxtext_runtime(argv)
     scratch: Path | None = None
     persistence: _ProductionBenchmarkPersist | None = None
+    body_error: BaseException | None = None
     try:
         adapter = Gemma4PrefixAdapter.from_maxtext(runtime.model, config)
         step = compile_adapter_step(adapter)
@@ -1755,21 +1756,45 @@ def benchmark_production_candidate(
                 persist=persistence,
                 diagnostics=persistence.diagnostics,
             )
+    except BaseException as error:
+        body_error = error
+        raise
     finally:
+        cleanup_errors: list[tuple[str, Exception]] = []
         try:
             if persistence is not None:
-                persistence.close()
+                try:
+                    if body_error is None:
+                        persistence.close()
+                    else:
+                        persistence.abort()
+                except Exception as error:  # preserve an active numerical error
+                    cleanup_errors.append(("benchmark persistence", error))
                 cleanup_remote = getattr(
                     persistence, "cleanup_remote_objects", None
                 )
                 if cleanup_remote is not None:
-                    cleanup_remote()
+                    try:
+                        cleanup_remote()
+                    except Exception as error:
+                        cleanup_errors.append(("benchmark object cleanup", error))
         finally:
             try:
-                _close_maxtext_runtime(runtime)
+                try:
+                    _close_maxtext_runtime(runtime)
+                except Exception as error:
+                    cleanup_errors.append(("MaxText runtime cleanup", error))
             finally:
                 if scratch is not None:
                     shutil.rmtree(scratch, ignore_errors=True)
+        if cleanup_errors:
+            if body_error is not None:
+                for label, error in cleanup_errors:
+                    body_error.add_note(
+                        f"suppressed {label} error: {type(error).__name__}: {error}"
+                    )
+            else:
+                raise cleanup_errors[0][1]
     if persistence is None:  # pragma: no cover - successful body always constructs it
         raise AssertionError("benchmark persistence was not initialized")
     expected_output_tokens = (
@@ -2247,6 +2272,13 @@ class _ProductionBenchmarkPersist:
 
     def close(self) -> None:
         self.flush()
+
+    def abort(self) -> None:
+        """Drain pending writes without sealing an incomplete benchmark host."""
+
+        if not self._closed:
+            self.sink.close()
+            self._closed = True
 
     def diagnostics(self) -> BenchmarkDiagnostics:
         final_cache = _jit_cache_size(self._compiled_step)
