@@ -62,6 +62,7 @@ def _distributed_qualifier(
     config = StoragePlanesQualificationConfig(
         minimum_control_free_bytes=1,
         minimum_local_buffer_free_bytes=1,
+        minimum_aggregate_local_write_bytes_per_second=0,
         gcs_probe_bytes_per_process=1024 * 1024,
         gcs_probe_block_bytes=64 * 1024,
         minimum_aggregate_upload_bytes_per_second=0,
@@ -152,6 +153,9 @@ def test_two_process_split_storage_qualification(tmp_path: Path) -> None:
         first.local_buffer.expected_probe_sha256_by_process
         == first.local_buffer.observed_probe_sha256_by_process
     )
+    assert first.local_buffer.write is not None
+    assert first.local_buffer.write.total_bytes == 2 * 1024 * 1024
+    assert first.local_buffer.write_cleanup_complete
     assert first.gcs.upload is not None
     assert first.gcs.download is not None
     assert first.gcs.upload.total_bytes == 2 * 1024 * 1024
@@ -219,6 +223,7 @@ def test_local_buffer_capacity_failure_skips_object_probe(
     config = StoragePlanesQualificationConfig(
         minimum_control_free_bytes=1,
         minimum_local_buffer_free_bytes=101,
+        minimum_aggregate_local_write_bytes_per_second=0,
         gcs_probe_bytes_per_process=1,
         gcs_probe_block_bytes=1,
         minimum_aggregate_upload_bytes_per_second=0,
@@ -268,6 +273,7 @@ def test_gcs_throughput_thresholds_are_hard_gates(tmp_path: Path) -> None:
     config = StoragePlanesQualificationConfig(
         minimum_control_free_bytes=1,
         minimum_local_buffer_free_bytes=1,
+        minimum_aggregate_local_write_bytes_per_second=0,
         gcs_probe_bytes_per_process=64 * 1024,
         gcs_probe_block_bytes=4096,
         minimum_aggregate_upload_bytes_per_second=1e30,
@@ -285,6 +291,36 @@ def test_gcs_throughput_thresholds_are_hard_gates(tmp_path: Path) -> None:
     assert result.gcs.download is not None
     assert any("GCS upload throughput below threshold" in item for item in result.failures)
     assert any("GCS download throughput below threshold" in item for item in result.failures)
+
+
+def test_local_write_throughput_is_a_hard_gate(tmp_path: Path) -> None:
+    config = StoragePlanesQualificationConfig(
+        minimum_control_free_bytes=1,
+        minimum_local_buffer_free_bytes=1,
+        minimum_aggregate_local_write_bytes_per_second=1e30,
+        gcs_probe_bytes_per_process=64 * 1024,
+        gcs_probe_block_bytes=4096,
+        minimum_aggregate_upload_bytes_per_second=0,
+        minimum_aggregate_download_bytes_per_second=0,
+    )
+    object_root = tmp_path / "objects"
+    result = qualify_storage_planes(
+        tmp_path / "control",
+        tmp_path / "local",
+        "gs://qualification-test/prefix",
+        LocalObjectStore(object_root),
+        config=config,
+    )
+
+    assert not result.passed
+    assert result.local_buffer.write is not None
+    assert result.local_buffer.write_cleanup_complete
+    assert any(
+        "local-buffer write throughput below threshold" in item
+        for item in result.failures
+    )
+    assert result.gcs.upload is None
+    assert not [path for path in object_root.rglob("*") if path.is_file()]
 
 
 def test_probe_fingerprint_matches_independent_file_digest(tmp_path: Path) -> None:
@@ -323,6 +359,7 @@ def test_cleanup_attempts_every_resource_after_local_unlink_failure(
         config=StoragePlanesQualificationConfig(
             minimum_control_free_bytes=1,
             minimum_local_buffer_free_bytes=1,
+            minimum_aggregate_local_write_bytes_per_second=0,
             gcs_probe_bytes_per_process=4096,
             gcs_probe_block_bytes=1024,
             minimum_aggregate_upload_bytes_per_second=0,
@@ -343,6 +380,7 @@ def test_activation_download_throughput_is_diagnostic_but_integrity_is_recorded(
     config = StoragePlanesQualificationConfig(
         minimum_control_free_bytes=1,
         minimum_local_buffer_free_bytes=1,
+        minimum_aggregate_local_write_bytes_per_second=0,
         gcs_probe_bytes_per_process=4096,
         gcs_probe_block_bytes=1024,
         minimum_aggregate_upload_bytes_per_second=0,
@@ -376,6 +414,7 @@ def test_activation_download_integrity_failure_remains_a_hard_gate(
     config = StoragePlanesQualificationConfig(
         minimum_control_free_bytes=1,
         minimum_local_buffer_free_bytes=1,
+        minimum_aggregate_local_write_bytes_per_second=0,
         gcs_probe_bytes_per_process=4096,
         gcs_probe_block_bytes=1024,
         minimum_aggregate_upload_bytes_per_second=0,
@@ -400,12 +439,13 @@ def test_activation_download_integrity_failure_remains_a_hard_gate(
     )
 
 
-def test_v5_activation_attestation_is_self_hashed_scoped_and_bound(
+def test_v6_activation_attestation_is_self_hashed_scoped_and_bound(
     tmp_path: Path,
 ) -> None:
     config = StoragePlanesQualificationConfig(
         minimum_control_free_bytes=1,
         minimum_local_buffer_free_bytes=1,
+        minimum_aggregate_local_write_bytes_per_second=0,
         gcs_probe_bytes_per_process=4096,
         gcs_probe_block_bytes=1024,
         minimum_aggregate_upload_bytes_per_second=0,
@@ -440,6 +480,13 @@ def test_v5_activation_attestation_is_self_hashed_scoped_and_bound(
     )
     assert digest == payload["attestation_sha256"]
     assert payload["scope"] == ACTIVATION_CAPTURE_SCOPE
+
+    legacy = copy.deepcopy(payload)
+    legacy["schema_version"] = "gemma4-storage-planes-qualification-v5"
+    legacy["attestation_sha256"] = storage_module.storage_attestation_digest(legacy)
+    with pytest.raises(StorageQualificationError, match="schema is incompatible"):
+        validate_storage_attestation(legacy)
+
     tampered = copy.deepcopy(payload)
     tampered["contract"]["gcs_probe_bytes_per_process"] += 1
     with pytest.raises(StorageQualificationError, match="self-hash mismatch"):
@@ -454,6 +501,16 @@ def test_v5_activation_attestation_is_self_hashed_scoped_and_bound(
     )
     with pytest.raises(StorageQualificationError, match="host-local buffer isolation"):
         validate_storage_attestation(isolation_tampered)
+
+    local_write_tampered = copy.deepcopy(payload)
+    local_write_tampered["qualification"]["local_buffer"]["write"][
+        "bytes_per_second"
+    ] = 0.0
+    local_write_tampered["attestation_sha256"] = (
+        storage_module.storage_attestation_digest(local_write_tampered)
+    )
+    with pytest.raises(StorageQualificationError, match="local-buffer write"):
+        validate_storage_attestation(local_write_tampered)
 
     scope_tampered = copy.deepcopy(payload)
     scope_tampered["scope"] = "sae-training"
@@ -486,6 +543,7 @@ def test_activation_local_capacity_boundary(
     config = StoragePlanesQualificationConfig(
         minimum_control_free_bytes=1,
         minimum_local_buffer_free_bytes=MINIMUM_ACTIVATION_LOCAL_FREE_BYTES,
+        minimum_aggregate_local_write_bytes_per_second=0,
         gcs_probe_bytes_per_process=1,
         gcs_probe_block_bytes=1,
         minimum_aggregate_upload_bytes_per_second=0,
@@ -508,6 +566,7 @@ def test_activation_local_capacity_boundary(
     [
         ("minimum_control_free_bytes", -1),
         ("minimum_local_buffer_free_bytes", -1),
+        ("minimum_aggregate_local_write_bytes_per_second", float("nan")),
         ("gcs_probe_bytes_per_process", 0),
         ("gcs_probe_block_bytes", 0),
         ("minimum_aggregate_upload_bytes_per_second", float("nan")),

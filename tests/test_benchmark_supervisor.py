@@ -34,6 +34,8 @@ def _passing(mesh, batch: int) -> BenchmarkObservation:
         per_device_sequence_batch=batch,
         synchronized_steps=200,
         elapsed_seconds=1.0,
+        device_elapsed_seconds=1.0,
+        persistence_seconds=0.0,
         useful_flops=0.60 * V4_32_BF16_PEAK_FLOPS,
         output_tokens=1_000,
         persisted_tokens=1_000,
@@ -190,7 +192,7 @@ def test_failed_candidate_is_published_then_next_fresh_worker_runs(
         (attempt_root / "raw.json").write_text(
             json.dumps(
                 {
-                    "schema_version": "gemma4-benchmark-worker-result-v1",
+                    "schema_version": "gemma4-benchmark-worker-result-v2",
                     "sweep_id": values["--sweep-id"],
                     "attempt_id": values["--attempt-id"],
                     "observation": observation.as_dict(),

@@ -144,7 +144,9 @@ Qualify this layout on the allocated v4-32, on all four controllers, before
 production preflight:
 
 ```zsh
-export LOCAL_BUFFER_ROOT="/mnt/localssd/moe-sae"
+# On the current v4-32 image, use this only after inspect_workers.sh confirms
+# that /dev/shm is the direct, private tmpfs mount with sufficient capacity.
+export LOCAL_BUFFER_ROOT="/dev/shm/moe-sae-local"
 export SAE_CHECKPOINT_ROOT="$BULK_GCS_ROOT/sae-checkpoints"
 
 uv run --extra tpu moe-sae qualify-storage \
@@ -156,10 +158,13 @@ uv run --extra tpu moe-sae qualify-storage \
 
 The activation-capture thresholds are pinned and cannot be overridden: at
 least 10GB free on the control volume, 24GiB per local rolling buffer,
-an incompressible 8GiB GCS probe per process, and at least 4GB/s aggregate
+an 8GiB local-write probe per process at least 4GB/s aggregate, an
+incompressible 8GiB GCS probe per process, and at least 4GB/s aggregate
 generation-pinned upload. Download integrity is mandatory and its throughput
 is recorded diagnostically; the configured 4GB/s download requirement is
-sealed for the later SAE-cache qualification. Qualification also proves
+sealed for the later SAE-cache qualification. `/dev/shm` is eligible only as
+the direct `tmpfs` mount and is deliberately ephemeral; durable state remains
+in GCS and the shared control plane. Qualification also proves
 that equal local-buffer paths resolve to process-private storage, cross-process
 `flock`, atomic rename and visibility, disjoint host files, durable directory
 fsync, end-to-end object hashes, and exact-generation cleanup. It then performs

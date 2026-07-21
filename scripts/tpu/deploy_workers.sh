@@ -20,7 +20,7 @@ Required environment variables (none are secrets):
   TPU_SERVICE_ACCOUNT         expected worker metadata service-account email
   PROJECT_COMMIT              full 40-character commit currently checked out
   TPU_PROJECT_ROOT            absolute checkout path on every worker
-  LOCAL_BUFFER_ROOT           explicit local-disk directory on every worker
+  LOCAL_BUFFER_ROOT           explicit host-local directory on every worker
   BULK_GCS_ROOT               durable root, e.g. gs://bucket/moe-sae/gemma4_v1
   NFS_SERVER                  explicit Filestore/NFS hostname or IPv4 address
   NFS_EXPORT                  explicit export path, e.g. /moe_sae_control

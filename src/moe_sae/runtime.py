@@ -35,6 +35,7 @@ TARGET_SEQUENCE_LENGTH = 1_024
 TARGET_LAYER_ONE_INDEXED = 15
 TARGET_TRAIN_TOKENS = 50_000_000
 TARGET_EVAL_TOKENS = 2_000_000
+BENCHMARK_TIMING_SCHEMA = "gemma4-benchmark-timing-v2"
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,12 +58,20 @@ PER_DEVICE_SEQUENCE_BATCHES = (1, 2, 4)
 
 @dataclass(frozen=True, slots=True)
 class BenchmarkObservation:
-    """Synchronized result for one mesh/batch harvester benchmark."""
+    """Synchronized result for one mesh/batch harvester benchmark.
+
+    ``device_elapsed_seconds`` contains only calls to the compiled prefix step
+    through their synchronization point. ``elapsed_seconds`` also contains
+    input handling and durable persistence, and is therefore the denominator
+    for persisted goodput rather than device MFU.
+    """
 
     mesh: MeshCandidate
     per_device_sequence_batch: int
     synchronized_steps: int
     elapsed_seconds: float
+    device_elapsed_seconds: float
+    persistence_seconds: float
     useful_flops: float
     output_tokens: int
     persisted_tokens: int
@@ -75,11 +84,13 @@ class BenchmarkObservation:
 
     @property
     def useful_mfu(self) -> float:
-        return self.useful_flops / (V4_32_BF16_PEAK_FLOPS * self.elapsed_seconds)
+        return self.useful_flops / (
+            V4_32_BF16_PEAK_FLOPS * self.device_elapsed_seconds
+        )
 
     @property
     def device_tokens_per_second(self) -> float:
-        return self.output_tokens / self.elapsed_seconds
+        return self.output_tokens / self.device_elapsed_seconds
 
     @property
     def persisted_tokens_per_second(self) -> float:
@@ -88,6 +99,10 @@ class BenchmarkObservation:
     @property
     def input_wait_fraction(self) -> float:
         return self.input_wait_seconds / self.elapsed_seconds
+
+    @property
+    def persistence_fraction(self) -> float:
+        return self.persistence_seconds / self.elapsed_seconds
 
     def passes_hard_gate(self, *, minimum_mfu: float = 0.50) -> bool:
         return (
@@ -103,10 +118,12 @@ class BenchmarkObservation:
 
     def as_dict(self) -> dict[str, Any]:
         result = asdict(self)
+        result["timing_schema"] = BENCHMARK_TIMING_SCHEMA
         result["useful_mfu"] = self.useful_mfu
         result["device_tokens_per_second"] = self.device_tokens_per_second
         result["persisted_tokens_per_second"] = self.persisted_tokens_per_second
         result["input_wait_fraction"] = self.input_wait_fraction
+        result["persistence_fraction"] = self.persistence_fraction
         result["passes_hard_gate"] = self.passes_hard_gate()
         return result
 

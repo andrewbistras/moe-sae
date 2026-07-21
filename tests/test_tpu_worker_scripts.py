@@ -74,3 +74,50 @@ def test_bootstrap_gates_activation_capacity_before_and_after_dependencies() -> 
         install,
     )
     assert before < install < after
+
+
+def _run_bootstrap_function(command: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; eval "$2"',
+            "bootstrap-test",
+            str(SCRIPT_ROOT / "bootstrap_worker.sh"),
+            command,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+
+
+def test_bootstrap_accepts_only_the_dedicated_dev_shm_tmpfs() -> None:
+    accepted = _run_bootstrap_function(
+        "validate_local_buffer_filesystem "
+        "/dev/shm/moe-sae-local /dev/shm tmpfs tmpfs rw,nosuid,nodev,inode64"
+    )
+    assert accepted.returncode == 0, accepted.stderr
+
+    wrong_mount = _run_bootstrap_function(
+        "validate_local_buffer_filesystem "
+        "/run/moe-sae-local /run tmpfs tmpfs rw,nosuid,nodev"
+    )
+    assert wrong_mount.returncode != 0
+    assert "strictly below /dev/shm" in wrong_mount.stderr
+
+    unsafe_options = _run_bootstrap_function(
+        "validate_local_buffer_filesystem "
+        "/dev/shm/moe-sae-local /dev/shm tmpfs tmpfs rw,nosuid"
+    )
+    assert unsafe_options.returncode != 0
+    assert "must be mounted nodev" in unsafe_options.stderr
+
+
+def test_bootstrap_keeps_local_disk_filesystems_eligible() -> None:
+    completed = _run_bootstrap_function(
+        "validate_local_buffer_filesystem "
+        "/home/user/moe-sae-local / /dev/sda1 ext4 rw,relatime"
+    )
+    assert completed.returncode == 0, completed.stderr

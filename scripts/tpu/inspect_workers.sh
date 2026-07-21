@@ -18,7 +18,9 @@ Optional environment variable:
   SSH_KEY_FILE  gcloud SSH key (default: ~/.ssh/google_compute_engine)
 
 This command is read-only. Use its lsblk/df/findmnt output to choose an
-existing local filesystem and set an explicit LOCAL_BUFFER_ROOT beneath it.
+existing host-local filesystem and set an explicit LOCAL_BUFFER_ROOT beneath
+it. The dedicated /dev/shm tmpfs is also eligible when its capacity is large
+enough; the production qualifier measures its real write path before use.
 It intentionally does not recommend, partition, format, mount, or create a
 scratch device. The later collective qualify-storage gate proves that the
 same path is actually private on every worker.
@@ -85,7 +87,9 @@ lsblk -e 7 -o NAME,TYPE,SIZE,FSTYPE,FSAVAIL,MOUNTPOINTS,MODEL
 printf '\nMounted filesystems:\n'
 findmnt -rn -o TARGET,SOURCE,FSTYPE,OPTIONS
 printf '\nCapacity of existing local mount roots:\n'
-df -hT / /home /mnt 2>/dev/null || true
+df -hT / /home /mnt /dev/shm 2>/dev/null || true
+printf '\nHost memory available to tmpfs-backed scratch:\n'
+awk '/^MemAvailable:/ {print}' /proc/meminfo
 printf '\nExisting directories immediately below /mnt and /media:\n'
 find /mnt /media -mindepth 1 -maxdepth 2 -type d -printf '%p\n' 2>/dev/null | sort || true
 REMOTE_BASH

@@ -42,6 +42,7 @@ from moe_sae.object_store import (
     object_identity_from_mapping,
 )
 from moe_sae.runtime import (
+    BENCHMARK_TIMING_SCHEMA,
     BoundedArtifactSink,
     BenchmarkObservation,
     CanaryObservation,
@@ -2431,6 +2432,8 @@ def _read_json_mapping(path: Path) -> dict[str, Any]:
 def _benchmark_observation_from_mapping(
     value: Mapping[str, Any],
 ) -> BenchmarkObservation:
+    if value.get("timing_schema") != BENCHMARK_TIMING_SCHEMA:
+        raise HarvestError("benchmark telemetry uses an obsolete timing schema")
     raw_mesh = value.get("mesh")
     if not isinstance(raw_mesh, Mapping):
         raise HarvestError("benchmark telemetry lacks structured mesh identity")
@@ -2446,6 +2449,8 @@ def _benchmark_observation_from_mapping(
             per_device_sequence_batch=int(value["per_device_sequence_batch"]),
             synchronized_steps=int(value["synchronized_steps"]),
             elapsed_seconds=float(value["elapsed_seconds"]),
+            device_elapsed_seconds=float(value["device_elapsed_seconds"]),
+            persistence_seconds=float(value["persistence_seconds"]),
             useful_flops=float(value["useful_flops"]),
             output_tokens=int(value["output_tokens"]),
             persisted_tokens=int(value["persisted_tokens"]),
@@ -2518,6 +2523,10 @@ def _aggregate_benchmark_hosts(
         per_device_sequence_batch=per_device_sequence_batch,
         synchronized_steps=reference.synchronized_steps,
         elapsed_seconds=max(item.elapsed_seconds for item in observations),
+        device_elapsed_seconds=max(
+            item.device_elapsed_seconds for item in observations
+        ),
+        persistence_seconds=max(item.persistence_seconds for item in observations),
         useful_flops=reference.useful_flops,
         output_tokens=reference.output_tokens,
         persisted_tokens=reference.persisted_tokens,
@@ -2573,6 +2582,8 @@ def benchmark_worker(
     output_tokens = 0
     persisted_tokens = 0
     input_wait = 0.0
+    device_elapsed = 0.0
+    persistence_elapsed = 0.0
     started = clock()
     for offset in range(measured_steps):
         wait_started = clock()
@@ -2580,10 +2591,13 @@ def benchmark_worker(
             next(iterator), expected_sequence_length=sequence_length
         )
         input_wait += clock() - wait_started
+        device_started = clock()
         output = step(
             grain.token_ids, grain.positions, grain.segment_ids, grain.segment_ids
         )
         _block_until_ready(output)
+        device_elapsed += clock() - device_started
+        persistence_started = clock()
         rows = _capture_rows(output)
         output_tokens += rows
         persisted = int(persist_output(output))
@@ -2592,12 +2606,17 @@ def benchmark_worker(
                 f"persist callback returned invalid token count {persisted}/{rows}"
             )
         persisted_tokens += persisted
+        persistence_elapsed += clock() - persistence_started
     flush = getattr(persist_output, "flush", None)
     if callable(flush):
+        persistence_started = clock()
         flush()
+        persistence_elapsed += clock() - persistence_started
     elapsed = clock() - started
     if elapsed <= 0.0:
         raise HarvestError("benchmark clock did not advance")
+    if device_elapsed <= 0.0:
+        raise HarvestError("benchmark device clock did not advance")
 
     details = diagnostics() if diagnostics is not None else BenchmarkDiagnostics()
     callback_backlog = int(getattr(persist_output, "max_observed_backlog", 0))
@@ -2611,6 +2630,8 @@ def benchmark_worker(
         per_device_sequence_batch=per_device_sequence_batch,
         synchronized_steps=measured_steps,
         elapsed_seconds=elapsed,
+        device_elapsed_seconds=device_elapsed,
+        persistence_seconds=persistence_elapsed,
         useful_flops=float(useful_flops),
         output_tokens=output_tokens,
         persisted_tokens=persisted_tokens,
@@ -2683,6 +2704,8 @@ def _benchmark_telemetry(
         payload = value.as_dict()
     elif isinstance(value, Mapping):
         payload = dict(value)
+        if payload.get("timing_schema") != BENCHMARK_TIMING_SCHEMA:
+            raise HarvestError("selected benchmark uses an obsolete timing schema")
         raw_mesh = payload.get("mesh")
         mesh_name = raw_mesh.get("name") if isinstance(raw_mesh, Mapping) else raw_mesh
         if mesh_name != mesh.name or int(

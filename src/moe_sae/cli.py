@@ -55,6 +55,7 @@ from moe_sae.object_store import (
     parse_gcs_uri,
 )
 from moe_sae.runtime import (
+    BENCHMARK_TIMING_SCHEMA,
     BenchmarkObservation,
     HARVEST_MESHES,
     PER_DEVICE_SEQUENCE_BATCHES,
@@ -69,6 +70,7 @@ from moe_sae.storage import (
     ACTIVATION_CAPTURE_SCOPE,
     MINIMUM_ACTIVATION_GCS_DOWNLOAD_BYTES_PER_SECOND,
     MINIMUM_ACTIVATION_LOCAL_FREE_BYTES,
+    MINIMUM_ACTIVATION_LOCAL_WRITE_BYTES_PER_SECOND,
 )
 
 
@@ -243,6 +245,9 @@ def _validate_storage_attestation_payload(
         StoragePlanesQualificationConfig(
             minimum_control_free_bytes=config.min_control_free_bytes,
             minimum_local_buffer_free_bytes=MINIMUM_ACTIVATION_LOCAL_FREE_BYTES,
+            minimum_aggregate_local_write_bytes_per_second=(
+                MINIMUM_ACTIVATION_LOCAL_WRITE_BYTES_PER_SECOND
+            ),
             gcs_probe_bytes_per_process=config.gcs_probe_bytes_per_process,
             gcs_probe_block_bytes=config.gcs_probe_block_bytes,
             minimum_aggregate_upload_bytes_per_second=(
@@ -1021,10 +1026,12 @@ def _aggregate_benchmark_observation(
         [
             observation.synchronized_steps,
             observation.elapsed_seconds,
+            observation.device_elapsed_seconds,
+            observation.persistence_seconds,
             observation.useful_flops,
             observation.output_tokens,
             observation.persisted_tokens,
-            observation.input_wait_fraction,
+            observation.input_wait_seconds,
             observation.recompilations,
             observation.dropped_routed_tokens,
             observation.max_writer_backlog,
@@ -1033,14 +1040,18 @@ def _aggregate_benchmark_observation(
         ],
         dtype=np.float64,
     )
-    rows = np.asarray(multihost_utils.process_allgather(local)).reshape((-1, 11))
+    rows = np.asarray(multihost_utils.process_allgather(local)).reshape((-1, 13))
     elapsed = float(np.max(rows[:, 1]))
-    if np.any(rows[:, 10] == 1.0):
+    device_elapsed = float(np.max(rows[:, 2]))
+    persistence_elapsed = float(np.max(rows[:, 3]))
+    if np.any(rows[:, 12] == 1.0):
         return BenchmarkObservation(
             mesh=observation.mesh,
             per_device_sequence_batch=observation.per_device_sequence_batch,
             synchronized_steps=0,
             elapsed_seconds=max(elapsed, 1e-9),
+            device_elapsed_seconds=max(device_elapsed, 1e-9),
+            persistence_seconds=max(persistence_elapsed, 0.0),
             useful_flops=0.0,
             output_tokens=0,
             persisted_tokens=0,
@@ -1050,9 +1061,9 @@ def _aggregate_benchmark_observation(
         )
     for column, name in (
         (0, "steps"),
-        (2, "useful FLOPs"),
-        (3, "output tokens"),
-        (4, "persisted tokens"),
+        (4, "useful FLOPs"),
+        (5, "output tokens"),
+        (6, "persisted tokens"),
     ):
         if not np.all(rows[:, column] == rows[0, column]):
             raise RuntimeError(f"benchmark controllers disagree on {name}")
@@ -1061,14 +1072,16 @@ def _aggregate_benchmark_observation(
         per_device_sequence_batch=observation.per_device_sequence_batch,
         synchronized_steps=int(rows[0, 0]),
         elapsed_seconds=elapsed,
-        useful_flops=float(rows[0, 2]),
-        output_tokens=int(rows[0, 3]),
-        persisted_tokens=int(rows[0, 4]),
-        input_wait_seconds=float(np.max(rows[:, 5])) * elapsed,
-        recompilations=int(np.max(rows[:, 6])),
-        dropped_routed_tokens=int(np.max(rows[:, 7])),
-        max_writer_backlog=int(np.max(rows[:, 8])),
-        instrumentation_equal=bool(np.all(rows[:, 9] == 1.0)),
+        device_elapsed_seconds=device_elapsed,
+        persistence_seconds=persistence_elapsed,
+        useful_flops=float(rows[0, 4]),
+        output_tokens=int(rows[0, 5]),
+        persisted_tokens=int(rows[0, 6]),
+        input_wait_seconds=float(np.max(rows[:, 7])),
+        recompilations=int(np.max(rows[:, 8])),
+        dropped_routed_tokens=int(np.max(rows[:, 9])),
+        max_writer_backlog=int(np.max(rows[:, 10])),
+        instrumentation_equal=bool(np.all(rows[:, 11] == 1.0)),
         failure=None,
     )
 
@@ -1140,6 +1153,7 @@ def _command_qualify_storage(args: argparse.Namespace) -> int:
         ACTIVATION_CAPTURE_SCOPE,
         MINIMUM_ACTIVATION_GCS_DOWNLOAD_BYTES_PER_SECOND,
         MINIMUM_ACTIVATION_LOCAL_FREE_BYTES,
+        MINIMUM_ACTIVATION_LOCAL_WRITE_BYTES_PER_SECOND,
         StoragePlanesQualificationConfig,
         build_storage_attestation,
         jax_coordination_hooks,
@@ -1159,6 +1173,9 @@ def _command_qualify_storage(args: argparse.Namespace) -> int:
         qualification_config = StoragePlanesQualificationConfig(
             minimum_control_free_bytes=int(args.minimum_control_free_bytes or 1),
             minimum_local_buffer_free_bytes=int(args.minimum_local_free_bytes or 1),
+            minimum_aggregate_local_write_bytes_per_second=float(
+                args.minimum_bytes_per_second or 0.0
+            ),
             gcs_probe_bytes_per_process=int(args.probe_bytes or 8 * 1024**2),
             gcs_probe_block_bytes=int(args.block_bytes or 1024**2),
             minimum_aggregate_upload_bytes_per_second=float(
@@ -1192,6 +1209,9 @@ def _command_qualify_storage(args: argparse.Namespace) -> int:
         qualification_config = StoragePlanesQualificationConfig(
             minimum_control_free_bytes=config.min_control_free_bytes,
             minimum_local_buffer_free_bytes=MINIMUM_ACTIVATION_LOCAL_FREE_BYTES,
+            minimum_aggregate_local_write_bytes_per_second=(
+                MINIMUM_ACTIVATION_LOCAL_WRITE_BYTES_PER_SECOND
+            ),
             gcs_probe_bytes_per_process=config.gcs_probe_bytes_per_process,
             gcs_probe_block_bytes=config.gcs_probe_block_bytes,
             minimum_aggregate_upload_bytes_per_second=(
@@ -1637,7 +1657,8 @@ def _benchmark_observation_from_dict(
 ) -> BenchmarkObservation:
     encoded_mesh = payload.get("mesh")
     if (
-        not isinstance(encoded_mesh, Mapping)
+        payload.get("timing_schema") != BENCHMARK_TIMING_SCHEMA
+        or not isinstance(encoded_mesh, Mapping)
         or encoded_mesh.get("name") != mesh.name
         or int(payload.get("per_device_sequence_batch", -1)) != batch
     ):
@@ -1647,6 +1668,8 @@ def _benchmark_observation_from_dict(
         per_device_sequence_batch=batch,
         synchronized_steps=int(payload["synchronized_steps"]),
         elapsed_seconds=float(payload["elapsed_seconds"]),
+        device_elapsed_seconds=float(payload["device_elapsed_seconds"]),
+        persistence_seconds=float(payload["persistence_seconds"]),
         useful_flops=float(payload["useful_flops"]),
         output_tokens=int(payload["output_tokens"]),
         persisted_tokens=int(payload["persisted_tokens"]),
@@ -1898,7 +1921,7 @@ def _run_supervised_benchmark_candidate(
                 raw = _read_json_object(raw_path, description="raw benchmark result")
                 if (
                     raw.get("schema_version")
-                    != "gemma4-benchmark-worker-result-v1"
+                    != "gemma4-benchmark-worker-result-v2"
                     or raw.get("sweep_id") != sweep_id
                     or raw.get("attempt_id") != attempt_id
                     or not isinstance(raw.get("observation"), Mapping)
@@ -1921,6 +1944,14 @@ def _run_supervised_benchmark_candidate(
                         for status in statuses
                     ),
                 ),
+                device_elapsed_seconds=max(
+                    1e-9,
+                    *(
+                        float(status.get("elapsed_seconds", 0.0))
+                        for status in statuses
+                    ),
+                ),
+                persistence_seconds=0.0,
                 useful_flops=0.0,
                 output_tokens=0,
                 persisted_tokens=0,
@@ -1929,7 +1960,7 @@ def _run_supervised_benchmark_candidate(
                 failure="candidate subprocess failed or timed out; see attempt telemetry",
             )
         envelope = {
-            "schema_version": "gemma4-benchmark-supervised-result-v1",
+            "schema_version": "gemma4-benchmark-supervised-result-v2",
             "sweep_id": sweep_id,
             "attempt_id": attempt_id,
             "observation": observation.as_dict(),
@@ -1943,7 +1974,7 @@ def _run_supervised_benchmark_candidate(
     )
     result = _read_json_object(result_path, description="supervised benchmark result")
     if (
-        result.get("schema_version") != "gemma4-benchmark-supervised-result-v1"
+        result.get("schema_version") != "gemma4-benchmark-supervised-result-v2"
         or result.get("sweep_id") != sweep_id
         or result.get("attempt_id") != attempt_id
         or not isinstance(result.get("observation"), Mapping)
@@ -2080,7 +2111,11 @@ def _load_selected_benchmark(
             "selected benchmark belongs to a different config/checkpoint/environment"
         )
     selected = payload.get("selected")
-    if not isinstance(selected, dict) or selected.get("passes_hard_gate") is not True:
+    if (
+        not isinstance(selected, dict)
+        or selected.get("timing_schema") != BENCHMARK_TIMING_SCHEMA
+        or selected.get("passes_hard_gate") is not True
+    ):
         raise RuntimeError("selected benchmark did not pass every hard gate")
     if float(selected.get("useful_mfu", 0.0)) < config.min_harvester_mfu:
         raise RuntimeError("selected benchmark does not meet the configured MFU gate")
@@ -2758,7 +2793,11 @@ def _load_harvester_report(
             "selected harvester benchmark has the wrong config/environment fingerprint"
         )
     selected = value.get("selected", value)
-    if not isinstance(selected, dict) or selected.get("passes_hard_gate") is not True:
+    if (
+        not isinstance(selected, dict)
+        or selected.get("timing_schema") != BENCHMARK_TIMING_SCHEMA
+        or selected.get("passes_hard_gate") is not True
+    ):
         raise RuntimeError(f"invalid/failing harvester benchmark: {benchmark_path}")
     if float(selected.get("useful_mfu", 0.0)) < config.min_harvester_mfu:
         raise RuntimeError("selected harvester benchmark is below the MFU hard gate")

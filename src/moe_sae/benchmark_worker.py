@@ -170,7 +170,7 @@ def _candidate(args: argparse.Namespace) -> int:
         _coordinator_write_json(
             Path(args.attempt_root) / "raw.json",
             {
-                "schema_version": "gemma4-benchmark-worker-result-v1",
+                "schema_version": "gemma4-benchmark-worker-result-v2",
                 "sweep_id": args.sweep_id,
                 "attempt_id": args.attempt_id,
                 "observation": observation.as_dict(),

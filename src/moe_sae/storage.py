@@ -37,16 +37,18 @@ from moe_sae.object_store import (
 )
 
 
-STORAGE_ATTESTATION_SCHEMA = "gemma4-storage-planes-qualification-v5"
+STORAGE_ATTESTATION_SCHEMA = "gemma4-storage-planes-qualification-v6"
 ORBAX_QUALIFICATION_SCHEMA = "gemma4-orbax-storage-qualification-v1"
 ACTIVATION_CAPTURE_SCOPE = "activation-capture"
 MINIMUM_ACTIVATION_LOCAL_FREE_BYTES = 24 * 1024**3
+MINIMUM_ACTIVATION_LOCAL_WRITE_BYTES_PER_SECOND = 4_000_000_000.0
 MINIMUM_ACTIVATION_GCS_DOWNLOAD_BYTES_PER_SECOND = 0.0
 DEFAULT_MINIMUM_CONTROL_FREE_BYTES = 10_000_000_000
 DEFAULT_MINIMUM_LOCAL_BUFFER_FREE_BYTES = 128 * 1024**3
 DEFAULT_GCS_PROBE_BYTES_PER_PROCESS = 8 * 1024**3
 DEFAULT_GCS_PROBE_BLOCK_BYTES = 8 * 1024**2
 DEFAULT_MINIMUM_GCS_BYTES_PER_SECOND = 4_000_000_000.0
+DEFAULT_MINIMUM_LOCAL_WRITE_BYTES_PER_SECOND = 4_000_000_000.0
 
 _RUN_ID_RE = re.compile(r"^[a-zA-Z0-9_.-]{1,128}$")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
@@ -77,6 +79,9 @@ class StoragePlanesQualificationConfig:
 
     minimum_control_free_bytes: int = DEFAULT_MINIMUM_CONTROL_FREE_BYTES
     minimum_local_buffer_free_bytes: int = DEFAULT_MINIMUM_LOCAL_BUFFER_FREE_BYTES
+    minimum_aggregate_local_write_bytes_per_second: float = (
+        DEFAULT_MINIMUM_LOCAL_WRITE_BYTES_PER_SECOND
+    )
     gcs_probe_bytes_per_process: int = DEFAULT_GCS_PROBE_BYTES_PER_PROCESS
     gcs_probe_block_bytes: int = DEFAULT_GCS_PROBE_BLOCK_BYTES
     minimum_aggregate_upload_bytes_per_second: float = (
@@ -105,6 +110,10 @@ class StoragePlanesQualificationConfig:
             raise ValueError("gcs_probe_block_bytes cannot exceed the probe size")
         for name, value in (
             (
+                "minimum_aggregate_local_write_bytes_per_second",
+                self.minimum_aggregate_local_write_bytes_per_second,
+            ),
+            (
                 "minimum_aggregate_upload_bytes_per_second",
                 self.minimum_aggregate_upload_bytes_per_second,
             ),
@@ -119,7 +128,7 @@ class StoragePlanesQualificationConfig:
 
 @dataclass(frozen=True, slots=True)
 class TransferMeasurement:
-    """One synchronized aggregate object-transfer measurement."""
+    """One synchronized aggregate storage-I/O measurement."""
 
     total_bytes: int
     elapsed_seconds: float
@@ -151,6 +160,8 @@ class LocalBufferQualification:
     host_isolation_proven: bool
     expected_probe_sha256_by_process: tuple[str, ...]
     observed_probe_sha256_by_process: tuple[str, ...]
+    write: TransferMeasurement | None
+    write_cleanup_complete: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -370,6 +381,42 @@ def qualify_storage_planes(
             + _error_suffix(local_isolation_errors)
         )
 
+    local_capacity_ok = (
+        not local_free_errors
+        and min(local_free)
+        >= max(config.minimum_local_buffer_free_bytes, required_local)
+    )
+    if local_capacity_ok and local_isolation_proven:
+        local_write, local_write_cleanup_complete = _qualify_local_write(
+            local_root,
+            run_id,
+            config.gcs_probe_bytes_per_process,
+            config.gcs_probe_block_bytes,
+            hooks,
+            process_index,
+            process_count,
+        )
+        if local_write.errors:
+            failures.append(
+                "local-buffer write probe failed: "
+                + "; ".join(local_write.errors)
+            )
+        elif (
+            local_write.bytes_per_second
+            < config.minimum_aggregate_local_write_bytes_per_second
+        ):
+            failures.append(
+                "aggregate local-buffer write throughput below threshold: "
+                f"actual={local_write.bytes_per_second:.3f} "
+                "required="
+                f"{config.minimum_aggregate_local_write_bytes_per_second:.3f} B/s"
+            )
+        if not local_write_cleanup_complete:
+            failures.append("local-buffer write-probe cleanup failed")
+    else:
+        local_write = None
+        local_write_cleanup_complete = True
+
     flock_correct, flock_errors = _qualify_flock(
         work, hooks, process_index, process_count
     )
@@ -392,10 +439,13 @@ def qualify_storage_planes(
         )
 
     enough_local = (
-        not local_free_errors
+        local_capacity_ok
         and local_isolation_proven
-        and min(local_free)
-        >= max(config.minimum_local_buffer_free_bytes, required_local)
+        and local_write is not None
+        and not local_write.errors
+        and local_write.bytes_per_second
+        >= config.minimum_aggregate_local_write_bytes_per_second
+        and local_write_cleanup_complete
     )
     if enough_local:
         objects, upload, download, cleanup_complete, object_failures = (
@@ -459,6 +509,8 @@ def qualify_storage_planes(
             host_isolation_proven=local_isolation_proven,
             expected_probe_sha256_by_process=expected_local_probe_sha256,
             observed_probe_sha256_by_process=observed_local_probe_sha256,
+            write=local_write,
+            write_cleanup_complete=local_write_cleanup_complete,
         ),
         gcs=ObjectPlaneQualification(
             prefix=object_prefix,
@@ -558,12 +610,15 @@ def validate_storage_attestation(
         raise StorageQualificationError("storage attestation has no valid self-hash")
     if storage_attestation_digest(payload) != claimed:
         raise StorageQualificationError("storage attestation self-hash mismatch")
+    contract = payload.get("contract")
     qualification = payload.get("qualification")
     if not isinstance(qualification, Mapping) or qualification.get("failures") not in (
         [],
         (),
     ):
         raise StorageQualificationError("storage attestation did not pass")
+    if not isinstance(contract, Mapping):
+        raise StorageQualificationError("storage attestation contract is malformed")
     expected_scalars = (
         ("config_sha256", expected_config_sha256),
         ("environment_sha256", expected_environment_sha256),
@@ -595,6 +650,58 @@ def validate_storage_attestation(
     ):
         raise StorageQualificationError(
             "storage attestation does not prove host-local buffer isolation"
+        )
+    local_write = local_buffer.get("write")
+    try:
+        local_probe_bytes = int(contract["gcs_probe_bytes_per_process"])
+        minimum_local_write = float(
+            contract["minimum_aggregate_local_write_bytes_per_second"]
+        )
+        local_write_total = int(local_write["total_bytes"])
+        local_write_seconds = float(local_write["elapsed_seconds"])
+        local_write_rate = float(local_write["bytes_per_second"])
+        local_write_process_bytes = tuple(
+            int(item) for item in local_write["per_process_bytes"]
+        )
+        local_write_process_seconds = tuple(
+            float(item) for item in local_write["per_process_seconds"]
+        )
+        local_write_errors = tuple(local_write["errors"])
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
+        raise StorageQualificationError(
+            "storage attestation local-write proof is malformed"
+        ) from exc
+    if (
+        not isinstance(local_write, Mapping)
+        or local_buffer.get("write_cleanup_complete") is not True
+        or local_probe_bytes <= 0
+        or not math.isfinite(minimum_local_write)
+        or minimum_local_write < 0.0
+        or local_write_total != process_count * local_probe_bytes
+        or local_write_process_bytes != (local_probe_bytes,) * process_count
+        or len(local_write_process_seconds) != process_count
+        or any(
+            not math.isfinite(item) or item <= 0.0
+            for item in local_write_process_seconds
+        )
+        or not math.isfinite(local_write_seconds)
+        or local_write_seconds <= 0.0
+        or not math.isclose(
+            local_write_seconds,
+            max(local_write_process_seconds),
+            rel_tol=1e-12,
+        )
+        or not math.isfinite(local_write_rate)
+        or not math.isclose(
+            local_write_rate,
+            local_write_total / local_write_seconds,
+            rel_tol=1e-12,
+        )
+        or local_write_rate < minimum_local_write
+        or local_write_errors
+    ):
+        raise StorageQualificationError(
+            "storage attestation does not prove local-buffer write throughput"
         )
     if expected_control_directory is not None and control.get("directory") != str(
         Path(expected_control_directory).expanduser().resolve()
@@ -881,6 +988,80 @@ def _orbax_path_finalized(ocp: Any, path: str) -> bool:
             "installed Orbax does not expose checkpoint finalization checks"
         )
     return bool(finalized(path))
+
+
+def _qualify_local_write(
+    local_root: Path,
+    run_id: str,
+    size: int,
+    block_bytes: int,
+    hooks: CoordinationHooks,
+    process_index: int,
+    process_count: int,
+) -> tuple[TransferMeasurement, bool]:
+    """Measure the synchronized host-local write path and remove its probe.
+
+    Block creation is outside the timed region. Repeating one incompressible
+    block avoids measuring a pseudorandom generator while still defeating
+    transparent filesystem compression. The probe is removed before the two
+    simultaneous GCS source/download files are allocated.
+    """
+
+    path = local_root / (
+        f".moe-sae-local-write-qualification-{run_id}-{process_index:05d}.probe"
+    )
+    prepare_error = ""
+    block = b""
+    try:
+        block = hashlib.shake_256(
+            f"{run_id}:{process_index}:local-write".encode("ascii")
+        ).digest(block_bytes)
+    except Exception as exc:
+        prepare_error = _format_error(exc)
+
+    write_error = prepare_error
+    written_bytes = 0
+    hooks.barrier("local-write-ready")
+    write_started = time.perf_counter()
+    if not write_error:
+        try:
+            remaining = size
+            with path.open("xb", buffering=0) as handle:
+                while remaining:
+                    portion = min(block_bytes, remaining)
+                    _write_all(handle.fileno(), block[:portion])
+                    remaining -= portion
+                os.fsync(handle.fileno())
+            written_bytes = size
+        except Exception as exc:
+            write_error = _format_error(exc)
+    hooks.barrier("local-write-complete")
+    write_seconds = time.perf_counter() - write_started
+    write_records = _gather_records(
+        hooks,
+        process_count,
+        {
+            "process_index": process_index,
+            "bytes": written_bytes,
+            "seconds": write_seconds,
+            "error": write_error,
+        },
+    )
+    measurement = _transfer_measurement(write_records)
+
+    cleanup_error = ""
+    try:
+        path.unlink(missing_ok=True)
+    except Exception as exc:
+        cleanup_error = _format_error(exc)
+    cleanup_records = _gather_records(
+        hooks,
+        process_count,
+        {"process_index": process_index, "error": cleanup_error},
+    )
+    hooks.barrier("local-write-cleanup-complete")
+    cleanup_errors = _record_errors(cleanup_records)
+    return measurement, not cleanup_errors
 
 
 def _qualify_object_plane(
@@ -1699,6 +1880,7 @@ __all__ = [
     "LocalBufferQualification",
     "MINIMUM_ACTIVATION_GCS_DOWNLOAD_BYTES_PER_SECOND",
     "MINIMUM_ACTIVATION_LOCAL_FREE_BYTES",
+    "MINIMUM_ACTIVATION_LOCAL_WRITE_BYTES_PER_SECOND",
     "ObjectPlaneQualification",
     "OrbaxCheckpointQualification",
     "ORBAX_QUALIFICATION_SCHEMA",

@@ -12,8 +12,10 @@ umask 077
 
 readonly MIN_CONTROL_FREE_BYTES=10000000000
 # Activation farming needs two simultaneous 8 GiB qualification probes plus
-# an 8 GiB reserve. SAE training's capture cache is a separate, unqualified
-# capability and is deliberately not authorized by this bootstrap.
+# an 8 GiB reserve. This may be a local disk or the worker-private /dev/shm
+# tmpfs; the collective qualifier proves capacity, isolation, and throughput
+# before either is authorized. SAE training's capture cache is a separate,
+# unqualified capability and is deliberately not authorized by this bootstrap.
 readonly MIN_LOCAL_FREE_BYTES=25769803776
 readonly METADATA_ROOT="http://metadata.google.internal/computeMetadata/v1"
 
@@ -310,16 +312,37 @@ mount_control_plane() {
   log "NFS control plane is mounted directly at $artifact_root"
 }
 
-reject_shared_filesystem() {
-  local filesystem_type=$1
+has_mount_option() {
+  local options=$1
+  local required=$2
+  [[ ",$options," == *",$required,"* ]]
+}
+
+validate_local_buffer_filesystem() {
+  local path=$1
+  local mount_target=$2
+  local source=$3
+  local filesystem_type=$4
+  local options=$5
   case "$filesystem_type" in
     nfs|nfs4|cifs|smb*|fuse*|9p|ceph|ceph-fuse|lustre|glusterfs|afs|gpfs|gcsfuse)
       die "LOCAL_BUFFER_ROOT resolves to shared/remote filesystem type '$filesystem_type'"
       ;;
     ext2|ext3|ext4|xfs|btrfs)
       ;;
+    tmpfs)
+      [[ "$path" == /dev/shm/* ]] || \
+        die "tmpfs LOCAL_BUFFER_ROOT must be strictly below /dev/shm"
+      [[ "$mount_target" == "/dev/shm" ]] || \
+        die "tmpfs LOCAL_BUFFER_ROOT must resolve to the direct /dev/shm mount, not '$mount_target'"
+      [[ "$source" == "tmpfs" ]] || \
+        die "/dev/shm source is '$source'; expected the kernel tmpfs source"
+      has_mount_option "$options" rw || die "/dev/shm must be mounted read-write"
+      has_mount_option "$options" nosuid || die "/dev/shm must be mounted nosuid"
+      has_mount_option "$options" nodev || die "/dev/shm must be mounted nodev"
+      ;;
     *)
-      die "LOCAL_BUFFER_ROOT filesystem type '$filesystem_type' is not an approved local disk filesystem"
+      die "LOCAL_BUFFER_ROOT filesystem type '$filesystem_type' is not an approved host-local filesystem"
       ;;
   esac
 }
@@ -329,6 +352,8 @@ prepare_local_buffer() {
   local inspect_path
   local parent
   local filesystem_type
+  local mount_options
+  local mount_target
   local source
   local probe
 
@@ -351,12 +376,13 @@ prepare_local_buffer() {
     inspect_path=$parent
   fi
 
-  IFS=' ' read -r source filesystem_type < <(
-    findmnt -rn -o SOURCE,FSTYPE --target "$inspect_path"
+  IFS=' ' read -r mount_target source filesystem_type mount_options < <(
+    findmnt -rn -o TARGET,SOURCE,FSTYPE,OPTIONS --target "$inspect_path"
   )
-  [[ -n "$source" && -n "$filesystem_type" ]] || \
+  [[ -n "$mount_target" && -n "$source" && -n "$filesystem_type" && -n "$mount_options" ]] || \
     die "cannot identify filesystem for LOCAL_BUFFER_ROOT parent: $inspect_path"
-  reject_shared_filesystem "$filesystem_type"
+  validate_local_buffer_filesystem \
+    "$LOCAL_BUFFER_ROOT" "$mount_target" "$source" "$filesystem_type" "$mount_options"
   require_free_bytes "$inspect_path" "$MIN_LOCAL_FREE_BYTES" "local-buffer filesystem"
 
   if [[ ! -e "$LOCAL_BUFFER_ROOT" ]]; then
@@ -366,10 +392,11 @@ prepare_local_buffer() {
     die "LOCAL_BUFFER_ROOT creation did not produce a real directory"
   [[ -w "$LOCAL_BUFFER_ROOT" ]] || die "LOCAL_BUFFER_ROOT is not writable by $(id -un)"
 
-  IFS=' ' read -r source filesystem_type < <(
-    findmnt -rn -o SOURCE,FSTYPE --target "$LOCAL_BUFFER_ROOT"
+  IFS=' ' read -r mount_target source filesystem_type mount_options < <(
+    findmnt -rn -o TARGET,SOURCE,FSTYPE,OPTIONS --target "$LOCAL_BUFFER_ROOT"
   )
-  reject_shared_filesystem "$filesystem_type"
+  validate_local_buffer_filesystem \
+    "$LOCAL_BUFFER_ROOT" "$mount_target" "$source" "$filesystem_type" "$mount_options"
   require_free_bytes "$LOCAL_BUFFER_ROOT" "$MIN_LOCAL_FREE_BYTES" "local buffer"
 
   probe=$(mktemp "$LOCAL_BUFFER_ROOT/.bootstrap-write.$(hostname -s).XXXXXX")
@@ -484,4 +511,6 @@ main() {
   log "READY commit=$PROJECT_COMMIT project=$PROJECT_ROOT local_buffer=$LOCAL_BUFFER_ROOT"
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

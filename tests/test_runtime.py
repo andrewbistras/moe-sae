@@ -28,6 +28,8 @@ def _observation(mesh_index: int, *, mfu: float, tokens: int) -> BenchmarkObserv
         per_device_sequence_batch=1,
         synchronized_steps=200,
         elapsed_seconds=elapsed,
+        device_elapsed_seconds=elapsed,
+        persistence_seconds=0.0,
         useful_flops=mfu * peak * elapsed,
         output_tokens=tokens,
         persisted_tokens=tokens,
@@ -42,6 +44,24 @@ def test_benchmark_selection_requires_gate_and_maximizes_persisted_goodput():
     assert choose_harvest_benchmark([too_low, slower, faster]) == faster
     with pytest.raises(RuntimeError, match="no harvester benchmark"):
         choose_harvest_benchmark([too_low])
+
+
+def test_benchmark_uses_device_time_for_mfu_and_total_time_for_persistence():
+    observation = BenchmarkObservation(
+        mesh=HARVEST_MESHES[0],
+        per_device_sequence_batch=1,
+        synchronized_steps=200,
+        elapsed_seconds=10.0,
+        device_elapsed_seconds=2.0,
+        persistence_seconds=7.0,
+        useful_flops=4.4e15,
+        output_tokens=1_000,
+        persisted_tokens=1_000,
+    )
+    assert observation.useful_mfu == pytest.approx(0.5)
+    assert observation.device_tokens_per_second == pytest.approx(500.0)
+    assert observation.persisted_tokens_per_second == pytest.approx(100.0)
+    assert observation.persistence_fraction == pytest.approx(0.7)
 
 
 def test_prefix_flops_are_explicit_and_scale_with_batch():

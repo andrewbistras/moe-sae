@@ -828,6 +828,68 @@ def test_benchmark_worker_uses_five_warmups_and_synchronized_200_steps():
         )
 
 
+def test_benchmark_worker_separates_device_and_persistence_wall_time():
+    raw = grain([[3, 4, 5, 6]], [[1, 1, 1, 1]])
+
+    class Clock:
+        value = 0.0
+
+        def __call__(self):
+            return self.value
+
+        def advance(self, seconds):
+            self.value += seconds
+
+    clock = Clock()
+
+    class Batches:
+        remaining = 205
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self.remaining == 0:
+                raise StopIteration
+            self.remaining -= 1
+            clock.advance(1.0)
+            return raw
+
+    delegate = FakeStep()
+
+    def step(*args):
+        clock.advance(2.0)
+        return delegate(*args)
+
+    class Persist:
+        max_observed_backlog = 1
+
+        def __call__(self, output):
+            clock.advance(3.0)
+            return output.rows
+
+        def flush(self):
+            clock.advance(4.0)
+
+    observation = benchmark_worker(
+        Batches(),
+        step,
+        mesh=HARVEST_MESHES[0],
+        per_device_sequence_batch=1,
+        persist=Persist(),
+        diagnostics=lambda: BenchmarkDiagnostics(instrumentation_equal=True),
+        sequence_length=4,
+        clock=clock,
+    )
+
+    assert observation.device_elapsed_seconds == 400.0
+    assert observation.persistence_seconds == 604.0
+    assert observation.input_wait_seconds == 200.0
+    assert observation.elapsed_seconds == 1_204.0
+    assert observation.device_tokens_per_second == 2.0
+    assert observation.persisted_tokens_per_second == pytest.approx(800 / 1_204)
+
+
 def test_production_benchmark_closes_runtime_on_adapter_setup_failure(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ):
@@ -1140,6 +1202,8 @@ def test_benchmark_host_aggregation_uses_slowest_host_and_exact_durable_union():
         per_device_sequence_batch=1,
         synchronized_steps=200,
         elapsed_seconds=4.0,
+        device_elapsed_seconds=2.0,
+        persistence_seconds=1.0,
         useful_flops=10.0,
         output_tokens=800,
         persisted_tokens=800,
@@ -1149,7 +1213,13 @@ def test_benchmark_host_aggregation_uses_slowest_host_and_exact_durable_union():
         max_writer_backlog=1,
         instrumentation_equal=True,
     )
-    slower = replace(observation, elapsed_seconds=5.0, input_wait_seconds=0.2)
+    slower = replace(
+        observation,
+        elapsed_seconds=5.0,
+        device_elapsed_seconds=3.0,
+        persistence_seconds=1.5,
+        input_wait_seconds=0.2,
+    )
     payloads = [
         {
             "observation": item.as_dict(),
@@ -1168,8 +1238,28 @@ def test_benchmark_host_aggregation_uses_slowest_host_and_exact_durable_union():
         global_chips=16,
     )
     assert result.elapsed_seconds == 5.0
+    assert result.device_elapsed_seconds == 3.0
+    assert result.persistence_seconds == 1.5
     assert result.input_wait_seconds == 0.2
     assert result.persisted_tokens == result.output_tokens == 800
+
+
+def test_selected_benchmark_rejects_obsolete_combined_timing_schema():
+    with pytest.raises(HarvestError, match="obsolete timing schema"):
+        harvest_module._benchmark_telemetry(
+            {
+                "mesh": HARVEST_MESHES[0].name,
+                "per_device_sequence_batch": 1,
+                "passes_hard_gate": True,
+                "useful_mfu": 0.55,
+                "persisted_tokens_per_second": 1.0,
+                "dropped_routed_tokens": 0,
+                "recompilations": 0,
+                "instrumentation_equal": True,
+            },
+            mesh=HARVEST_MESHES[0],
+            per_device_sequence_batch=1,
+        )
 
 
 def test_nnx_jit_cache_diagnostic_unwraps_jitted_fn():

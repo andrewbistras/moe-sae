@@ -33,6 +33,7 @@ from moe_sae.model import (
     expected_hf_repository_inventory_sha256,
     expected_hf_snapshot_inventory_sha256,
 )
+from moe_sae.runtime import BENCHMARK_TIMING_SCHEMA
 from moe_sae.storage import (
     MINIMUM_ACTIVATION_GCS_DOWNLOAD_BYTES_PER_SECOND,
     STORAGE_ATTESTATION_SCHEMA,
@@ -186,6 +187,9 @@ def test_activation_storage_attestation_seals_future_download_gate(
             minimum_local_buffer_free_bytes=(
                 cli_module.MINIMUM_ACTIVATION_LOCAL_FREE_BYTES
             ),
+            minimum_aggregate_local_write_bytes_per_second=(
+                cli_module.MINIMUM_ACTIVATION_LOCAL_WRITE_BYTES_PER_SECOND
+            ),
             gcs_probe_bytes_per_process=config.gcs_probe_bytes_per_process,
             gcs_probe_block_bytes=config.gcs_probe_block_bytes,
             minimum_aggregate_upload_bytes_per_second=(
@@ -214,6 +218,15 @@ def test_activation_storage_attestation_seals_future_download_gate(
                 "host_isolation_proven": True,
                 "expected_probe_sha256_by_process": [digest],
                 "observed_probe_sha256_by_process": [digest],
+                "write": {
+                    "total_bytes": config.gcs_probe_bytes_per_process,
+                    "elapsed_seconds": 1.0,
+                    "bytes_per_second": float(config.gcs_probe_bytes_per_process),
+                    "per_process_bytes": [config.gcs_probe_bytes_per_process],
+                    "per_process_seconds": [1.0],
+                    "errors": [],
+                },
+                "write_cleanup_complete": True,
             },
             "gcs": {"prefix": bulk_root},
         },
@@ -1001,6 +1014,7 @@ def test_harvester_report_uses_measured_train_and_eval_capture_cost(tmp_path):
                 "conversion_attestation_sha256": "9" * 64,
                 "storage_attestation_sha256": "8" * 64,
                 "selected": {
+                    "timing_schema": BENCHMARK_TIMING_SCHEMA,
                     "mesh": {"name": "ep16-fsdp1-tp1"},
                     "per_device_sequence_batch": 1,
                     "useful_mfu": 0.57,
@@ -1129,6 +1143,7 @@ def _selected_benchmark(config):
         "storage_attestation_sha256": "8" * 64,
         "environment": cli_module._coordinated_environment(),
         "selected": {
+            "timing_schema": BENCHMARK_TIMING_SCHEMA,
             "mesh": {"name": "ep16-fsdp1-tp1"},
             "per_device_sequence_batch": 1,
             "passes_hard_gate": True,
