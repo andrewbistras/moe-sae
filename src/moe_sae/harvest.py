@@ -33,6 +33,10 @@ from moe_sae.artifacts import (
     load_manifest,
     publish_manifest,
 )
+from moe_sae.benchmark_waiver import (
+    BenchmarkWaiverError,
+    validate_performance_waiver,
+)
 from moe_sae.config import Gemma4Config
 from moe_sae.harvest_control import HarvestCampaignControl
 from moe_sae.model import CaptureBatch, Gemma4PrefixAdapter, validate_capture_batch
@@ -176,6 +180,7 @@ class CampaignSummary:
     useful_flops: float
     useful_mfu: float
     benchmark_useful_mfu: float | None
+    performance_waiver_sha256: str | None
     dropped_routed_tokens: int
     recompilations: int
     instrumentation_equal: bool
@@ -249,6 +254,10 @@ class CampaignSummary:
             raise HarvestError("campaign telemetry must be finite and nonnegative")
         if self.wall_seconds <= 0.0 or self.chip_seconds <= 0.0:
             raise HarvestError("campaign wall/chip-seconds must be positive")
+        if self.performance_waiver_sha256 is not None and not re.fullmatch(
+            r"[0-9a-f]{64}", self.performance_waiver_sha256
+        ):
+            raise HarvestError("campaign performance waiver is not a SHA-256")
         expected_chip_seconds = self.global_chips * self.wall_seconds
         if not math.isclose(self.chip_seconds, expected_chip_seconds, rel_tol=1e-12):
             raise HarvestError("campaign chip-seconds are not global_chips * max wall")
@@ -2739,25 +2748,40 @@ def _benchmark_telemetry(
             "benchmark_observation must be a BenchmarkObservation or mapping"
         )
 
-    if not bool(payload.get("passes_hard_gate", False)):
-        raise HarvestError("selected synthetic benchmark did not pass every hard gate")
     synthetic = float(payload.get("persisted_tokens_per_second", 0.0))
     useful_mfu = float(payload.get("useful_mfu", 0.0))
     if not math.isfinite(synthetic) or synthetic <= 0.0:
         raise HarvestError("selected benchmark has invalid persisted goodput")
-    if not math.isfinite(useful_mfu) or useful_mfu < 0.50:
+    if not math.isfinite(useful_mfu) or useful_mfu < 0.0:
         raise HarvestError("selected benchmark has invalid useful MFU")
     dropped = int(payload.get("dropped_routed_tokens", -1))
     recompilations = int(payload.get("recompilations", -1))
     instrumentation_equal = payload.get("instrumentation_equal") is True
     if dropped != 0 or recompilations != 0 or not instrumentation_equal:
         raise HarvestError("selected benchmark diagnostics are not fail-closed clean")
+    performance_waiver_sha256: str | None = None
+    if not bool(payload.get("passes_hard_gate", False)) or useful_mfu < 0.50:
+        waiver = payload.get("performance_waiver")
+        if not isinstance(waiver, Mapping):
+            raise HarvestError(
+                "selected synthetic benchmark did not pass every hard gate"
+            )
+        try:
+            validated_waiver = validate_performance_waiver(
+                waiver,
+                payload,
+                minimum_mfu=float(waiver.get("minimum_useful_mfu", math.nan)),
+            )
+        except BenchmarkWaiverError as error:
+            raise HarvestError("selected benchmark performance waiver is invalid") from error
+        performance_waiver_sha256 = str(validated_waiver["waiver_sha256"])
     return {
         "synthetic_goodput": synthetic,
         "useful_mfu": useful_mfu,
         "dropped_routed_tokens": dropped,
         "recompilations": recompilations,
         "instrumentation_equal": instrumentation_equal,
+        "performance_waiver_sha256": performance_waiver_sha256,
     }
 
 
@@ -2767,6 +2791,7 @@ def _benchmark_from_summary(summary: CampaignSummary) -> dict[str, Any]:
     return {
         "synthetic_goodput": summary.synthetic_goodput,
         "useful_mfu": summary.benchmark_useful_mfu,
+        "performance_waiver_sha256": summary.performance_waiver_sha256,
         "dropped_routed_tokens": summary.dropped_routed_tokens,
         "recompilations": summary.recompilations,
         "instrumentation_equal": summary.instrumentation_equal,
@@ -2861,6 +2886,8 @@ def _validate_campaign_summary_identity(
         or summary.recompilations != int(benchmark.get("recompilations", -1))
         or summary.instrumentation_equal
         is not bool(benchmark.get("instrumentation_equal", False))
+        or summary.performance_waiver_sha256
+        != benchmark.get("performance_waiver_sha256")
     ):
         raise HarvestError("existing campaign used a different selected benchmark")
 
@@ -3288,6 +3315,11 @@ def _aggregate_campaign_summary(
         useful_flops=useful_flops,
         useful_mfu=useful_flops / (V4_32_BF16_PEAK_FLOPS * wall),
         benchmark_useful_mfu=float(benchmark["useful_mfu"]),
+        performance_waiver_sha256=(
+            str(benchmark["performance_waiver_sha256"])
+            if benchmark.get("performance_waiver_sha256") is not None
+            else None
+        ),
         dropped_routed_tokens=int(benchmark["dropped_routed_tokens"]),
         recompilations=int(benchmark["recompilations"]),
         instrumentation_equal=bool(benchmark["instrumentation_equal"]),

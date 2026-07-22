@@ -34,7 +34,12 @@ from moe_sae.model import (
     expected_hf_repository_inventory_sha256,
     expected_hf_snapshot_inventory_sha256,
 )
-from moe_sae.runtime import BENCHMARK_TIMING_SCHEMA
+from moe_sae.runtime import (
+    BENCHMARK_TIMING_SCHEMA,
+    HARVEST_MESHES,
+    V4_32_BF16_PEAK_FLOPS,
+    BenchmarkObservation,
+)
 from moe_sae.storage import (
     MINIMUM_ACTIVATION_GCS_DOWNLOAD_BYTES_PER_SECOND,
     STORAGE_ATTESTATION_SCHEMA,
@@ -253,6 +258,7 @@ def campaign(split: str, tokens: int, chip_seconds: float) -> dict:
         useful_flops=1.0,
         useful_mfu=0.57,
         benchmark_useful_mfu=0.57,
+        performance_waiver_sha256=None,
         dropped_routed_tokens=0,
         recompilations=0,
         instrumentation_equal=True,
@@ -271,6 +277,7 @@ def test_single_cli_exposes_exact_subcommands():
         "preflight",
         "convert-checkpoint",
         "benchmark-harvest",
+        "authorize-benchmark-waiver",
         "harvest",
         "activation-farm",
         "activation-status",
@@ -1176,28 +1183,9 @@ def test_harvester_report_uses_measured_train_and_eval_capture_cost(tmp_path):
     harvest = tmp_path / "harvest"
     benchmark.mkdir()
     harvest.mkdir()
+    selected_envelope = _selected_benchmark(config, useful_mfu=0.57)
     (benchmark / "selected.json").write_text(
-        json.dumps(
-            {
-                "schema_version": config.schema_version,
-                "config_sha256": config.config_hash,
-                "checkpoint_sha256": "a" * 64,
-                "conversion_attestation_sha256": "9" * 64,
-                "storage_attestation_sha256": "8" * 64,
-                "selected": {
-                    "timing_schema": BENCHMARK_TIMING_SCHEMA,
-                    "mesh": {"name": "ep16-fsdp1-tp1"},
-                    "per_device_sequence_batch": 1,
-                    "useful_mfu": 0.57,
-                    "persisted_tokens_per_second": 10,
-                    "dropped_routed_tokens": 0,
-                    "recompilations": 0,
-                    "instrumentation_equal": True,
-                    "passes_hard_gate": True,
-                },
-            }
-        ),
-        encoding="utf-8",
+        json.dumps(selected_envelope), encoding="utf-8"
     )
     (harvest / "train.json").write_text(
         json.dumps(campaign("train", config.train_tokens, 100.0)),
@@ -1305,7 +1293,23 @@ def _run_args(tmp_path):
     )
 
 
-def _selected_benchmark(config):
+def _selected_benchmark(config, *, useful_mfu=0.55):
+    selected = BenchmarkObservation(
+        mesh=HARVEST_MESHES[0],
+        per_device_sequence_batch=1,
+        synchronized_steps=200,
+        elapsed_seconds=10.0,
+        device_elapsed_seconds=8.0,
+        persistence_seconds=2.0,
+        useful_flops=useful_mfu * V4_32_BF16_PEAK_FLOPS * 8.0,
+        output_tokens=100,
+        persisted_tokens=100,
+        input_wait_seconds=0.0,
+        recompilations=0,
+        dropped_routed_tokens=0,
+        max_writer_backlog=1,
+        instrumentation_equal=True,
+    ).as_dict()
     return {
         "schema_version": config.schema_version,
         "config_sha256": config.config_hash,
@@ -1313,13 +1317,7 @@ def _selected_benchmark(config):
         "conversion_attestation_sha256": "9" * 64,
         "storage_attestation_sha256": "8" * 64,
         "environment": cli_module._coordinated_environment(),
-        "selected": {
-            "timing_schema": BENCHMARK_TIMING_SCHEMA,
-            "mesh": {"name": "ep16-fsdp1-tp1"},
-            "per_device_sequence_batch": 1,
-            "passes_hard_gate": True,
-            "useful_mfu": 0.55,
-        },
+        "selected": selected,
     }
 
 

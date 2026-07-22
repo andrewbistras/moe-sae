@@ -66,6 +66,7 @@ def test_public_cli_import_is_jax_cold_and_exposes_expected_commands():
         "preflight",
         "convert-checkpoint",
         "benchmark-harvest",
+        "authorize-benchmark-waiver",
         "harvest",
         "activation-farm",
         "activation-status",

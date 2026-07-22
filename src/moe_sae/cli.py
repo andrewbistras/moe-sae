@@ -27,6 +27,13 @@ from moe_sae.artifacts import (
     load_manifest,
     verify_staged_dataset_manifest,
 )
+from moe_sae.benchmark_waiver import (
+    BenchmarkWaiverError,
+    create_performance_waiver,
+    normalize_observation,
+    selection_gate_status,
+    sha256_json,
+)
 from moe_sae.config import Gemma4Config, load_config
 from moe_sae.metrics import (
     MetricsSink,
@@ -2209,16 +2216,203 @@ def _load_selected_benchmark(
         raise RuntimeError(
             "selected benchmark belongs to a different config/checkpoint/environment"
         )
-    selected = payload.get("selected")
-    if (
-        not isinstance(selected, dict)
-        or selected.get("timing_schema") != BENCHMARK_TIMING_SCHEMA
-        or selected.get("passes_hard_gate") is not True
-    ):
-        raise RuntimeError("selected benchmark did not pass every hard gate")
-    if float(selected.get("useful_mfu", 0.0)) < config.min_harvester_mfu:
-        raise RuntimeError("selected benchmark does not meet the configured MFU gate")
+    identities = {
+        "config_sha256": config.config_hash,
+        "checkpoint_sha256": checkpoint_sha256,
+        "conversion_attestation_sha256": conversion_attestation_sha256,
+        "storage_attestation_sha256": str(payload.get("storage_attestation_sha256", "")),
+        "environment_sha256": str(current_environment.get("sha256", "")),
+    }
+    try:
+        selected, waiver = selection_gate_status(
+            payload,
+            minimum_mfu=config.min_harvester_mfu,
+            expected_identities=identities,
+        )
+    except BenchmarkWaiverError as error:
+        raise RuntimeError("selected benchmark did not pass the hard gate or waiver policy") from error
+    if waiver is not None:
+        selected["performance_waiver"] = waiver
     return selected
+
+
+def _command_authorize_benchmark_waiver(args: argparse.Namespace) -> int:
+    """Publish an identity-bound MFU-only exception without rewriting evidence."""
+
+    require_v4_32_runtime()
+    config = _config(args)
+    config.validate_production()
+    root = _artifact_root(config, args.artifact_root).resolve()
+    _require_production_artifact_root(root)
+    environment = _coordinated_environment()
+    storage_payload = _load_storage_attestation_payload(
+        root, config, environment=environment
+    )
+    conversion_sha256 = _load_conversion_attestation(
+        root, config, args.checkpoint_sha256
+    )
+    source = Path(args.observation).expanduser().resolve()
+    try:
+        source_bytes = source.read_bytes()
+        source_payload = json.loads(source_bytes)
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"cannot load benchmark waiver evidence: {source}") from error
+    if not isinstance(source_payload, dict):
+        raise RuntimeError("benchmark waiver evidence must be a JSON object")
+    selected = normalize_observation(source_payload)
+    _coordinated_sha256(
+        sha256_json(selected), purpose="performance-waiver benchmark observation"
+    )
+    identities = {
+        "config_sha256": config.config_hash,
+        "checkpoint_sha256": args.checkpoint_sha256,
+        "conversion_attestation_sha256": conversion_sha256,
+        "storage_attestation_sha256": str(storage_payload["attestation_sha256"]),
+        "environment_sha256": str(environment["sha256"]),
+    }
+    bootstrap_path = Path(args.observation_bootstrap).expanduser().resolve()
+    try:
+        bootstrap_bytes = bootstrap_path.read_bytes()
+        bootstrap = json.loads(bootstrap_bytes)
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(
+            f"cannot load benchmark producer bootstrap: {bootstrap_path}"
+        ) from error
+    bootstrap_environment = (
+        bootstrap.get("environment") if isinstance(bootstrap, Mapping) else None
+    )
+    source_sweep_id = str(source_payload.get("sweep_id", ""))
+    if (
+        not isinstance(bootstrap, Mapping)
+        or bootstrap.get("schema_version") != "gemma4-benchmark-bootstrap-v1"
+        or not source_sweep_id
+        or bootstrap.get("sweep_id") != source_sweep_id
+        or not isinstance(bootstrap_environment, Mapping)
+    ):
+        raise RuntimeError("benchmark producer bootstrap does not match the observation")
+    observation_producer = {
+        "config_sha256": str(bootstrap.get("config_sha256", "")),
+        "checkpoint_sha256": str(bootstrap.get("checkpoint_sha256", "")),
+        "conversion_attestation_sha256": str(
+            bootstrap.get("conversion_attestation_sha256", "")
+        ),
+        "storage_attestation_sha256": str(
+            bootstrap.get("storage_attestation_sha256", "")
+        ),
+        "environment_sha256": str(bootstrap_environment.get("sha256", "")),
+        "benchmark_sweep_id": source_sweep_id,
+        "bootstrap_record": str(bootstrap_path),
+        "bootstrap_record_sha256": hashlib.sha256(bootstrap_bytes).hexdigest(),
+    }
+    cross_environment_evidence = any(
+        observation_producer[field] != identities[field]
+        for field in ("storage_attestation_sha256", "environment_sha256")
+    )
+    if cross_environment_evidence and not args.authorize_cross_environment_evidence:
+        raise RuntimeError(
+            "benchmark observation predates the current environment/storage; pass "
+            "--authorize-cross-environment-evidence to record that explicit exception"
+        )
+    supplementary_evidence = []
+    for raw_path in args.diagnostic_profile:
+        evidence_path = Path(raw_path).expanduser().resolve()
+        if evidence_path.is_file():
+            evidence_bytes = evidence_path.read_bytes()
+            supplementary_evidence.append(
+                {
+                    "kind": "file",
+                    "path": str(evidence_path),
+                    "sha256": hashlib.sha256(evidence_bytes).hexdigest(),
+                    "bytes": len(evidence_bytes),
+                    "files": 1,
+                }
+            )
+            continue
+        if not evidence_path.is_dir():
+            raise RuntimeError(f"diagnostic profile does not exist: {evidence_path}")
+        inventory = []
+        total_bytes = 0
+        for member in sorted(item for item in evidence_path.rglob("*") if item.is_file()):
+            member_bytes = member.read_bytes()
+            total_bytes += len(member_bytes)
+            inventory.append(
+                {
+                    "path": member.relative_to(evidence_path).as_posix(),
+                    "sha256": hashlib.sha256(member_bytes).hexdigest(),
+                    "bytes": len(member_bytes),
+                }
+            )
+        if not inventory:
+            raise RuntimeError(f"diagnostic profile is empty: {evidence_path}")
+        supplementary_evidence.append(
+            {
+                "kind": "directory-inventory",
+                "path": str(evidence_path),
+                "sha256": sha256_json(inventory),
+                "bytes": total_bytes,
+                "files": len(inventory),
+            }
+        )
+    _coordinated_sha256(
+        sha256_json(supplementary_evidence),
+        purpose="performance-waiver supplementary diagnostics",
+    )
+    process_index, _ = _process_context()
+    destination = root / "benchmark" / "selected.json"
+    if destination.exists() and not args.replace:
+        raise RuntimeError(
+            f"selected benchmark already exists: {destination}; pass --replace explicitly"
+        )
+    waiver = (
+        create_performance_waiver(
+            selected,
+            minimum_mfu=config.min_harvester_mfu,
+            identities=identities,
+            reason=args.reason,
+            operator_identity=args.operator_identity,
+            operator_authorization=args.operator_authorization,
+            source_record=str(source),
+            source_record_sha256=hashlib.sha256(source_bytes).hexdigest(),
+            observation_producer=observation_producer,
+            cross_environment_evidence_authorized=cross_environment_evidence,
+            supplementary_evidence=supplementary_evidence,
+        )
+        if process_index == 0
+        else None
+    )
+    sweep_id = source_payload.get("sweep_id") or source_payload.get(
+        "benchmark_sweep_id"
+    )
+    envelope = {
+        "schema_version": config.schema_version,
+        "config_sha256": config.config_hash,
+        "checkpoint_sha256": args.checkpoint_sha256,
+        "conversion_attestation_sha256": conversion_sha256,
+        "environment": environment,
+        "storage_attestation_sha256": storage_payload["attestation_sha256"],
+        "benchmark_sweep_id": str(
+            sweep_id or f"performance-waiver-{sha256_json(selected)[:16]}"
+        ),
+        "observations": [selected],
+        "selected": selected,
+        "performance_waiver": waiver,
+    }
+    _coordinator_write_json(
+        destination,
+        envelope,
+        barrier="gemma4-publish-performance-waiver",
+        coordinator_owned_fields=("performance_waiver",),
+    )
+    loaded = _load_selected_benchmark(
+        destination,
+        config,
+        args.checkpoint_sha256,
+        conversion_sha256,
+        str(storage_payload["attestation_sha256"]),
+    )
+    if process_index == 0:
+        print(json.dumps(loaded, indent=2, sort_keys=True))
+    return 0
 
 
 def _command_harvest(args: argparse.Namespace) -> int:
@@ -2891,16 +3085,44 @@ def _load_harvester_report(
         raise RuntimeError(
             "selected harvester benchmark has the wrong config/environment fingerprint"
         )
-    selected = value.get("selected", value)
-    if (
-        not isinstance(selected, dict)
-        or selected.get("timing_schema") != BENCHMARK_TIMING_SCHEMA
-        or selected.get("passes_hard_gate") is not True
-    ):
-        raise RuntimeError(f"invalid/failing harvester benchmark: {benchmark_path}")
-    if float(selected.get("useful_mfu", 0.0)) < config.min_harvester_mfu:
-        raise RuntimeError("selected harvester benchmark is below the MFU hard gate")
+    benchmark_identity = {
+        "config_sha256": config.config_hash,
+        "checkpoint_sha256": str(value.get("checkpoint_sha256", "")),
+        "conversion_attestation_sha256": str(
+            value.get("conversion_attestation_sha256", "")
+        ),
+        "storage_attestation_sha256": str(
+            value.get("storage_attestation_sha256", "")
+        ),
+        "environment_sha256": str(
+            benchmark_environment.get("sha256", "")
+            if isinstance(benchmark_environment, Mapping)
+            else ""
+        ),
+    }
+    try:
+        selected, performance_waiver = selection_gate_status(
+            value,
+            minimum_mfu=config.min_harvester_mfu,
+            expected_identities=benchmark_identity,
+        )
+    except BenchmarkWaiverError as error:
+        raise RuntimeError(f"invalid/failing harvester benchmark: {benchmark_path}") from error
     result: dict[str, Any] = dict(selected)
+    result["performance_gate_met"] = performance_waiver is None
+    result["performance_gate_status"] = (
+        "passed" if performance_waiver is None else "waived-unmet"
+    )
+    result["performance_waiver"] = performance_waiver
+    result["performance_gate_label"] = (
+        "Harvester performance hard gate passed."
+        if performance_waiver is None
+        else (
+            "Harvester performance hard gate was unmet and explicitly waived; "
+            f"actual useful MFU={float(selected['useful_mfu']):.4%}, "
+            f"required={config.min_harvester_mfu:.2%}."
+        )
+    )
     result["checkpoint_sha256"] = value.get("checkpoint_sha256")
     result["conversion_attestation_sha256"] = value.get(
         "conversion_attestation_sha256"
@@ -2970,6 +3192,12 @@ def _load_harvester_report(
             != int(selected.get("recompilations", -2))
             or campaign.get("instrumentation_equal")
             is not selected.get("instrumentation_equal")
+            or campaign.get("performance_waiver_sha256")
+            != (
+                performance_waiver.get("waiver_sha256")
+                if isinstance(performance_waiver, Mapping)
+                else None
+            )
         ):
             raise RuntimeError(f"{split} campaign does not use the selected benchmark")
         if expected_captures is not None:
@@ -3281,6 +3509,14 @@ def _command_report(args: argparse.Namespace) -> int:
         evaluation_seconds=evaluation_seconds,
         nominal_candidate_exposure_percent=100.0 * config.candidate_exposure,
     )
+    if harvester.get("performance_gate_status") == "waived-unmet":
+        report["scientific_result_status_without_performance_gate"] = report["status"]
+        report["status"] = "exploratory-performance-waived"
+        report["headline_eligible"] = False
+        report["headline"] = (
+            f"{report['headline']} Exploratory: the harvester's 50% useful-MFU "
+            "hard gate was unmet and explicitly waived."
+        )
     prefetch_by_run = {
         f"{condition}/seed-{seed}": {
             "seconds": float(
@@ -3349,7 +3585,7 @@ def _command_report(args: argparse.Namespace) -> int:
             f"efficiency report is not visible after barrier: {destination}"
         )
     if process_index == 0:
-        print(render_headline(report))
+        print(report["headline"])
     return 0
 
 
@@ -3525,6 +3761,12 @@ def _campaign_is_complete(
         or summary.recompilations != int(benchmark.get("recompilations", -1))
         or summary.instrumentation_equal
         is not bool(benchmark.get("instrumentation_equal", False))
+        or summary.performance_waiver_sha256
+        != (
+            benchmark.get("performance_waiver", {}).get("waiver_sha256")
+            if isinstance(benchmark.get("performance_waiver"), Mapping)
+            else None
+        )
         or (split == "train" and summary.canary_passed is not True)
     ):
         raise RuntimeError(f"existing harvest campaign is incompatible: {path}")
@@ -4051,12 +4293,24 @@ def _activation_gate_payload(args: argparse.Namespace) -> dict[str, Any]:
     )
     sequence_batch = int(selected["per_device_sequence_batch"])
     if args.phase == "benchmark":
+        performance_waiver = selected.get("performance_waiver")
         return {
             "phase": "benchmark",
             "path": str(benchmark_path),
             "mesh": mesh_name,
             "per_device_sequence_batch": sequence_batch,
             "useful_mfu": float(selected["useful_mfu"]),
+            "passes_hard_gate": selected.get("passes_hard_gate") is True,
+            "performance_gate_status": (
+                "waived-unmet"
+                if isinstance(performance_waiver, Mapping)
+                else "passed"
+            ),
+            "performance_waiver_sha256": (
+                performance_waiver.get("waiver_sha256")
+                if isinstance(performance_waiver, Mapping)
+                else None
+            ),
         }
 
     split = "train" if args.phase in {"canary", "train"} else "eval"
@@ -4136,6 +4390,11 @@ def _activation_gate_payload(args: argparse.Namespace) -> dict[str, Any]:
             "dropped_routed_tokens": selected["dropped_routed_tokens"],
             "recompilations": selected["recompilations"],
             "instrumentation_equal": selected["instrumentation_equal"],
+            "performance_waiver_sha256": (
+                selected["performance_waiver"].get("waiver_sha256")
+                if isinstance(selected.get("performance_waiver"), Mapping)
+                else None
+            ),
         },
     )
     if args.phase == "canary":
@@ -4549,6 +4808,44 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark.add_argument("--output")
     benchmark.add_argument("--steps", type=int, default=200)
     benchmark.set_defaults(handler=_command_benchmark_harvest)
+
+    waiver = subparsers.add_parser(
+        "authorize-benchmark-waiver",
+        help="publish a self-hashed exception for an MFU-only benchmark failure",
+    )
+    _add_common(waiver)
+    waiver.add_argument(
+        "--checkpoint-sha256", type=_sha256_argument, required=True
+    )
+    waiver.add_argument(
+        "--observation",
+        required=True,
+        help="direct observation, raw result, or supervised benchmark JSON",
+    )
+    waiver.add_argument("--observation-bootstrap", required=True)
+    waiver.add_argument("--reason", required=True)
+    waiver.add_argument("--operator-identity", required=True)
+    waiver.add_argument("--operator-authorization", required=True)
+    waiver.add_argument(
+        "--diagnostic-profile",
+        action="append",
+        default=[],
+        help="optional diagnostic file/directory to bind into the waiver (repeatable)",
+    )
+    waiver.add_argument(
+        "--authorize-cross-environment-evidence",
+        action="store_true",
+        help=(
+            "explicitly authorize conservative benchmark evidence from a prior "
+            "environment while recording both producer and execution identities"
+        ),
+    )
+    waiver.add_argument(
+        "--replace",
+        action="store_true",
+        help="explicitly replace an existing selected.json",
+    )
+    waiver.set_defaults(handler=_command_authorize_benchmark_waiver)
 
     harvest = subparsers.add_parser(
         "harvest", help="capture one deterministic C4 split"

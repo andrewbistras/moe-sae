@@ -30,6 +30,11 @@ import tempfile
 import time
 from typing import Any, Iterator
 
+from moe_sae.benchmark_waiver import (
+    BenchmarkWaiverError,
+    selection_gate_status,
+)
+
 
 ACTIVATION_PHASES = ("benchmark", "canary", "train", "eval")
 STATE_SCHEMA = "gemma4-activation-operator-v1"
@@ -1123,26 +1128,42 @@ class ActivationControl:
             return {"present": False, "valid": False, "path": str(path)}
         try:
             payload = _read_json(path)
-            selected = payload.get("selected")
-            valid = isinstance(selected, dict) and selected.get("passes_hard_gate") is True
+            waiver_payload = payload.get("performance_waiver")
+            minimum_mfu = (
+                float(waiver_payload.get("minimum_useful_mfu", 0.50))
+                if isinstance(waiver_payload, Mapping)
+                else 0.50
+            )
+            selected, waiver = selection_gate_status(
+                payload, minimum_mfu=minimum_mfu
+            )
             return {
                 "present": True,
-                "valid": valid,
+                "valid": True,
                 "path": str(path),
-                "mesh": selected.get("mesh") if isinstance(selected, dict) else None,
-                "per_device_sequence_batch": (
-                    selected.get("per_device_sequence_batch")
-                    if isinstance(selected, dict)
-                    else None
+                "mesh": selected.get("mesh"),
+                "per_device_sequence_batch": selected.get(
+                    "per_device_sequence_batch"
                 ),
-                "useful_mfu": selected.get("useful_mfu") if isinstance(selected, dict) else None,
-                "persisted_tokens_per_second": (
-                    selected.get("persisted_tokens_per_second")
-                    if isinstance(selected, dict)
-                    else None
+                "useful_mfu": selected.get("useful_mfu"),
+                "persisted_tokens_per_second": selected.get(
+                    "persisted_tokens_per_second"
+                ),
+                "passes_hard_gate": selected.get("passes_hard_gate"),
+                "performance_gate_status": (
+                    "passed" if waiver is None else "waived-unmet"
+                ),
+                "performance_waiver_sha256": (
+                    None if waiver is None else waiver.get("waiver_sha256")
+                ),
+                "performance_waiver_reason": (
+                    None if waiver is None else waiver.get("reason")
+                ),
+                "performance_waiver_authorized_at_utc": (
+                    None if waiver is None else waiver.get("authorized_at_utc")
                 ),
             }
-        except ActivationOperatorError as error:
+        except (ActivationOperatorError, BenchmarkWaiverError, TypeError, ValueError) as error:
             return {"present": True, "valid": False, "path": str(path), "error": str(error)}
 
     def _observe_campaign(self, name: str, tokens: int, *, canary: bool) -> dict[str, Any]:
