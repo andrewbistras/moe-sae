@@ -1,13 +1,49 @@
 # DeepSeek-R1-0528 checkpoint conversion contract
 
-**Status:** source-backed design audit, 2026-07-22. No weight payload was
-downloaded during this audit. Safetensor headers, the Hugging Face index and
-configuration, and the pinned MaxText source were inspected.
+**Status:** source-backed design audit plus bounded reference execution core,
+2026-07-23. No weight payload was downloaded during this work. Safetensor
+headers, the Hugging Face index and configuration, and the pinned MaxText
+source were inspected.
 
 This document defines the only checkpoint conversion that may authorize the
 one-indexed block-31 activation prefix. It is intentionally fail closed. A
 converter completing without an exception is not evidence that the resulting
 checkpoint is scientifically equivalent to the released model.
+
+The active implementation now has two deliberately separate layers:
+
+- [`checkpoint_inventory.py`](../src/moe_sae/r1/checkpoint_inventory.py) is the
+  sole authority for the exact source inventory, routed-prefix selection,
+  FP8/scale pairing, and canonical HF-to-MaxText map.
+- [`checkpoint_conversion.py`](../src/moe_sae/r1/checkpoint_conversion.py)
+  derives deterministic, shard-ordered chunks from that authority and executes
+  bounded identity, transpose/reshape, and blockwise FP8-to-BF16 transforms
+  against pluggable verified-source and create-only-sink protocols. Synthetic
+  tests cover layout parity, boundary blocks, FP32 multiply-before-BF16
+  rounding, bitwise BF16/FP32 passthrough, cross-shard scales, crash/resume,
+  conflicting receipts, and pre-I/O memory rejection.
+
+The chunk identity binds the exact conversion-module hash, the measured NumPy
+and `ml_dtypes` native-extension and distribution-record hashes, and an
+explicit externally attested source-adapter implementation hash.
+`ml_dtypes==0.5.4` is a direct dependency rather than an accidental transitive
+JAX dependency.
+
+This is not an Orbax converter and produces no production seal. There is no
+real safetensor source adapter, TensorStore/Orbax sink, fresh-process restore,
+independent real-R1 FP8 hash oracle, full-model logit oracle, or prefix/full
+parity result yet. The only public sealing function fails unconditionally
+until those gates exist.
+
+The memory limits are statically checked bounds on the core's numerical array
+working set under synchronous source/sink contracts. The one-validated-shard
+local-scratch limit and sink staging limit remain adapter obligations and have
+not been measured because those adapters do not exist. The shared project
+environment also still resolves MaxText to the Gemma commit; it must not be
+used for R1. A separate R1 runtime/lock pinned to the MaxText revision below is
+required before a real source, Orbax sink, restore, or parity run. The pinned
+plan constructor measures both `pyproject.toml` and `uv.lock` and explicitly
+rejects this current shared lock rather than accepting the prose revision.
 
 ## Immutable source identity
 
@@ -241,14 +277,20 @@ For each immutable source key:
 - write chunked destination arrays so a full `[256, ...]` expert stack is
   never required in host RAM.
 
+The reference core rejects non-finite inverse scales. It does not currently
+invent a positivity gate: scale positivity remains to be established by the
+real 21,749-scale payload scan, while the released transform itself is FP32
+multiplication.
+
 Progress is journaled by an immutable identity containing the source revision,
 source shard hash, source key, transform version, destination logical key, and
 destination slice. A resume may reuse a slice only after verifying that exact
 identity and output hash.
 
-Local scratch is bounded by one validated source shard plus one destination
-chunk. Durable output is written under a unique attempt prefix. No mutable
-`latest` pointer is published during conversion.
+The production source adapter must keep local scratch to one validated source
+shard; the core rejects any declared source blob or numerical chunk above its
+plan limits before reading it. Durable output is written under a unique attempt
+prefix. No mutable `latest` pointer is published during conversion.
 
 ### 3. Seal output last
 

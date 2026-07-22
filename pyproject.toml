@@ -6,6 +6,7 @@ requires-python = ">=3.12,<3.13"
 dependencies = [
     "google-crc32c==1.8.0",
     "jax>=0.8.0,<0.11",
+    "ml_dtypes==0.5.4",
     "numpy>=2.0",
     "pyyaml>=6.0",
     "safetensors>=0.5",
