@@ -32,12 +32,12 @@ from moe_sae.artifacts import ArtifactDataset, bf16_bits_to_float32
 from moe_sae.checkpointing import (
     checkpoint_payload_uri,
     final_pointer_from_latest,
-    load_pointer,
     make_pointer,
     new_attempt_id,
     normalize_payload_root,
     pointer_path,
     publish_pointer,
+    validate_pointer,
 )
 from moe_sae.pipeline import (
     ActivationBatch,
@@ -47,6 +47,11 @@ from moe_sae.pipeline import (
     _fixed_microbatches,
     _scientific_rows,
     check_seed_health,
+)
+from moe_sae.metrics_journal import (
+    JournalIdentity,
+    MetricsJournal,
+    training_journal_snapshot,
 )
 from moe_sae.sae import (
     AdamState,
@@ -60,6 +65,11 @@ from moe_sae.sae import (
     init_train_state,
 )
 from moe_sae.runtime import atomic_write_json
+
+
+CHECKPOINT_CONTROL_VISIBILITY_TIMEOUT_SECONDS = 90.0
+CHECKPOINT_CONTROL_VISIBILITY_POLL_SECONDS = 0.25
+CHECKPOINT_CONTROL_MAX_BYTES = 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -132,6 +142,7 @@ class DistributedTrainingResult:
     timing: DistributedRunTiming
     latest_checkpoint: str | None
     final_checkpoint: str | None
+    metrics_journal: dict[str, Any] | None = None
 
     @property
     def compile_seconds(self) -> float:
@@ -420,9 +431,9 @@ def _local_a_scores(
     safe_local_id = jnp.clip(local_id, 0, local_experts - 1)
 
     # Rank assignments within each local expert without a host-side sort.  The
-    # [token×route, local_experts] bookkeeping is small (16 experts/chip on the
-    # default 4-way feature mesh) and the expensive expert matmul is performed
-    # exactly once per owned routed bank.
+    # [token×route, local_experts] bookkeeping is small (32 experts per feature
+    # device on the production 4-way feature axis); the expensive expert
+    # matmul is performed exactly once per owned routed bank.
     membership = jax.nn.one_hot(safe_local_id, local_experts, dtype=jnp.int32) * owned[
         :, None
     ].astype(jnp.int32)
@@ -855,16 +866,449 @@ def _checkpoint_barrier(label: str) -> None:
         multihost_utils.sync_global_devices(label)
 
 
+def _checkpoint_collective_failed(local_failed: bool) -> bool:
+    """Return one identical checkpoint-control decision on every process."""
+
+    if jax.process_count() == 1:
+        return bool(local_failed)
+    from jax.experimental import multihost_utils
+
+    gathered = np.asarray(
+        multihost_utils.process_allgather(
+            np.asarray([local_failed], dtype=np.uint8), tiled=False
+        ),
+        dtype=np.uint8,
+    )
+    return bool(np.any(gathered))
+
+
+def _checkpoint_phase_decision(
+    operation: str, local_error: Exception | None
+) -> None:
+    """Raise only after every process has received the phase outcome."""
+
+    if not _checkpoint_collective_failed(local_error is not None):
+        return
+    error = RuntimeError(f"distributed checkpoint {operation} failed")
+    if local_error is not None:
+        raise error from local_error
+    raise error
+
+
+def _coordinator_read_checkpoint_json_if_exists(
+    path: Path, *, operation: str
+) -> Any | None:
+    """Broadcast process zero's exact control-plane observation to all hosts."""
+
+    source: bytes | None = None
+    read_error: Exception | None = None
+    if jax.process_index() == 0:
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            source = None
+        except OSError as error:
+            read_error = error
+        else:
+            try:
+                value = json.loads(raw)
+                source = json.dumps(
+                    value,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ).encode("utf-8")
+                if len(source) > CHECKPOINT_CONTROL_MAX_BYTES:
+                    raise ValueError("checkpoint control JSON exceeds the size bound")
+            except (json.JSONDecodeError, TypeError, ValueError) as error:
+                read_error = error
+    _checkpoint_phase_decision(f"{operation} read", read_error)
+
+    if jax.process_count() == 1:
+        shared = source
+    else:
+        from jax.experimental import multihost_utils
+
+        local_length = (
+            -1
+            if jax.process_index() == 0 and source is None
+            else len(source)
+            if jax.process_index() == 0 and source is not None
+            else 0
+        )
+        length_value = np.asarray(
+            multihost_utils.broadcast_one_to_all(
+                np.asarray([local_length], dtype=np.int32),
+                is_source=jax.process_index() == 0,
+            ),
+            dtype=np.int32,
+        )
+        length = int(length_value.reshape(-1)[0])
+        if length == -1:
+            shared = None
+        elif not 0 <= length <= CHECKPOINT_CONTROL_MAX_BYTES:
+            shared = None
+            read_error = RuntimeError("checkpoint control broadcast length is invalid")
+        else:
+            local = (
+                np.frombuffer(source, dtype=np.uint8).copy()
+                if jax.process_index() == 0 and source is not None
+                else np.zeros((length,), dtype=np.uint8)
+            )
+            value = np.asarray(
+                multihost_utils.broadcast_one_to_all(
+                    local, is_source=jax.process_index() == 0
+                ),
+                dtype=np.uint8,
+            )
+            if value.shape != (length,):
+                shared = None
+                read_error = RuntimeError(
+                    "checkpoint control broadcast payload is invalid"
+                )
+            else:
+                shared = value.tobytes()
+    _checkpoint_phase_decision(f"{operation} broadcast", read_error)
+    if shared is None:
+        return None
+    decoded: Any | None = None
+    decode_error: Exception | None = None
+    try:
+        decoded = json.loads(shared.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        decode_error = error
+    _checkpoint_phase_decision(f"{operation} decode", decode_error)
+    return decoded
+
+
+def _collective_load_pointer(
+    checkpoint_dir: str | Path,
+    *,
+    kind: str,
+    payload_root: str | Path,
+    run_identity: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Choose pointer absence/presence once, then validate it collectively."""
+
+    path: Path | None = None
+    prepare_error: Exception | None = None
+    try:
+        if kind not in {"latest", "final"}:
+            raise ValueError("checkpoint pointer kind must be latest or final")
+        path = pointer_path(checkpoint_dir, kind)  # type: ignore[arg-type]
+    except Exception as error:
+        prepare_error = error
+    _checkpoint_phase_decision("pointer load preparation", prepare_error)
+    assert path is not None
+    raw = _coordinator_read_checkpoint_json_if_exists(
+        path, operation=f"{kind} pointer"
+    )
+    if raw is None:
+        return None
+
+    pointer: dict[str, Any] | None = None
+    validation_error: Exception | None = None
+    try:
+        if not isinstance(raw, Mapping):
+            raise RuntimeError("checkpoint pointer must be a JSON object")
+        pointer = validate_pointer(
+            raw,
+            expected_kind=kind,  # type: ignore[arg-type]
+            payload_root=payload_root,
+            run_identity=run_identity,
+        )
+    except Exception as error:
+        validation_error = error
+    _checkpoint_phase_decision("pointer validation", validation_error)
+    assert pointer is not None
+    return pointer
+
+
+def _collectively_require_finalized_checkpoint(payload_uri: str) -> None:
+    local_error: Exception | None = None
+    try:
+        if not _orbax_path_finalized(_import_orbax(), payload_uri):
+            raise RuntimeError("checkpoint payload is not finalized")
+    except Exception as error:
+        local_error = error
+    _checkpoint_phase_decision("payload finalization check", local_error)
+
+
+def _broadcast_coordinator_json(
+    source: Mapping[str, Any] | None, *, operation: str
+) -> dict[str, Any]:
+    """Broadcast one strict coordinator-owned JSON object to every process."""
+
+    encoded: bytes | None = None
+    encode_error: Exception | None = None
+    if jax.process_index() == 0:
+        try:
+            if not isinstance(source, Mapping):
+                raise TypeError("coordinator JSON source must be a mapping")
+            encoded = json.dumps(
+                dict(source),
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+            if len(encoded) > CHECKPOINT_CONTROL_MAX_BYTES:
+                raise ValueError("coordinator JSON exceeds the size bound")
+        except Exception as error:
+            encode_error = error
+    _checkpoint_phase_decision(f"{operation} encoding", encode_error)
+
+    if jax.process_count() == 1:
+        shared = encoded
+    else:
+        from jax.experimental import multihost_utils
+
+        local_length = len(encoded) if encoded is not None else 0
+        length_value = np.asarray(
+            multihost_utils.broadcast_one_to_all(
+                np.asarray([local_length], dtype=np.int32),
+                is_source=jax.process_index() == 0,
+            ),
+            dtype=np.int32,
+        )
+        length = int(length_value.reshape(-1)[0])
+        broadcast_error: Exception | None = None
+        if not 0 < length <= CHECKPOINT_CONTROL_MAX_BYTES:
+            shared = None
+            broadcast_error = RuntimeError(
+                "coordinator JSON broadcast length is invalid"
+            )
+        else:
+            local = (
+                np.frombuffer(encoded, dtype=np.uint8).copy()
+                if encoded is not None
+                else np.zeros((length,), dtype=np.uint8)
+            )
+            value = np.asarray(
+                multihost_utils.broadcast_one_to_all(
+                    local, is_source=jax.process_index() == 0
+                ),
+                dtype=np.uint8,
+            )
+            if value.shape != (length,):
+                shared = None
+                broadcast_error = RuntimeError(
+                    "coordinator JSON broadcast payload is invalid"
+                )
+            else:
+                shared = value.tobytes()
+        _checkpoint_phase_decision(f"{operation} broadcast", broadcast_error)
+    assert shared is not None
+    result: dict[str, Any] | None = None
+    decode_error: Exception | None = None
+    try:
+        value = json.loads(shared.decode("utf-8"))
+        if not isinstance(value, dict):
+            raise TypeError("broadcast coordinator JSON is not an object")
+        result = value
+    except Exception as error:
+        decode_error = error
+    _checkpoint_phase_decision(f"{operation} decoding", decode_error)
+    assert result is not None
+    return result
+
+
+def _collective_training_journal_snapshot(
+    journal: MetricsJournal | None,
+    training_config: TrainingConfig,
+    *,
+    operation: str,
+) -> dict[str, Any]:
+    source: dict[str, Any] | None = None
+    local_error: Exception | None = None
+    if jax.process_index() == 0:
+        try:
+            if journal is None:
+                raise RuntimeError("coordinator metrics journal is unavailable")
+            source = training_journal_snapshot(
+                journal,
+                total_tokens=training_config.total_tokens,
+                effective_batch_tokens=training_config.effective_batch_tokens,
+                expected_l0=training_config.sae.k,
+            )
+        except Exception as error:
+            local_error = error
+    _checkpoint_phase_decision(f"{operation} snapshot", local_error)
+    return _broadcast_coordinator_json(source, operation=operation)
+
+
+def _prepare_training_journal(
+    path: str | Path | None,
+    identity: JournalIdentity | None,
+    training_config: TrainingConfig,
+    *,
+    restored_step: int,
+    restored_tokens: int,
+) -> tuple[MetricsJournal | None, dict[str, Any] | None]:
+    if (path is None) != (identity is None):
+        raise ValueError(
+            "metrics journal path and identity must be supplied together"
+        )
+    if path is None:
+        return None, None
+    if not isinstance(identity, JournalIdentity):
+        raise TypeError("metrics journal identity must be a JournalIdentity")
+    if "://" in str(path):
+        raise ValueError("metrics journal requires a shared POSIX path")
+
+    journal: MetricsJournal | None = None
+    local_error: Exception | None = None
+    if jax.process_index() == 0:
+        try:
+            journal = MetricsJournal(path, identity)
+            journal.reconcile(step=restored_step, tokens_seen=restored_tokens)
+        except Exception as error:
+            local_error = error
+    _checkpoint_phase_decision("metrics journal reconciliation", local_error)
+    snapshot = _collective_training_journal_snapshot(
+        journal, training_config, operation="metrics journal reconciled prefix"
+    )
+    binding = snapshot.get("binding")
+    if (
+        not isinstance(binding, Mapping)
+        or int(binding.get("last_step", -1)) != restored_step
+        or int(binding.get("last_tokens_seen", -1)) != restored_tokens
+    ):
+        raise RuntimeError("metrics journal does not match restored checkpoint")
+    return journal, snapshot
+
+
+def _metric_journal_record(
+    metric: StepMetrics,
+    *,
+    step: int,
+    tokens_seen: int,
+    optimizer_wall_seconds: float,
+) -> dict[str, Any]:
+    record: dict[str, Any] = {
+        "step": step,
+        "tokens_seen": tokens_seen,
+        "optimizer_wall_seconds": float(optimizer_wall_seconds),
+    }
+    for name, value in metric._asdict().items():
+        array = np.asarray(jax.device_get(value))
+        if array.ndim != 0:
+            raise TypeError(f"distributed metric {name} is not scalar")
+        record[name] = array.item()
+    return record
+
+
+def _append_training_journal_metric(
+    journal: MetricsJournal | None,
+    metric: StepMetrics,
+    *,
+    step: int,
+    tokens_seen: int,
+    optimizer_wall_seconds: float,
+    metric_callback: Any | None,
+) -> None:
+    local_error: Exception | None = None
+    if jax.process_index() == 0:
+        try:
+            if journal is not None:
+                journal.append(
+                    _metric_journal_record(
+                        metric,
+                        step=step,
+                        tokens_seen=tokens_seen,
+                        optimizer_wall_seconds=optimizer_wall_seconds,
+                    )
+                )
+            if metric_callback is not None:
+                metric_callback(metric)
+        except Exception as error:
+            local_error = error
+    _checkpoint_phase_decision("metrics journal append", local_error)
+
+
+def _load_exact_checkpoint_control_with_retry(
+    path: Path,
+    expected: Mapping[str, Any],
+    *,
+    timeout_seconds: float = CHECKPOINT_CONTROL_VISIBILITY_TIMEOUT_SECONDS,
+    poll_seconds: float = CHECKPOINT_CONTROL_VISIBILITY_POLL_SECONDS,
+    clock: Any = time.monotonic,
+    sleep: Any = time.sleep,
+) -> None:
+    """Wait boundedly until one mutable control path has the exact new value.
+
+    A shared filesystem client can retain an ENOENT or the previous contents
+    after another client atomically replaces a file.  Reading the pathname
+    directly (without an ``exists()`` branch) and waiting for the exact value
+    handles both cases while keeping the surrounding collective schedule fixed.
+    Malformed visible JSON is not treated as propagation lag.
+    """
+
+    if (
+        not math.isfinite(timeout_seconds)
+        or timeout_seconds < 0.0
+        or not math.isfinite(poll_seconds)
+        or poll_seconds <= 0.0
+    ):
+        raise ValueError("checkpoint visibility retry bounds are invalid")
+    deadline = clock() + timeout_seconds
+    while True:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            payload = None
+        except json.JSONDecodeError as error:
+            raise RuntimeError(
+                f"checkpoint control file contains malformed JSON: {path}"
+            ) from error
+        except OSError as error:
+            raise RuntimeError(
+                f"cannot read checkpoint control file: {path}"
+            ) from error
+        if payload == dict(expected):
+            return
+        remaining = deadline - clock()
+        if remaining <= 0.0:
+            raise RuntimeError(
+                "checkpoint control publication did not become exactly visible "
+                f"before the bounded retry expired: {path}"
+            )
+        sleep(min(poll_seconds, remaining))
+
+
 def _publish_checkpoint_pointer(
     checkpoint_dir: str | Path,
     pointer: Mapping[str, Any],
 ) -> str:
+    destination: Path | None = None
+    expected: dict[str, Any] | None = None
+    prepare_error: Exception | None = None
+    try:
+        kind = str(pointer["kind"])
+        if kind not in {"latest", "final"}:
+            raise ValueError("checkpoint pointer kind must be latest or final")
+        int(pointer["tokens_seen"])
+        destination = pointer_path(checkpoint_dir, kind)
+        expected = dict(pointer)
+    except Exception as error:  # decision must precede every process raising
+        prepare_error = error
+    _checkpoint_phase_decision("pointer preparation", prepare_error)
+    assert destination is not None and expected is not None
+
+    publish_error: Exception | None = None
     if jax.process_index() == 0:
-        publish_pointer(checkpoint_dir, pointer)
-    kind = str(pointer["kind"])
-    tokens = int(pointer["tokens_seen"])
-    _checkpoint_barrier(f"gemma4-sae-{kind}-pointer-{tokens}")
-    return str(pointer_path(checkpoint_dir, kind))
+        try:
+            publish_pointer(checkpoint_dir, expected)
+        except Exception as error:  # decision must precede every process raising
+            publish_error = error
+    _checkpoint_phase_decision("pointer publication", publish_error)
+
+    visibility_error: Exception | None = None
+    try:
+        _load_exact_checkpoint_control_with_retry(destination, expected)
+    except Exception as error:  # decision must precede every process raising
+        visibility_error = error
+    _checkpoint_phase_decision("pointer visibility", visibility_error)
+    return str(destination)
 
 
 def _delete_stale_checkpoint_payload(payload_uri: str, *, tokens_seen: int) -> None:
@@ -916,22 +1360,42 @@ def _publish_checkpoint_timing(
     compile_seconds: float,
     checkpoint_seconds: float,
 ) -> None:
-    payload = {
-        **checkpoint_identity,
-        "tokens_seen": tokens_seen,
-        "steps": steps,
-        "optimizer_wall_seconds": optimizer_wall_seconds,
-        "compile_seconds": compile_seconds,
-        "checkpoint_seconds": checkpoint_seconds,
-    }
-    if jax.process_index() == 0:
-        atomic_write_json(_checkpoint_timing_path(checkpoint_dir), payload)
-    if jax.process_count() > 1:
-        from jax.experimental import multihost_utils
+    destination: Path | None = None
+    payload: dict[str, Any] | None = None
+    prepare_error: Exception | None = None
+    try:
+        destination = _checkpoint_timing_path(checkpoint_dir)
+        payload = {
+            **checkpoint_identity,
+            "tokens_seen": tokens_seen,
+            "steps": steps,
+            "optimizer_wall_seconds": optimizer_wall_seconds,
+            "compile_seconds": compile_seconds,
+            "checkpoint_seconds": checkpoint_seconds,
+        }
+        # Prove the payload is JSON-compatible before process zero mutates the
+        # shared control plane.  The round trip also gives every process the
+        # same exact value used for visibility validation.
+        payload = json.loads(json.dumps(payload, allow_nan=False))
+    except Exception as error:  # decision must precede every process raising
+        prepare_error = error
+    _checkpoint_phase_decision("timing preparation", prepare_error)
+    assert destination is not None and payload is not None
 
-        multihost_utils.sync_global_devices(
-            f"gemma4-sae-checkpoint-timing-{tokens_seen}"
-        )
+    publish_error: Exception | None = None
+    if jax.process_index() == 0:
+        try:
+            atomic_write_json(destination, payload)
+        except Exception as error:  # decision must precede every process raising
+            publish_error = error
+    _checkpoint_phase_decision("timing publication", publish_error)
+
+    visibility_error: Exception | None = None
+    try:
+        _load_exact_checkpoint_control_with_retry(destination, payload)
+    except Exception as error:  # decision must precede every process raising
+        visibility_error = error
+    _checkpoint_phase_decision("timing visibility", visibility_error)
 
 
 def _load_checkpoint_timing(
@@ -940,24 +1404,49 @@ def _load_checkpoint_timing(
     checkpoint_identity: Mapping[str, Any],
     restored_tokens: int,
 ) -> dict[str, Any] | None:
-    path = _checkpoint_timing_path(checkpoint_dir)
-    if not path.exists():
-        return None
+    path: Path | None = None
+    prepare_error: Exception | None = None
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise RuntimeError(f"cannot read checkpoint timing sidecar: {path}") from error
-    if any(payload.get(name) != value for name, value in checkpoint_identity.items()):
-        raise RuntimeError("checkpoint timing sidecar belongs to another run")
-    sidecar_tokens = int(payload.get("tokens_seen", -1))
-    if sidecar_tokens > restored_tokens:
-        raise RuntimeError("checkpoint timing sidecar is ahead of restored state")
-    if sidecar_tokens < restored_tokens:
+        path = _checkpoint_timing_path(checkpoint_dir)
+    except Exception as error:
+        prepare_error = error
+    _checkpoint_phase_decision("timing load preparation", prepare_error)
+    assert path is not None
+    value = _coordinator_read_checkpoint_json_if_exists(
+        path, operation="checkpoint timing"
+    )
+    if value is None:
         return None
-    for name in ("optimizer_wall_seconds", "compile_seconds", "checkpoint_seconds"):
-        value = float(payload.get(name, -1.0))
-        if not math.isfinite(value) or value < 0.0:
-            raise RuntimeError(f"checkpoint timing sidecar has invalid {name}")
+    payload: dict[str, Any] | None = None
+    validation_error: Exception | None = None
+    try:
+        if not isinstance(value, Mapping):
+            raise RuntimeError("checkpoint timing sidecar must be a JSON object")
+        payload = dict(value)
+        if any(
+            payload.get(name) != expected
+            for name, expected in checkpoint_identity.items()
+        ):
+            raise RuntimeError("checkpoint timing sidecar belongs to another run")
+        sidecar_tokens = int(payload.get("tokens_seen", -1))
+        if sidecar_tokens > restored_tokens:
+            raise RuntimeError("checkpoint timing sidecar is ahead of restored state")
+        if sidecar_tokens < restored_tokens:
+            payload = None
+        else:
+            for name in (
+                "optimizer_wall_seconds",
+                "compile_seconds",
+                "checkpoint_seconds",
+            ):
+                timing_value = float(payload.get(name, -1.0))
+                if not math.isfinite(timing_value) or timing_value < 0.0:
+                    raise RuntimeError(
+                        f"checkpoint timing sidecar has invalid {name}"
+                    )
+    except Exception as error:
+        validation_error = error
+    _checkpoint_phase_decision("timing validation", validation_error)
     return payload
 
 
@@ -981,6 +1470,8 @@ def run_distributed_training(
     prior_checkpoint_seconds: float = 0.0,
     process_local_source_offset: int = 0,
     checkpoint_identity: Mapping[str, Any] | None = None,
+    metrics_journal_path: str | Path | None = None,
+    metrics_journal_identity: JournalIdentity | None = None,
 ) -> DistributedTrainingResult:
     """Complete sharded train path with explicit marginal-cost accounting.
 
@@ -1022,25 +1513,29 @@ def run_distributed_training(
     existing_latest_pointer: dict[str, Any] | None = None
     if checkpoint_dir is not None:
         assert payload_root is not None
-        existing_latest_pointer = load_pointer(
+        existing_latest_pointer = _collective_load_pointer(
             checkpoint_dir,
             kind="latest",
             payload_root=payload_root,
             run_identity=checkpoint_identity,
         )
         if existing_latest_pointer is not None:
-            if not _orbax_path_finalized(
-                _import_orbax(), str(existing_latest_pointer["payload_uri"])
-            ):
-                raise RuntimeError("latest checkpoint payload is not finalized")
-            if (
-                int(existing_latest_pointer["tokens_seen"]) != start_tokens
-                or int(existing_latest_pointer["step"]) != start_step
-            ):
-                raise RuntimeError(
-                    "training state does not match the validated latest "
-                    "checkpoint pointer"
-                )
+            _collectively_require_finalized_checkpoint(
+                str(existing_latest_pointer["payload_uri"])
+            )
+            state_error: Exception | None = None
+            try:
+                if (
+                    int(existing_latest_pointer["tokens_seen"]) != start_tokens
+                    or int(existing_latest_pointer["step"]) != start_step
+                ):
+                    raise RuntimeError(
+                        "training state does not match the validated latest "
+                        "checkpoint pointer"
+                    )
+            except Exception as error:
+                state_error = error
+            _checkpoint_phase_decision("resume state validation", state_error)
     if start_tokens > training_config.total_tokens:
         raise ValueError("checkpoint exceeds configured token budget")
     if (
@@ -1048,6 +1543,13 @@ def run_distributed_training(
         and start_tokens % training_config.effective_batch_tokens
     ):
         raise ValueError("non-final distributed resume must be on an update boundary")
+    metrics_journal, journal_prefix = _prepare_training_journal(
+        metrics_journal_path,
+        metrics_journal_identity,
+        training_config,
+        restored_step=start_step,
+        restored_tokens=start_tokens,
+    )
 
     target_tokens = training_config.total_tokens
     if stop_after_tokens is not None and stop_after_tokens < target_tokens:
@@ -1160,10 +1662,28 @@ def run_distributed_training(
         optimizer_seconds_local += elapsed
         step_seconds.append(elapsed)
         metrics.append(metric)
-        if metric_callback is not None:
-            metric_callback(metric)
 
         tokens_seen = int(np.asarray(jax.device_get(state.tokens_seen)))
+        step = int(np.asarray(jax.device_get(state.step)))
+        if metrics_journal_path is not None or metric_callback is not None:
+            journal_started = time.perf_counter()
+            cumulative_before_append = (
+                prior_optimizer_wall_seconds
+                + _global_max_seconds(optimizer_seconds_local)
+                if metrics_journal_path is not None
+                else 0.0
+            )
+            _append_training_journal_metric(
+                metrics_journal,
+                metric,
+                step=step,
+                tokens_seen=tokens_seen,
+                optimizer_wall_seconds=cumulative_before_append,
+                metric_callback=metric_callback,
+            )
+            journal_phase_seconds = time.perf_counter() - journal_started
+            optimizer_seconds_local += journal_phase_seconds
+            step_seconds[-1] += journal_phase_seconds
         if checkpoint_dir is not None and tokens_seen >= next_checkpoint:
             assert payload_root is not None
             cumulative_optimizer = prior_optimizer_wall_seconds + _global_max_seconds(
@@ -1173,7 +1693,6 @@ def run_distributed_training(
                 compile_seconds
             )
             checkpoint_started = time.perf_counter()
-            step = int(np.asarray(jax.device_get(state.step)))
             attempt_id = _collective_attempt_id()
             payload_uri = checkpoint_payload_uri(
                 payload_root,
@@ -1327,6 +1846,22 @@ def run_distributed_training(
                 + _global_max_seconds(checkpoint_seconds_local),
             )
 
+    journal_snapshot = journal_prefix
+    if metrics_journal_path is not None:
+        journal_snapshot = _collective_training_journal_snapshot(
+            metrics_journal,
+            training_config,
+            operation="metrics journal final prefix",
+        )
+        journal_binding = journal_snapshot.get("binding")
+        if (
+            not isinstance(journal_binding, Mapping)
+            or int(journal_binding.get("last_step", -1))
+            != int(np.asarray(jax.device_get(state.step)))
+            or int(journal_binding.get("last_tokens_seen", -1)) != tokens_seen
+        ):
+            raise RuntimeError("final metrics journal does not match training state")
+
     health = None
     if tokens_seen >= training_config.health_gate_tokens:
         last_l0 = (
@@ -1334,9 +1869,17 @@ def run_distributed_training(
             if metrics
             else float(training_config.sae.k)
         )
-        topk_valid = all(
-            bool(np.asarray(jax.device_get(metric.topk_valid))) for metric in metrics
-        )
+        if journal_snapshot is not None:
+            if journal_snapshot.get("complete_prefix_exact_l0") is not True:
+                last_l0 = math.nan
+            topk_valid = (
+                journal_snapshot.get("complete_prefix_topk_valid") is True
+            )
+        else:
+            topk_valid = all(
+                bool(np.asarray(jax.device_get(metric.topk_valid)))
+                for metric in metrics
+            )
         health = check_seed_health(
             state, training_config, l0=last_l0, topk_valid=topk_valid
         )
@@ -1359,6 +1902,7 @@ def run_distributed_training(
         timing=timing,
         latest_checkpoint=latest_checkpoint,
         final_checkpoint=final_checkpoint,
+        metrics_journal=journal_snapshot,
     )
     if require_health_pass and health is not None and not health.passed:
         raise RuntimeError(
@@ -1639,8 +2183,6 @@ def _restore_distributed_payload(
     """Restore a payload after its control pointer has already been validated."""
 
     ocp = _import_orbax()
-    if not _orbax_path_finalized(ocp, path):
-        raise RuntimeError(f"Orbax checkpoint payload is not finalized: {path}")
     checkpointer = ocp.StandardCheckpointer()
     try:
         checkpoint_metadata = checkpointer.metadata(path).custom_metadata or {}
@@ -1686,7 +2228,7 @@ def restore_distributed_checkpoint(
     payload_root = _effective_checkpoint_payload_root(
         pointer_file.parent, checkpoint_payload_root
     )
-    pointer = load_pointer(
+    pointer = _collective_load_pointer(
         pointer_file.parent,
         kind=kind,
         payload_root=payload_root,
@@ -1694,32 +2236,45 @@ def restore_distributed_checkpoint(
     )
     if pointer is None:
         raise RuntimeError(f"checkpoint pointer is missing: {pointer_file}")
-    restored, metadata = _restore_distributed_payload(
-        str(pointer["payload_uri"]), template, mesh, training_config
-    )
-    restored_tokens = int(np.asarray(jax.device_get(restored.tokens_seen)))
-    restored_step = int(np.asarray(jax.device_get(restored.step)))
-    if (
-        int(pointer["tokens_seen"]) != restored_tokens
-        or int(pointer["step"]) != restored_step
-    ):
-        raise RuntimeError("checkpoint pointer disagrees with restored payload state")
-    if (
-        metadata.get("checkpoint_payload_uri") != pointer["payload_uri"]
-        or metadata.get("tokens_seen") != restored_tokens
-        or metadata.get("steps") != restored_step
-    ):
-        raise RuntimeError("checkpoint payload metadata disagrees with its pointer")
-    mismatches = {
-        name: (metadata.get(name), expected)
-        for name, expected in identity.items()
-        if metadata.get(name) != expected
-    }
-    if mismatches:
-        raise RuntimeError(
-            "checkpoint payload belongs to a different run: "
-            + ", ".join(sorted(mismatches))
+    _collectively_require_finalized_checkpoint(str(pointer["payload_uri"]))
+    restored: TrainState | None = None
+    metadata: dict[str, Any] | None = None
+    restore_error: Exception | None = None
+    try:
+        restored, metadata = _restore_distributed_payload(
+            str(pointer["payload_uri"]), template, mesh, training_config
         )
+        restored_tokens = int(np.asarray(jax.device_get(restored.tokens_seen)))
+        restored_step = int(np.asarray(jax.device_get(restored.step)))
+        if (
+            int(pointer["tokens_seen"]) != restored_tokens
+            or int(pointer["step"]) != restored_step
+        ):
+            raise RuntimeError(
+                "checkpoint pointer disagrees with restored payload state"
+            )
+        if (
+            metadata.get("checkpoint_payload_uri") != pointer["payload_uri"]
+            or metadata.get("tokens_seen") != restored_tokens
+            or metadata.get("steps") != restored_step
+        ):
+            raise RuntimeError(
+                "checkpoint payload metadata disagrees with its pointer"
+            )
+        mismatches = {
+            name: (metadata.get(name), expected)
+            for name, expected in identity.items()
+            if metadata.get(name) != expected
+        }
+        if mismatches:
+            raise RuntimeError(
+                "checkpoint payload belongs to a different run: "
+                + ", ".join(sorted(mismatches))
+            )
+    except Exception as error:
+        restore_error = error
+    _checkpoint_phase_decision("payload restore", restore_error)
+    assert restored is not None and metadata is not None
     return restored, metadata
 
 
@@ -1813,16 +2368,6 @@ def precompute_distributed_a_capacity(
         raise ValueError("training batches must partition evenly across processes")
     process = jax.process_index()
     local_tokens = token_count // data_size
-    route_only = isinstance(dataset, ArtifactDataset) and hasattr(
-        dataset, "iter_expert_ids_range"
-    )
-    if route_only:
-        start = local_tokens * process
-        source = dataset.iter_expert_ids_range(start, start + local_tokens)
-    else:
-        source, local_tokens, _ = _process_local_source(
-            dataset, training_config.total_tokens
-        )
     local_microbatch_tokens = training_config.microbatch_tokens // data_size
     worst = 0
 
@@ -1834,43 +2379,65 @@ def precompute_distributed_a_capacity(
         )
         worst = max(worst, int(counts.max(initial=0)))
 
-    if route_only:
-        micro = local_microbatch_tokens
-        buffered = np.empty((0, training_config.sae.top_routed), dtype=np.int32)
-        consumed = 0
-        for raw_ids in source:
-            ids = np.asarray(raw_ids, dtype=np.int32)
-            consumed += ids.shape[0]
-            if buffered.shape[0]:
-                ids = np.concatenate((buffered, ids), axis=0)
-            whole = (ids.shape[0] // micro) * micro
-            for offset in range(0, whole, micro):
-                observe(ids[offset : offset + micro])
-            buffered = ids[whole:]
-        if consumed != local_tokens:
-            raise RuntimeError(
-                f"route-only capacity source yielded {consumed}/{local_tokens} rows"
-            )
-        if buffered.shape[0]:
-            padding = _balanced_padding_ids(
-                micro - buffered.shape[0], training_config.sae
-            )
-            observe(np.concatenate((buffered, padding), axis=0))
-    else:
-        if total_tokens is not None and total_tokens != training_config.total_tokens:
-            raise TypeError(
-                "capacity token override requires ArtifactDataset route-only input"
-            )
-        local_config = dataclasses.replace(
-            training_config,
-            total_tokens=local_tokens,
-            effective_batch_tokens=training_config.effective_batch_tokens // data_size,
-            microbatch_tokens=local_microbatch_tokens,
+    scan_error: Exception | None = None
+    try:
+        route_only = isinstance(dataset, ArtifactDataset) and hasattr(
+            dataset, "iter_expert_ids_range"
         )
-        for batch in _fixed_microbatches(
-            source, local_config, skip_tokens=0, take_tokens=local_tokens
-        ):
-            observe(np.asarray(batch.expert_ids))
+        if route_only:
+            start = local_tokens * process
+            source = dataset.iter_expert_ids_range(start, start + local_tokens)
+        else:
+            source, local_tokens, _ = _process_local_source(
+                dataset, training_config.total_tokens
+            )
+        if route_only:
+            micro = local_microbatch_tokens
+            buffered = np.empty(
+                (0, training_config.sae.top_routed), dtype=np.int32
+            )
+            consumed = 0
+            for raw_ids in source:
+                ids = np.asarray(raw_ids, dtype=np.int32)
+                consumed += ids.shape[0]
+                if buffered.shape[0]:
+                    ids = np.concatenate((buffered, ids), axis=0)
+                whole = (ids.shape[0] // micro) * micro
+                for offset in range(0, whole, micro):
+                    observe(ids[offset : offset + micro])
+                buffered = ids[whole:]
+            if consumed != local_tokens:
+                raise RuntimeError(
+                    f"route-only capacity source yielded {consumed}/{local_tokens} rows"
+                )
+            if buffered.shape[0]:
+                padding = _balanced_padding_ids(
+                    micro - buffered.shape[0], training_config.sae
+                )
+                observe(np.concatenate((buffered, padding), axis=0))
+        else:
+            if (
+                total_tokens is not None
+                and total_tokens != training_config.total_tokens
+            ):
+                raise TypeError(
+                    "capacity token override requires ArtifactDataset route-only input"
+                )
+            local_config = dataclasses.replace(
+                training_config,
+                total_tokens=local_tokens,
+                effective_batch_tokens=(
+                    training_config.effective_batch_tokens // data_size
+                ),
+                microbatch_tokens=local_microbatch_tokens,
+            )
+            for batch in _fixed_microbatches(
+                source, local_config, skip_tokens=0, take_tokens=local_tokens
+            ):
+                observe(np.asarray(batch.expert_ids))
+    except Exception as error:
+        scan_error = error
+    _checkpoint_phase_decision("condition-A capacity scan", scan_error)
     if jax.process_count() > 1:
         from jax.experimental import multihost_utils
 
@@ -1894,6 +2461,8 @@ def train_distributed(
     metric_callback: Any | None = None,
     checkpoint_identity: Mapping[str, Any] | None = None,
     prior_run_timing: Mapping[str, Any] | None = None,
+    metrics_journal_path: str | Path | None = None,
+    metrics_journal_identity: JournalIdentity | None = None,
 ) -> DistributedTrainingResult:
     """CLI-facing multi-host train/resume entrypoint.
 
@@ -1926,7 +2495,7 @@ def train_distributed(
         payload_root = _effective_checkpoint_payload_root(
             checkpoint_dir, checkpoint_payload_root
         )
-        latest = load_pointer(
+        latest = _collective_load_pointer(
             checkpoint_dir,
             kind="latest",
             payload_root=payload_root,
@@ -2006,9 +2575,10 @@ def train_distributed(
         checkpoint_payload_root=payload_root,
         stop_after_tokens=stop_after_tokens,
         require_health_pass=False,
-        # Metrics are logically replicated across hosts; only process zero may
-        # mutate the shared JSONL sink.
-        metric_callback=metric_callback if jax.process_index() == 0 else None,
+        # Metrics are logically replicated across hosts; the inner loop lets
+        # only process zero mutate the shared journal/callback and then gives
+        # every peer one collective outcome before another update begins.
+        metric_callback=metric_callback,
         process_local_inputs=True,
         prior_optimizer_wall_seconds=float(
             prior_timing.get("optimizer_wall_seconds", 0.0)
@@ -2017,6 +2587,8 @@ def train_distributed(
         prior_checkpoint_seconds=float(prior_timing.get("checkpoint_seconds", 0.0)),
         process_local_source_offset=applied_offset,
         checkpoint_identity=checkpoint_identity,
+        metrics_journal_path=metrics_journal_path,
+        metrics_journal_identity=metrics_journal_identity,
     )
 
 
@@ -2030,8 +2602,15 @@ def evaluate_distributed(
     expected_sst: float | None = None,
     checkpoint_identity: Mapping[str, Any] | None = None,
     checkpoint_payload_root: str | Path | None = None,
+    evaluation_a_capacity: int | None = None,
 ) -> EvaluationResult:
-    """CLI-facing evaluation restored only through a final control pointer."""
+    """CLI-facing evaluation restored only through a final control pointer.
+
+    ``training_config`` must remain byte-for-byte identical to the configuration
+    stored in the checkpoint.  Condition A may need a different static routing
+    capacity for the held-out token order, so that execution-only value is
+    supplied separately and is never folded into restore identity.
+    """
 
     distributed = DistributedConfig(
         microbatches_per_update=training_config.microbatches_per_update
@@ -2085,6 +2664,13 @@ def evaluate_distributed(
             "evaluation token budget must partition evenly across processes"
         )
     local_microbatch = training_config.microbatch_tokens // jax.process_count()
+    effective_a_capacity = (
+        evaluation_a_capacity
+        if training_config.sae.condition == "A"
+        else training_config.a_capacity
+    )
+    if training_config.sae.condition == "A" and effective_a_capacity is None:
+        raise ValueError("condition A evaluation requires a routing capacity")
     return distributed_evaluate(
         state.params,
         source,
@@ -2094,7 +2680,7 @@ def evaluate_distributed(
         expected_sst=expected_sst,
         max_tokens=local_max,
         microbatch_tokens=local_microbatch,
-        a_capacity=training_config.a_capacity,
+        a_capacity=effective_a_capacity,
         distributed=distributed,
         process_local_inputs=True,
     )

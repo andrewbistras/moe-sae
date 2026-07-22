@@ -23,7 +23,6 @@ from pathlib import Path
 import re
 import shutil
 import struct
-import subprocess
 from typing import Any
 
 import numpy as np

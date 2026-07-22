@@ -25,6 +25,7 @@ def _args(tmp_path: Path) -> SimpleNamespace:
         grain_eval="eval.array_record",
         dataset_train_manifest="train.json",
         dataset_eval_manifest="eval.json",
+        operation_sha256="f" * 64,
     )
 
 
@@ -63,6 +64,7 @@ def test_public_cli_import_is_jax_cold_and_exposes_expected_commands():
     assert set(action.choices) == {
         "stage-c4",
         "qualify-storage",
+        "qualify-sae-storage",
         "preflight",
         "convert-checkpoint",
         "benchmark-harvest",
@@ -71,6 +73,12 @@ def test_public_cli_import_is_jax_cold_and_exposes_expected_commands():
         "activation-farm",
         "activation-status",
         "activation-abort",
+        "sae-smoke",
+        "sae-begin",
+        "sae-farm",
+        "sae-status",
+        "sae-abort",
+        "sae-phase",
         "train",
         "eval",
         "report",
@@ -78,7 +86,9 @@ def test_public_cli_import_is_jax_cold_and_exposes_expected_commands():
     }
 
 
-def test_run_launches_missing_benchmark_before_tpu_preflight(tmp_path, monkeypatch):
+def test_run_rejects_missing_post_capture_inputs_without_launching_them(
+    tmp_path, monkeypatch
+):
     args = _args(tmp_path)
     config = Gemma4Config()
     events = []
@@ -104,12 +114,12 @@ def test_run_launches_missing_benchmark_before_tpu_preflight(tmp_path, monkeypat
         raise RuntimeError("stop after ordering assertion")
 
     monkeypatch.setattr(cli, "run_preflight", preflight)
-    with pytest.raises(RuntimeError, match="ordering assertion"):
+    with pytest.raises(RuntimeError, match="post-capture SAE orchestrator"):
         cli._command_run(args)
-    assert events == ["benchmark", "preflight"]
+    assert events == []
 
 
-def test_run_rejects_activation_scope_before_benchmark(tmp_path, monkeypatch):
+def test_run_rejects_missing_sae_attestation_before_benchmark(tmp_path, monkeypatch):
     args = _args(tmp_path)
     config = Gemma4Config()
     monkeypatch.setattr(cli, "_config", lambda args: config)
@@ -129,7 +139,7 @@ def test_run_rejects_activation_scope_before_benchmark(tmp_path, monkeypatch):
         lambda args: (_ for _ in ()).throw(AssertionError("benchmark launched")),
     )
 
-    with pytest.raises(RuntimeError, match="activation-capture only"):
+    with pytest.raises(RuntimeError, match="qualify-sae-storage"):
         cli._command_run(args)
 
 

@@ -5,6 +5,8 @@ import hashlib
 import os
 from pathlib import Path
 import subprocess
+import threading
+import time
 from types import SimpleNamespace
 import uuid
 
@@ -616,6 +618,88 @@ def test_cache_rejects_one_object_larger_than_bound(tmp_path: Path) -> None:
     cache = ShardCache(tmp_path / "cache", store, max_bytes=1)
     with pytest.raises(ObjectStoreError, match="exceeds the local cache bound"):
         cache.materialize(identity)
+
+
+def test_cache_materialize_many_downloads_four_objects_concurrently(
+    tmp_path: Path,
+) -> None:
+    local = LocalObjectStore(tmp_path / "objects")
+    identities = []
+    for index in range(4):
+        source = tmp_path / f"source-{index}.bin"
+        digest = _write(source, bytes([index + 1]) * 64)
+        identities.append(
+            local.put_if_absent(
+                source,
+                f"gs://bucket/concurrent/{digest}.safetensors",
+                sha256=digest,
+            )
+        )
+
+    class ConcurrentStore:
+        def __init__(self) -> None:
+            self.barrier = threading.Barrier(4)
+            self.lock = threading.Lock()
+            self.active = 0
+            self.peak = 0
+
+        def download(self, identity, destination):
+            with self.lock:
+                self.active += 1
+                self.peak = max(self.peak, self.active)
+            self.barrier.wait(timeout=5)
+            time.sleep(0.01)
+            try:
+                local.download(identity, destination)
+            finally:
+                with self.lock:
+                    self.active -= 1
+
+    store = ConcurrentStore()
+    cache = ShardCache(tmp_path / "cache", store, max_bytes=4 * 64)
+    paths = cache.materialize_many(identities, max_workers=4)
+
+    assert store.peak == 4
+    assert [path.read_bytes() for path in paths] == [
+        bytes([index + 1]) * 64 for index in range(4)
+    ]
+    assert not list((tmp_path / "cache").glob("*.partial"))
+
+
+def test_resident_only_cache_never_refills_missing_or_corrupt_objects(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.bin"
+    digest = _write(source, b"qualified resident object")
+    store = LocalObjectStore(tmp_path / "objects")
+    identity = store.put_if_absent(
+        source,
+        f"gs://bucket/qualified/{digest}.safetensors",
+        sha256=digest,
+    )
+    cache_root = tmp_path / "cache"
+    cached = ShardCache(cache_root, store, max_bytes=1024).materialize(identity)
+
+    class NoDownloadStore:
+        def download(self, *_args, **_kwargs):
+            pytest.fail("resident-only cache attempted an unqualified refill")
+
+    resident = ShardCache(
+        cache_root,
+        NoDownloadStore(),
+        max_bytes=1024,
+        resident_only=True,
+    )
+    assert resident.materialize_many((identity,)) == (cached,)
+
+    cached.write_bytes(b"corrupt")
+    with pytest.raises(ObjectStoreError, match="requalify a fresh SAE cache"):
+        resident.materialize(identity)
+    assert cached.read_bytes() == b"corrupt"
+
+    cached.unlink()
+    with pytest.raises(ObjectStoreError, match="requalify a fresh SAE cache"):
+        resident.materialize_many((identity,))
 
 
 @pytest.mark.parametrize(

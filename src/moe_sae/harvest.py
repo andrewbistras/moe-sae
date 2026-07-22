@@ -66,6 +66,8 @@ from moe_sae.runtime import (
 EXCLUDED_TOKEN_IDS = (0, 1, 2)
 DEFAULT_SEQUENCE_LENGTH = 1_024
 DEFAULT_CANARY_TOKENS = 2_000_000
+MANIFEST_VISIBILITY_TIMEOUT_SECONDS = 90.0
+MANIFEST_VISIBILITY_POLL_SECONDS = 0.25
 _SHARD_RANGE_RE = re.compile(
     r"^(?P<split>train|eval)-p(?P<process>\d{5})-r(?P<start>\d{12})"
     r"-n(?P<count>\d{9})$"
@@ -1558,11 +1560,17 @@ def _publish_production_after_telemetry(
                 total_tokens=total_tokens,
                 object_store=object_store,
             )
+            published_manifest = load_manifest(artifact_root)
             atomic_write_json(
                 status_path,
                 {
                     "ok": True,
                     "state": "published",
+                    "capture_manifest_sha256": published_manifest[
+                        "manifest_sha256"
+                    ],
+                    "metadata_sha256": published_manifest["metadata_sha256"],
+                    "total_tokens": published_manifest["total_tokens"],
                     "publication_seconds": prior_publication_seconds
                     + time.time()
                     - publication_started_unix,
@@ -1599,9 +1607,15 @@ def _publish_production_after_telemetry(
             f"capture publication failed: {status.get('error_type', 'Error')}: "
             f"{status.get('error', 'unknown error')}"
         )
-    manifest = load_manifest(artifact_root)
-    if int(manifest.get("total_tokens", -1)) != total_tokens:
-        raise HarvestError("published manifest has the wrong exact token count")
+    expected_manifest_sha256 = status.get("capture_manifest_sha256")
+    if not isinstance(expected_manifest_sha256, str):
+        raise HarvestError("publication status lacks the sealed manifest identity")
+    _load_expected_manifest_with_retry(
+        artifact_root,
+        expected_tokens=total_tokens,
+        expected_metadata=metadata.to_dict(),
+        expected_manifest_sha256=expected_manifest_sha256,
+    )
     publication_seconds = float(status.get("publication_seconds", -1.0))
     if not math.isfinite(publication_seconds) or publication_seconds < 0.0:
         raise HarvestError("publication timing is missing or invalid")
@@ -1674,7 +1688,18 @@ def run_harvest(
                     total_tokens=total_tokens,
                     object_store=object_store,
                 )
-                atomic_write_json(publication_status, {"ok": True})
+                published_manifest = load_manifest(artifact_root)
+                atomic_write_json(
+                    publication_status,
+                    {
+                        "ok": True,
+                        "capture_manifest_sha256": published_manifest[
+                            "manifest_sha256"
+                        ],
+                        "metadata_sha256": published_manifest["metadata_sha256"],
+                        "total_tokens": published_manifest["total_tokens"],
+                    },
+                )
             except Exception as exc:
                 atomic_write_json(
                     publication_status,
@@ -1696,11 +1721,15 @@ def run_harvest(
                 f"capture publication failed: {status.get('error_type', 'Error')}: "
                 f"{status.get('error', 'unknown error')}"
             )
-        manifest = load_manifest(artifact_root)
-        if manifest["total_tokens"] != total_tokens:
-            raise HarvestError(
-                "global manifest count changed after publication barrier"
-            )
+        expected_manifest_sha256 = status.get("capture_manifest_sha256")
+        if not isinstance(expected_manifest_sha256, str):
+            raise HarvestError("publication status lacks the sealed manifest identity")
+        _load_expected_manifest_with_retry(
+            artifact_root,
+            expected_tokens=total_tokens,
+            expected_metadata=metadata.to_dict(),
+            expected_manifest_sha256=expected_manifest_sha256,
+        )
         manifest_path = str(Path(artifact_root) / MANIFEST_NAME)
     return _replace_result_manifest(result, manifest_path)
 
@@ -2031,6 +2060,16 @@ def run_production_harvest(
     summary_path = _campaign_summary_path(artifact_root, stop)
     if summary_path.exists():
         completed = _load_campaign_summary(summary_path)
+        completed_manifest = (
+            _load_expected_manifest_with_retry(
+                artifact_root,
+                expected_tokens=total_tokens,
+                expected_metadata=metadata.to_dict(),
+                expected_manifest_sha256=completed.capture_manifest_sha256,
+            )
+            if phase == "production"
+            else None
+        )
         _validate_campaign_summary_identity(
             completed,
             split=split,
@@ -2039,8 +2078,8 @@ def run_production_harvest(
             per_device_sequence_batch=per_device_sequence_batch,
             capture_metadata=metadata.to_dict(),
             capture_manifest_sha256=(
-                str(load_manifest(artifact_root)["manifest_sha256"])
-                if phase == "production"
+                str(completed_manifest["manifest_sha256"])
+                if completed_manifest is not None
                 else None
             ),
             benchmark=benchmark,
@@ -2048,7 +2087,10 @@ def run_production_harvest(
         if phase == "canary" and completed.canary_passed is not True:
             raise HarvestError("the existing real-data canary did not pass")
         return completed
-    if (Path(artifact_root) / MANIFEST_NAME).exists():
+    manifest_visible = (Path(artifact_root) / MANIFEST_NAME).exists()
+    if process_count > 1:
+        manifest_visible = _jax_manifest_visibility_collective(manifest_visible)
+    if manifest_visible:
         return _recover_sealed_campaign(
             artifact_root=artifact_root,
             config=config,
@@ -2802,6 +2844,63 @@ def _telemetry_directory(artifact_root: str | Path) -> Path:
     return Path(artifact_root) / "telemetry"
 
 
+def _load_expected_manifest_with_retry(
+    artifact_root: str | Path,
+    *,
+    expected_tokens: int,
+    expected_metadata: Mapping[str, Any],
+    expected_manifest_sha256: str | None = None,
+    timeout_seconds: float = MANIFEST_VISIBILITY_TIMEOUT_SECONDS,
+    poll_seconds: float = MANIFEST_VISIBILITY_POLL_SECONDS,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+    path_visible: Callable[[Path], bool] | None = None,
+    loader: Callable[[str | Path], Mapping[str, Any]] = load_manifest,
+) -> dict[str, Any]:
+    """Wait only for ENOENT, then require the exact expected manifest identity.
+
+    Atomic publication on one NFS client does not invalidate another client's
+    cached negative lookup.  Retrying the pathname is safe because the final
+    manifest is immutable.  A visible but malformed or identity-mismatched
+    manifest fails immediately rather than being mistaken for propagation lag.
+    """
+
+    if (
+        not math.isfinite(timeout_seconds)
+        or timeout_seconds < 0.0
+        or not math.isfinite(poll_seconds)
+        or poll_seconds <= 0.0
+    ):
+        raise ValueError("manifest visibility retry bounds are invalid")
+    if expected_manifest_sha256 is not None and not re.fullmatch(
+        r"[0-9a-f]{64}", expected_manifest_sha256
+    ):
+        raise ValueError("expected_manifest_sha256 must be lowercase SHA-256")
+    root = Path(artifact_root)
+    path = root / MANIFEST_NAME
+    visible = path_visible or (lambda candidate: candidate.exists())
+    deadline = clock() + timeout_seconds
+    while not visible(path):
+        remaining = deadline - clock()
+        if remaining <= 0.0:
+            raise HarvestError(
+                "sealed manifest did not become visible before the bounded "
+                f"retry expired: {path}"
+            )
+        sleep(min(poll_seconds, remaining))
+
+    manifest = dict(loader(root))
+    if int(manifest.get("total_tokens", -1)) != expected_tokens:
+        raise HarvestError("visible manifest has the wrong exact token count")
+    if manifest.get("metadata") != dict(expected_metadata):
+        raise HarvestError("visible manifest has a different capture identity")
+    if expected_manifest_sha256 is not None and (
+        manifest.get("manifest_sha256") != expected_manifest_sha256
+    ):
+        raise HarvestError("visible manifest SHA-256 differs from publication identity")
+    return manifest
+
+
 def _host_result_path(
     artifact_root: str | Path,
     stop_after_tokens: int,
@@ -2954,6 +3053,9 @@ def _recover_interrupted_publication(
                 {
                     "ok": True,
                     "state": "recovered",
+                    "capture_manifest_sha256": manifest["manifest_sha256"],
+                    "metadata_sha256": manifest["metadata_sha256"],
+                    "total_tokens": manifest["total_tokens"],
                     "publication_seconds": publication_seconds,
                     "recovered_at_unix": time.time(),
                 },
@@ -3000,13 +3102,11 @@ def _recover_sealed_campaign(
 ) -> CampaignSummary:
     """Rebuild only a missing summary after exact manifest publication."""
 
-    manifest = load_manifest(artifact_root)
-    if int(manifest.get("total_tokens", -1)) != total_tokens:
-        raise HarvestError("sealed capture token count does not match this campaign")
-    if manifest.get("metadata") != dict(expected_capture_metadata):
-        raise HarvestError(
-            "sealed capture metadata does not match the current invocation"
-        )
+    manifest = _load_expected_manifest_with_retry(
+        artifact_root,
+        expected_tokens=total_tokens,
+        expected_metadata=expected_capture_metadata,
+    )
     try:
         jax = import_module("jax")
         process_count = int(jax.process_count())
@@ -3026,6 +3126,17 @@ def _recover_sealed_campaign(
         process_index=process_index,
         split=split,
         object_store=object_store,
+    )
+    recovered_manifest_sha256 = publication_status.get(
+        "capture_manifest_sha256", manifest["manifest_sha256"]
+    )
+    if not isinstance(recovered_manifest_sha256, str):
+        raise HarvestError("sealed recovery lacks a manifest identity")
+    manifest = _load_expected_manifest_with_retry(
+        artifact_root,
+        expected_tokens=total_tokens,
+        expected_metadata=expected_capture_metadata,
+        expected_manifest_sha256=recovered_manifest_sha256,
     )
     publication_seconds = float(publication_status.get("publication_seconds", -1.0))
     if not math.isfinite(publication_seconds) or publication_seconds < 0.0:
@@ -3375,6 +3486,24 @@ def _jax_abort_collective(local_abort_requested: bool) -> bool:
     gathered = np.asarray(
         multihost.process_allgather(
             np.asarray(local_abort_requested, dtype=np.uint8), tiled=False
+        ),
+        dtype=np.uint8,
+    )
+    return bool(np.any(gathered))
+
+
+def _jax_manifest_visibility_collective(local_manifest_visible: bool) -> bool:
+    """Route every controller into sealed recovery if any sees the manifest."""
+
+    try:
+        multihost = import_module("jax.experimental.multihost_utils")
+    except (ImportError, ModuleNotFoundError) as exc:
+        raise HarvestDependencyError(
+            "multi-host manifest coordination requires JAX"
+        ) from exc
+    gathered = np.asarray(
+        multihost.process_allgather(
+            np.asarray(local_manifest_visible, dtype=np.uint8), tiled=False
         ),
         dtype=np.uint8,
     )

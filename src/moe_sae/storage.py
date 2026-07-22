@@ -37,7 +37,7 @@ from moe_sae.object_store import (
 )
 
 
-STORAGE_ATTESTATION_SCHEMA = "gemma4-storage-planes-qualification-v6"
+STORAGE_ATTESTATION_SCHEMA = "gemma4-storage-planes-qualification-v7"
 ORBAX_QUALIFICATION_SCHEMA = "gemma4-orbax-storage-qualification-v1"
 ACTIVATION_CAPTURE_SCOPE = "activation-capture"
 MINIMUM_ACTIVATION_LOCAL_FREE_BYTES = 24 * 1024**3
@@ -147,6 +147,7 @@ class ControlPlaneQualification:
     minimum_free_bytes: int
     flock_correct: bool
     atomic_rename_visible: bool
+    negative_lookup_creation_visible: bool
     disjoint_files_visible: bool
 
 
@@ -429,6 +430,16 @@ def qualify_storage_planes(
         failures.append(
             "atomic rename/visibility failed" + _error_suffix(rename_errors)
         )
+    negative_creation_visible, negative_creation_errors = (
+        _qualify_negative_lookup_creation_visibility(
+            work, run_id, hooks, process_index, process_count
+        )
+    )
+    if not negative_creation_visible:
+        failures.append(
+            "absent-to-present cross-process visibility failed"
+            + _error_suffix(negative_creation_errors)
+        )
     disjoint_visible, disjoint_errors = _qualify_disjoint_files(
         work, run_id, hooks, process_index, process_count
     )
@@ -498,6 +509,7 @@ def qualify_storage_planes(
             minimum_free_bytes=config.minimum_control_free_bytes,
             flock_correct=flock_correct,
             atomic_rename_visible=rename_visible,
+            negative_lookup_creation_visible=negative_creation_visible,
             disjoint_files_visible=disjoint_visible,
         ),
         local_buffer=LocalBufferQualification(
@@ -631,6 +643,10 @@ def validate_storage_attestation(
     gcs = qualification.get("gcs")
     if not all(isinstance(item, Mapping) for item in (control, local_buffer, gcs)):
         raise StorageQualificationError("storage attestation plane records are malformed")
+    if control.get("negative_lookup_creation_visible") is not True:
+        raise StorageQualificationError(
+            "storage attestation does not prove absent-to-present control visibility"
+        )
     expected_local = tuple(
         local_buffer.get("expected_probe_sha256_by_process", ())
     )
@@ -1708,6 +1724,90 @@ def _qualify_atomic_rename(
         and all(bool(item["visible"]) for item in before)
         and all(not item["error"] for item in replaced)
         and all(bool(item["visible"]) for item in after)
+        and not errors
+    )
+    return correct, errors
+
+
+def _qualify_negative_lookup_creation_visibility(
+    work: Path,
+    run_id: str,
+    hooks: CoordinationHooks,
+    process_index: int,
+    process_count: int,
+) -> tuple[bool, tuple[str, ...]]:
+    """Prove a file created after every client cached its absence is visible.
+
+    NFS clients may cache a negative directory lookup even after another client
+    has durably created the pathname.  A collective barrier does not invalidate
+    that cache.  This probe deliberately establishes the dangerous ordering:
+    every process first observes ENOENT, process zero publishes the file, and
+    every process must then read the identity-bound payload immediately.
+    """
+
+    path = work / "negative-lookup-created.bin"
+    payload = hashlib.shake_256(
+        f"{run_id}:negative-lookup-created".encode("ascii")
+    ).digest(65536)
+    negative_error = ""
+    try:
+        absent = not path.exists()
+    except OSError as exc:
+        absent = False
+        negative_error = _format_error(exc)
+    primed = _gather_records(
+        hooks,
+        process_count,
+        {
+            "process_index": process_index,
+            "absent": absent,
+            "error": negative_error,
+        },
+    )
+    hooks.barrier("negative-lookup-primed")
+
+    publish_error = ""
+    if process_index == 0:
+        if any(item["error"] or not bool(item["absent"]) for item in primed):
+            publish_error = "probe pathname was not absent on every process"
+        else:
+            try:
+                _write_bytes_durable(path, payload, exclusive=True)
+                _fsync_directory(work)
+            except OSError as exc:
+                publish_error = _format_error(exc)
+    published = _gather_records(
+        hooks,
+        process_count,
+        {"process_index": process_index, "error": publish_error},
+    )
+    hooks.barrier("negative-lookup-created")
+
+    visibility_error = ""
+    try:
+        visible = path.read_bytes() == payload
+    except OSError as exc:
+        visible = False
+        visibility_error = _format_error(exc)
+    observed = _gather_records(
+        hooks,
+        process_count,
+        {
+            "process_index": process_index,
+            "visible": visible,
+            "error": visibility_error,
+        },
+    )
+    errors = tuple(
+        f"process {item['process_index']}: {item['error']}"
+        for records in (primed, published, observed)
+        for item in records
+        if item["error"]
+    )
+    correct = (
+        all(bool(item["absent"]) and not item["error"] for item in primed)
+        and all(not item["error"] for item in published)
+        and all(bool(item["visible"]) and not item["error"] for item in observed)
         and not errors
     )
     return correct, errors

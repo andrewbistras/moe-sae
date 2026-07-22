@@ -2,6 +2,7 @@ import argparse
 import dataclasses
 import json
 import hashlib
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -35,11 +36,12 @@ from moe_sae.model import (
     expected_hf_snapshot_inventory_sha256,
 )
 from moe_sae.runtime import (
-    BENCHMARK_TIMING_SCHEMA,
     HARVEST_MESHES,
     V4_32_BF16_PEAK_FLOPS,
     BenchmarkObservation,
 )
+from moe_sae.sae_operator import SAEControl, SAEOperationSpec
+from moe_sae.sae_paths import SAEOperationPaths
 from moe_sae.storage import (
     MINIMUM_ACTIVATION_GCS_DOWNLOAD_BYTES_PER_SECOND,
     STORAGE_ATTESTATION_SCHEMA,
@@ -175,6 +177,117 @@ def test_noncoordinator_validates_publication_without_writing(
     assert barriers == ["publication-visible"]
 
 
+def test_coordinator_publication_failure_is_decided_before_barrier(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    decisions: list[tuple[str | None, str]] = []
+
+    def decide(error: str | None, *, purpose: str) -> None:
+        decisions.append((error, purpose))
+        if error:
+            raise RuntimeError("collective publication failure")
+
+    monkeypatch.setattr(cli_module, "_process_context", lambda: (0, 4))
+    monkeypatch.setattr(
+        cli_module,
+        "atomic_write_json",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("NFS down")),
+    )
+    monkeypatch.setattr(cli_module, "_collective_raise_if_any", decide)
+    monkeypatch.setattr(
+        cli_module,
+        "_global_barrier",
+        lambda *_args: pytest.fail("barrier entered after coordinator failure"),
+    )
+
+    with pytest.raises(RuntimeError, match="collective publication failure"):
+        cli_module._coordinator_write_json(
+            tmp_path / "result.json", {"ok": True}, barrier="must-not-run"
+        )
+    assert decisions and "NFS down" in str(decisions[0][0])
+
+
+def test_immutable_publication_never_streams_into_final_name(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = tmp_path / "identity.json"
+    payload = {"schema_version": "identity-v1", "digest": "a" * 64}
+    monkeypatch.setattr(
+        cli_module.os,
+        "link",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("link failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="link failed"):
+        cli_module._coordinator_publish_immutable_json(
+            path, payload, barrier="must-not-run"
+        )
+
+    assert not path.exists()
+    evidence = list(tmp_path.glob(".identity.json.*.unpublished"))
+    assert len(evidence) == 1
+    assert json.loads(evidence[0].read_text(encoding="utf-8")) == payload
+
+
+def test_immutable_publication_accepts_exact_retry_and_rejects_conflict(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = tmp_path / "evaluation.json"
+    payload = {"schema_version": "evaluation-v1", "ev": 0.5}
+    barriers: list[str] = []
+    monkeypatch.setattr(cli_module, "_process_context", lambda: (0, 1))
+    monkeypatch.setattr(cli_module, "_global_barrier", barriers.append)
+
+    assert cli_module._coordinator_publish_immutable_json(
+        path, payload, barrier="first-publication"
+    )
+    original = path.read_bytes()
+    assert cli_module._coordinator_publish_immutable_json(
+        path, payload, barrier="idempotent-retry"
+    )
+    assert path.read_bytes() == original
+    assert barriers == ["first-publication", "idempotent-retry"]
+
+    with pytest.raises(RuntimeError, match="conflicts with retry"):
+        cli_module._coordinator_publish_immutable_json(
+            path,
+            {**payload, "ev": 0.6},
+            barrier="conflicting-retry",
+        )
+    assert path.read_bytes() == original
+    assert barriers == ["first-publication", "idempotent-retry"]
+
+
+def test_attestation_timestamp_is_coordinator_broadcast(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[bytes | None] = []
+    monkeypatch.setattr(cli_module, "_process_context", lambda: (3, 4))
+
+    def broadcast(source: bytes | None, *, purpose: str) -> bytes:
+        observed.append(source)
+        assert purpose == "attestation timestamp"
+        return b"2026-07-22T03:04:05+00:00"
+
+    monkeypatch.setattr(cli_module, "_broadcast_coordinator_bytes", broadcast)
+    assert (
+        cli_module._coordinator_created_at_utc()
+        == "2026-07-22T03:04:05+00:00"
+    )
+    assert observed == [None]
+
+
+def test_sae_storage_attestation_path_is_consumer_environment_versioned(
+    tmp_path: Path,
+) -> None:
+    digest = "7" * 64
+    assert cli_module._sae_storage_attestation_path(tmp_path, digest) == (
+        tmp_path / "preflight" / "sae-storage" / f"{digest}.json"
+    )
+    with pytest.raises(RuntimeError, match="environment identity"):
+        cli_module._sae_storage_attestation_path(tmp_path, "not-a-digest")
+
+
 def test_coordinator_json_wait_allows_only_declared_coordinator_owned_values(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -274,6 +387,7 @@ def test_single_cli_exposes_exact_subcommands():
     assert set(action.choices) == {
         "stage-c4",
         "qualify-storage",
+        "qualify-sae-storage",
         "preflight",
         "convert-checkpoint",
         "benchmark-harvest",
@@ -282,11 +396,204 @@ def test_single_cli_exposes_exact_subcommands():
         "activation-farm",
         "activation-status",
         "activation-abort",
+        "sae-smoke",
+        "sae-begin",
+        "sae-farm",
+        "sae-status",
+        "sae-abort",
+        "sae-phase",
         "train",
         "eval",
         "report",
         "run",
     }
+
+
+@pytest.mark.parametrize(
+    ("argv", "handler"),
+    [
+        (
+            ["sae-smoke", "--condition", "F", "--cache-root", "/tmp/smoke"],
+            cli_module._command_sae_smoke,
+        ),
+        (
+            ["sae-begin", "--cache-root", "/tmp/smoke"],
+            cli_module._command_sae_begin,
+        ),
+        (
+            ["sae-farm", "--operation-sha256", "a" * 64],
+            cli_module._command_sae_farm,
+        ),
+        (
+            ["sae-status", "--operation-sha256", "a" * 64],
+            cli_module._command_sae_status,
+        ),
+        (
+            ["sae-abort", "--operation-sha256", "a" * 64, "--reason", "stop"],
+            cli_module._command_sae_abort,
+        ),
+        (
+            [
+                "sae-phase",
+                "--operation-sha256",
+                "a" * 64,
+                "--phase",
+                "full-A-seed-1",
+                "--attempt-id",
+                "b" * 32,
+                "--attempt-number",
+                "1",
+            ],
+            cli_module._command_sae_phase,
+        ),
+    ],
+)
+def test_sae_control_commands_dispatch_to_exact_handlers(argv, handler):
+    assert build_parser().parse_args(argv).handler is handler
+
+
+def test_smoke_process_ranges_are_exact_disjoint_full_batch():
+    ranges = [
+        cli_module._smoke_process_token_range(16_384, index, 4)
+        for index in range(4)
+    ]
+    assert ranges == [(0, 4_096), (4_096, 8_192), (8_192, 12_288), (12_288, 16_384)]
+    with pytest.raises(RuntimeError, match="exactly four"):
+        cli_module._smoke_process_token_range(16_384, 0, 2)
+
+
+def test_sae_phase_requires_inherited_fd_for_exact_live_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lane_id = "a" * 24
+    attempt_id = "b" * 32
+    lanes = tmp_path / "lanes"
+    lanes.mkdir()
+    lock_path = lanes / f"lane-{lane_id}.lock"
+    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+
+    class Control:
+        root = tmp_path
+
+        @staticmethod
+        def load_state():
+            return {
+                "phases": {
+                    "full-A-seed-1": {
+                        "status": "running",
+                        "attempt_id": attempt_id,
+                        "attempts": 2,
+                    }
+                }
+            }
+
+        @staticmethod
+        def status():
+            return {
+                "lanes": [
+                    {
+                        "lane_id": lane_id,
+                        "lease_held": True,
+                        "state": "running",
+                        "phase": "full-A-seed-1",
+                        "attempt_id": attempt_id,
+                    }
+                ]
+            }
+
+    args = SimpleNamespace(
+        phase="full-A-seed-1", attempt_id=attempt_id, attempt_number=2
+    )
+    monkeypatch.setenv("MOE_SAE_SAE_LEASE_FD", str(descriptor))
+    try:
+        result = cli_module._validate_inherited_sae_phase(args, Control())
+        assert result["lease_fd"] == descriptor
+        assert result["lane"]["lane_id"] == lane_id
+        with pytest.raises(RuntimeError, match="exact active"):
+            cli_module._validate_inherited_sae_phase(
+                SimpleNamespace(
+                    phase=args.phase,
+                    attempt_id=args.attempt_id,
+                    attempt_number=3,
+                ),
+                Control(),
+            )
+    finally:
+        os.close(descriptor)
+
+
+def test_smoke_cache_root_is_inferred_only_from_bound_attempt_shape(tmp_path: Path):
+    campaign = "c" * 64
+    attempt = "d" * 32
+    smoke_root = tmp_path / "host-private-smoke"
+    cache = (
+        smoke_root
+        / "sae-smoke"
+        / "campaigns"
+        / campaign
+        / "conditions"
+        / "00-F"
+        / "attempts"
+        / attempt
+        / "cache"
+    )
+    record = (
+        tmp_path
+        / "sae-smoke"
+        / "campaigns"
+        / campaign
+        / "conditions"
+        / "00-F"
+        / "attempts"
+        / attempt
+        / "attempt.json"
+    )
+    record.parent.mkdir(parents=True)
+    record.write_text(json.dumps({"identity": {"cache_path": str(cache)}}))
+    (record.parent / "result.json").write_text("{}")
+
+    failed_attempt = "a" * 32
+    failed_record = record.parents[1] / failed_attempt / "attempt.json"
+    failed_record.parent.mkdir()
+    failed_record.write_text(
+        json.dumps({"identity": {"cache_path": str(tmp_path / "wrong-cache")}})
+    )
+    (failed_record.parent / "failure.json").write_text("{}")
+    assert cli_module._infer_smoke_cache_root(tmp_path, campaign) == smoke_root
+
+    record.write_text(json.dumps({"identity": {"cache_path": str(tmp_path)}}))
+    with pytest.raises(RuntimeError, match="unexpected identity"):
+        cli_module._infer_smoke_cache_root(tmp_path, campaign)
+
+
+def test_passed_smoke_cleanup_removes_only_exact_attempt_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cache_root = tmp_path / "cache-root"
+    attempt_cache = (
+        cache_root
+        / "sae-smoke"
+        / "campaigns"
+        / ("a" * 64)
+        / "conditions"
+        / "00-F"
+        / "attempts"
+        / ("b" * 32)
+        / "cache"
+    )
+    attempt_cache.mkdir(parents=True)
+    (attempt_cache / "activation.safetensors").write_bytes(b"diagnostic")
+    unrelated = cache_root / "keep-me"
+    unrelated.write_text("untouched", encoding="utf-8")
+    monkeypatch.setattr(cli_module, "_collective_raise_if_any", lambda *a, **k: None)
+    monkeypatch.setattr(cli_module, "_global_barrier", lambda *a, **k: None)
+
+    cli_module._cleanup_passed_smoke_cache(attempt_cache, cache_root)
+
+    assert not attempt_cache.exists()
+    assert unrelated.read_text(encoding="utf-8") == "untouched"
+    with pytest.raises(RuntimeError, match="refusing"):
+        cli_module._cleanup_passed_smoke_cache(cache_root / "keep-me", cache_root)
 
 
 def test_storage_roots_and_orbax_probe_are_fail_closed():
@@ -345,7 +652,7 @@ def test_activation_storage_attestation_cannot_authorize_sae_consumers() -> None
             "configured_sae_capture_cache_max_bytes": 100 * 1024**3,
         },
     }
-    with pytest.raises(RuntimeError, match="activation-capture only"):
+    with pytest.raises(RuntimeError, match="activation storage cannot authorize"):
         cli_module._require_sae_cache_qualification(payload)
 
 
@@ -390,7 +697,10 @@ def test_activation_storage_attestation_seals_future_download_gate(
             "run_id": run_id,
             "process_count": 1,
             "failures": [],
-            "control": {"directory": str(root)},
+            "control": {
+                "directory": str(root),
+                "negative_lookup_creation_visible": True,
+            },
             "local_buffer": {
                 "directories": [str(local)],
                 "host_isolation_proven": True,
@@ -482,27 +792,214 @@ def test_checkpoint_save_and_restore_share_one_exact_identity_builder():
         Gemma4Config(),
         capture_manifest_sha256="a" * 64,
         capture_checkpoint_sha256="b" * 64,
-        environment_sha256="c" * 64,
+        producer_environment_sha256="c" * 64,
+        consumer_environment_sha256="d" * 64,
         condition="A",
         seed=1,
-        run_instance_id="d" * 32,
-        storage_attestation_sha256="e" * 64,
+        run_instance_id="f" * 32,
+        activation_storage_attestation_sha256="e" * 64,
+        sae_storage_attestation_sha256="f" * 64,
+        capture_compatibility_sha256="1" * 64,
+        canary_waiver_sha256="2" * 64,
+        sealed_recovery_waiver_sha256="3" * 64,
         checkpoint_payload_root="gs://bucket/checkpoints",
+        operation_sha256="4" * 64,
     )
 
     assert set(identity) == {
         "config_sha256",
         "capture_manifest_sha256",
         "capture_checkpoint_sha256",
-        "environment_sha256",
+        "capture_producer_environment_sha256",
+        "sae_consumer_environment_sha256",
         "condition",
         "seed",
         "run_instance_id",
-        "storage_attestation_sha256",
+        "activation_storage_attestation_sha256",
+        "sae_storage_attestation_sha256",
+        "capture_compatibility_sha256",
+        "canary_waiver_sha256",
+        "sealed_recovery_waiver_sha256",
         "checkpoint_payload_root",
+        "operation_sha256",
     }
     assert "tokens_seen" not in identity
     assert "steps" not in identity
+
+
+def _begin_test_sae_operation(
+    root: Path,
+    config: Gemma4Config,
+) -> tuple[SAEOperationPaths, dict, dict, dict]:
+    environment = {
+        "sha256": "1" * 64,
+        "repository_content_sha256": "2" * 64,
+    }
+    bundle = {
+        "train_manifest": {"manifest_sha256": "3" * 64},
+        "eval_manifest": {"manifest_sha256": "4" * 64},
+        "activation": {"attestation_sha256": "5" * 64},
+        "sae": {"attestation_sha256": "6" * 64},
+        "compatibility": {"compatibility_sha256": "7" * 64},
+        "layout": {"sae_checkpoint_root": "gs://bucket/checkpoints"},
+        "benchmark": {},
+    }
+    canary_gate = {
+        "status": "passed",
+        "waiver_sha256": None,
+        "recovery_waiver_sha256": None,
+    }
+    spec = SAEOperationSpec(
+        config_sha256=config.config_hash,
+        repository_content_sha256=environment["repository_content_sha256"],
+        consumer_environment_sha256=environment["sha256"],
+        train_capture_manifest_sha256=bundle["train_manifest"][
+            "manifest_sha256"
+        ],
+        eval_capture_manifest_sha256=bundle["eval_manifest"][
+            "manifest_sha256"
+        ],
+        activation_storage_attestation_sha256=bundle["activation"][
+            "attestation_sha256"
+        ],
+        sae_storage_attestation_sha256=bundle["sae"]["attestation_sha256"],
+        capture_compatibility_sha256=bundle["compatibility"][
+            "compatibility_sha256"
+        ],
+        smoke_campaign_sha256="8" * 64,
+        smoke_suite_sha256="9" * 64,
+        checkpoint_payload_root=bundle["layout"]["sae_checkpoint_root"],
+    )
+    SAEControl(root).begin(spec)
+    return SAEOperationPaths(root, spec.sha256), environment, bundle, canary_gate
+
+
+def test_authoritative_paths_require_and_validate_existing_operation(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+):
+    config = Gemma4Config()
+    paths, environment, bundle, canary_gate = _begin_test_sae_operation(
+        tmp_path, config
+    )
+    args = SimpleNamespace(operation_sha256=paths.operation_sha256)
+    monkeypatch.setattr(
+        cli_module,
+        "_validated_operation_smoke_hashes",
+        lambda *_args, **_kwargs: ("8" * 64, "9" * 64),
+    )
+
+    assert cli_module._operation_paths_for_command(
+        args, tmp_path, authoritative=True
+    ) == paths
+    state = cli_module._validate_sae_operation(
+        paths,
+        config=config,
+        environment=environment,
+        storage_bundle=bundle,
+        canary_gate=canary_gate,
+    )
+    assert state["operation_sha256"] == paths.operation_sha256
+
+    monkeypatch.setattr(
+        cli_module,
+        "_validated_operation_smoke_hashes",
+        lambda *_args, **_kwargs: ("a" * 64, "b" * 64),
+    )
+    with pytest.raises(RuntimeError, match="smoke_campaign_sha256"):
+        cli_module._validate_sae_operation(
+            paths,
+            config=config,
+            environment=environment,
+            storage_bundle=bundle,
+            canary_gate=canary_gate,
+        )
+    monkeypatch.setattr(
+        cli_module,
+        "_validated_operation_smoke_hashes",
+        lambda *_args, **_kwargs: ("8" * 64, "9" * 64),
+    )
+
+    with pytest.raises(RuntimeError, match="state is absent"):
+        cli_module._validate_sae_operation(
+            SAEOperationPaths(tmp_path, "f" * 64),
+            config=config,
+            environment=environment,
+            storage_bundle=bundle,
+            canary_gate=canary_gate,
+        )
+
+    drifted_environment = dict(environment, repository_content_sha256="e" * 64)
+    with pytest.raises(RuntimeError, match="repository_content_sha256"):
+        cli_module._validate_sae_operation(
+            paths,
+            config=config,
+            environment=drifted_environment,
+            storage_bundle=bundle,
+            canary_gate=canary_gate,
+        )
+
+
+def test_reference_paths_cannot_claim_an_authoritative_operation(tmp_path):
+    missing = SimpleNamespace(operation_sha256=None)
+    with pytest.raises(RuntimeError, match="require --operation-sha256"):
+        cli_module._operation_paths_for_command(
+            missing, tmp_path, authoritative=True
+        )
+    assert (
+        cli_module._operation_paths_for_command(
+            missing, tmp_path, authoritative=False
+        )
+        is None
+    )
+    with pytest.raises(RuntimeError, match="reserved for authoritative"):
+        cli_module._operation_paths_for_command(
+            SimpleNamespace(operation_sha256="a" * 64),
+            tmp_path,
+            authoritative=False,
+        )
+
+
+def test_cross_operation_artifacts_and_legacy_poison_are_not_selected(tmp_path):
+    first = SAEOperationPaths(tmp_path, "a" * 64)
+    second = SAEOperationPaths(tmp_path, "b" * 64)
+    legacy = cli_module._run_root(tmp_path, "A", 1)
+    first_root = first.run_root("A", 1)
+    second_root = second.run_root("A", 1)
+    for path in (legacy, first_root):
+        path.mkdir(parents=True)
+        (path / "run.json").write_text('{"poison": true}', encoding="utf-8")
+
+    assert second_root not in {legacy, first_root}
+    assert not (second_root / "run.json").exists()
+    assert cli_module._training_metrics_journal_path(
+        second_root,
+        "c" * 32,
+        operation_paths=second,
+        condition="A",
+        seed=1,
+    ) == second.metrics_path("A", 1)
+    assert second.evaluation_path("A", 1) != cli_module._evaluation_path(
+        tmp_path, "A", 1
+    )
+    assert second.report_path != tmp_path / "report.json"
+
+
+def test_operation_sha256_cli_validation_and_authoritative_requirement():
+    parser = build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["report"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "train",
+                "--condition",
+                "A",
+                "--seed",
+                "1",
+                "--operation-sha256",
+                "not-a-digest",
+            ]
+        )
 
 
 def test_conversion_attestation_is_self_hashed_and_parity_gated(tmp_path):
@@ -980,9 +1477,15 @@ def test_conversion_output_must_be_an_empty_gcs_prefix(monkeypatch):
 
 def test_authoritative_cost_telemetry_is_recomputed_from_components():
     config = Gemma4Config()
+    run_instance_id = "a" * 32
+    steps = config.planned_updates
     record = {
         "authoritative": True,
+        "condition": "A",
+        "seed": 1,
+        "run_instance_id": run_instance_id,
         "tokens_seen": config.train_tokens,
+        "steps": steps,
         "chip_count": 16,
         "optimizer_wall_seconds": 8.0,
         "compile_seconds": 2.0,
@@ -992,6 +1495,30 @@ def test_authoritative_cost_telemetry_is_recomputed_from_components():
         "chip_seconds": 160.0,
         "tokens_per_second": config.train_tokens / 10.0,
         "optimizer_tokens_per_second": config.train_tokens / 8.0,
+        "metrics_journal": {
+            "schema_version": "gemma4-sae-training-journal-snapshot-v1",
+            "path": f"/tmp/{run_instance_id}.jsonl",
+            "binding": {
+                "schema_version": "gemma4-sae-metrics-journal-v1",
+                "identity": {
+                    "run_instance_id": run_instance_id,
+                    "condition": "A",
+                    "seed": 1,
+                },
+                "identity_sha256": "1" * 64,
+                "file_sha256": "2" * 64,
+                "journal_sha256": "3" * 64,
+                "row_count": steps,
+                "last_step": steps,
+                "last_tokens_seen": config.train_tokens,
+            },
+            "total_tokens": config.train_tokens,
+            "effective_batch_tokens": config.effective_batch_tokens,
+            "expected_l0": config.topk_features,
+            "complete_prefix_topk_valid": True,
+            "complete_prefix_exact_l0": True,
+            "last_cumulative_optimizer_wall_seconds": 7.9,
+        },
     }
     cli_module._validate_authoritative_run_timing(
         record, config, "A", expected_tokens=config.train_tokens
@@ -1000,6 +1527,54 @@ def test_authoritative_cost_telemetry_is_recomputed_from_components():
     record["chip_seconds"] = 159.0
     with pytest.raises(RuntimeError, match="internally inconsistent"):
         cli_module._validate_authoritative_run_timing(record, config, "A")
+
+
+def test_report_journal_snapshot_is_recomputed_from_bound_bytes(tmp_path):
+    from moe_sae.metrics_journal import (
+        JournalIdentity,
+        MetricsJournal,
+        training_journal_snapshot,
+    )
+
+    config = Gemma4Config()
+    run_instance_id = "4" * 32
+    identity = JournalIdentity(run_instance_id, "B", 1)
+    journal = MetricsJournal(tmp_path / "metrics.jsonl", identity)
+    journal.append(
+        {
+            "step": 1,
+            "tokens_seen": config.effective_batch_tokens,
+            "valid_tokens": config.effective_batch_tokens,
+            "l0": float(config.topk_features),
+            "topk_valid": True,
+            "optimizer_wall_seconds": 1.0,
+        }
+    )
+    sealed = training_journal_snapshot(
+        journal,
+        total_tokens=config.train_tokens,
+        effective_batch_tokens=config.effective_batch_tokens,
+        expected_l0=config.topk_features,
+    )
+    record = {
+        "run_instance_id": run_instance_id,
+        "condition": "B",
+        "seed": 1,
+        "metrics_journal": sealed,
+    }
+
+    assert cli_module._coordinated_training_journal_snapshot(record, config) == sealed
+    journal.append(
+        {
+            "step": 2,
+            "tokens_seen": 2 * config.effective_batch_tokens,
+            "valid_tokens": config.effective_batch_tokens,
+            "l0": float(config.topk_features),
+            "topk_valid": True,
+            "optimizer_wall_seconds": 2.0,
+        }
+    )
+    assert cli_module._coordinated_training_journal_snapshot(record, config) != sealed
 
 
 def test_production_artifact_root_cannot_escape_v1_namespace(tmp_path):
@@ -1177,6 +1752,59 @@ def test_capacity_is_scanned_from_fixed_order_with_margin():
     assert capacity % 8 == 0
 
 
+def test_production_capacity_cache_is_content_addressed_by_consumer_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import jax
+    import moe_sae.distributed as distributed_module
+
+    config = Gemma4Config()
+
+    class Dataset:
+        manifest_sha256 = "c" * 64
+
+    environment = {"repository_content_sha256": "1" * 64}
+    writes: list[tuple[Path, dict]] = []
+    monkeypatch.setattr(jax, "process_count", lambda: 4)
+    monkeypatch.setattr(
+        cli_module, "_coordinated_environment", lambda: dict(environment)
+    )
+    monkeypatch.setattr(
+        cli_module, "_coordinator_read_json_if_exists", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        distributed_module,
+        "precompute_distributed_a_capacity",
+        lambda *args, **kwargs: 24,
+    )
+    monkeypatch.setattr(
+        cli_module, "_collective_raise_if_any", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(cli_module, "_global_max_seconds", lambda _value: 2.5)
+
+    def publish(path: Path, payload: dict, **_kwargs) -> bool:
+        writes.append((path, payload))
+        return True
+
+    monkeypatch.setattr(cli_module, "_coordinator_write_json", publish)
+    training = SimpleNamespace(seed=1)
+    assert cli_module._production_a_capacity(
+        tmp_path, Dataset(), config, training
+    ) == (24, 2.5)
+    first_path, first_payload = writes[-1]
+    assert first_payload["schema_version"] == "gemma4-a-capacity-cache-v2"
+    assert first_path.name == (
+        "a_capacity-train-seed-1-"
+        f"{first_payload['identity_sha256']}.json"
+    )
+
+    environment["repository_content_sha256"] = "2" * 64
+    assert cli_module._production_a_capacity(
+        tmp_path, Dataset(), config, training
+    ) == (24, 2.5)
+    assert writes[-1][0] != first_path
+
+
 def test_harvester_report_uses_measured_train_and_eval_capture_cost(tmp_path):
     config = Gemma4Config()
     benchmark = tmp_path / "benchmark"
@@ -1290,6 +1918,7 @@ def _run_args(tmp_path):
         grain_eval="eval.array_record@*",
         dataset_train_manifest="train.manifest.json",
         dataset_eval_manifest="eval.manifest.json",
+        operation_sha256="0" * 64,
     )
 
 
@@ -1357,6 +1986,25 @@ def _sae_storage_attestation() -> dict:
     }
 
 
+def _consumer_storage_bundle(tmp_path: Path, config: Gemma4Config) -> dict:
+    return {
+        "activation": {"attestation_sha256": "8" * 64},
+        "sae": {"attestation_sha256": "7" * 64},
+        "compatibility": {"compatibility_sha256": "6" * 64},
+        "producer_environment_sha256": "b" * 64,
+        "conversion_attestation_sha256": "9" * 64,
+        "train_manifest": {},
+        "eval_manifest": {},
+        "benchmark": _selected_benchmark(config),
+        "layout": {
+            "capture_cache_root": tmp_path / "cache",
+            "capture_cache_max_bytes": 100 * 1024**3,
+            "bulk_gcs_root": "gs://test-bucket/bulk",
+            "sae_checkpoint_root": "gs://test-bucket/checkpoints",
+        },
+    }
+
+
 def test_run_fresh_state_orders_canary_health_production_and_eval(
     tmp_path, monkeypatch
 ):
@@ -1370,8 +2018,26 @@ def test_run_fresh_state_orders_canary_health_production_and_eval(
             self.total_tokens = (
                 config.train_tokens if split == "train" else config.eval_tokens
             )
-            self.manifest = {"metadata": {"checkpoint_sha256": "a" * 64}}
+            self.manifest = {
+                "metadata": {
+                    "checkpoint_sha256": "a" * 64,
+                    "dataset_fingerprint": "5" * 64,
+                }
+            }
             self.manifest_sha256 = f"{split}-manifest"
+
+    benchmark_root = tmp_path / "benchmark"
+    benchmark_root.mkdir(parents=True)
+    (benchmark_root / "selected.json").write_text(
+        json.dumps(_selected_benchmark(config)), encoding="utf-8"
+    )
+    preflight = tmp_path / "preflight"
+    preflight.mkdir()
+    sae_path = cli_module._sae_storage_attestation_path(
+        tmp_path, cli_module._coordinated_environment()["sha256"]
+    )
+    sae_path.parent.mkdir(parents=True, exist_ok=True)
+    sae_path.write_text("{}", encoding="utf-8")
 
     monkeypatch.setattr(cli_module, "run_preflight", lambda **kwargs: ())
     monkeypatch.setattr(
@@ -1412,11 +2078,28 @@ def test_run_fresh_state_orders_canary_health_production_and_eval(
     monkeypatch.setattr(
         cli_module,
         "_sealed_dataset",
-        lambda path: Dataset("eval" if path.name == "eval" else "train"),
+        lambda path, **kwargs: Dataset("eval" if path.name == "eval" else "train"),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_load_sae_storage_bundle",
+        lambda *args, **kwargs: _consumer_storage_bundle(tmp_path, config),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_consumer_canary_gate",
+        lambda *args, **kwargs: {
+            "status": "passed",
+            "waiver_sha256": None,
+            "recovery_waiver_sha256": None,
+        },
     )
     monkeypatch.setattr(cli_module, "_require_exact_capture", lambda *args: None)
     monkeypatch.setattr(
         cli_module, "_require_capture_identity", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        cli_module, "_validate_sae_operation", lambda *args, **kwargs: {}
     )
 
     def benchmark(args):
@@ -1451,7 +2134,17 @@ def test_run_fresh_state_orders_canary_health_production_and_eval(
         del root, cfg, capture
         return progress.get((condition, seed))
 
-    def existing_eval(root, cfg, train, heldout, condition, seed, run_record):
+    def existing_eval(
+        root,
+        cfg,
+        train,
+        heldout,
+        condition,
+        seed,
+        run_record,
+        **kwargs,
+    ):
+        del kwargs
         del root, cfg, train, heldout, run_record
         return {} if (condition, seed) in evaluations else None
 
@@ -1470,12 +2163,7 @@ def test_run_fresh_state_orders_canary_health_production_and_eval(
     monkeypatch.setattr(cli_module, "_command_report", lambda args: 0)
 
     assert cli_module._command_run(_run_args(tmp_path)) == 0
-    assert events[:4] == [
-        ("benchmark",),
-        ("harvest", "train", True),
-        ("harvest", "train", False),
-        ("harvest", "eval", False),
-    ]
+    assert not [event for event in events if event[0] in {"benchmark", "harvest"}]
     training = [event for event in events if event[0] == "train"]
     assert training[:3] == [
         ("train", "A", 1, config.health_gate_tokens),
@@ -1493,6 +2181,13 @@ def test_run_resume_skips_every_matching_sealed_stage(tmp_path, monkeypatch):
     (benchmark / "selected.json").write_text(
         json.dumps(_selected_benchmark(config)), encoding="utf-8"
     )
+    preflight = tmp_path / "preflight"
+    preflight.mkdir()
+    sae_path = cli_module._sae_storage_attestation_path(
+        tmp_path, cli_module._coordinated_environment()["sha256"]
+    )
+    sae_path.parent.mkdir(parents=True, exist_ok=True)
+    sae_path.write_text("{}", encoding="utf-8")
     for split in ("train", "eval"):
         capture = tmp_path / "captures" / split
         capture.mkdir(parents=True)
@@ -1500,7 +2195,12 @@ def test_run_resume_skips_every_matching_sealed_stage(tmp_path, monkeypatch):
 
     class Dataset:
         total_tokens = config.train_tokens
-        manifest = {"metadata": {"checkpoint_sha256": "a" * 64}}
+        manifest = {
+            "metadata": {
+                "checkpoint_sha256": "a" * 64,
+                "dataset_fingerprint": "5" * 64,
+            }
+        }
         manifest_sha256 = "manifest"
 
     monkeypatch.setattr(cli_module, "run_preflight", lambda **kwargs: ())
@@ -1538,10 +2238,27 @@ def test_run_resume_skips_every_matching_sealed_stage(tmp_path, monkeypatch):
             "sae_checkpoint_root": "gs://test-bucket/checkpoints",
         },
     )
-    monkeypatch.setattr(cli_module, "_sealed_dataset", lambda path: Dataset())
+    monkeypatch.setattr(cli_module, "_sealed_dataset", lambda path, **kwargs: Dataset())
+    monkeypatch.setattr(
+        cli_module,
+        "_load_sae_storage_bundle",
+        lambda *args, **kwargs: _consumer_storage_bundle(tmp_path, config),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_consumer_canary_gate",
+        lambda *args, **kwargs: {
+            "status": "passed",
+            "waiver_sha256": None,
+            "recovery_waiver_sha256": None,
+        },
+    )
     monkeypatch.setattr(cli_module, "_require_exact_capture", lambda *args: None)
     monkeypatch.setattr(
         cli_module, "_require_capture_identity", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        cli_module, "_validate_sae_operation", lambda *args, **kwargs: {}
     )
     monkeypatch.setattr(
         cli_module, "_campaign_is_complete", lambda *args, **kwargs: True
@@ -1554,7 +2271,9 @@ def test_run_resume_skips_every_matching_sealed_stage(tmp_path, monkeypatch):
             "chip_seconds": 1.0,
         },
     )
-    monkeypatch.setattr(cli_module, "_existing_evaluation", lambda *args: {})
+    monkeypatch.setattr(
+        cli_module, "_existing_evaluation", lambda *args, **kwargs: {}
+    )
     monkeypatch.setattr(
         cli_module,
         "_command_benchmark_harvest",

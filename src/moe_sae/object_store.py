@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 import base64
 import fcntl
@@ -803,6 +804,7 @@ class ShardCache:
         store: ImmutableObjectStore,
         *,
         max_bytes: int,
+        resident_only: bool = False,
     ):
         if max_bytes <= 0:
             raise ValueError("cache max_bytes must be positive")
@@ -810,6 +812,7 @@ class ShardCache:
         self.root.mkdir(parents=True, exist_ok=True)
         self.store = store
         self.max_bytes = int(max_bytes)
+        self.resident_only = bool(resident_only)
         self._lock = threading.Lock()
         self._lock_path = self.root / ".cache.lock"
 
@@ -834,19 +837,19 @@ class ShardCache:
 
         return _Lock(self._lock_path)
 
-    def _evict_for(self, required_bytes: int, keep: Path) -> None:
+    def _evict_for_many(self, required_bytes: int, keep: set[Path]) -> None:
         if required_bytes > self.max_bytes:
             raise ObjectStoreError(
-                f"one shard ({required_bytes} bytes) exceeds the local cache bound"
+                f"requested materialization ({required_bytes} bytes) exceeds the "
+                "local cache bound"
             )
         candidates = [
             path
             for path in self.root.glob("*.safetensors")
-            if path.is_file() and path != keep
+            if path.is_file() and path not in keep
         ]
         total = sum(path.stat().st_size for path in candidates)
-        if keep.is_file():
-            total += keep.stat().st_size
+        total += sum(path.stat().st_size for path in keep if path.is_file())
         for path in sorted(candidates, key=lambda item: item.stat().st_mtime_ns):
             if total + required_bytes <= self.max_bytes:
                 break
@@ -861,10 +864,15 @@ class ShardCache:
                 f"local cache has only {free} free bytes; need {required_bytes}"
             )
 
+    def _evict_for(self, required_bytes: int, keep: Path) -> None:
+        self._evict_for_many(required_bytes, {keep})
+
     def materialize(self, value: Any) -> Path:
         identity = (
             value if isinstance(value, ObjectIdentity) else object_identity_from_mapping(value)
         )
+        if self.resident_only:
+            return self.require_resident_many((identity,))[0]
         target = self.root / f"{identity.sha256}.safetensors"
         with self._lock:
             with self._process_lock():
@@ -895,6 +903,222 @@ class ShardCache:
                 finally:
                     temporary.unlink(missing_ok=True)
                 return target
+
+    def materialize_many(
+        self,
+        values: Any,
+        *,
+        max_workers: int = 4,
+        preserve_failure_evidence: bool = False,
+    ) -> tuple[Path, ...]:
+        """Cold-materialize several immutable objects concurrently.
+
+        The entire reservation and commit is serialized against other cache
+        users.  Downloads go to unique partial files, and each partial is
+        checked against the manifest's exact generation-bound SHA-256 and size
+        before a file fsync and atomic rename.  This is intentionally a batch
+        operation: it lets the SAE storage gate exercise four independent GCS
+        objects at once without weakening the bounded-cache contract.
+        """
+
+        if (
+            isinstance(max_workers, bool)
+            or not isinstance(max_workers, int)
+            or max_workers <= 0
+        ):
+            raise ValueError("max_workers must be a positive integer")
+        try:
+            raw_values = tuple(values)
+        except TypeError as error:
+            raise TypeError("values must be an iterable of object identities") from error
+        if self.resident_only:
+            return self.require_resident_many(raw_values)
+        identities = tuple(
+            value
+            if isinstance(value, ObjectIdentity)
+            else object_identity_from_mapping(value)
+            for value in raw_values
+        )
+        if not identities:
+            return ()
+
+        # A repeated exact object needs one transfer.  A SHA collision between
+        # different immutable identities is rejected rather than allowing one
+        # generation to stand in for another in qualification evidence.
+        unique: list[ObjectIdentity] = []
+        by_object: dict[tuple[str, int], ObjectIdentity] = {}
+        by_sha: dict[str, ObjectIdentity] = {}
+        for identity in identities:
+            object_key = (identity.uri, identity.generation)
+            prior = by_object.get(object_key)
+            if prior is not None:
+                if prior != identity:
+                    raise ObjectStoreError(
+                        "one immutable object has conflicting cache identities"
+                    )
+                continue
+            same_sha = by_sha.get(identity.sha256)
+            if same_sha is not None and same_sha != identity:
+                raise ObjectStoreError(
+                    "different immutable objects unexpectedly share one cache SHA-256"
+                )
+            by_object[object_key] = identity
+            by_sha[identity.sha256] = identity
+            unique.append(identity)
+
+        targets = {
+            identity: self.root / f"{identity.sha256}.safetensors"
+            for identity in unique
+        }
+        with self._lock:
+            with self._process_lock():
+                hits: set[Path] = set()
+                missing: list[ObjectIdentity] = []
+                for identity in unique:
+                    target = targets[identity]
+                    if target.is_file():
+                        digest, size = sha256_file(target)
+                        if digest == identity.sha256 and size == identity.size_bytes:
+                            os.utime(target, None)
+                            hits.add(target)
+                            continue
+                        target.unlink()
+                    missing.append(identity)
+
+                self._evict_for_many(
+                    sum(identity.size_bytes for identity in missing), hits
+                )
+                if not missing:
+                    return tuple(
+                        targets[by_object[(item.uri, item.generation)]]
+                        for item in identities
+                    )
+                temporaries: dict[ObjectIdentity, Path] = {}
+                for identity in missing:
+                    descriptor, temporary_name = tempfile.mkstemp(
+                        prefix=f".{identity.sha256}.{uuid.uuid4().hex}.",
+                        suffix=".partial",
+                        dir=self.root,
+                    )
+                    os.close(descriptor)
+                    temporaries[identity] = Path(temporary_name)
+
+                def _download(identity: ObjectIdentity) -> Path:
+                    temporary = temporaries[identity]
+                    self.store.download(identity, temporary)
+                    digest, size = sha256_file(temporary)
+                    if digest != identity.sha256 or size != identity.size_bytes:
+                        raise ObjectStoreError(
+                            "downloaded object failed SHA-256/size verification: "
+                            f"{identity.uri}"
+                        )
+                    with temporary.open("rb") as handle:
+                        os.fsync(handle.fileno())
+                    return temporary
+
+                failures: list[str] = []
+                try:
+                    with ThreadPoolExecutor(
+                        max_workers=min(max_workers, len(missing)),
+                        thread_name_prefix="moe-sae-cache",
+                    ) as executor:
+                        future_to_identity = {
+                            executor.submit(_download, identity): identity
+                            for identity in missing
+                        }
+                        for future in as_completed(future_to_identity):
+                            identity = future_to_identity[future]
+                            try:
+                                temporary = future.result()
+                                target = targets[identity]
+                                os.replace(temporary, target)
+                                _fsync_directory(self.root)
+                            except Exception as error:  # retain every failure
+                                failures.append(
+                                    f"{identity.uri}: {type(error).__name__}: {error}"
+                                )
+                    if failures:
+                        raise ObjectStoreError(
+                            "concurrent cache materialization failed: "
+                            + "; ".join(failures)
+                        )
+                    total = sum(
+                        path.stat().st_size
+                        for path in self.root.glob("*.safetensors")
+                        if path.is_file()
+                    )
+                    if total > self.max_bytes:
+                        raise ObjectStoreError(
+                            "concurrent materialization exceeded the cache bound"
+                        )
+                    return tuple(
+                        targets[by_object[(item.uri, item.generation)]]
+                        for item in identities
+                    )
+                finally:
+                    if not preserve_failure_evidence or not failures:
+                        for temporary in temporaries.values():
+                            temporary.unlink(missing_ok=True)
+
+    def require_resident_many(self, values: Any) -> tuple[Path, ...]:
+        """Return exact verified cache hits without downloading or mutating them.
+
+        Production SAE consumers use this after the cache has been qualified.
+        A missing or corrupt file therefore invalidates that qualification
+        instead of silently changing the run into an unmeasured GCS refill.
+        """
+
+        try:
+            raw_values = tuple(values)
+        except TypeError as error:
+            raise TypeError("values must be an iterable of object identities") from error
+        identities = tuple(
+            value
+            if isinstance(value, ObjectIdentity)
+            else object_identity_from_mapping(value)
+            for value in raw_values
+        )
+        if not identities:
+            return ()
+
+        by_object: dict[tuple[str, int], ObjectIdentity] = {}
+        by_sha: dict[str, ObjectIdentity] = {}
+        for identity in identities:
+            object_key = (identity.uri, identity.generation)
+            prior = by_object.get(object_key)
+            if prior is not None and prior != identity:
+                raise ObjectStoreError(
+                    "one immutable object has conflicting cache identities"
+                )
+            same_sha = by_sha.get(identity.sha256)
+            if same_sha is not None and same_sha != identity:
+                raise ObjectStoreError(
+                    "different immutable objects unexpectedly share one cache SHA-256"
+                )
+            by_object[object_key] = identity
+            by_sha[identity.sha256] = identity
+
+        with self._lock:
+            with self._process_lock():
+                targets: dict[tuple[str, int], Path] = {}
+                for object_key, identity in by_object.items():
+                    target = self.root / f"{identity.sha256}.safetensors"
+                    if not target.is_file() or target.is_symlink():
+                        raise ObjectStoreError(
+                            "qualified cache object is absent; requalify a fresh "
+                            f"SAE cache before continuing: {target}"
+                        )
+                    digest, size = sha256_file(target)
+                    if digest != identity.sha256 or size != identity.size_bytes:
+                        raise ObjectStoreError(
+                            "qualified cache object failed SHA-256/size verification; "
+                            f"requalify a fresh SAE cache: {target}"
+                        )
+                    targets[object_key] = target
+                return tuple(
+                    targets[(identity.uri, identity.generation)]
+                    for identity in identities
+                )
 
 
 def _fsync_directory(path: Path) -> None:

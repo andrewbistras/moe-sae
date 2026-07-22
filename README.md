@@ -19,10 +19,13 @@ the active tree. It is preserved at Git tag
 
 - [`configs/gemma4_26b_a4b.yaml`](configs/gemma4_26b_a4b.yaml) — the single
   production configuration.
-- `moe-sae` — the single CLI, with `stage-c4`, `qualify-storage`, `preflight`,
+- `moe-sae` — the single CLI, with `stage-c4`, `qualify-storage`,
+  `qualify-sae-storage`, `preflight`,
   `convert-checkpoint`, `benchmark-harvest`, `harvest`, `activation-farm`,
-  `activation-status`, `activation-abort`, `train`, `eval`, `report`, and
-  `run`.
+  `activation-status`, `activation-abort`, `sae-smoke`, `sae-begin`,
+  `sae-farm`, `sae-status`, `sae-abort`, `train`, `eval`, `report`, and `run`.
+  Production SAE operation goes through the `sae-*` commands; `sae-phase` is
+  a hidden, lease-fenced farm child and is never an operator command.
 - [`src/moe_sae/data.py`](src/moe_sae/data.py) — deterministic C4 packing and
   the fixed-record Grain/ArrayRecord reader.
 - [`src/moe_sae/model.py`](src/moe_sae/model.py) — pinned MaxText prefix adapter.
@@ -39,6 +42,10 @@ the active tree. It is preserved at Git tag
   Orbax payload namespaces and self-hashed POSIX control pointers.
 - [`src/moe_sae/sae.py`](src/moe_sae/sae.py) — exact A/B/F scoring, distributed
   TopK, sparse decode, and optimizer math.
+- [`src/moe_sae/sae_operator.py`](src/moe_sae/sae_operator.py) and
+  [`src/moe_sae/sae_farm.py`](src/moe_sae/sae_farm.py) — the four-controller
+  SAE operation identity, lifetime lane leases, fixed phase plan, durable
+  status, and cooperative boundary aborts.
 - [`src/moe_sae/metrics.py`](src/moe_sae/metrics.py) — reconstruction and cost
   report contract.
 
@@ -171,19 +178,28 @@ fsync, end-to-end object hashes, and exact-generation cleanup. It then performs
 a tiny collective Orbax save, finalization check, and
 fresh-checkpointer restore at the exact checkpoint prefix; that immutable probe
 and its timings are sealed into the self-hashed, `activation-capture`-scoped
-`preflight/storage.json`. Benchmark and harvest accept that scope. Train, eval,
-report, and the full `run` command reject it until a separate immutable SAE
-cache qualification or streaming-cache design is implemented. All commands reject a
+`preflight/storage.json`. Benchmark and harvest accept that scope. After both
+captures seal, `qualify-sae-storage` cold-fills each host's exact contiguous
+partition into a 100 GiB bounded cache (outer-4 objects, inner-16 workers,
+16 MiB chunks), requires 128 GiB free afterward and 4 GB/s aggregate verified
+throughput, then publishes the separate immutable, `sae-training`-scoped
+`preflight/sae-storage/<consumer-environment-sha256>.json`. Train, eval,
+report, and post-capture `run` select the proof for their exact environment
+and require both producer and consumer records. All commands reject a
 different config, environment, topology, path layout, Orbax proof, or storage
-attestation.
+attestation. The qualified `/dev/shm` files are part of that proof: if they are
+lost, the current deployment stops instead of silently refilling from GCS.
 
 The first-run order is therefore: stage and publish both C4 splits and convert
 the model checkpoint off-cluster; qualify the three storage planes on the
 v4-32; run `preflight`; then use `activation-farm` for the supervised
 benchmark, canary, train capture, and held-out capture. It stops before SAE
-training. The later `train`, `eval`, and `report` stages consume only the sealed
-captures; `run` is the full experiment orchestrator and resumes only
-provenance-matching sealed stages. The converter's
+training. After both captures seal, run fresh full-shape `sae-smoke` processes
+in the exact order F, A, B; qualify the distinct resident SAE cache; seal those
+proofs with `sae-begin`; then launch one detached `sae-farm` supervisor on each
+of the four controllers. The farm alone advances the seed-1 gates, all nine
+training runs, all nine evaluations, and the final report under one immutable
+operation SHA. The converter's
 self-hashed parity attestation, checkpoint inventory digest, storage
 attestation, and C4 manifest fingerprints are bound through the resulting
 benchmark, capture, campaign, checkpoint, and report metadata.

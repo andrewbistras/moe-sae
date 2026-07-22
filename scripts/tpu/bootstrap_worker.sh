@@ -266,16 +266,29 @@ mount_control_plane() {
   local expected_source="$NFS_SERVER:$NFS_EXPORT"
   local actual_source
   local filesystem_type
+  local mount_options
   local probe
 
   [[ ! -L "$artifact_root" ]] || die "artifact root must not be a symlink: $artifact_root"
   if mountpoint -q "$artifact_root"; then
     [[ -d "$artifact_root" ]] || die "mounted artifact root is not a directory"
-    IFS=' ' read -r actual_source filesystem_type < <(
-      findmnt -rn -o SOURCE,FSTYPE --mountpoint "$artifact_root"
+    IFS=' ' read -r actual_source filesystem_type mount_options < <(
+      findmnt -rn -o SOURCE,FSTYPE,OPTIONS --mountpoint "$artifact_root"
     )
     [[ "$actual_source" == "$expected_source" ]] || \
       die "artifact root is mounted from '$actual_source'; expected '$expected_source'"
+    if ! has_positive_lookup_cache "$mount_options"; then
+      log "unmounting NFS control plane before enabling lookupcache=positive"
+      # NFS-specific cache policy is not reliably changed by a generic remount.
+      # Bootstrap runs before any workload, so a normal unmount must succeed;
+      # never use force/lazy unmount because that could split control-plane state.
+      sudo umount "$artifact_root"
+      sudo mount -t nfs -o rw,hard,timeo=600,retrans=2,lookupcache=positive \
+        "$expected_source" "$artifact_root"
+      IFS=' ' read -r actual_source filesystem_type mount_options < <(
+        findmnt -rn -o SOURCE,FSTYPE,OPTIONS --mountpoint "$artifact_root"
+      )
+    fi
   else
     if [[ ! -e "$artifact_root" ]]; then
       sudo install -d -m 0755 -o "$(id -un)" -g "$(id -gn)" "$artifact_root"
@@ -285,10 +298,10 @@ mount_control_plane() {
       die "unmounted artifact root is not empty: $artifact_root"
     fi
     log "mounting NFS control plane $expected_source at $artifact_root"
-    sudo mount -t nfs -o rw,hard,timeo=600,retrans=2 \
+    sudo mount -t nfs -o rw,hard,timeo=600,retrans=2,lookupcache=positive \
       "$expected_source" "$artifact_root"
-    IFS=' ' read -r actual_source filesystem_type < <(
-      findmnt -rn -o SOURCE,FSTYPE --mountpoint "$artifact_root"
+    IFS=' ' read -r actual_source filesystem_type mount_options < <(
+      findmnt -rn -o SOURCE,FSTYPE,OPTIONS --mountpoint "$artifact_root"
     )
   fi
 
@@ -298,6 +311,8 @@ mount_control_plane() {
   esac
   [[ "$actual_source" == "$expected_source" ]] || \
     die "mounted NFS source is '$actual_source'; expected '$expected_source'"
+  has_positive_lookup_cache "$mount_options" || \
+    die "NFS control plane must be mounted with lookupcache=positive"
 
   if [[ ! -w "$artifact_root" ]]; then
     sudo chown "$(id -u):$(id -g)" "$artifact_root"
@@ -316,6 +331,14 @@ has_mount_option() {
   local options=$1
   local required=$2
   [[ ",$options," == *",$required,"* ]]
+}
+
+has_positive_lookup_cache() {
+  local options=$1
+  # util-linux/findmnt renders the kernel's accepted "positive" value as
+  # either lookupcache=positive or the abbreviated lookupcache=pos.
+  has_mount_option "$options" lookupcache=positive || \
+    has_mount_option "$options" lookupcache=pos
 }
 
 validate_local_buffer_filesystem() {

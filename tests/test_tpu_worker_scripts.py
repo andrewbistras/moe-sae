@@ -76,6 +76,28 @@ def test_bootstrap_gates_activation_capacity_before_and_after_dependencies() -> 
     assert before < install < after
 
 
+def test_bootstrap_disables_negative_nfs_lookup_caching() -> None:
+    bootstrap = (SCRIPT_ROOT / "bootstrap_worker.sh").read_text()
+
+    assert "rw,hard,timeo=600,retrans=2,lookupcache=positive" in bootstrap
+    assert 'sudo umount "$artifact_root"' in bootstrap
+    assert "remount,lookupcache=positive" not in bootstrap
+    assert 'has_positive_lookup_cache "$mount_options" ||' in bootstrap
+
+
+def test_bootstrap_accepts_findmnt_positive_lookup_cache_spellings() -> None:
+    for spelling in ("lookupcache=positive", "lookupcache=pos"):
+        result = _run_bootstrap_function(
+            f"has_positive_lookup_cache 'rw,hard,{spelling}'"
+        )
+        assert result.returncode == 0, result.stderr
+
+    missing = _run_bootstrap_function(
+        "has_positive_lookup_cache 'rw,hard,lookupcache=all'"
+    )
+    assert missing.returncode != 0
+
+
 def _run_bootstrap_function(command: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [

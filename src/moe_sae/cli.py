@@ -6,6 +6,7 @@ import argparse
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 import dataclasses
+from datetime import datetime, timezone
 import gc
 import hashlib
 import json
@@ -14,8 +15,10 @@ import os
 from pathlib import Path
 import re
 import signal
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any
 
@@ -39,8 +42,13 @@ from moe_sae.metrics import (
     MetricsSink,
     SeedEvaluation,
     build_efficiency_report,
-    render_headline,
-    write_report_json,
+)
+from moe_sae.metrics_journal import (
+    JOURNAL_SCHEMA_VERSION,
+    TRAINING_JOURNAL_SNAPSHOT_SCHEMA,
+    JournalIdentity,
+    MetricsJournal,
+    training_journal_snapshot,
 )
 from moe_sae.model import (
     CaptureBatch,
@@ -73,6 +81,8 @@ from moe_sae.runtime import (
     require_v4_32_runtime,
     run_preflight,
 )
+from moe_sae.sae_operator import SAEControl, SAE_PHASES
+from moe_sae.sae_paths import SAEOperationPaths
 from moe_sae.storage import (
     ACTIVATION_CAPTURE_SCOPE,
     MINIMUM_ACTIVATION_GCS_DOWNLOAD_BYTES_PER_SECOND,
@@ -88,11 +98,21 @@ _BENCHMARK_KILL_GRACE_SECONDS = 15.0
 _ACTIVATION_CHILD_KILL_GRACE_SECONDS = 30.0
 _COORDINATOR_JSON_VISIBILITY_TIMEOUT_SECONDS = 15.0
 _COORDINATOR_JSON_VISIBILITY_POLL_SECONDS = 0.05
+_COLLECTIVE_ERROR_BYTES = 4096
+_COORDINATOR_BROADCAST_MAX_BYTES = 64 * 1024**2
 
 
 def _sha256_argument(value: str) -> str:
     if not re.fullmatch(r"[0-9a-f]{64}", value):
         raise argparse.ArgumentTypeError("must be a lowercase 64-character SHA-256")
+    return value
+
+
+def _attempt_id_argument(value: str) -> str:
+    if not re.fullmatch(r"[0-9a-f]{32}", value):
+        raise argparse.ArgumentTypeError(
+            "must be a lowercase 32-character attempt ID"
+        )
     return value
 
 
@@ -135,6 +155,21 @@ def _conversion_attestation_digest(payload: dict[str, Any]) -> str:
 
 def _storage_attestation_path(root: Path) -> Path:
     return root / "preflight" / "storage.json"
+
+
+def _sae_storage_attestation_path(
+    root: Path, consumer_environment_sha256: str
+) -> Path:
+    """Consumer-versioned proof; never aliases another code environment."""
+
+    if not re.fullmatch(r"[0-9a-f]{64}", consumer_environment_sha256):
+        raise RuntimeError("SAE consumer environment identity is not a SHA-256")
+    return (
+        root
+        / "preflight"
+        / "sae-storage"
+        / f"{consumer_environment_sha256}.json"
+    )
 
 
 def _validate_gcs_storage_roots(
@@ -241,6 +276,7 @@ def _validate_storage_attestation_payload(
     environment_sha256: str,
     process_count: int,
     global_device_count: int,
+    allow_historical_producer: bool = False,
 ) -> str:
     from moe_sae.storage import (
         StoragePlanesQualificationConfig,
@@ -322,6 +358,19 @@ def _validate_storage_attestation_payload(
     ):
         raise RuntimeError("storage attestation local-buffer layout is incompatible")
     try:
+        if (
+            allow_historical_producer
+            and payload.get("schema_version")
+            == "gemma4-storage-planes-qualification-v6"
+        ):
+            return _validate_historical_activation_storage_attestation(
+                payload,
+                expected_config_sha256=config.config_hash,
+                expected_environment_sha256=environment_sha256,
+                expected_control_directory=root,
+                expected_local_directories=local_directories,
+                expected_object_prefix=str(gcs.get("prefix", "")),
+            )
         return validate_storage_attestation(
             payload,
             expected_config_sha256=config.config_hash,
@@ -333,6 +382,100 @@ def _validate_storage_attestation_payload(
         )
     except RuntimeError as error:
         raise RuntimeError("storage attestation validation failed") from error
+
+
+def _validate_historical_activation_storage_attestation(
+    payload: Mapping[str, Any],
+    *,
+    expected_config_sha256: str,
+    expected_environment_sha256: str,
+    expected_control_directory: Path,
+    expected_local_directories: Sequence[str],
+    expected_object_prefix: str,
+) -> str:
+    """Validate immutable storage-v6 without inventing the later NFS proof.
+
+    The producer attestation is already embedded in every capture.  Schema v7
+    added an absent-to-present NFS lookup probe after capture; requiring that
+    new field would force an impossible rewrite.  This explicit historical
+    validator preserves every v6 gate and records the v7/SAE consumer evidence
+    separately.
+    """
+
+    from moe_sae.storage import storage_attestation_digest
+
+    claimed = payload.get("attestation_sha256")
+    contract = payload.get("contract")
+    qualification = payload.get("qualification")
+    if (
+        payload.get("schema_version")
+        != "gemma4-storage-planes-qualification-v6"
+        or payload.get("scope") != ACTIVATION_CAPTURE_SCOPE
+        or not isinstance(claimed, str)
+        or re.fullmatch(r"[0-9a-f]{64}", claimed) is None
+        or storage_attestation_digest(payload) != claimed
+        or payload.get("config_sha256") != expected_config_sha256
+        or payload.get("environment_sha256") != expected_environment_sha256
+        or not isinstance(contract, Mapping)
+        or not isinstance(qualification, Mapping)
+        or qualification.get("failures") not in ([], ())
+    ):
+        raise RuntimeError("historical activation storage identity is invalid")
+    control = qualification.get("control")
+    local = qualification.get("local_buffer")
+    gcs = qualification.get("gcs")
+    if not all(isinstance(item, Mapping) for item in (control, local, gcs)):
+        raise RuntimeError("historical activation storage planes are malformed")
+    process_count = qualification.get("process_count")
+    expected_probe = tuple(local.get("expected_probe_sha256_by_process", ()))
+    observed_probe = tuple(local.get("observed_probe_sha256_by_process", ()))
+    if (
+        isinstance(process_count, bool)
+        or not isinstance(process_count, int)
+        or process_count <= 0
+        or local.get("host_isolation_proven") is not True
+        or len(expected_probe) != process_count
+        or expected_probe != observed_probe
+        or len(set(expected_probe)) != process_count
+        or any(re.fullmatch(r"[0-9a-f]{64}", str(item)) is None for item in expected_probe)
+    ):
+        raise RuntimeError("historical activation local-buffer proof is invalid")
+    local_write = local.get("write")
+    try:
+        probe_bytes = int(contract["gcs_probe_bytes_per_process"])
+        minimum_rate = float(
+            contract["minimum_aggregate_local_write_bytes_per_second"]
+        )
+        total_bytes = int(local_write["total_bytes"])
+        elapsed = float(local_write["elapsed_seconds"])
+        rate = float(local_write["bytes_per_second"])
+        per_process_bytes = tuple(int(item) for item in local_write["per_process_bytes"])
+        per_process_seconds = tuple(
+            float(item) for item in local_write["per_process_seconds"]
+        )
+    except (KeyError, TypeError, ValueError, OverflowError) as error:
+        raise RuntimeError("historical activation write proof is malformed") from error
+    if (
+        not isinstance(local_write, Mapping)
+        or local.get("write_cleanup_complete") is not True
+        or tuple(local_write.get("errors", ()))
+        or total_bytes != process_count * probe_bytes
+        or per_process_bytes != (probe_bytes,) * process_count
+        or len(per_process_seconds) != process_count
+        or any(not math.isfinite(item) or item <= 0.0 for item in per_process_seconds)
+        or not math.isfinite(elapsed)
+        or elapsed <= 0.0
+        or not math.isclose(elapsed, max(per_process_seconds), rel_tol=1e-12)
+        or not math.isfinite(rate)
+        or not math.isclose(rate, total_bytes / elapsed, rel_tol=1e-12)
+        or rate < minimum_rate
+        or control.get("directory") != str(expected_control_directory.resolve())
+        or tuple(local.get("directories", ()))
+        != tuple(str(Path(item).expanduser().resolve()) for item in expected_local_directories)
+        or gcs.get("prefix") != expected_object_prefix.rstrip("/")
+    ):
+        raise RuntimeError("historical activation storage proof failed its v6 gates")
+    return claimed
 
 
 def _read_storage_attestation_payload(root: Path) -> dict[str, Any]:
@@ -389,6 +532,237 @@ def _load_storage_attestation(
     )
 
 
+def _load_activation_producer_attestation_payload(
+    root: Path, config: Gemma4Config
+) -> dict[str, Any]:
+    """Validate the immutable capture-side attestation as producer evidence."""
+
+    payload = _read_storage_attestation_payload(root)
+    producer_environment = str(payload.get("environment_sha256", ""))
+    if re.fullmatch(r"[0-9a-f]{64}", producer_environment) is None:
+        raise RuntimeError("activation storage attestation lacks its producer environment")
+    _, process_count = _process_context()
+    try:
+        import jax
+
+        global_device_count = int(jax.device_count())
+    except ImportError:
+        global_device_count = 1
+    _validate_storage_attestation_payload(
+        payload,
+        root=root,
+        config=config,
+        environment_sha256=producer_environment,
+        process_count=process_count,
+        global_device_count=global_device_count,
+        allow_historical_producer=True,
+    )
+    return payload
+
+
+def _read_sae_storage_attestation_payload(
+    root: Path, consumer_environment_sha256: str
+) -> dict[str, Any]:
+    path = _sae_storage_attestation_path(root, consumer_environment_sha256)
+    payload = _coordinator_read_json(path, purpose="SAE storage attestation")
+    if not isinstance(payload, dict):
+        raise RuntimeError("SAE storage attestation must be an object")
+    return payload
+
+
+def _sae_storage_layout(
+    activation_payload: Mapping[str, Any], sae_payload: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Resolve producer GCS roots and this consumer's qualified cache."""
+
+    process_index, process_count = _process_context()
+    layout = sae_payload.get("layout")
+    activation_metadata = activation_payload.get("metadata")
+    if not isinstance(layout, Mapping) or not isinstance(activation_metadata, Mapping):
+        raise RuntimeError("SAE storage layout is malformed")
+    directories = layout.get("cache_directories")
+    if not isinstance(directories, list) or len(directories) != process_count:
+        raise RuntimeError("SAE cache layout no longer matches process topology")
+    bulk = str(activation_metadata.get("bulk_gcs_root", "")).rstrip("/")
+    checkpoint = str(activation_metadata.get("sae_checkpoint_root", "")).rstrip("/")
+    if (
+        layout.get("bulk_gcs_root") != bulk
+        or layout.get("sae_checkpoint_root") != checkpoint
+    ):
+        raise RuntimeError("SAE and activation storage roots disagree")
+    return {
+        "capture_cache_root": Path(directories[process_index]).expanduser().resolve(),
+        "capture_cache_max_bytes": int(layout["cache_max_bytes"]),
+        "bulk_gcs_root": bulk,
+        "sae_checkpoint_root": checkpoint,
+        "activation_storage_attestation_sha256": str(
+            activation_payload["attestation_sha256"]
+        ),
+        "sae_storage_attestation_sha256": str(sae_payload["attestation_sha256"]),
+    }
+
+
+def _load_sae_storage_bundle(
+    root: Path,
+    config: Gemma4Config,
+    *,
+    environment: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Require both immutable storage records and recompute compatibility."""
+
+    from moe_sae.compatibility import validate_capture_compatibility
+    from moe_sae.sae_storage import (
+        validate_local_sae_cache_residency,
+        validate_sae_storage_assignments,
+        validate_sae_storage_attestation,
+    )
+
+    current_environment = dict(environment or _coordinated_environment())
+    activation: dict[str, Any] | None = None
+    process_index, process_count = _process_context()
+    local_device_count = 0
+    global_device_count = 0
+    activation_error: str | None = None
+    try:
+        activation = _load_activation_producer_attestation_payload(root, config)
+        import jax
+
+        local_device_count = int(jax.local_device_count())
+        global_device_count = int(jax.device_count())
+        if (process_count, local_device_count, global_device_count) != (4, 4, 16):
+            raise RuntimeError(
+                "SAE production requires topology process/local/global=4/4/16"
+            )
+    except Exception as error:
+        activation_error = f"{type(error).__name__}: {error}"
+    _collective_raise_if_any(
+        activation_error, purpose="SAE activation producer validation"
+    )
+    assert activation is not None
+
+    sae_value = _coordinator_read_json(
+        _sae_storage_attestation_path(
+            root, str(current_environment.get("sha256", ""))
+        ),
+        purpose="SAE storage attestation for this consumer environment",
+    )
+    if not isinstance(sae_value, dict):
+        raise RuntimeError("SAE storage attestation must be an object")
+    sae = sae_value
+
+    train_manifest: dict[str, Any] | None = None
+    eval_manifest: dict[str, Any] | None = None
+    producer_environment_sha256 = ""
+    checkpoint_sha256 = ""
+    conversion_sha256 = ""
+    evidence_error: str | None = None
+    try:
+        validate_sae_storage_attestation(
+            sae,
+            expected_config_sha256=config.config_hash,
+            expected_activation_storage_attestation_sha256=str(
+                activation["attestation_sha256"]
+            ),
+            expected_consumer_environment_sha256=str(
+                current_environment.get("sha256", "")
+            ),
+            expected_process_count=process_count,
+            expected_local_device_count=local_device_count,
+            expected_global_device_count=global_device_count,
+        )
+        train_manifest = load_manifest(_capture_root(root, "train"))
+        eval_manifest = load_manifest(_capture_root(root, "eval"))
+        validate_sae_storage_assignments(sae, (train_manifest, eval_manifest))
+        validate_local_sae_cache_residency(
+            sae,
+            (train_manifest, eval_manifest),
+            process_index=process_index,
+        )
+        producer_environment_sha256 = str(
+            train_manifest["metadata"].get("environment_sha256", "")
+        )
+        sae_producer = sae.get("producer")
+        if (
+            eval_manifest["metadata"].get("environment_sha256")
+            != producer_environment_sha256
+            or activation.get("environment_sha256")
+            != producer_environment_sha256
+            or not isinstance(sae_producer, Mapping)
+            or sae_producer.get("environment_sha256")
+            != producer_environment_sha256
+        ):
+            raise RuntimeError("capture producer environment identity changed")
+        checkpoint_sha256 = str(
+            train_manifest["metadata"].get("checkpoint_sha256", "")
+        )
+        if eval_manifest["metadata"].get("checkpoint_sha256") != checkpoint_sha256:
+            raise RuntimeError("train/eval captures use different model checkpoints")
+        conversion_sha256 = _load_conversion_attestation(
+            root, config, checkpoint_sha256
+        )
+    except Exception as error:
+        evidence_error = f"{type(error).__name__}: {error}"
+    _collective_raise_if_any(
+        evidence_error, purpose="SAE storage and capture evidence validation"
+    )
+    assert train_manifest is not None
+    assert eval_manifest is not None
+
+    benchmark_value = _coordinator_read_json(
+        root / "benchmark" / "selected.json",
+        purpose="capture-producer benchmark identity",
+    )
+    if not isinstance(benchmark_value, dict):
+        raise RuntimeError("capture-producer benchmark identity is malformed")
+    benchmark = benchmark_value
+
+    compatibility: Mapping[str, Any] | None = None
+    layout: dict[str, Any] | None = None
+    compatibility_error: str | None = None
+    try:
+        compatibility = sae.get("capture_compatibility")
+        if not isinstance(compatibility, Mapping):
+            raise RuntimeError("SAE storage attestation lacks capture compatibility")
+        validate_capture_compatibility(
+            compatibility,
+            repo_root=REPO_ROOT,
+            config_sha256=config.config_hash,
+            model_id=config.model_id,
+            maxtext_commit=config.maxtext_commit,
+            checkpoint_sha256=checkpoint_sha256,
+            conversion_attestation_sha256=conversion_sha256,
+            activation_storage_attestation_sha256=str(
+                activation["attestation_sha256"]
+            ),
+            train_manifest=train_manifest,
+            eval_manifest=eval_manifest,
+            train_tokens=config.train_tokens,
+            eval_tokens=config.eval_tokens,
+            benchmark_record=benchmark,
+            consumer_environment=current_environment,
+        )
+        layout = _sae_storage_layout(activation, sae)
+    except Exception as error:
+        compatibility_error = f"{type(error).__name__}: {error}"
+    _collective_raise_if_any(
+        compatibility_error, purpose="SAE capture compatibility validation"
+    )
+    assert compatibility is not None
+    assert layout is not None
+    return {
+        "activation": activation,
+        "sae": sae,
+        "layout": layout,
+        "compatibility": dict(compatibility),
+        "producer_environment_sha256": producer_environment_sha256,
+        "conversion_attestation_sha256": conversion_sha256,
+        "consumer_environment": current_environment,
+        "train_manifest": train_manifest,
+        "eval_manifest": eval_manifest,
+        "benchmark": benchmark,
+    }
+
+
 def _storage_layout(payload: Mapping[str, Any]) -> dict[str, Any]:
     """Resolve this controller's attested local root and shared GCS roots."""
 
@@ -410,16 +784,13 @@ def _storage_layout(payload: Mapping[str, Any]) -> dict[str, Any]:
 def _require_sae_cache_qualification(payload: Mapping[str, Any]) -> None:
     """Reject activation-only storage evidence on SAE consumer paths."""
 
-    metadata = payload.get("metadata")
     if (
         payload.get("scope") != "sae-training"
-        or not isinstance(metadata, Mapping)
-        or metadata.get("sae_cache_qualified") is not True
+        or payload.get("qualification", {}).get("passed") is not True
     ):
         raise RuntimeError(
-            "storage attestation is scoped to activation-capture only; "
-            "SAE training/evaluation requires a separate cache qualification "
-            "or streaming-cache redesign"
+            "activation storage cannot authorize SAE consumers; require the "
+            "separate immutable preflight/sae-storage/<consumer-sha256>.json"
         )
 
 
@@ -467,11 +838,22 @@ def _load_conversion_attestation(
     return claimed
 
 
+class _QualifiedCacheRefillForbidden:
+    """Sentinel store proving resident-only consumers cannot reach GCS."""
+
+    def download(self, *_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError(
+            "qualified SAE cache refill is forbidden; stop and requalify"
+        )
+
+
 def _sealed_dataset(
     root: Path,
     *,
     cache_root: Path | None = None,
     cache_max_bytes: int | None = None,
+    require_resident_cache: bool = False,
+    sealed_manifest: Mapping[str, Any] | None = None,
 ) -> ArtifactDataset:
     """Open a sealed capture and hash each shard as the consumer reads it.
 
@@ -482,7 +864,9 @@ def _sealed_dataset(
     the coordinator validates before sealing.
     """
 
-    manifest = load_manifest(root)
+    manifest = (
+        load_manifest(root) if sealed_manifest is None else dict(sealed_manifest)
+    )
     remote = any("object" in entry for entry in manifest["shards"])
     cache = None
     if remote:
@@ -491,14 +875,23 @@ def _sealed_dataset(
         if cache_root is not None and cache_max_bytes is not None:
             cache = ShardCache(
                 cache_root,
-                GCSObjectStore(),
+                (
+                    _QualifiedCacheRefillForbidden()
+                    if require_resident_cache
+                    else GCSObjectStore(
+                        parallel_download_workers=16,
+                        parallel_download_chunk_bytes=16 * 1024**2,
+                    )
+                ),
                 max_bytes=cache_max_bytes,
+                resident_only=require_resident_cache,
             )
     return ArtifactDataset(
         root,
         verify_hashes=True,
         verify_statistics=False,
         cache=cache,
+        manifest=manifest,
     )
 
 
@@ -512,14 +905,217 @@ def _prefetch_process_partition(
     end = (total_tokens * (process_index + 1)) // process_count
     _global_barrier(f"gemma4-{label}-prefetch-start")
     started = time.perf_counter()
-    result = dataset.prefetch_token_range(start, end)
-    elapsed = _global_max_seconds(time.perf_counter() - started)
+    result: dict[str, int] | None = None
+    local_error: str | None = None
+    try:
+        result = dataset.prefetch_token_range(start, end)
+    except Exception as error:
+        local_error = f"{type(error).__name__}: {error}"
+    local_elapsed = time.perf_counter() - started
+    _collective_raise_if_any(
+        local_error, purpose=f"{label} qualified-cache prefetch"
+    )
+    assert result is not None
+    elapsed = _global_max_seconds(local_elapsed)
     _global_barrier(f"gemma4-{label}-prefetch-complete")
     return result, elapsed
 
 
 def _run_root(root: Path, condition: str, seed: int) -> Path:
+    """Legacy CPU-reference path; authoritative runs use ``SAEOperationPaths``."""
+
     return root / "training" / condition / f"seed-{seed}"
+
+
+def _training_metrics_journal_path(
+    run_root: Path,
+    run_instance_id: str,
+    *,
+    operation_paths: SAEOperationPaths | None = None,
+    condition: str | None = None,
+    seed: int | None = None,
+) -> Path:
+    """Return the caller-owned journal path for one immutable run identity."""
+
+    if re.fullmatch(r"[0-9a-f]{32}", run_instance_id) is None:
+        raise ValueError("invalid run instance ID for metrics journal")
+    if operation_paths is not None:
+        if condition is None or seed is None:
+            raise ValueError("authoritative journal requires condition and seed")
+        expected_root = operation_paths.run_root(condition, seed)
+        if run_root.resolve() != expected_root:
+            raise ValueError("authoritative journal run root is outside its operation")
+        # The path is stable within an operation, while JournalIdentity binds
+        # every row to the immutable run-instance ID and rejects a collision.
+        return operation_paths.metrics_path(condition, seed)
+    return run_root / "journals" / f"{run_instance_id}.jsonl"
+
+
+def _operation_paths_for_command(
+    args: argparse.Namespace,
+    root: Path,
+    *,
+    authoritative: bool,
+) -> SAEOperationPaths | None:
+    """Select an immutable operation namespace or the legacy reference tree."""
+
+    operation_sha256 = getattr(args, "operation_sha256", None)
+    if authoritative:
+        if operation_sha256 is None:
+            raise RuntimeError(
+                "authoritative SAE commands require --operation-sha256"
+            )
+        return SAEOperationPaths(root, operation_sha256)
+    if operation_sha256 is not None:
+        raise RuntimeError(
+            "--operation-sha256 is reserved for authoritative TPU artifacts; "
+            "reference runs remain in the non-authoritative legacy namespace"
+        )
+    return None
+
+
+def _performance_waiver_sha256(benchmark: Mapping[str, Any]) -> str | None:
+    waiver = benchmark.get("performance_waiver")
+    if not isinstance(waiver, Mapping):
+        return None
+    value = waiver.get("waiver_sha256")
+    return str(value) if value is not None else None
+
+
+def _validate_sae_operation(
+    operation_paths: SAEOperationPaths,
+    *,
+    config: Gemma4Config,
+    environment: Mapping[str, Any],
+    storage_bundle: Mapping[str, Any],
+    canary_gate: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Attach to and validate the pre-created immutable SAE operation.
+
+    This consumer never constructs an operation spec.  It accepts only a
+    self-validating ``SAEControl`` state whose digest is the requested
+    operation and whose identities match the evidence already validated by
+    the command.
+    """
+
+    state = SAEControl(
+        operation_paths.artifact_root, operation_paths.operation_sha256
+    ).load_state()
+    spec = state.get("spec")
+    if not isinstance(spec, Mapping):
+        raise RuntimeError("SAE operation state lacks its immutable spec")
+    repository_sha256 = environment.get("repository_content_sha256")
+    if not isinstance(repository_sha256, str) or re.fullmatch(
+        r"[0-9a-f]{64}", repository_sha256
+    ) is None:
+        raise RuntimeError("consumer environment lacks repository content identity")
+    train_manifest = storage_bundle.get("train_manifest")
+    eval_manifest = storage_bundle.get("eval_manifest")
+    activation = storage_bundle.get("activation")
+    sae = storage_bundle.get("sae")
+    compatibility = storage_bundle.get("compatibility")
+    layout = storage_bundle.get("layout")
+    benchmark = storage_bundle.get("benchmark")
+    if not all(
+        isinstance(value, Mapping)
+        for value in (
+            train_manifest,
+            eval_manifest,
+            activation,
+            sae,
+            compatibility,
+            layout,
+            benchmark,
+        )
+    ):
+        raise RuntimeError("SAE storage bundle cannot validate operation identity")
+    smoke_campaign_sha256, smoke_suite_sha256 = (
+        _validated_operation_smoke_hashes(
+            operation_paths.artifact_root,
+            config,
+            environment,
+            storage_bundle,
+            spec,
+        )
+    )
+    expected = {
+        "config_sha256": config.config_hash,
+        "repository_content_sha256": repository_sha256,
+        "consumer_environment_sha256": environment.get("sha256"),
+        "train_capture_manifest_sha256": train_manifest.get("manifest_sha256"),
+        "eval_capture_manifest_sha256": eval_manifest.get("manifest_sha256"),
+        "activation_storage_attestation_sha256": activation.get(
+            "attestation_sha256"
+        ),
+        "sae_storage_attestation_sha256": sae.get("attestation_sha256"),
+        "capture_compatibility_sha256": compatibility.get(
+            "compatibility_sha256"
+        ),
+        "smoke_campaign_sha256": smoke_campaign_sha256,
+        "smoke_suite_sha256": smoke_suite_sha256,
+        "checkpoint_payload_root": layout.get("sae_checkpoint_root"),
+        "canary_waiver_sha256": canary_gate.get("waiver_sha256"),
+        "sealed_recovery_waiver_sha256": canary_gate.get(
+            "recovery_waiver_sha256"
+        ),
+        "performance_waiver_sha256": _performance_waiver_sha256(benchmark),
+    }
+    mismatches = sorted(
+        name for name, value in expected.items() if spec.get(name) != value
+    )
+    if mismatches:
+        raise RuntimeError(
+            "SAE operation spec disagrees with validated consumer evidence: "
+            + ", ".join(mismatches)
+        )
+    return state
+
+
+def _coordinated_training_journal_snapshot(
+    record: Mapping[str, Any], config: Gemma4Config
+) -> dict[str, Any]:
+    """Re-read and validate authoritative journal bytes on the coordinator."""
+
+    process_index, _ = _process_context()
+    source: bytes | None = None
+    local_error: str | None = None
+    if process_index == 0:
+        try:
+            declared = record.get("metrics_journal")
+            if not isinstance(declared, Mapping):
+                raise RuntimeError("run metadata lacks its metrics journal binding")
+            identity = JournalIdentity(
+                run_instance_id=str(record["run_instance_id"]),
+                condition=str(record["condition"]),
+                seed=int(record["seed"]),
+            )
+            journal = MetricsJournal(str(declared["path"]), identity)
+            snapshot = training_journal_snapshot(
+                journal,
+                total_tokens=config.train_tokens,
+                effective_batch_tokens=config.effective_batch_tokens,
+                expected_l0=config.topk_features,
+            )
+            source = _canonical_coordinator_json(snapshot).encode("utf-8")
+            if len(source) > _COORDINATOR_BROADCAST_MAX_BYTES:
+                raise RuntimeError("metrics journal snapshot exceeds broadcast bound")
+        except Exception as error:
+            local_error = f"{type(error).__name__}: {error}"
+    _collective_raise_if_any(
+        local_error, purpose="validate authoritative training metrics journal"
+    )
+    shared = _broadcast_coordinator_bytes(
+        source, purpose="authoritative training metrics journal snapshot"
+    )
+    if shared is None:
+        raise RuntimeError("coordinator did not provide a metrics journal snapshot")
+    try:
+        value = json.loads(shared.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeError("metrics journal snapshot broadcast is invalid") from error
+    if not isinstance(value, dict):
+        raise RuntimeError("metrics journal snapshot is not an object")
+    return value
 
 
 def _run_identity_expected(
@@ -527,21 +1123,35 @@ def _run_identity_expected(
     *,
     capture_manifest_sha256: str,
     capture_checkpoint_sha256: str,
-    environment_sha256: str,
+    producer_environment_sha256: str,
+    consumer_environment_sha256: str,
     condition: str,
     seed: int,
-    storage_attestation_sha256: str | None = None,
+    activation_storage_attestation_sha256: str | None = None,
+    sae_storage_attestation_sha256: str | None = None,
+    capture_compatibility_sha256: str | None = None,
+    canary_waiver_sha256: str | None = None,
+    sealed_recovery_waiver_sha256: str | None = None,
     checkpoint_payload_root: str | None = None,
+    operation_sha256: str | None = None,
 ) -> dict[str, Any]:
     return {
-        "schema_version": "gemma4-sae-run-identity-v1",
+        "schema_version": "gemma4-sae-run-identity-v3",
+        "operation_sha256": operation_sha256,
         "config_sha256": config.config_hash,
         "capture_manifest_sha256": capture_manifest_sha256,
         "capture_checkpoint_sha256": capture_checkpoint_sha256,
-        "environment_sha256": environment_sha256,
+        "capture_producer_environment_sha256": producer_environment_sha256,
+        "sae_consumer_environment_sha256": consumer_environment_sha256,
         "condition": condition,
         "seed": seed,
-        "storage_attestation_sha256": storage_attestation_sha256,
+        "activation_storage_attestation_sha256": (
+            activation_storage_attestation_sha256
+        ),
+        "sae_storage_attestation_sha256": sae_storage_attestation_sha256,
+        "capture_compatibility_sha256": capture_compatibility_sha256,
+        "canary_waiver_sha256": canary_waiver_sha256,
+        "sealed_recovery_waiver_sha256": sealed_recovery_waiver_sha256,
         "checkpoint_payload_root": checkpoint_payload_root,
     }
 
@@ -551,12 +1161,18 @@ def _checkpoint_identity_expected(
     *,
     capture_manifest_sha256: str,
     capture_checkpoint_sha256: str,
-    environment_sha256: str,
+    producer_environment_sha256: str,
+    consumer_environment_sha256: str,
     condition: str,
     seed: int,
     run_instance_id: str,
-    storage_attestation_sha256: str | None,
+    activation_storage_attestation_sha256: str | None,
+    sae_storage_attestation_sha256: str | None,
+    capture_compatibility_sha256: str | None,
+    canary_waiver_sha256: str | None,
+    sealed_recovery_waiver_sha256: str | None,
     checkpoint_payload_root: str | None,
+    operation_sha256: str | None,
 ) -> dict[str, Any]:
     """Build the exact immutable identity shared by save and restore."""
 
@@ -564,11 +1180,19 @@ def _checkpoint_identity_expected(
         config,
         capture_manifest_sha256=capture_manifest_sha256,
         capture_checkpoint_sha256=capture_checkpoint_sha256,
-        environment_sha256=environment_sha256,
+        producer_environment_sha256=producer_environment_sha256,
+        consumer_environment_sha256=consumer_environment_sha256,
         condition=condition,
         seed=seed,
-        storage_attestation_sha256=storage_attestation_sha256,
+        activation_storage_attestation_sha256=(
+            activation_storage_attestation_sha256
+        ),
+        sae_storage_attestation_sha256=sae_storage_attestation_sha256,
+        capture_compatibility_sha256=capture_compatibility_sha256,
+        canary_waiver_sha256=canary_waiver_sha256,
+        sealed_recovery_waiver_sha256=sealed_recovery_waiver_sha256,
         checkpoint_payload_root=checkpoint_payload_root,
+        operation_sha256=operation_sha256,
     )
     identity.pop("schema_version")
     identity["run_instance_id"] = run_instance_id
@@ -576,10 +1200,15 @@ def _checkpoint_identity_expected(
 
 
 def _load_run_identity(path: Path, expected: dict[str, Any]) -> str:
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise RuntimeError(f"cannot read immutable run identity: {path}") from error
+    payload = _coordinator_read_json(path, purpose="immutable SAE run identity")
+    if not isinstance(payload, Mapping):
+        raise RuntimeError(f"immutable run identity is not an object: {path}")
+    return _validate_run_identity_payload(payload, path, expected)
+
+
+def _validate_run_identity_payload(
+    payload: Mapping[str, Any], path: Path, expected: Mapping[str, Any]
+) -> str:
     if any(payload.get(name) != value for name, value in expected.items()):
         raise RuntimeError(f"run identity belongs to another experiment: {path}")
     run_instance_id = str(payload.get("run_instance_id", ""))
@@ -589,7 +1218,41 @@ def _load_run_identity(path: Path, expected: dict[str, Any]) -> str:
 
 
 def _evaluation_path(root: Path, condition: str, seed: int) -> Path:
+    """Legacy CPU-reference path; authoritative evaluations are operation-scoped."""
+
     return root / "evaluations" / f"{condition}-seed-{seed}.json"
+
+
+def _consumer_canary_gate(
+    root: Path,
+    *,
+    train_manifest: Mapping[str, Any],
+    benchmark_record: Mapping[str, Any],
+) -> dict[str, Any]:
+    from moe_sae.canary_gate import validate_canary_gate
+
+    path = root / "harvest" / "train.json"
+    campaign = _coordinator_read_json(
+        path, purpose="truthful production canary outcome"
+    )
+    if not isinstance(campaign, dict):
+        raise RuntimeError("production train campaign must be an object")
+    result: dict[str, Any] | None = None
+    local_error: str | None = None
+    try:
+        result = validate_canary_gate(
+            root,
+            train_manifest=train_manifest,
+            production_campaign=campaign,
+            selected_benchmark=benchmark_record,
+        )
+    except Exception as error:
+        local_error = f"{type(error).__name__}: {error}"
+    _collective_raise_if_any(
+        local_error, purpose="canary waiver and sealed recovery validation"
+    )
+    assert result is not None
+    return result
 
 
 def _sae_config(config: Gemma4Config, condition: str) -> Any:
@@ -729,7 +1392,6 @@ def _production_a_capacity(
     total_tokens: int | None = None,
 ) -> tuple[int, float]:
     import jax
-    from jax.experimental import multihost_utils
     from moe_sae.distributed import precompute_distributed_a_capacity
 
     token_count = config.train_tokens if total_tokens is None else total_tokens
@@ -741,10 +1403,28 @@ def _production_a_capacity(
         scope,
         token_count,
     )
-    path = root / "routing" / f"a_capacity-{scope}-seed-{training_config.seed}.json"
-    if path.exists():
-        cached = json.loads(path.read_text(encoding="utf-8"))
-        if cached.get("identity") != identity:
+    identity_sha256 = hashlib.sha256(
+        _canonical_coordinator_json(identity).encode("utf-8")
+    ).hexdigest()
+    path = (
+        root
+        / "routing"
+        / (
+            f"a_capacity-{scope}-seed-{training_config.seed}-"
+            f"{identity_sha256}.json"
+        )
+    )
+    cached = _coordinator_read_json_if_exists(
+        path, purpose=f"condition-A {scope} capacity cache"
+    )
+    if cached is not None:
+        if not isinstance(cached, Mapping):
+            raise RuntimeError("cached A capacity is not an object")
+        if (
+            cached.get("schema_version") != "gemma4-a-capacity-cache-v2"
+            or cached.get("identity_sha256") != identity_sha256
+            or cached.get("identity") != identity
+        ):
             raise RuntimeError(
                 "cached A capacity does not match this capture/config/mesh"
             )
@@ -757,23 +1437,31 @@ def _production_a_capacity(
         return capacity, wall_seconds
 
     started = time.perf_counter()
-    capacity = precompute_distributed_a_capacity(
-        dataset, training_config, total_tokens=token_count
-    )
-    wall_seconds = _global_max_seconds(time.perf_counter() - started)
-    if jax.process_index() == 0:
-        atomic_write_json(
-            path,
-            {
-                "identity": identity,
-                "capacity": capacity,
-                "precompute_wall_seconds": wall_seconds,
-            },
+    capacity: int | None = None
+    capacity_error: str | None = None
+    try:
+        capacity = precompute_distributed_a_capacity(
+            dataset, training_config, total_tokens=token_count
         )
-    if jax.process_count() > 1:
-        multihost_utils.sync_global_devices("gemma4-a-capacity-published")
-    if not path.exists():
-        raise RuntimeError("A capacity cache is not visible on every process")
+    except Exception as error:
+        capacity_error = f"{type(error).__name__}: {error}"
+    _collective_raise_if_any(
+        capacity_error,
+        purpose=f"condition-A {scope} capacity precomputation",
+    )
+    assert capacity is not None
+    wall_seconds = _global_max_seconds(time.perf_counter() - started)
+    _coordinator_write_json(
+        path,
+        {
+            "schema_version": "gemma4-a-capacity-cache-v2",
+            "identity_sha256": identity_sha256,
+            "identity": identity,
+            "capacity": capacity,
+            "precompute_wall_seconds": wall_seconds,
+        },
+        barrier=f"gemma4-a-capacity-{scope}-{training_config.seed}-published",
+    )
     return capacity, wall_seconds
 
 
@@ -921,7 +1609,14 @@ def _coordinated_sha256(digest: str, *, purpose: str) -> str:
 def _coordinated_environment() -> dict[str, Any]:
     """Require identical source/package/device provenance on every controller."""
 
-    value = environment_fingerprint(REPO_ROOT)
+    value: dict[str, Any] | None = None
+    local_error: str | None = None
+    try:
+        value = environment_fingerprint(REPO_ROOT)
+    except Exception as error:
+        local_error = f"{type(error).__name__}: {error}"
+    _collective_raise_if_any(local_error, purpose="environment fingerprint")
+    assert value is not None
     value["sha256"] = _coordinated_sha256(
         str(value.get("sha256", "")), purpose="environment fingerprint"
     )
@@ -1019,6 +1714,147 @@ def _global_max_seconds(value: float) -> float:
 
     gathered = multihost_utils.process_allgather(np.asarray(value, np.float64))
     return float(np.max(np.asarray(gathered)))
+
+
+def _collective_raise_if_any(local_error: str | None, *, purpose: str) -> None:
+    """Give every controller one bounded success/failure decision before raising."""
+
+    process_index, process_count = _process_context()
+    message = "" if local_error is None else str(local_error)
+    if process_count == 1:
+        if message:
+            raise RuntimeError(f"{purpose} failed: {message}")
+        return
+    from jax.experimental import multihost_utils
+
+    encoded = message.encode("utf-8", errors="replace")[:_COLLECTIVE_ERROR_BYTES]
+    row = np.zeros((4 + _COLLECTIVE_ERROR_BYTES,), dtype=np.uint8)
+    row[:4] = np.frombuffer(len(encoded).to_bytes(4, "big"), dtype=np.uint8)
+    if encoded:
+        row[4 : 4 + len(encoded)] = np.frombuffer(encoded, dtype=np.uint8)
+    gathered = np.asarray(
+        multihost_utils.process_allgather(row, tiled=False), dtype=np.uint8
+    ).reshape(process_count, -1)
+    failures: list[str] = []
+    for index, value in enumerate(gathered):
+        length = int.from_bytes(value[:4].tobytes(), "big")
+        if not 0 <= length <= _COLLECTIVE_ERROR_BYTES:
+            failures.append(f"process {index}: invalid collective error record")
+        elif length:
+            failures.append(
+                f"process {index}: "
+                + value[4 : 4 + length].tobytes().decode(
+                    "utf-8", errors="replace"
+                )
+            )
+    if failures:
+        raise RuntimeError(f"{purpose} failed collectively: " + "; ".join(failures))
+
+
+def _broadcast_coordinator_bytes(
+    source: bytes | None, *, purpose: str
+) -> bytes | None:
+    """Broadcast one bounded coordinator value after a collective error gate."""
+
+    process_index, process_count = _process_context()
+    if process_count == 1:
+        return source
+    from jax.experimental import multihost_utils
+
+    if process_index == 0:
+        length = -1 if source is None else len(source)
+    else:
+        length = -2
+    shared_length = np.asarray(
+        multihost_utils.broadcast_one_to_all(
+            np.asarray([length], dtype=np.int32), is_source=process_index == 0
+        ),
+        dtype=np.int32,
+    )
+    if shared_length.shape != (1,):
+        raise RuntimeError(f"{purpose} length broadcast is invalid")
+    length = int(shared_length[0])
+    if length == -1:
+        return None
+    if not 0 <= length <= _COORDINATOR_BROADCAST_MAX_BYTES:
+        raise RuntimeError(f"{purpose} exceeds the bounded broadcast size")
+    local = (
+        np.frombuffer(source, dtype=np.uint8).copy()
+        if process_index == 0 and source is not None
+        else np.zeros((length,), dtype=np.uint8)
+    )
+    shared = np.asarray(
+        multihost_utils.broadcast_one_to_all(local, is_source=process_index == 0),
+        dtype=np.uint8,
+    )
+    if shared.shape != (length,):
+        raise RuntimeError(f"{purpose} payload broadcast is invalid")
+    return shared.tobytes()
+
+
+def _coordinator_read_json_if_exists(
+    path: Path, *, purpose: str
+) -> Any | None:
+    """Choose a shared-file branch on process zero and broadcast exact JSON."""
+
+    process_index, process_count = _process_context()
+    if process_count == 1:
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except (OSError, json.JSONDecodeError) as error:
+            raise RuntimeError(f"cannot read {purpose}: {path}") from error
+
+    source: bytes | None = None
+    local_error: str | None = None
+    if process_index == 0:
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            source = None
+        except OSError as error:
+            local_error = f"{type(error).__name__}: {error}"
+        else:
+            try:
+                value = json.loads(raw)
+                source = _canonical_coordinator_json(value).encode("utf-8")
+                if len(source) > _COORDINATOR_BROADCAST_MAX_BYTES:
+                    raise ValueError("JSON exceeds the bounded broadcast size")
+            except (json.JSONDecodeError, TypeError, ValueError) as error:
+                local_error = f"{type(error).__name__}: {error}"
+    _collective_raise_if_any(local_error, purpose=f"read {purpose}")
+    shared = _broadcast_coordinator_bytes(source, purpose=purpose)
+    if shared is None:
+        return None
+    try:
+        return json.loads(shared.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        # Every process received the identical bytes, so this deterministic
+        # failure cannot split the subsequent collective schedule.
+        raise RuntimeError(f"coordinator broadcast invalid {purpose}") from error
+
+
+def _coordinator_read_json(path: Path, *, purpose: str) -> Any:
+    value = _coordinator_read_json_if_exists(path, purpose=purpose)
+    if value is None:
+        raise RuntimeError(f"missing {purpose}: {path}")
+    return value
+
+
+def _coordinator_created_at_utc() -> str:
+    """Generate one attestation timestamp on process zero and broadcast it."""
+
+    process_index, _ = _process_context()
+    source = (
+        datetime.now(timezone.utc).isoformat().encode("ascii")
+        if process_index == 0
+        else None
+    )
+    shared = _broadcast_coordinator_bytes(source, purpose="attestation timestamp")
+    if shared is None:
+        raise RuntimeError("coordinator did not provide an attestation timestamp")
+    return shared.decode("ascii")
 
 
 def _aggregate_benchmark_observation(
@@ -1190,15 +2026,113 @@ def _coordinator_write_json(
     """Publish shared JSON and make every controller validate its exact value."""
 
     process_index, _ = _process_context()
+    local_error: str | None = None
     if process_index == 0:
-        atomic_write_json(path, payload)
+        try:
+            atomic_write_json(path, payload)
+        except Exception as error:
+            local_error = f"{type(error).__name__}: {error}"
+    _collective_raise_if_any(
+        local_error, purpose=f"coordinator publication {path}"
+    )
     _global_barrier(barrier)
-    _wait_for_coordinator_json(
-        path,
-        payload,
-        coordinator_owned_fields=(
-            coordinator_owned_fields if process_index != 0 else ()
-        ),
+    visibility_error: str | None = None
+    try:
+        _wait_for_coordinator_json(
+            path,
+            payload,
+            coordinator_owned_fields=(
+                coordinator_owned_fields if process_index != 0 else ()
+            ),
+        )
+    except Exception as error:
+        visibility_error = f"{type(error).__name__}: {error}"
+    _collective_raise_if_any(
+        visibility_error, purpose=f"coordinator publication visibility {path}"
+    )
+    return process_index == 0
+
+
+def _coordinator_publish_immutable_json(
+    path: Path, payload: Mapping[str, Any], *, barrier: str
+) -> bool:
+    """Create JSON once, accepting only an exact-byte idempotent retry."""
+
+    process_index, _ = _process_context()
+    local_error: str | None = None
+    if process_index == 0:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            encoded = (
+                json.dumps(
+                    payload,
+                    indent=2,
+                    sort_keys=True,
+                    ensure_ascii=True,
+                    allow_nan=False,
+                )
+                + "\n"
+            ).encode("utf-8")
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=f".{path.name}.", suffix=".unpublished", dir=path.parent
+            )
+            temporary = Path(temporary_name)
+            with os.fdopen(descriptor, "wb") as handle:
+                os.fchmod(handle.fileno(), 0o644)
+                handle.write(encoded)
+                handle.flush()
+                os.fsync(handle.fileno())
+            # Hard-linking is the portable POSIX no-replace commit: the final
+            # name can never expose the earlier streaming write and can never
+            # overwrite a racing immutable attestation.
+            try:
+                os.link(temporary, path)
+            except FileExistsError:
+                flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                existing_descriptor = os.open(path, flags)
+                try:
+                    existing_stat = os.fstat(existing_descriptor)
+                    if not stat.S_ISREG(existing_stat.st_mode):
+                        raise RuntimeError(
+                            "existing immutable publication is not a regular file"
+                        )
+                    chunks: list[bytes] = []
+                    while True:
+                        chunk = os.read(existing_descriptor, 1024 * 1024)
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                finally:
+                    os.close(existing_descriptor)
+                if b"".join(chunks) != encoded:
+                    raise RuntimeError(
+                        "existing immutable publication conflicts with retry"
+                    )
+            temporary.unlink()
+            directory = os.open(
+                path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            )
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        except Exception as error:
+            # Preserve a fully or partially written private temporary as local
+            # failure evidence. The immutable final name is either absent or a
+            # complete inode; it is never unlinked or replaced here.
+            local_error = f"{type(error).__name__}: {error}"
+    _collective_raise_if_any(
+        local_error, purpose=f"immutable coordinator publication {path}"
+    )
+    _global_barrier(barrier)
+    visibility_error: str | None = None
+    try:
+        _wait_for_coordinator_json(path, payload)
+    except Exception as error:
+        visibility_error = f"{type(error).__name__}: {error}"
+    _collective_raise_if_any(
+        visibility_error,
+        purpose=f"immutable coordinator publication visibility {path}",
     )
     return process_index == 0
 
@@ -1375,6 +2309,194 @@ def _command_qualify_storage(args: argparse.Namespace) -> int:
         payload,
         barrier="gemma4-storage-qualification-attested",
         coordinator_owned_fields=("created_at_utc", "attestation_sha256"),
+    )
+    if coordinator:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    return 0
+
+
+def _command_qualify_sae_storage(args: argparse.Namespace) -> int:
+    """Qualify each host's exact 100 GiB train+eval consumer cache."""
+
+    from moe_sae.compatibility import build_capture_compatibility
+    from moe_sae.sae_storage import (
+        DEFAULT_STREAMING_CACHE_MAX_BYTES,
+        build_sae_storage_attestation,
+        qualify_sae_streaming_cache,
+    )
+    from moe_sae.storage import jax_coordination_hooks
+
+    config = _config(args)
+    config.validate_production()
+    root = _artifact_root(config, args.artifact_root).resolve()
+    _require_production_artifact_root(root)
+    require_v4_32_runtime()
+    current_environment = _coordinated_environment()
+    path = _sae_storage_attestation_path(
+        root, str(current_environment.get("sha256", ""))
+    )
+    existing = _coordinator_read_json_if_exists(
+        path, purpose="immutable SAE storage attestation"
+    )
+    if existing is not None:
+        # An attestation name is immutable.  A safe retry validates and reuses
+        # it instead of redownloading or replacing evidence.
+        bundle: dict[str, Any] | None = None
+        reuse_error: str | None = None
+        try:
+            bundle = _load_sae_storage_bundle(root, config)
+        except Exception as error:
+            reuse_error = f"{type(error).__name__}: {error}"
+        _collective_raise_if_any(
+            reuse_error, purpose="reuse immutable SAE storage attestation"
+        )
+        assert bundle is not None
+        if _process_context()[0] == 0:
+            print(json.dumps(bundle["sae"], indent=2, sort_keys=True))
+        return 0
+    process_index, process_count = _process_context()
+    del process_index
+    import jax
+
+    local_device_count = int(jax.local_device_count())
+    global_device_count = int(jax.device_count())
+    topology_error = (
+        None
+        if (process_count, local_device_count, global_device_count) == (4, 4, 16)
+        else (
+            "SAE storage qualification requires four controllers with four local "
+            "v4 chips each (4x4 mesh)"
+        )
+    )
+    _collective_raise_if_any(
+        topology_error, purpose="SAE storage qualification topology"
+    )
+    activation: dict[str, Any] | None = None
+    activation_layout: dict[str, Any] | None = None
+    train_manifest: dict[str, Any] | None = None
+    eval_manifest: dict[str, Any] | None = None
+    benchmark: dict[str, Any] | None = None
+    compatibility: dict[str, Any] | None = None
+    producer_environment = ""
+    checkpoint_sha256 = ""
+    conversion_sha256 = ""
+    preparation_error: str | None = None
+    try:
+        activation = _load_activation_producer_attestation_payload(root, config)
+        activation_layout = _storage_layout(activation)
+        train_manifest = load_manifest(_capture_root(root, "train"))
+        eval_manifest = load_manifest(_capture_root(root, "eval"))
+        producer_environment = str(
+            train_manifest["metadata"].get("environment_sha256", "")
+        )
+        if (
+            eval_manifest["metadata"].get("environment_sha256")
+            != producer_environment
+            or activation.get("environment_sha256") != producer_environment
+        ):
+            raise RuntimeError("capture and activation attestation producers differ")
+        checkpoint_sha256 = str(
+            train_manifest["metadata"].get("checkpoint_sha256", "")
+        )
+        if eval_manifest["metadata"].get("checkpoint_sha256") != checkpoint_sha256:
+            raise RuntimeError("train/eval captures use different checkpoints")
+        conversion_sha256 = _load_conversion_attestation(
+            root, config, checkpoint_sha256
+        )
+    except Exception as error:
+        preparation_error = f"{type(error).__name__}: {error}"
+    _collective_raise_if_any(
+        preparation_error, purpose="SAE storage qualification input validation"
+    )
+    assert activation is not None
+    assert activation_layout is not None
+    assert train_manifest is not None
+    assert eval_manifest is not None
+
+    benchmark_value = _coordinator_read_json(
+        root / "benchmark" / "selected.json",
+        purpose="producer benchmark for compatibility",
+    )
+    if not isinstance(benchmark_value, dict):
+        # Every controller received the same broadcast value.
+        raise RuntimeError("producer benchmark must be an object")
+    benchmark = benchmark_value
+    compatibility_error: str | None = None
+    try:
+        compatibility = build_capture_compatibility(
+            repo_root=REPO_ROOT,
+            config_sha256=config.config_hash,
+            model_id=config.model_id,
+            maxtext_commit=config.maxtext_commit,
+            checkpoint_sha256=checkpoint_sha256,
+            conversion_attestation_sha256=conversion_sha256,
+            activation_storage_attestation_sha256=str(
+                activation["attestation_sha256"]
+            ),
+            train_manifest=train_manifest,
+            eval_manifest=eval_manifest,
+            train_tokens=config.train_tokens,
+            eval_tokens=config.eval_tokens,
+            benchmark_record=benchmark,
+            consumer_environment=current_environment,
+        )
+    except Exception as error:
+        compatibility_error = f"{type(error).__name__}: {error}"
+    _collective_raise_if_any(
+        compatibility_error, purpose="SAE storage compatibility validation"
+    )
+    assert compatibility is not None
+    cache_root = Path(args.cache_root).expanduser().resolve()
+    qualification = qualify_sae_streaming_cache(
+        cache_root,
+        (train_manifest, eval_manifest),
+        GCSObjectStore(
+            parallel_download_workers=16,
+            parallel_download_chunk_bytes=16 * 1024**2,
+        ),
+        cache_max_bytes=DEFAULT_STREAMING_CACHE_MAX_BYTES,
+        minimum_free_after_bytes=config.min_local_buffer_free_bytes,
+        minimum_aggregate_download_bytes_per_second=(
+            config.min_gcs_download_bytes_per_second
+        ),
+        coordination=jax_coordination_hooks(),
+    )
+    if qualification.get("passed") is not True:
+        raise RuntimeError(
+            "SAE cache qualification failed: "
+            + "; ".join(str(item) for item in qualification.get("failures", ()))
+        )
+    created_at_utc = _coordinator_created_at_utc()
+    payload: dict[str, Any] | None = None
+    payload_error: str | None = None
+    try:
+        payload = build_sae_storage_attestation(
+            qualification,
+            config_sha256=config.config_hash,
+            activation_storage_attestation_sha256=str(
+                activation["attestation_sha256"]
+            ),
+            producer_environment_sha256=producer_environment,
+            consumer_environment=current_environment,
+            global_device_count=global_device_count,
+            local_device_count=local_device_count,
+            bulk_gcs_root=str(activation_layout["bulk_gcs_root"]),
+            sae_checkpoint_root=str(activation_layout["sae_checkpoint_root"]),
+            capture_compatibility=compatibility,
+            created_at_utc=created_at_utc,
+        )
+    except Exception as error:
+        payload_error = f"{type(error).__name__}: {error}"
+    _collective_raise_if_any(
+        payload_error, purpose="build SAE storage attestation"
+    )
+    assert payload is not None
+    _coordinated_sha256(
+        str(payload.get("attestation_sha256", "")),
+        purpose="SAE storage attestation",
+    )
+    coordinator = _coordinator_publish_immutable_json(
+        path, payload, barrier="gemma4-sae-storage-attested"
     )
     if coordinator:
         print(json.dumps(payload, indent=2, sort_keys=True))
@@ -2500,28 +3622,50 @@ def _command_harvest(args: argparse.Namespace) -> int:
 
 def _command_train(args: argparse.Namespace) -> int:
     config = _config(args)
-    if not args.reference:
-        config.validate_production()
-        require_v4_32_runtime()
+    authoritative = not args.reference
     if args.condition not in config.conditions or args.seed not in config.seeds:
         raise ValueError(
             "condition/seed is outside the single experiment configuration"
         )
     root = _artifact_root(config, args.artifact_root)
-    if not args.reference:
+    if authoritative:
         _require_production_artifact_root(root)
+    operation_paths = _operation_paths_for_command(
+        args, root, authoritative=authoritative
+    )
+    if authoritative:
+        config.validate_production()
+        require_v4_32_runtime()
     current_environment = _coordinated_environment()
     if args.reference:
         storage_layout = None
-        storage_attestation_sha256 = None
+        activation_storage_attestation_sha256 = None
+        sae_storage_attestation_sha256 = None
+        capture_compatibility_sha256 = None
         checkpoint_payload_root = None
+        producer_environment_sha256 = current_environment["sha256"]
+        canary_gate = {
+            "status": "reference",
+            "waiver_sha256": None,
+            "recovery_waiver_sha256": None,
+        }
     else:
-        storage_payload = _load_storage_attestation_payload(
+        storage_bundle = _load_sae_storage_bundle(
             root, config, environment=current_environment
         )
-        _require_sae_cache_qualification(storage_payload)
-        storage_layout = _storage_layout(storage_payload)
-        storage_attestation_sha256 = str(storage_payload["attestation_sha256"])
+        storage_layout = storage_bundle["layout"]
+        activation_storage_attestation_sha256 = str(
+            storage_bundle["activation"]["attestation_sha256"]
+        )
+        sae_storage_attestation_sha256 = str(
+            storage_bundle["sae"]["attestation_sha256"]
+        )
+        capture_compatibility_sha256 = str(
+            storage_bundle["compatibility"]["compatibility_sha256"]
+        )
+        producer_environment_sha256 = str(
+            storage_bundle["producer_environment_sha256"]
+        )
         checkpoint_payload_root = str(storage_layout["sae_checkpoint_root"])
     dataset = _sealed_dataset(
         _capture_root(root, "train"),
@@ -2529,7 +3673,13 @@ def _command_train(args: argparse.Namespace) -> int:
             None if storage_layout is None else storage_layout["capture_cache_root"]
         ),
         cache_max_bytes=(
-            None if storage_layout is None else config.capture_cache_max_bytes
+            None
+            if storage_layout is None
+            else storage_layout["capture_cache_max_bytes"]
+        ),
+        require_resident_cache=storage_layout is not None,
+        sealed_manifest=(
+            None if args.reference else storage_bundle["train_manifest"]
         ),
     )
     _require_exact_capture(dataset, config.train_tokens, "training")
@@ -2538,15 +3688,15 @@ def _command_train(args: argparse.Namespace) -> int:
     conversion_attestation_sha256 = (
         None
         if args.reference
-        else _load_conversion_attestation(root, config, capture_checkpoint_sha256)
+        else str(storage_bundle["conversion_attestation_sha256"])
     )
     _require_capture_identity(
         dataset,
         config,
         "train",
         conversion_attestation_sha256=conversion_attestation_sha256,
-        environment_sha256=current_environment["sha256"],
-        storage_attestation_sha256=storage_attestation_sha256,
+        environment_sha256=producer_environment_sha256,
+        storage_attestation_sha256=activation_storage_attestation_sha256,
         object_prefix=(
             None
             if storage_layout is None
@@ -2558,6 +3708,20 @@ def _command_train(args: argparse.Namespace) -> int:
             )
         ),
     )
+    if authoritative:
+        canary_gate = _consumer_canary_gate(
+            root,
+            train_manifest=dataset.manifest,
+            benchmark_record=storage_bundle["benchmark"],
+        )
+        assert operation_paths is not None
+        _validate_sae_operation(
+            operation_paths,
+            config=config,
+            environment=current_environment,
+            storage_bundle=storage_bundle,
+            canary_gate=canary_gate,
+        )
     capture_prefetch = {"objects": 0, "bytes": 0}
     capture_prefetch_wall_seconds = 0.0
     if storage_layout is not None:
@@ -2584,9 +3748,20 @@ def _command_train(args: argparse.Namespace) -> int:
             "authoritative A runs must measure their fixed-order capacity prepass; "
             "--a-capacity is reference-only"
         )
-    run_root = _run_root(root, args.condition, args.seed)
-    run_root.mkdir(parents=True, exist_ok=True)
-    sink = MetricsSink(run_root)
+    run_root = (
+        _run_root(root, args.condition, args.seed)
+        if operation_paths is None
+        else operation_paths.run_root(args.condition, args.seed)
+    )
+    sink: MetricsSink | None = None
+    setup_error: str | None = None
+    try:
+        run_root.mkdir(parents=True, exist_ok=True)
+        sink = MetricsSink(run_root)
+    except Exception as error:
+        setup_error = f"{type(error).__name__}: {error}"
+    _collective_raise_if_any(setup_error, purpose="prepare SAE run control directory")
+    assert sink is not None
     prior: dict[str, Any] = {}
     prior_path = run_root / "run.json"
     identity_path = run_root / "identity.json"
@@ -2594,22 +3769,52 @@ def _command_train(args: argparse.Namespace) -> int:
         config,
         capture_manifest_sha256=capture_manifest_sha256,
         capture_checkpoint_sha256=capture_checkpoint_sha256,
-        environment_sha256=current_environment["sha256"],
+        producer_environment_sha256=producer_environment_sha256,
+        consumer_environment_sha256=current_environment["sha256"],
         condition=args.condition,
         seed=args.seed,
-        storage_attestation_sha256=storage_attestation_sha256,
+        activation_storage_attestation_sha256=(
+            activation_storage_attestation_sha256
+        ),
+        sae_storage_attestation_sha256=sae_storage_attestation_sha256,
+        capture_compatibility_sha256=capture_compatibility_sha256,
+        canary_waiver_sha256=canary_gate.get("waiver_sha256"),
+        sealed_recovery_waiver_sha256=canary_gate.get(
+            "recovery_waiver_sha256"
+        ),
         checkpoint_payload_root=checkpoint_payload_root,
+        operation_sha256=(
+            None if operation_paths is None else operation_paths.operation_sha256
+        ),
     )
-    if prior_path.exists():
-        prior = json.loads(prior_path.read_text(encoding="utf-8"))
+    prior_value = _coordinator_read_json_if_exists(
+        prior_path, purpose=f"SAE run metadata {args.condition}/seed-{args.seed}"
+    )
+    if prior_value is not None:
+        if not isinstance(prior_value, dict):
+            raise RuntimeError("existing SAE run metadata is not an object")
+        prior = prior_value
         if (
             prior.get("config_sha256") != config.config_hash
+            or prior.get("operation_sha256")
+            != (
+                None
+                if operation_paths is None
+                else operation_paths.operation_sha256
+            )
             or prior.get("condition") != args.condition
             or prior.get("seed") != args.seed
             or prior.get("capture_manifest_sha256") != capture_manifest_sha256
             or prior.get("capture_checkpoint_sha256") != capture_checkpoint_sha256
-            or prior.get("storage_attestation_sha256")
-            != storage_attestation_sha256
+            or prior.get("activation_storage_attestation_sha256")
+            != activation_storage_attestation_sha256
+            or prior.get("sae_storage_attestation_sha256")
+            != sae_storage_attestation_sha256
+            or prior.get("capture_compatibility_sha256")
+            != capture_compatibility_sha256
+            or prior.get("capture_producer_environment_sha256")
+            != producer_environment_sha256
+            or prior.get("canary_gate") != canary_gate
             or prior.get("checkpoint_payload_root") != checkpoint_payload_root
             or not re.fullmatch(r"[0-9a-f]{32}", str(prior.get("run_instance_id", "")))
             or not isinstance(prior.get("environment"), dict)
@@ -2618,29 +3823,78 @@ def _command_train(args: argparse.Namespace) -> int:
             raise RuntimeError(
                 "existing run metadata belongs to a different config/run/environment"
             )
-    if identity_path.exists():
-        run_instance_id = _load_run_identity(identity_path, expected_identity)
+    identity_value = _coordinator_read_json_if_exists(
+        identity_path,
+        purpose=f"immutable SAE run identity {args.condition}/seed-{args.seed}",
+    )
+    if identity_value is not None:
+        if not isinstance(identity_value, Mapping):
+            raise RuntimeError("existing SAE run identity is not an object")
+        run_instance_id = _validate_run_identity_payload(
+            identity_value, identity_path, expected_identity
+        )
     else:
         if prior:
             raise RuntimeError("existing run metadata lacks its immutable identity")
         run_instance_id = _new_run_instance_id()
-        _coordinator_write_json(
+        _coordinator_publish_immutable_json(
             identity_path,
             {**expected_identity, "run_instance_id": run_instance_id},
             barrier=f"gemma4-run-identity-{args.condition}-{args.seed}",
         )
     if prior and prior.get("run_instance_id") != run_instance_id:
         raise RuntimeError("run.json and immutable run identity disagree")
+    authoritative_journal_path = _training_metrics_journal_path(
+        run_root,
+        run_instance_id,
+        operation_paths=operation_paths,
+        condition=args.condition,
+        seed=args.seed,
+    )
+    authoritative_journal_identity = JournalIdentity(
+        run_instance_id=run_instance_id,
+        condition=args.condition,
+        seed=args.seed,
+    )
+    if prior and not args.reference:
+        _validate_authoritative_run_timing(prior, config, args.condition)
+        declared_journal = prior.get("metrics_journal")
+        if (
+            not isinstance(declared_journal, Mapping)
+            or declared_journal.get("path")
+            != str(authoritative_journal_path.expanduser().resolve())
+        ):
+            raise RuntimeError(
+                "existing run metadata names a different metrics journal"
+            )
     if prior:
         prior_tokens = int(prior.get("tokens_seen", -1))
         latest_name = "latest.npz" if args.reference else "latest.json"
-        if prior_tokens > 0 and not (run_root / latest_name).exists():
+        latest_present = (
+            (run_root / latest_name).exists()
+            if args.reference
+            else _coordinator_read_json_if_exists(
+                run_root / latest_name,
+                purpose=f"SAE latest checkpoint {args.condition}/seed-{args.seed}",
+            )
+            is not None
+        )
+        if prior_tokens > 0 and not latest_present:
             raise RuntimeError(
                 "existing run metadata has progress but its latest checkpoint is missing"
             )
         if prior_tokens == config.train_tokens:
             final_name = "final.npz" if args.reference else "final.json"
-            if not (run_root / final_name).exists():
+            final_present = (
+                (run_root / final_name).exists()
+                if args.reference
+                else _coordinator_read_json_if_exists(
+                    run_root / final_name,
+                    purpose=f"SAE final checkpoint {args.condition}/seed-{args.seed}",
+                )
+                is not None
+            )
+            if not final_present:
                 raise RuntimeError(
                     "complete run metadata exists without its final checkpoint"
                 )
@@ -2678,19 +3932,31 @@ def _command_train(args: argparse.Namespace) -> int:
             checkpoint_dir=run_root,
             checkpoint_payload_root=checkpoint_payload_root,
             stop_after_tokens=args.stop_after_tokens,
-            metric_callback=lambda metric: sink.log(_metric_record(metric)),
+            metric_callback=None,
             checkpoint_identity=_checkpoint_identity_expected(
                 config,
                 capture_manifest_sha256=capture_manifest_sha256,
                 capture_checkpoint_sha256=capture_checkpoint_sha256,
-                environment_sha256=current_environment["sha256"],
+                producer_environment_sha256=producer_environment_sha256,
+                consumer_environment_sha256=current_environment["sha256"],
                 condition=args.condition,
                 seed=args.seed,
                 run_instance_id=run_instance_id,
-                storage_attestation_sha256=storage_attestation_sha256,
+                activation_storage_attestation_sha256=(
+                    activation_storage_attestation_sha256
+                ),
+                sae_storage_attestation_sha256=sae_storage_attestation_sha256,
+                capture_compatibility_sha256=capture_compatibility_sha256,
+                canary_waiver_sha256=canary_gate.get("waiver_sha256"),
+                sealed_recovery_waiver_sha256=canary_gate.get(
+                    "recovery_waiver_sha256"
+                ),
                 checkpoint_payload_root=checkpoint_payload_root,
+                operation_sha256=operation_paths.operation_sha256,
             ),
             prior_run_timing=prior,
+            metrics_journal_path=authoritative_journal_path,
+            metrics_journal_identity=authoritative_journal_identity,
         )
         segment_optimizer_seconds = result.optimizer_wall_seconds
         segment_compile_seconds = result.compile_seconds
@@ -2722,21 +3988,31 @@ def _command_train(args: argparse.Namespace) -> int:
     marginal_wall_seconds = optimizer_wall_seconds + capacity_precompute_wall_seconds
     timing = {
         "schema_version": config.schema_version,
+        "operation_sha256": (
+            None if operation_paths is None else operation_paths.operation_sha256
+        ),
         "config_sha256": config.config_hash,
         "environment": current_environment,
+        "capture_producer_environment_sha256": producer_environment_sha256,
         "capture_manifest_sha256": capture_manifest_sha256,
         "capture_checkpoint_sha256": capture_checkpoint_sha256,
         "condition": args.condition,
         "seed": args.seed,
         "run_instance_id": run_instance_id,
         "tokens_seen": tokens_seen,
+        "steps": int(np.asarray(result.state.step)),
         "segment_tokens": segment_tokens,
         "a_capacity": capacity,
         "authoritative": authoritative,
         "optimizer_wall_seconds": optimizer_wall_seconds,
         "compile_seconds": compile_seconds,
         "checkpoint_seconds": checkpoint_seconds,
-        "storage_attestation_sha256": storage_attestation_sha256,
+        "activation_storage_attestation_sha256": (
+            activation_storage_attestation_sha256
+        ),
+        "sae_storage_attestation_sha256": sae_storage_attestation_sha256,
+        "capture_compatibility_sha256": capture_compatibility_sha256,
+        "canary_gate": canary_gate,
         "checkpoint_payload_root": checkpoint_payload_root,
         "capture_prefetch": capture_prefetch,
         "capture_prefetch_wall_seconds_excluded": capture_prefetch_wall_seconds,
@@ -2750,6 +4026,7 @@ def _command_train(args: argparse.Namespace) -> int:
         "optimizer_tokens_per_second": (
             tokens_seen / optimizer_wall_seconds if optimizer_wall_seconds else 0.0
         ),
+        "metrics_journal": result.metrics_journal if authoritative else None,
         "health": None if result.health is None else dataclasses.asdict(result.health),
     }
     coordinator = _coordinator_write_json(
@@ -2769,40 +4046,64 @@ def _command_train(args: argparse.Namespace) -> int:
 def _command_eval_one(
     args: argparse.Namespace, config: Gemma4Config, condition: str, seed: int
 ) -> dict[str, Any]:
-    if not args.reference:
+    authoritative = not args.reference
+    root = _artifact_root(config, args.artifact_root)
+    if authoritative:
+        _require_production_artifact_root(root)
+    operation_paths = _operation_paths_for_command(
+        args, root, authoritative=authoritative
+    )
+    if authoritative:
         config.validate_production()
         require_v4_32_runtime()
-    root = _artifact_root(config, args.artifact_root)
-    if not args.reference:
-        _require_production_artifact_root(root)
     current_environment = _coordinated_environment()
     if args.reference:
         storage_layout = None
-        storage_attestation_sha256 = None
+        activation_storage_attestation_sha256 = None
+        sae_storage_attestation_sha256 = None
+        capture_compatibility_sha256 = None
         checkpoint_payload_root = None
+        storage_bundle = None
     else:
-        storage_payload = _load_storage_attestation_payload(
+        storage_bundle = _load_sae_storage_bundle(
             root, config, environment=current_environment
         )
-        _require_sae_cache_qualification(storage_payload)
-        storage_layout = _storage_layout(storage_payload)
-        storage_attestation_sha256 = str(storage_payload["attestation_sha256"])
+        storage_layout = storage_bundle["layout"]
+        activation_storage_attestation_sha256 = str(
+            storage_bundle["activation"]["attestation_sha256"]
+        )
+        sae_storage_attestation_sha256 = str(
+            storage_bundle["sae"]["attestation_sha256"]
+        )
+        capture_compatibility_sha256 = str(
+            storage_bundle["compatibility"]["compatibility_sha256"]
+        )
         checkpoint_payload_root = str(storage_layout["sae_checkpoint_root"])
     cache_root = (
         None if storage_layout is None else storage_layout["capture_cache_root"]
     )
     cache_max_bytes = (
-        None if storage_layout is None else config.capture_cache_max_bytes
+        None
+        if storage_layout is None
+        else storage_layout["capture_cache_max_bytes"]
     )
     train_dataset = _sealed_dataset(
         _capture_root(root, "train"),
         cache_root=cache_root,
         cache_max_bytes=cache_max_bytes,
+        require_resident_cache=storage_layout is not None,
+        sealed_manifest=(
+            None if args.reference else storage_bundle["train_manifest"]
+        ),
     )
     eval_dataset = _sealed_dataset(
         _capture_root(root, "eval"),
         cache_root=cache_root,
         cache_max_bytes=cache_max_bytes,
+        require_resident_cache=storage_layout is not None,
+        sealed_manifest=(
+            None if args.reference else storage_bundle["eval_manifest"]
+        ),
     )
     _require_exact_capture(train_dataset, config.train_tokens, "training")
     _require_exact_capture(eval_dataset, config.eval_tokens, "held-out")
@@ -2810,18 +4111,23 @@ def _command_eval_one(
     eval_checkpoint_sha = str(eval_dataset.manifest["metadata"]["checkpoint_sha256"])
     if train_checkpoint_sha != eval_checkpoint_sha:
         raise RuntimeError("training and held-out captures use different checkpoints")
+    producer_environment_sha256 = str(
+        train_dataset.manifest["metadata"].get("environment_sha256", "")
+    )
+    if eval_dataset.manifest["metadata"].get("environment_sha256") != producer_environment_sha256:
+        raise RuntimeError("training and held-out captures use different producers")
     conversion_attestation_sha256 = (
         None
         if args.reference
-        else _load_conversion_attestation(root, config, train_checkpoint_sha)
+        else str(storage_bundle["conversion_attestation_sha256"])
     )
     _require_capture_identity(
         train_dataset,
         config,
         "train",
         conversion_attestation_sha256=conversion_attestation_sha256,
-        environment_sha256=current_environment["sha256"],
-        storage_attestation_sha256=storage_attestation_sha256,
+        environment_sha256=producer_environment_sha256,
+        storage_attestation_sha256=activation_storage_attestation_sha256,
         object_prefix=(
             None
             if storage_layout is None
@@ -2838,8 +4144,8 @@ def _command_eval_one(
         config,
         "eval",
         conversion_attestation_sha256=conversion_attestation_sha256,
-        environment_sha256=current_environment["sha256"],
-        storage_attestation_sha256=storage_attestation_sha256,
+        environment_sha256=producer_environment_sha256,
+        storage_attestation_sha256=activation_storage_attestation_sha256,
         object_prefix=(
             None
             if storage_layout is None
@@ -2851,6 +4157,29 @@ def _command_eval_one(
             )
         ),
     )
+    canary_gate = (
+        {
+            "status": "reference",
+            "waiver_sha256": None,
+            "recovery_waiver_sha256": None,
+        }
+        if args.reference
+        else _consumer_canary_gate(
+            root,
+            train_manifest=train_dataset.manifest,
+            benchmark_record=storage_bundle["benchmark"],
+        )
+    )
+    if authoritative:
+        assert operation_paths is not None
+        assert storage_bundle is not None
+        _validate_sae_operation(
+            operation_paths,
+            config=config,
+            environment=current_environment,
+            storage_bundle=storage_bundle,
+            canary_gate=canary_gate,
+        )
     evaluation_prefetch = {"objects": 0, "bytes": 0}
     evaluation_prefetch_seconds = 0.0
     if storage_layout is not None:
@@ -2859,30 +4188,65 @@ def _command_eval_one(
                 eval_dataset, config.eval_tokens, label="eval-capture"
             )
         )
-    run_root = _run_root(root, condition, seed)
-    timing = json.loads((run_root / "run.json").read_text(encoding="utf-8"))
+    run_root = (
+        _run_root(root, condition, seed)
+        if operation_paths is None
+        else operation_paths.run_root(condition, seed)
+    )
+    timing_value = _coordinator_read_json(
+        run_root / "run.json",
+        purpose=f"complete SAE run metadata {condition}/seed-{seed}",
+    )
+    if not isinstance(timing_value, dict):
+        raise RuntimeError("complete SAE run metadata is not an object")
+    timing = timing_value
     run_instance_id = _load_run_identity(
         run_root / "identity.json",
         _run_identity_expected(
             config,
             capture_manifest_sha256=train_dataset.manifest_sha256,
             capture_checkpoint_sha256=train_checkpoint_sha,
-            environment_sha256=current_environment["sha256"],
+            producer_environment_sha256=producer_environment_sha256,
+            consumer_environment_sha256=current_environment["sha256"],
             condition=condition,
             seed=seed,
-            storage_attestation_sha256=storage_attestation_sha256,
+            activation_storage_attestation_sha256=(
+                activation_storage_attestation_sha256
+            ),
+            sae_storage_attestation_sha256=sae_storage_attestation_sha256,
+            capture_compatibility_sha256=capture_compatibility_sha256,
+            canary_waiver_sha256=canary_gate.get("waiver_sha256"),
+            sealed_recovery_waiver_sha256=canary_gate.get(
+                "recovery_waiver_sha256"
+            ),
             checkpoint_payload_root=checkpoint_payload_root,
+            operation_sha256=(
+                None
+                if operation_paths is None
+                else operation_paths.operation_sha256
+            ),
         ),
     )
     if (
         timing.get("config_sha256") != config.config_hash
+        or timing.get("operation_sha256")
+        != (
+            None if operation_paths is None else operation_paths.operation_sha256
+        )
         or timing.get("condition") != condition
         or timing.get("seed") != seed
         or int(timing.get("tokens_seen", -1)) != config.train_tokens
         or timing.get("capture_manifest_sha256") != train_dataset.manifest_sha256
         or timing.get("capture_checkpoint_sha256") != train_checkpoint_sha
-        or timing.get("storage_attestation_sha256")
-        != storage_attestation_sha256
+        or timing.get("activation_storage_attestation_sha256")
+        != activation_storage_attestation_sha256
+        or timing.get("sae_storage_attestation_sha256")
+        != sae_storage_attestation_sha256
+        or timing.get("capture_compatibility_sha256")
+        != capture_compatibility_sha256
+        or timing.get("capture_producer_environment_sha256")
+        != producer_environment_sha256
+        or timing.get("canary_gate") != canary_gate
         or timing.get("checkpoint_payload_root") != checkpoint_payload_root
         or not re.fullmatch(r"[0-9a-f]{32}", str(timing.get("run_instance_id", "")))
         or timing.get("run_instance_id") != run_instance_id
@@ -2899,6 +4263,16 @@ def _command_eval_one(
             condition,
             expected_tokens=config.train_tokens,
         )
+        journal = timing.get("metrics_journal")
+        if (
+            operation_paths is None
+            or not isinstance(journal, Mapping)
+            or journal.get("path")
+            != str(operation_paths.metrics_path(condition, seed))
+        ):
+            raise RuntimeError(
+                "authoritative training journal is outside the SAE operation"
+            )
     if not timing.get("authoritative") and not args.allow_reference_cost:
         raise RuntimeError("reference timing is not valid for the primary cost report")
     health = timing.get("health")
@@ -2910,6 +4284,7 @@ def _command_eval_one(
         config, condition, seed, a_capacity=timing.get("a_capacity")
     )
     evaluation_capacity_seconds = 0.0
+    evaluation_capacity = None
     if condition == "A":
         if args.reference:
             capacity_started = time.perf_counter()
@@ -2926,9 +4301,6 @@ def _command_eval_one(
                 scope="eval",
                 total_tokens=config.eval_tokens,
             )
-        training_config = dataclasses.replace(
-            training_config, a_capacity=evaluation_capacity
-        )
     expected_sst = eval_dataset.sst_about(train_dataset.mean)
     started = time.perf_counter()
     if args.reference:
@@ -2942,9 +4314,14 @@ def _command_eval_one(
             raise RuntimeError(
                 "reference final checkpoint is not a complete training run"
             )
+        evaluation_config = (
+            dataclasses.replace(training_config, a_capacity=evaluation_capacity)
+            if condition == "A"
+            else training_config
+        )
         result = evaluate(
             state.params,
-            training_config,
+            evaluation_config,
             _reference_evaluation_batches(
                 eval_dataset, training_config.microbatch_tokens
             ),
@@ -2966,26 +4343,47 @@ def _command_eval_one(
                 config,
                 capture_manifest_sha256=train_dataset.manifest_sha256,
                 capture_checkpoint_sha256=train_checkpoint_sha,
-                environment_sha256=timing["environment"]["sha256"],
+                producer_environment_sha256=producer_environment_sha256,
+                consumer_environment_sha256=timing["environment"]["sha256"],
                 condition=condition,
                 seed=seed,
                 run_instance_id=timing["run_instance_id"],
-                storage_attestation_sha256=storage_attestation_sha256,
+                activation_storage_attestation_sha256=(
+                    activation_storage_attestation_sha256
+                ),
+                sae_storage_attestation_sha256=sae_storage_attestation_sha256,
+                capture_compatibility_sha256=capture_compatibility_sha256,
+                canary_waiver_sha256=canary_gate.get("waiver_sha256"),
+                sealed_recovery_waiver_sha256=canary_gate.get(
+                    "recovery_waiver_sha256"
+                ),
                 checkpoint_payload_root=checkpoint_payload_root,
+                operation_sha256=operation_paths.operation_sha256,
             ),
             checkpoint_payload_root=checkpoint_payload_root,
+            evaluation_a_capacity=evaluation_capacity,
         )
     evaluation_seconds = time.perf_counter() - started
     if not args.reference:
         evaluation_seconds = _global_max_seconds(evaluation_seconds)
     record = {
         "schema_version": config.schema_version,
+        "operation_sha256": (
+            None if operation_paths is None else operation_paths.operation_sha256
+        ),
         "config_sha256": config.config_hash,
         "environment": _coordinated_environment(),
         "train_capture_manifest_sha256": train_dataset.manifest_sha256,
         "eval_capture_manifest_sha256": eval_dataset.manifest_sha256,
         "capture_checkpoint_sha256": train_checkpoint_sha,
+        "capture_producer_environment_sha256": producer_environment_sha256,
         "training_environment_sha256": timing["environment"]["sha256"],
+        "activation_storage_attestation_sha256": (
+            activation_storage_attestation_sha256
+        ),
+        "sae_storage_attestation_sha256": sae_storage_attestation_sha256,
+        "capture_compatibility_sha256": capture_compatibility_sha256,
+        "canary_gate": canary_gate,
         "condition": condition,
         "seed": seed,
         "run_instance_id": timing["run_instance_id"],
@@ -3009,18 +4407,27 @@ def _command_eval_one(
         ),
         "capture_prefetch": evaluation_prefetch,
         "capture_prefetch_wall_seconds_excluded": evaluation_prefetch_seconds,
-        "evaluation_capacity": training_config.a_capacity if condition == "A" else None,
+        "training_capacity": training_config.a_capacity if condition == "A" else None,
+        "evaluation_capacity": evaluation_capacity if condition == "A" else None,
         "evaluation_capacity_precompute_seconds_excluded": evaluation_capacity_seconds,
     }
     SeedEvaluation.from_value(record)
-    destination = _evaluation_path(root, condition, seed)
-    process_index, _ = _process_context()
-    if process_index == 0:
-        write_report_json(destination, record)
-    _global_barrier(f"gemma4-eval-{condition}-{seed}")
-    if not destination.exists():
-        raise RuntimeError(
-            f"evaluation output is not visible after barrier: {destination}"
+    destination = (
+        _evaluation_path(root, condition, seed)
+        if operation_paths is None
+        else operation_paths.evaluation_path(condition, seed)
+    )
+    if operation_paths is None:
+        _coordinator_write_json(
+            destination,
+            record,
+            barrier=f"gemma4-eval-{condition}-{seed}",
+        )
+    else:
+        _coordinator_publish_immutable_json(
+            destination,
+            record,
+            barrier=f"gemma4-eval-{condition}-{seed}",
         )
     return record
 
@@ -3049,6 +4456,7 @@ def _load_harvester_report(
     environment_sha256: str | None = None,
     conversion_attestation_sha256: str | None = None,
     storage_attestation_sha256: str | None = None,
+    canary_gate: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Combine the selected MFU benchmark with measured shared capture cost."""
 
@@ -3057,9 +4465,12 @@ def _load_harvester_report(
     benchmark_path = (
         Path(override) if override else root / "benchmark" / "selected.json"
     )
-    if not benchmark_path.exists():
-        raise RuntimeError(f"missing selected harvester benchmark: {benchmark_path}")
-    value = json.loads(benchmark_path.read_text(encoding="utf-8"))
+    benchmark_value = _coordinator_read_json(
+        benchmark_path, purpose="selected harvester benchmark"
+    )
+    if not isinstance(benchmark_value, dict):
+        raise RuntimeError("selected harvester benchmark must be an object")
+    value = benchmark_value
     benchmark_environment = value.get("environment")
     if (
         value.get("schema_version") != config.schema_version
@@ -3148,9 +4559,9 @@ def _load_harvester_report(
     have_capture_cost = False
     for split in ("train", "eval"):
         path = root / "harvest" / f"{split}.json"
-        if not path.exists():
-            raise RuntimeError(f"missing measured {split} harvest campaign: {path}")
-        raw_campaign = json.loads(path.read_text(encoding="utf-8"))
+        raw_campaign = _coordinator_read_json(
+            path, purpose=f"measured {split} harvest campaign"
+        )
         if not isinstance(raw_campaign, dict):
             raise RuntimeError(f"invalid harvest campaign payload: {path}")
         campaign = CampaignSummary.from_mapping(raw_campaign).as_dict()
@@ -3218,15 +4629,22 @@ def _load_harvester_report(
                     f"{split} harvest cost is not bound to the sealed capture"
                 )
         if split == "train" and campaign.get("canary_passed") is not True:
-            raise RuntimeError(
-                "training harvest does not descend from a passing canary"
-            )
+            if (
+                campaign.get("canary_passed") is not False
+                or not isinstance(canary_gate, Mapping)
+                or canary_gate.get("status") != "waived-unmet"
+                or canary_gate.get("canary_passed") is not False
+            ):
+                raise RuntimeError(
+                    "training harvest has neither a passing canary nor an exact waiver"
+                )
         campaigns[split] = campaign
         if campaign.get("chip_seconds") is None:
             raise RuntimeError(f"{split} harvest lacks measured chip-seconds")
         capture_chip_seconds += float(campaign["chip_seconds"])
         have_capture_cost = True
     result["campaigns"] = campaigns
+    result["canary_gate"] = None if canary_gate is None else dict(canary_gate)
     if not have_capture_cost:
         raise RuntimeError("shared harvest has no measured cost")
     result["chip_seconds"] = capture_chip_seconds
@@ -3267,6 +4685,88 @@ def _canonical_evaluation_metrics(
     return canonical
 
 
+def _validate_training_journal_binding(
+    record: Mapping[str, Any],
+    config: Gemma4Config,
+    condition: str,
+    *,
+    tokens: int,
+    steps: int,
+    optimizer_wall_seconds: float,
+) -> None:
+    """Validate the immutable journal snapshot embedded in ``run.json``."""
+
+    snapshot = record.get("metrics_journal")
+    if not isinstance(snapshot, Mapping):
+        raise RuntimeError("authoritative run lacks a metrics journal snapshot")
+    binding = snapshot.get("binding")
+    if not isinstance(binding, Mapping):
+        raise RuntimeError("metrics journal snapshot lacks its binding")
+    identity = binding.get("identity")
+    if not isinstance(identity, Mapping):
+        raise RuntimeError("metrics journal binding lacks its run identity")
+
+    run_instance_id = record.get("run_instance_id")
+    seed = record.get("seed")
+    path = snapshot.get("path")
+    expected_steps = math.ceil(tokens / config.effective_batch_tokens)
+    integer_fields = {
+        "row_count": binding.get("row_count"),
+        "last_step": binding.get("last_step"),
+        "last_tokens_seen": binding.get("last_tokens_seen"),
+        "total_tokens": snapshot.get("total_tokens"),
+        "effective_batch_tokens": snapshot.get("effective_batch_tokens"),
+        "expected_l0": snapshot.get("expected_l0"),
+    }
+    if any(
+        isinstance(value, bool) or not isinstance(value, int)
+        for value in integer_fields.values()
+    ):
+        raise RuntimeError("metrics journal snapshot counters are not integers")
+    try:
+        last_cumulative = float(
+            snapshot["last_cumulative_optimizer_wall_seconds"]
+        )
+    except (KeyError, TypeError, ValueError, OverflowError) as error:
+        raise RuntimeError("metrics journal optimizer timing is invalid") from error
+
+    sha_fields = (
+        binding.get("identity_sha256"),
+        binding.get("file_sha256"),
+        binding.get("journal_sha256"),
+    )
+    if (
+        snapshot.get("schema_version") != TRAINING_JOURNAL_SNAPSHOT_SCHEMA
+        or binding.get("schema_version") != JOURNAL_SCHEMA_VERSION
+        or not isinstance(path, str)
+        or not Path(path).is_absolute()
+        or "://" in path
+        or re.fullmatch(r"[0-9a-f]{32}", str(run_instance_id)) is None
+        or identity.get("run_instance_id") != run_instance_id
+        or identity.get("condition") != condition
+        or identity.get("seed") != seed
+        or integer_fields["row_count"] != steps
+        or integer_fields["last_step"] != steps
+        or integer_fields["last_tokens_seen"] != tokens
+        or integer_fields["total_tokens"] != config.train_tokens
+        or integer_fields["effective_batch_tokens"]
+        != config.effective_batch_tokens
+        or integer_fields["expected_l0"] != config.topk_features
+        or steps != expected_steps
+        or snapshot.get("complete_prefix_topk_valid") is not True
+        or snapshot.get("complete_prefix_exact_l0") is not True
+        or not math.isfinite(last_cumulative)
+        or last_cumulative <= 0.0
+        or last_cumulative > optimizer_wall_seconds
+        or any(
+            not isinstance(value, str)
+            or re.fullmatch(r"[0-9a-f]{64}", value) is None
+            for value in sha_fields
+        )
+    ):
+        raise RuntimeError("authoritative metrics journal binding is inconsistent")
+
+
 def _validate_authoritative_run_timing(
     record: Mapping[str, Any],
     config: Gemma4Config,
@@ -3278,6 +4778,7 @@ def _validate_authoritative_run_timing(
 
     try:
         tokens = int(record["tokens_seen"])
+        steps = int(record["steps"])
         chip_count = int(record["chip_count"])
         optimizer = float(record["optimizer_wall_seconds"])
         compile_seconds = float(record["compile_seconds"])
@@ -3310,6 +4811,7 @@ def _validate_authoritative_run_timing(
         or record.get("authoritative") is not True
         or chip_count != 16
         or tokens <= 0
+        or steps <= 0
         or (expected_tokens is not None and tokens != expected_tokens)
         or any(not math.isfinite(value) for value in values)
         or optimizer <= 0.0
@@ -3334,6 +4836,14 @@ def _validate_authoritative_run_timing(
         )
     ):
         raise RuntimeError("authoritative SAE cost telemetry is internally inconsistent")
+    _validate_training_journal_binding(
+        record,
+        config,
+        condition,
+        tokens=tokens,
+        steps=steps,
+        optimizer_wall_seconds=optimizer,
+    )
 
 
 def _command_report(args: argparse.Namespace) -> int:
@@ -3341,22 +4851,46 @@ def _command_report(args: argparse.Namespace) -> int:
     config.validate_production()
     root = _artifact_root(config, args.artifact_root)
     _require_production_artifact_root(root)
+    operation_paths = _operation_paths_for_command(args, root, authoritative=True)
+    assert operation_paths is not None
     current_environment = _coordinated_environment()
-    storage_payload = _load_storage_attestation_payload(
+    storage_bundle = _load_sae_storage_bundle(
         root, config, environment=current_environment
     )
-    _require_sae_cache_qualification(storage_payload)
-    storage_layout = _storage_layout(storage_payload)
-    storage_attestation_sha256 = str(storage_payload["attestation_sha256"])
+    activation_storage_payload = storage_bundle["activation"]
+    sae_storage_payload = storage_bundle["sae"]
+    storage_layout = storage_bundle["layout"]
+    activation_storage_attestation_sha256 = str(
+        activation_storage_payload["attestation_sha256"]
+    )
+    sae_storage_attestation_sha256 = str(
+        sae_storage_payload["attestation_sha256"]
+    )
+    capture_compatibility_sha256 = str(
+        storage_bundle["compatibility"]["compatibility_sha256"]
+    )
     pairs = [
         (condition, seed) for condition in config.conditions for seed in config.seeds
     ]
-    evaluations = [
-        json.loads(_evaluation_path(root, condition, seed).read_text(encoding="utf-8"))
-        for condition, seed in pairs
-    ]
-    train_capture = _sealed_dataset(_capture_root(root, "train"))
-    eval_capture = _sealed_dataset(_capture_root(root, "eval"))
+    evaluations: list[dict[str, Any]] = []
+    for condition, seed in pairs:
+        value = _coordinator_read_json(
+            operation_paths.evaluation_path(condition, seed),
+            purpose=f"evaluation {condition}/seed-{seed}",
+        )
+        if not isinstance(value, dict):
+            raise RuntimeError(
+                f"evaluation {condition}/seed-{seed} is not an object"
+            )
+        evaluations.append(value)
+    train_capture = _sealed_dataset(
+        _capture_root(root, "train"),
+        sealed_manifest=storage_bundle["train_manifest"],
+    )
+    eval_capture = _sealed_dataset(
+        _capture_root(root, "eval"),
+        sealed_manifest=storage_bundle["eval_manifest"],
+    )
     producer_environment_sha256 = str(
         train_capture.manifest["metadata"].get("environment_sha256", "")
     )
@@ -3367,8 +4901,8 @@ def _command_report(args: argparse.Namespace) -> int:
     checkpoint_sha = str(train_capture.manifest["metadata"]["checkpoint_sha256"])
     if eval_capture.manifest["metadata"]["checkpoint_sha256"] != checkpoint_sha:
         raise RuntimeError("report captures use different base checkpoints")
-    conversion_attestation_sha256 = _load_conversion_attestation(
-        root, config, checkpoint_sha
+    conversion_attestation_sha256 = str(
+        storage_bundle["conversion_attestation_sha256"]
     )
     _require_capture_identity(
         train_capture,
@@ -3376,7 +4910,7 @@ def _command_report(args: argparse.Namespace) -> int:
         "train",
         conversion_attestation_sha256=conversion_attestation_sha256,
         environment_sha256=producer_environment_sha256,
-        storage_attestation_sha256=storage_attestation_sha256,
+        storage_attestation_sha256=activation_storage_attestation_sha256,
         object_prefix=join_gcs_uri(
             storage_layout["bulk_gcs_root"],
             "captures",
@@ -3390,7 +4924,7 @@ def _command_report(args: argparse.Namespace) -> int:
         "eval",
         conversion_attestation_sha256=conversion_attestation_sha256,
         environment_sha256=producer_environment_sha256,
-        storage_attestation_sha256=storage_attestation_sha256,
+        storage_attestation_sha256=activation_storage_attestation_sha256,
         object_prefix=join_gcs_uri(
             storage_layout["bulk_gcs_root"],
             "captures",
@@ -3398,11 +4932,25 @@ def _command_report(args: argparse.Namespace) -> int:
             "eval",
         ),
     )
+    canary_gate = _consumer_canary_gate(
+        root,
+        train_manifest=train_capture.manifest,
+        benchmark_record=storage_bundle["benchmark"],
+    )
+    _validate_sae_operation(
+        operation_paths,
+        config=config,
+        environment=current_environment,
+        storage_bundle=storage_bundle,
+        canary_gate=canary_gate,
+    )
     common_sst = eval_capture.sst_about(train_capture.mean)
     canonical_evaluations: list[dict[str, Any]] = []
     for (condition, seed), record in zip(pairs, evaluations, strict=True):
         if (
             record.get("config_sha256") != config.config_hash
+            or record.get("operation_sha256")
+            != operation_paths.operation_sha256
             or record.get("condition") != condition
             or record.get("seed") != seed
             or int(record.get("tokens", -1)) != config.eval_tokens
@@ -3414,7 +4962,17 @@ def _command_report(args: argparse.Namespace) -> int:
             != eval_capture.manifest_sha256
             or record.get("capture_checkpoint_sha256") != checkpoint_sha
             or not isinstance(record.get("environment"), dict)
-            or record["environment"].get("sha256") != producer_environment_sha256
+            or record["environment"].get("sha256")
+            != current_environment["sha256"]
+            or record.get("capture_producer_environment_sha256")
+            != producer_environment_sha256
+            or record.get("activation_storage_attestation_sha256")
+            != activation_storage_attestation_sha256
+            or record.get("sae_storage_attestation_sha256")
+            != sae_storage_attestation_sha256
+            or record.get("capture_compatibility_sha256")
+            != capture_compatibility_sha256
+            or record.get("canary_gate") != canary_gate
         ):
             raise RuntimeError(
                 f"incomplete/incompatible evaluation for {condition}/seed-{seed}"
@@ -3428,16 +4986,22 @@ def _command_report(args: argparse.Namespace) -> int:
         expected_captures={"train": train_capture, "eval": eval_capture},
         environment_sha256=producer_environment_sha256,
         conversion_attestation_sha256=conversion_attestation_sha256,
-        storage_attestation_sha256=storage_attestation_sha256,
+        storage_attestation_sha256=activation_storage_attestation_sha256,
+        canary_gate=canary_gate,
     )
     if harvester.get("checkpoint_sha256") != checkpoint_sha:
         raise RuntimeError("benchmark and captures use different checkpoints")
-    run_records = [
-        json.loads(
-            (_run_root(root, condition, seed) / "run.json").read_text(encoding="utf-8")
+    run_records: list[dict[str, Any]] = []
+    for condition, seed in pairs:
+        value = _coordinator_read_json(
+            operation_paths.run_root(condition, seed) / "run.json",
+            purpose=f"SAE run metadata {condition}/seed-{seed}",
         )
-        for condition, seed in pairs
-    ]
+        if not isinstance(value, dict):
+            raise RuntimeError(
+                f"SAE run metadata {condition}/seed-{seed} is not an object"
+            )
+        run_records.append(value)
     for (condition, seed), run_record, evaluation in zip(
         pairs, run_records, evaluations, strict=True
     ):
@@ -3448,20 +5012,49 @@ def _command_report(args: argparse.Namespace) -> int:
             expected_tokens=config.train_tokens,
         )
         run_instance_id = _load_run_identity(
-            _run_root(root, condition, seed) / "identity.json",
+            operation_paths.run_root(condition, seed) / "identity.json",
             _run_identity_expected(
                 config,
                 capture_manifest_sha256=train_capture.manifest_sha256,
                 capture_checkpoint_sha256=checkpoint_sha,
-                environment_sha256=producer_environment_sha256,
+                producer_environment_sha256=producer_environment_sha256,
+                consumer_environment_sha256=current_environment["sha256"],
                 condition=condition,
                 seed=seed,
-                storage_attestation_sha256=storage_attestation_sha256,
+                activation_storage_attestation_sha256=(
+                    activation_storage_attestation_sha256
+                ),
+                sae_storage_attestation_sha256=sae_storage_attestation_sha256,
+                capture_compatibility_sha256=capture_compatibility_sha256,
+                canary_waiver_sha256=canary_gate.get("waiver_sha256"),
+                sealed_recovery_waiver_sha256=canary_gate.get(
+                    "recovery_waiver_sha256"
+                ),
                 checkpoint_payload_root=storage_layout["sae_checkpoint_root"],
+                operation_sha256=operation_paths.operation_sha256,
             ),
         )
+        declared_journal = run_record.get("metrics_journal")
+        if (
+            not isinstance(declared_journal, Mapping)
+            or declared_journal.get("path")
+            != str(operation_paths.metrics_path(condition, seed))
+        ):
+            raise RuntimeError(
+                f"metrics journal is outside operation for {condition}/seed-{seed}"
+            )
+        actual_journal_snapshot = _coordinated_training_journal_snapshot(
+            run_record, config
+        )
+        if actual_journal_snapshot != run_record.get("metrics_journal"):
+            raise RuntimeError(
+                f"metrics journal changed after run sealing for "
+                f"{condition}/seed-{seed}"
+            )
         if (
             run_record.get("config_sha256") != config.config_hash
+            or run_record.get("operation_sha256")
+            != operation_paths.operation_sha256
             or run_record.get("condition") != condition
             or run_record.get("seed") != seed
             or run_record.get("authoritative") is not True
@@ -3472,8 +5065,15 @@ def _command_report(args: argparse.Namespace) -> int:
             or run_record.get("capture_manifest_sha256")
             != train_capture.manifest_sha256
             or run_record.get("capture_checkpoint_sha256") != checkpoint_sha
-            or run_record.get("storage_attestation_sha256")
-            != storage_attestation_sha256
+            or run_record.get("activation_storage_attestation_sha256")
+            != activation_storage_attestation_sha256
+            or run_record.get("sae_storage_attestation_sha256")
+            != sae_storage_attestation_sha256
+            or run_record.get("capture_compatibility_sha256")
+            != capture_compatibility_sha256
+            or run_record.get("capture_producer_environment_sha256")
+            != producer_environment_sha256
+            or run_record.get("canary_gate") != canary_gate
             or run_record.get("checkpoint_payload_root")
             != storage_layout["sae_checkpoint_root"]
             or not re.fullmatch(
@@ -3481,8 +5081,11 @@ def _command_report(args: argparse.Namespace) -> int:
             )
             or run_record.get("run_instance_id") != run_instance_id
             or evaluation.get("run_instance_id") != run_record.get("run_instance_id")
+            or evaluation.get("operation_sha256")
+            != operation_paths.operation_sha256
             or not isinstance(run_record.get("environment"), dict)
-            or run_record["environment"].get("sha256") != producer_environment_sha256
+            or run_record["environment"].get("sha256")
+            != current_environment["sha256"]
             or evaluation.get("training_environment_sha256")
             != run_record["environment"].get("sha256")
             or not math.isclose(
@@ -3509,14 +5112,21 @@ def _command_report(args: argparse.Namespace) -> int:
         evaluation_seconds=evaluation_seconds,
         nominal_candidate_exposure_percent=100.0 * config.candidate_exposure,
     )
+    waived_labels: list[str] = []
     if harvester.get("performance_gate_status") == "waived-unmet":
+        waived_labels.append("the harvester's 50% useful-MFU gate")
+    if canary_gate.get("status") == "waived-unmet":
+        waived_labels.append("the real-data canary performance gates")
+    if waived_labels:
         report["scientific_result_status_without_performance_gate"] = report["status"]
         report["status"] = "exploratory-performance-waived"
         report["headline_eligible"] = False
         report["headline"] = (
-            f"{report['headline']} Exploratory: the harvester's 50% useful-MFU "
-            "hard gate was unmet and explicitly waived."
+            f"{report['headline']} Exploratory: "
+            + " and ".join(waived_labels)
+            + " were unmet and explicitly waived."
         )
+    report["canary_gate"] = canary_gate
     prefetch_by_run = {
         f"{condition}/seed-{seed}": {
             "seconds": float(
@@ -3537,15 +5147,22 @@ def _command_report(args: argparse.Namespace) -> int:
             "timing and reused across A/B/F"
         ),
     }
-    storage_qualification = storage_payload["qualification"]
     report["storage_planes"] = {
-        "attestation_sha256": storage_attestation_sha256,
-        "control": storage_qualification["control"],
-        "local_buffer": storage_qualification["local_buffer"],
-        "gcs": storage_qualification["gcs"],
-        "contract": storage_payload["contract"],
+        "activation_producer": {
+            "attestation_sha256": activation_storage_attestation_sha256,
+            "environment_sha256": producer_environment_sha256,
+            "qualification": activation_storage_payload["qualification"],
+            "contract": activation_storage_payload["contract"],
+        },
+        "sae_consumer": {
+            "attestation_sha256": sae_storage_attestation_sha256,
+            "environment_sha256": current_environment["sha256"],
+            "qualification": sae_storage_payload["qualification"],
+            "capture_compatibility_sha256": capture_compatibility_sha256,
+        },
     }
     report["experiment"] = {
+        "operation_sha256": operation_paths.operation_sha256,
         "config_sha256": config.config_hash,
         "model_id": config.model_id,
         "maxtext_commit": config.maxtext_commit,
@@ -3557,7 +5174,13 @@ def _command_report(args: argparse.Namespace) -> int:
         "conditions": list(config.conditions),
         "checkpoint_sha256": checkpoint_sha,
         "conversion_attestation_sha256": conversion_attestation_sha256,
-        "storage_attestation_sha256": storage_attestation_sha256,
+        "activation_storage_attestation_sha256": (
+            activation_storage_attestation_sha256
+        ),
+        "sae_storage_attestation_sha256": sae_storage_attestation_sha256,
+        "capture_compatibility_sha256": capture_compatibility_sha256,
+        "capture_producer_environment_sha256": producer_environment_sha256,
+        "sae_consumer_environment_sha256": current_environment["sha256"],
         "bulk_gcs_root": storage_layout["bulk_gcs_root"],
         "sae_checkpoint_root": storage_layout["sae_checkpoint_root"],
         "train_capture_manifest_sha256": train_capture.manifest_sha256,
@@ -3575,16 +5198,20 @@ def _command_report(args: argparse.Namespace) -> int:
             for (condition, seed), run_record in zip(pairs, run_records, strict=True)
         },
     }
-    destination = Path(args.output) if args.output else root / "report.json"
-    process_index, _ = _process_context()
-    if process_index == 0:
-        write_report_json(destination, report)
-    _global_barrier("gemma4-efficiency-report")
-    if not destination.exists():
-        raise RuntimeError(
-            f"efficiency report is not visible after barrier: {destination}"
-        )
-    if process_index == 0:
+    destination = operation_paths.report_path
+    if args.output is not None:
+        requested = Path(args.output).expanduser().resolve()
+        if requested != destination:
+            raise RuntimeError(
+                "authoritative report output must equal its immutable "
+                f"operation path: {destination}"
+            )
+    coordinator = _coordinator_publish_immutable_json(
+        destination,
+        report,
+        barrier="gemma4-efficiency-report",
+    )
+    if coordinator:
         print(report["headline"])
     return 0
 
@@ -3596,35 +5223,61 @@ def _load_resume_run(
     condition: str,
     seed: int,
     *,
-    storage_attestation_sha256: str,
+    producer_environment_sha256: str,
+    consumer_environment_sha256: str,
+    activation_storage_attestation_sha256: str,
+    sae_storage_attestation_sha256: str,
+    capture_compatibility_sha256: str,
+    canary_gate: Mapping[str, Any],
     checkpoint_payload_root: str,
+    operation_paths: SAEOperationPaths,
 ) -> dict[str, Any] | None:
     """Validate existing run state before the production state machine skips it."""
 
-    run_root = _run_root(root, condition, seed)
+    if operation_paths.artifact_root != root.resolve():
+        raise RuntimeError("SAE resume operation belongs to another artifact root")
+    run_root = operation_paths.run_root(condition, seed)
     path = run_root / "run.json"
-    if not path.exists():
+    value = _coordinator_read_json_if_exists(
+        path, purpose=f"existing SAE run metadata {condition}/seed-{seed}"
+    )
+    if value is None:
         return None
-    try:
-        record = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise RuntimeError(f"cannot read existing run metadata: {path}") from error
+    if not isinstance(value, dict):
+        raise RuntimeError(f"existing run metadata is not an object: {path}")
+    record = value
     checkpoint_sha = str(train_capture.manifest["metadata"]["checkpoint_sha256"])
     tokens = int(record.get("tokens_seen", -1))
     try:
         _validate_authoritative_run_timing(record, config, condition)
     except RuntimeError as error:
         raise RuntimeError(f"existing run has invalid cost telemetry: {path}") from error
-    current_environment = _coordinated_environment()
+    declared_journal = record.get("metrics_journal")
+    if (
+        not isinstance(declared_journal, Mapping)
+        or declared_journal.get("path")
+        != str(operation_paths.metrics_path(condition, seed))
+    ):
+        raise RuntimeError(f"existing run journal is outside its operation: {path}")
     expected_identity = _run_identity_expected(
         config,
         capture_manifest_sha256=train_capture.manifest_sha256,
         capture_checkpoint_sha256=checkpoint_sha,
-        environment_sha256=current_environment["sha256"],
+        producer_environment_sha256=producer_environment_sha256,
+        consumer_environment_sha256=consumer_environment_sha256,
         condition=condition,
         seed=seed,
-        storage_attestation_sha256=storage_attestation_sha256,
+        activation_storage_attestation_sha256=(
+            activation_storage_attestation_sha256
+        ),
+        sae_storage_attestation_sha256=sae_storage_attestation_sha256,
+        capture_compatibility_sha256=capture_compatibility_sha256,
+        canary_waiver_sha256=canary_gate.get("waiver_sha256"),
+        sealed_recovery_waiver_sha256=canary_gate.get(
+            "recovery_waiver_sha256"
+        ),
         checkpoint_payload_root=checkpoint_payload_root,
+        operation_sha256=operation_paths.operation_sha256,
     )
     run_instance_id = _load_run_identity(run_root / "identity.json", expected_identity)
     valid_boundary = tokens == config.train_tokens or (
@@ -3632,19 +5285,27 @@ def _load_resume_run(
     )
     if (
         record.get("config_sha256") != config.config_hash
+        or record.get("operation_sha256") != operation_paths.operation_sha256
         or record.get("condition") != condition
         or record.get("seed") != seed
         or record.get("authoritative") is not True
         or int(record.get("chip_count", -1)) != 16
         or record.get("capture_manifest_sha256") != train_capture.manifest_sha256
         or record.get("capture_checkpoint_sha256") != checkpoint_sha
-        or record.get("storage_attestation_sha256")
-        != storage_attestation_sha256
+        or record.get("capture_producer_environment_sha256")
+        != producer_environment_sha256
+        or record.get("activation_storage_attestation_sha256")
+        != activation_storage_attestation_sha256
+        or record.get("sae_storage_attestation_sha256")
+        != sae_storage_attestation_sha256
+        or record.get("capture_compatibility_sha256")
+        != capture_compatibility_sha256
+        or record.get("canary_gate") != canary_gate
         or record.get("checkpoint_payload_root") != checkpoint_payload_root
         or not re.fullmatch(r"[0-9a-f]{32}", str(record.get("run_instance_id", "")))
         or record.get("run_instance_id") != run_instance_id
         or not isinstance(record.get("environment"), dict)
-        or record["environment"].get("sha256") != current_environment.get("sha256")
+        or record["environment"].get("sha256") != consumer_environment_sha256
         or not valid_boundary
     ):
         raise RuntimeError(f"existing run is not safely resumable: {path}")
@@ -3655,7 +5316,10 @@ def _load_resume_run(
     checkpoint = run_root / (
         "final.json" if tokens == config.train_tokens else "latest.json"
     )
-    if not checkpoint.exists():
+    if _coordinator_read_json_if_exists(
+        checkpoint,
+        purpose=f"resumable checkpoint pointer {condition}/seed-{seed}",
+    ) is None:
         raise RuntimeError(f"existing run lacks its resumable checkpoint: {checkpoint}")
     return record
 
@@ -3668,21 +5332,31 @@ def _existing_evaluation(
     condition: str,
     seed: int,
     run_record: dict[str, Any],
+    *,
+    operation_paths: SAEOperationPaths,
 ) -> dict[str, Any] | None:
-    path = _evaluation_path(root, condition, seed)
-    if not path.exists():
+    if operation_paths.artifact_root != root.resolve():
+        raise RuntimeError("SAE evaluation operation belongs to another artifact root")
+    path = operation_paths.evaluation_path(condition, seed)
+    value = _coordinator_read_json_if_exists(
+        path, purpose=f"existing evaluation {condition}/seed-{seed}"
+    )
+    if value is None:
         return None
     try:
-        record = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(value, dict):
+            raise TypeError("evaluation is not an object")
+        record = value
         SeedEvaluation.from_value(record)
         record = _canonical_evaluation_metrics(
             record, eval_capture.sst_about(train_capture.mean)
         )
-    except (OSError, json.JSONDecodeError, TypeError, ValueError) as error:
+    except (TypeError, ValueError) as error:
         raise RuntimeError(f"existing evaluation is invalid: {path}") from error
     checkpoint_sha = str(train_capture.manifest["metadata"]["checkpoint_sha256"])
     if (
         record.get("config_sha256") != config.config_hash
+        or record.get("operation_sha256") != operation_paths.operation_sha256
         or record.get("condition") != condition
         or record.get("seed") != seed
         or int(record.get("tokens", -1)) != config.eval_tokens
@@ -3692,10 +5366,20 @@ def _existing_evaluation(
         or record.get("eval_capture_manifest_sha256") != eval_capture.manifest_sha256
         or record.get("capture_checkpoint_sha256") != checkpoint_sha
         or record.get("run_instance_id") != run_record.get("run_instance_id")
+        or run_record.get("operation_sha256") != operation_paths.operation_sha256
         or not isinstance(record.get("environment"), dict)
         or record["environment"].get("sha256") != run_record["environment"]["sha256"]
         or record.get("training_environment_sha256")
         != run_record["environment"]["sha256"]
+        or record.get("capture_producer_environment_sha256")
+        != run_record.get("capture_producer_environment_sha256")
+        or record.get("activation_storage_attestation_sha256")
+        != run_record.get("activation_storage_attestation_sha256")
+        or record.get("sae_storage_attestation_sha256")
+        != run_record.get("sae_storage_attestation_sha256")
+        or record.get("capture_compatibility_sha256")
+        != run_record.get("capture_compatibility_sha256")
+        or record.get("canary_gate") != run_record.get("canary_gate")
         or not math.isclose(
             float(record.get("chip_seconds", -1.0)),
             float(run_record["chip_seconds"]),
@@ -3780,152 +5464,77 @@ def _command_run(args: argparse.Namespace) -> int:
     config.validate_production()
     root = _artifact_root(config, args.artifact_root)
     _require_production_artifact_root(root)
-    # `run` includes SAE training and evaluation. Check its distinct storage
-    # capability before launching even the subprocess benchmark; operators who
-    # only qualified the 24 GiB rolling capture buffer must use activation-farm.
-    _require_sae_cache_qualification(_read_storage_attestation_payload(root))
+    operation_paths = _operation_paths_for_command(args, root, authoritative=True)
+    assert operation_paths is not None
     benchmark = root / "benchmark" / "selected.json"
-    if not benchmark.exists():
-        # The supervisor and all candidate processes must run before this
-        # long-lived orchestration process initializes JAX distributed.
-        benchmark_args = argparse.Namespace(**vars(args))
-        benchmark_args.output = str(root / "benchmark")
-        benchmark_args.steps = config.benchmark_steps
-        _command_benchmark_harvest(benchmark_args)
-
-    run_preflight(
-        repo_root=REPO_ROOT,
-        artifact_root=root,
-        checkpoint_path=args.checkpoint,
-        grain_train_files=args.grain_train,
-        grain_eval_files=args.grain_eval,
-        require_tpu=True,
-    )
-    staged = {
-        "train": _verified_dataset_provenance(
-            args,
-            config,
-            split="train",
-            grain_files=args.grain_train,
-            manifest_location=args.dataset_train_manifest,
-        ),
-        "eval": _verified_dataset_provenance(
-            args,
-            config,
-            split="eval",
-            grain_files=args.grain_eval,
-            manifest_location=args.dataset_eval_manifest,
-        ),
-    }
     current_environment = _coordinated_environment()
-    storage_payload = _load_storage_attestation_payload(
+    benchmark_value = _coordinator_read_json_if_exists(
+        benchmark, purpose="post-capture selected benchmark"
+    )
+    sae_storage_value = _coordinator_read_json_if_exists(
+        _sae_storage_attestation_path(
+            root, str(current_environment.get("sha256", ""))
+        ),
+        purpose="post-capture SAE storage attestation",
+    )
+    if benchmark_value is None or sae_storage_value is None:
+        raise RuntimeError(
+            "run is the post-capture SAE orchestrator: first finish activation-farm "
+            "and qualify-sae-storage for this exact consumer environment"
+        )
+    storage_bundle = _load_sae_storage_bundle(
         root, config, environment=current_environment
     )
-    _require_sae_cache_qualification(storage_payload)
-    storage_layout = _storage_layout(storage_payload)
-    storage_attestation_sha256 = str(storage_payload["attestation_sha256"])
-    conversion_attestation_sha256 = _load_conversion_attestation(
-        root, config, args.checkpoint_sha256
+    storage_layout = storage_bundle["layout"]
+    activation_storage_attestation_sha256 = str(
+        storage_bundle["activation"]["attestation_sha256"]
     )
-
-    selected = _load_selected_benchmark(
-        benchmark,
-        config,
-        args.checkpoint_sha256,
-        conversion_attestation_sha256,
-        storage_attestation_sha256,
+    sae_storage_attestation_sha256 = str(
+        storage_bundle["sae"]["attestation_sha256"]
     )
-    selected_mesh = selected.get("mesh")
-    mesh_name = (
-        selected_mesh.get("name")
-        if isinstance(selected_mesh, dict)
-        else str(selected_mesh)
+    capture_compatibility_sha256 = str(
+        storage_bundle["compatibility"]["compatibility_sha256"]
     )
-    sequence_batch = int(selected["per_device_sequence_batch"])
-
-    for split, files, expected in (
-        ("train", args.grain_train, config.train_tokens),
-        ("eval", args.grain_eval, config.eval_tokens),
-    ):
-        dataset_fingerprint = staged[split].fingerprint_sha256
-        dataset_manifest = (
-            args.dataset_train_manifest
-            if split == "train"
-            else args.dataset_eval_manifest
-        )
-        capture_root = _capture_root(root, split)
-        sealed = (capture_root / "manifest.json").exists()
-        if sealed:
-            capture_dataset = _sealed_dataset(capture_root)
-            _require_exact_capture(capture_dataset, expected, split)
-            _require_capture_identity(
-                capture_dataset,
-                config,
-                split,
-                checkpoint_sha256=args.checkpoint_sha256,
-                conversion_attestation_sha256=conversion_attestation_sha256,
-                dataset_fingerprint=dataset_fingerprint,
-                environment_sha256=current_environment["sha256"],
-                storage_attestation_sha256=storage_attestation_sha256,
-                object_prefix=join_gcs_uri(
-                    storage_layout["bulk_gcs_root"],
-                    "captures",
-                    config.config_hash,
-                    split,
-                ),
-            )
-        if split == "train" and not sealed:
-            canary_args = argparse.Namespace(**vars(args))
-            canary_args.split = split
-            canary_args.grain_files = files
-            canary_args.dataset_manifest = dataset_manifest
-            canary_args.canary = True
-            canary_args.benchmark = str(benchmark)
-            canary_args.mesh = mesh_name
-            canary_args.per_device_sequence_batch = sequence_batch
-            _command_harvest(canary_args)
-            _release_accelerator_state("train-canary")
-
-        campaign_path = root / "harvest" / f"{split}.json"
-        campaign_complete = sealed and _campaign_is_complete(
-            campaign_path,
-            split=split,
-            tokens=expected,
-            mesh_name=mesh_name,
-            sequence_batch=sequence_batch,
-            config_sha256=config.config_hash,
-            checkpoint_sha256=args.checkpoint_sha256,
-            conversion_attestation_sha256=conversion_attestation_sha256,
-            dataset_fingerprint=dataset_fingerprint,
-            environment_sha256=current_environment["sha256"],
-            capture_manifest_sha256=capture_dataset.manifest_sha256,
-            benchmark=selected,
-        )
-        if not campaign_complete:
-            harvest_args = argparse.Namespace(**vars(args))
-            harvest_args.split = split
-            harvest_args.grain_files = files
-            harvest_args.dataset_manifest = dataset_manifest
-            harvest_args.canary = False
-            harvest_args.benchmark = str(benchmark)
-            harvest_args.mesh = mesh_name
-            harvest_args.per_device_sequence_batch = sequence_batch
-            _command_harvest(harvest_args)
-            _release_accelerator_state(f"{split}-production-harvest")
-
-    train_capture = _sealed_dataset(_capture_root(root, "train"))
-    eval_capture = _sealed_dataset(_capture_root(root, "eval"))
+    producer_environment_sha256 = str(
+        storage_bundle["producer_environment_sha256"]
+    )
+    train_capture = _sealed_dataset(
+        _capture_root(root, "train"),
+        cache_root=storage_layout["capture_cache_root"],
+        cache_max_bytes=storage_layout["capture_cache_max_bytes"],
+        require_resident_cache=True,
+        sealed_manifest=storage_bundle["train_manifest"],
+    )
+    eval_capture = _sealed_dataset(
+        _capture_root(root, "eval"),
+        cache_root=storage_layout["capture_cache_root"],
+        cache_max_bytes=storage_layout["capture_cache_max_bytes"],
+        require_resident_cache=True,
+        sealed_manifest=storage_bundle["eval_manifest"],
+    )
     _require_exact_capture(train_capture, config.train_tokens, "training")
     _require_exact_capture(eval_capture, config.eval_tokens, "held-out")
+    capture_checkpoint_sha256 = str(
+        train_capture.manifest["metadata"]["checkpoint_sha256"]
+    )
+    if (
+        eval_capture.manifest["metadata"].get("checkpoint_sha256")
+        != capture_checkpoint_sha256
+        or args.checkpoint_sha256 != capture_checkpoint_sha256
+    ):
+        raise RuntimeError("run checkpoint differs from the sealed captures")
+    conversion_attestation_sha256 = str(
+        storage_bundle["conversion_attestation_sha256"]
+    )
     _require_capture_identity(
         train_capture,
         config,
         "train",
-        checkpoint_sha256=args.checkpoint_sha256,
+        checkpoint_sha256=capture_checkpoint_sha256,
         conversion_attestation_sha256=conversion_attestation_sha256,
-        dataset_fingerprint=staged["train"].fingerprint_sha256,
-        environment_sha256=current_environment["sha256"],
-        storage_attestation_sha256=storage_attestation_sha256,
+        dataset_fingerprint=train_capture.manifest["metadata"]["dataset_fingerprint"],
+        environment_sha256=producer_environment_sha256,
+        storage_attestation_sha256=activation_storage_attestation_sha256,
         object_prefix=join_gcs_uri(
             storage_layout["bulk_gcs_root"],
             "captures",
@@ -3937,17 +5546,29 @@ def _command_run(args: argparse.Namespace) -> int:
         eval_capture,
         config,
         "eval",
-        checkpoint_sha256=args.checkpoint_sha256,
+        checkpoint_sha256=capture_checkpoint_sha256,
         conversion_attestation_sha256=conversion_attestation_sha256,
-        dataset_fingerprint=staged["eval"].fingerprint_sha256,
-        environment_sha256=current_environment["sha256"],
-        storage_attestation_sha256=storage_attestation_sha256,
+        dataset_fingerprint=eval_capture.manifest["metadata"]["dataset_fingerprint"],
+        environment_sha256=producer_environment_sha256,
+        storage_attestation_sha256=activation_storage_attestation_sha256,
         object_prefix=join_gcs_uri(
             storage_layout["bulk_gcs_root"],
             "captures",
             config.config_hash,
             "eval",
         ),
+    )
+    canary_gate = _consumer_canary_gate(
+        root,
+        train_manifest=train_capture.manifest,
+        benchmark_record=storage_bundle["benchmark"],
+    )
+    _validate_sae_operation(
+        operation_paths,
+        config=config,
+        environment=current_environment,
+        storage_bundle=storage_bundle,
+        canary_gate=canary_gate,
     )
 
     def train_to(condition: str, seed: int, stop_after: int | None) -> dict[str, Any]:
@@ -3957,8 +5578,16 @@ def _command_run(args: argparse.Namespace) -> int:
             train_capture,
             condition,
             seed,
-            storage_attestation_sha256=storage_attestation_sha256,
+            producer_environment_sha256=producer_environment_sha256,
+            consumer_environment_sha256=current_environment["sha256"],
+            activation_storage_attestation_sha256=(
+                activation_storage_attestation_sha256
+            ),
+            sae_storage_attestation_sha256=sae_storage_attestation_sha256,
+            capture_compatibility_sha256=capture_compatibility_sha256,
+            canary_gate=canary_gate,
             checkpoint_payload_root=storage_layout["sae_checkpoint_root"],
+            operation_paths=operation_paths,
         )
         target = config.train_tokens if stop_after is None else stop_after
         if existing is not None and int(existing["tokens_seen"]) >= target:
@@ -3977,8 +5606,16 @@ def _command_run(args: argparse.Namespace) -> int:
             train_capture,
             condition,
             seed,
-            storage_attestation_sha256=storage_attestation_sha256,
+            producer_environment_sha256=producer_environment_sha256,
+            consumer_environment_sha256=current_environment["sha256"],
+            activation_storage_attestation_sha256=(
+                activation_storage_attestation_sha256
+            ),
+            sae_storage_attestation_sha256=sae_storage_attestation_sha256,
+            capture_compatibility_sha256=capture_compatibility_sha256,
+            canary_gate=canary_gate,
             checkpoint_payload_root=storage_layout["sae_checkpoint_root"],
+            operation_paths=operation_paths,
         )
         if completed is None or int(completed["tokens_seen"]) < target:
             raise RuntimeError(
@@ -4003,8 +5640,16 @@ def _command_run(args: argparse.Namespace) -> int:
                 train_capture,
                 condition,
                 seed,
-                storage_attestation_sha256=storage_attestation_sha256,
+                producer_environment_sha256=producer_environment_sha256,
+                consumer_environment_sha256=current_environment["sha256"],
+                activation_storage_attestation_sha256=(
+                    activation_storage_attestation_sha256
+                ),
+                sae_storage_attestation_sha256=sae_storage_attestation_sha256,
+                capture_compatibility_sha256=capture_compatibility_sha256,
+                canary_gate=canary_gate,
                 checkpoint_payload_root=storage_layout["sae_checkpoint_root"],
+                operation_paths=operation_paths,
             )
             if (
                 run_record is None
@@ -4020,6 +5665,7 @@ def _command_run(args: argparse.Namespace) -> int:
                     condition,
                     seed,
                     run_record,
+                    operation_paths=operation_paths,
                 )
                 is None
             ):
@@ -4031,8 +5677,998 @@ def _command_run(args: argparse.Namespace) -> int:
 
     report_args = argparse.Namespace(**vars(args))
     report_args.harvester = str(benchmark)
-    report_args.output = str(root / "report.json")
+    report_args.output = str(operation_paths.report_path)
     return _command_report(report_args)
+
+
+def _smoke_full_shape(config: Gemma4Config) -> Any:
+    from moe_sae.sae_smoke import SAEFullShape
+
+    shape = SAEFullShape(
+        hidden_dim=config.hidden_size,
+        num_experts=config.num_routed_experts,
+        bank_width=config.bank_width,
+        top_routed=config.experts_per_token,
+        topk_features=config.topk_features,
+        effective_batch_tokens=config.effective_batch_tokens,
+    )
+    if shape != SAEFullShape.gemma4_26b_a4b():
+        raise RuntimeError("SAE smoke shape differs from the production Gemma 4 shape")
+    return shape
+
+
+def _build_smoke_campaign_inputs(
+    root: Path,
+    config: Gemma4Config,
+    environment: Mapping[str, Any],
+    *,
+    storage_bundle: Mapping[str, Any] | None = None,
+) -> tuple[Any, dict[str, Any]]:
+    """Build the exact pre-attestation smoke identity from sealed evidence."""
+
+    from moe_sae.compatibility import build_capture_compatibility
+    from moe_sae.sae_smoke import SmokeCampaignIdentity
+
+    activation: Mapping[str, Any] | None = None
+    train_manifest: Mapping[str, Any] | None = None
+    eval_manifest: Mapping[str, Any] | None = None
+    benchmark: Mapping[str, Any] | None = None
+    compatibility: Mapping[str, Any] | None = None
+    layout: Mapping[str, Any] | None = None
+    conversion_sha256 = ""
+    local_error: str | None = None
+    try:
+        if storage_bundle is None:
+            activation = _load_activation_producer_attestation_payload(root, config)
+            layout = _storage_layout(activation)
+            train_manifest = load_manifest(_capture_root(root, "train"))
+            eval_manifest = load_manifest(_capture_root(root, "eval"))
+            benchmark_value = _coordinator_read_json(
+                root / "benchmark" / "selected.json",
+                purpose="smoke capture-producer benchmark",
+            )
+            if not isinstance(benchmark_value, Mapping):
+                raise RuntimeError("smoke benchmark evidence must be an object")
+            benchmark = benchmark_value
+            checkpoint_sha256 = str(
+                train_manifest["metadata"].get("checkpoint_sha256", "")
+            )
+            if (
+                eval_manifest["metadata"].get("checkpoint_sha256")
+                != checkpoint_sha256
+            ):
+                raise RuntimeError("smoke train/eval captures use different checkpoints")
+            conversion_sha256 = _load_conversion_attestation(
+                root, config, checkpoint_sha256
+            )
+            compatibility = build_capture_compatibility(
+                repo_root=REPO_ROOT,
+                config_sha256=config.config_hash,
+                model_id=config.model_id,
+                maxtext_commit=config.maxtext_commit,
+                checkpoint_sha256=checkpoint_sha256,
+                conversion_attestation_sha256=conversion_sha256,
+                activation_storage_attestation_sha256=str(
+                    activation["attestation_sha256"]
+                ),
+                train_manifest=train_manifest,
+                eval_manifest=eval_manifest,
+                train_tokens=config.train_tokens,
+                eval_tokens=config.eval_tokens,
+                benchmark_record=benchmark,
+                consumer_environment=environment,
+            )
+        else:
+            activation = storage_bundle.get("activation")
+            train_manifest = storage_bundle.get("train_manifest")
+            eval_manifest = storage_bundle.get("eval_manifest")
+            benchmark = storage_bundle.get("benchmark")
+            compatibility = storage_bundle.get("compatibility")
+            layout = storage_bundle.get("layout")
+            conversion_sha256 = str(
+                storage_bundle.get("conversion_attestation_sha256", "")
+            )
+        if not all(
+            isinstance(value, Mapping)
+            for value in (
+                activation,
+                train_manifest,
+                eval_manifest,
+                benchmark,
+                compatibility,
+                layout,
+            )
+        ):
+            raise RuntimeError("smoke prerequisites are incomplete")
+        repository_sha256 = environment.get("repository_content_sha256")
+        if not isinstance(repository_sha256, str):
+            raise RuntimeError("smoke consumer lacks repository content identity")
+        campaign = SmokeCampaignIdentity(
+            config_sha256=config.config_hash,
+            repository_content_sha256=repository_sha256,
+            train_capture_manifest_sha256=str(
+                train_manifest["manifest_sha256"]
+            ),
+            eval_capture_manifest_sha256=str(eval_manifest["manifest_sha256"]),
+            consumer_environment_sha256=str(environment.get("sha256", "")),
+            capture_compatibility_sha256=str(
+                compatibility["compatibility_sha256"]
+            ),
+            full_shape=_smoke_full_shape(config),
+            checkpoint_payload_root=str(layout["sae_checkpoint_root"]),
+        )
+    except Exception as error:
+        local_error = f"{type(error).__name__}: {error}"
+        campaign = None
+    _collective_raise_if_any(local_error, purpose="SAE smoke prerequisite validation")
+    assert campaign is not None
+    assert activation is not None
+    assert train_manifest is not None
+    assert eval_manifest is not None
+    assert benchmark is not None
+    assert compatibility is not None
+    assert layout is not None
+    return campaign, {
+        "activation": dict(activation),
+        "train_manifest": dict(train_manifest),
+        "eval_manifest": dict(eval_manifest),
+        "benchmark": dict(benchmark),
+        "compatibility": dict(compatibility),
+        "layout": dict(layout),
+        "conversion_attestation_sha256": conversion_sha256,
+    }
+
+
+def _smoke_runner(
+    root: Path,
+    campaign: Any,
+    smoke_cache_root: str | Path,
+) -> Any:
+    from moe_sae.sae_smoke import SAESmokeRunner
+
+    return SAESmokeRunner(
+        root,
+        campaign,
+        smoke_cache_root=Path(smoke_cache_root).expanduser().resolve(),
+    )
+
+
+def _smoke_process_token_range(
+    effective_batch_tokens: int, process_index: int, process_count: int
+) -> tuple[int, int]:
+    if (
+        effective_batch_tokens != 16_384
+        or process_count != 4
+        or process_index not in range(process_count)
+    ):
+        raise RuntimeError(
+            "SAE smoke requires one 16,384-token batch over exactly four processes"
+        )
+    local_tokens = effective_batch_tokens // process_count
+    if local_tokens != 4_096:
+        raise RuntimeError("SAE smoke must consume exactly 4,096 tokens per process")
+    start = process_index * local_tokens
+    return start, start + local_tokens
+
+
+def _collective_smoke_attempt_id(requested: str | None) -> str:
+    process_index, _ = _process_context()
+    source = (
+        (requested or os.urandom(16).hex()).encode("ascii")
+        if process_index == 0
+        else None
+    )
+    shared = _broadcast_coordinator_bytes(source, purpose="SAE smoke attempt ID")
+    if shared is None:
+        raise RuntimeError("coordinator did not provide an SAE smoke attempt ID")
+    try:
+        attempt_id = shared.decode("ascii")
+    except UnicodeDecodeError as error:
+        raise RuntimeError("SAE smoke attempt ID broadcast is invalid") from error
+    local_error = (
+        None
+        if re.fullmatch(r"[0-9a-f]{32}", attempt_id)
+        and (requested is None or requested == attempt_id)
+        else "SAE smoke attempt ID differs across processes"
+    )
+    _collective_raise_if_any(local_error, purpose="SAE smoke attempt identity")
+    return attempt_id
+
+
+def _cleanup_passed_smoke_cache(cache_path: Path, cache_root: Path) -> None:
+    """Collectively remove only one passed attempt's host-private cache."""
+
+    import shutil
+
+    selected = cache_path.expanduser().resolve()
+    root = cache_root.expanduser().resolve()
+    try:
+        selected.relative_to(root)
+    except ValueError as error:
+        raise RuntimeError("smoke attempt cache escapes --cache-root") from error
+    if selected.name != "cache" or "sae-smoke" not in selected.parts:
+        raise RuntimeError("refusing to clean a non-attempt smoke cache path")
+    local_error: str | None = None
+    try:
+        if selected.is_symlink():
+            raise RuntimeError("smoke attempt cache cannot be a symlink")
+        if selected.exists():
+            shutil.rmtree(selected)
+        parent_fd = os.open(
+            selected.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+    except Exception as error:
+        local_error = f"{type(error).__name__}: {error}"
+    _collective_raise_if_any(local_error, purpose="passed SAE smoke cache cleanup")
+    _global_barrier("gemma4-sae-smoke-cache-cleaned")
+
+
+def _command_sae_smoke(args: argparse.Namespace) -> int:
+    """Run one fresh-process member of the mandatory collective F/A/B suite."""
+
+    from moe_sae.distributed import (
+        DistributedConfig,
+        create_mesh,
+        precompute_distributed_a_capacity,
+    )
+    from moe_sae.sae_smoke_collective import SAESmokeCollectiveRunner
+    from moe_sae.sae_smoke_jax import jax_collective_hooks
+    from moe_sae.sae_smoke_tpu import SAESmokeTPUAdapter
+
+    config = _config(args)
+    config.validate_production()
+    root = _artifact_root(config, args.artifact_root).resolve()
+    _require_production_artifact_root(root)
+    require_v4_32_runtime()
+    environment = _coordinated_environment()
+    campaign, evidence = _build_smoke_campaign_inputs(
+        root, config, environment
+    )
+    cache_root = Path(args.cache_root).expanduser().resolve()
+    runner = _smoke_runner(root, campaign, cache_root)
+    attempt_id = _collective_smoke_attempt_id(args.attempt_id)
+    attempt_paths = runner.paths(
+        args.condition, attempt_id, condition_attempt_number=1
+    )
+    dataset = _sealed_dataset(
+        _capture_root(root, "train"),
+        cache_root=attempt_paths.cache_path,
+        cache_max_bytes=config.capture_cache_max_bytes,
+        sealed_manifest=evidence["train_manifest"],
+    )
+    _require_exact_capture(dataset, config.train_tokens, "training")
+    producer_environment_sha256 = str(
+        dataset.manifest["metadata"].get("environment_sha256", "")
+    )
+    _require_capture_identity(
+        dataset,
+        config,
+        "train",
+        conversion_attestation_sha256=evidence[
+            "conversion_attestation_sha256"
+        ],
+        environment_sha256=producer_environment_sha256,
+        storage_attestation_sha256=evidence["activation"][
+            "attestation_sha256"
+        ],
+        object_prefix=join_gcs_uri(
+            evidence["layout"]["bulk_gcs_root"],
+            "captures",
+            config.config_hash,
+            "train",
+        ),
+    )
+    process_index, process_count = _process_context()
+    start, end = _smoke_process_token_range(
+        config.effective_batch_tokens, process_index, process_count
+    )
+    prefetch_error: str | None = None
+    try:
+        dataset.prefetch_token_range(start, end)
+    except Exception as error:
+        prefetch_error = f"{type(error).__name__}: {error}"
+    _collective_raise_if_any(prefetch_error, purpose="SAE smoke batch prefetch")
+    distributed = DistributedConfig(
+        microbatches_per_update=config.microbatches_per_update
+    )
+    a_capacity: int | None = None
+    training_config = _training_config(
+        config, args.condition, 1, a_capacity=None
+    )
+    if args.condition == "A":
+        a_capacity = precompute_distributed_a_capacity(
+            dataset,
+            training_config,
+            distributed,
+            total_tokens=config.effective_batch_tokens,
+        )
+        training_config = dataclasses.replace(
+            training_config, a_capacity=a_capacity
+        )
+    mesh = create_mesh(distributed)
+    collective = SAESmokeCollectiveRunner(runner, jax_collective_hooks())
+    adapter = SAESmokeTPUAdapter(
+        campaign_identity=campaign,
+        training_config=training_config,
+        batches=dataset.iter_token_range(start, end),
+        mean=dataset.mean,
+        mesh=mesh,
+        distributed_config=distributed,
+        smoke_a_capacity=a_capacity,
+        process_local_inputs=True,
+    )
+    outcome = collective.run_attempt(
+        args.condition,
+        callbacks=adapter.callbacks(),
+        attempt_id=attempt_id,
+    )
+    payload: dict[str, Any] = {
+        "campaign_sha256": campaign.sha256,
+        "condition": args.condition,
+        "attempt_id": outcome.attempt.attempt_id,
+        "outcome_sha256": outcome.outcome_sha256,
+        "checkpoint_sha256": outcome.checkpoint_sha256,
+        "state_sha256": outcome.state_sha256,
+        "process_token_range": [start, end],
+        "a_capacity": a_capacity,
+    }
+    if args.condition == "B":
+        suite = None
+        suite_error: str | None = None
+        try:
+            suite = runner.validate_passed_suite()
+        except Exception as error:
+            suite_error = f"{type(error).__name__}: {error}"
+        _collective_raise_if_any(suite_error, purpose="validate SAE smoke suite")
+        assert suite is not None
+        _coordinated_sha256(suite.sha256, purpose="SAE smoke suite")
+        payload["smoke_suite_sha256"] = suite.sha256
+    _cleanup_passed_smoke_cache(outcome.paths.cache_path, cache_root)
+    payload["attempt_cache_cleaned"] = True
+    if process_index == 0:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    return 0
+
+
+def _operation_spec_from_validated_inputs(
+    config: Gemma4Config,
+    environment: Mapping[str, Any],
+    storage_bundle: Mapping[str, Any],
+    canary_gate: Mapping[str, Any],
+    *,
+    smoke_campaign_sha256: str,
+    smoke_suite_sha256: str,
+) -> Any:
+    from moe_sae.sae_operator import SAEOperationSpec
+
+    return SAEOperationSpec(
+        config_sha256=config.config_hash,
+        repository_content_sha256=str(
+            environment.get("repository_content_sha256", "")
+        ),
+        consumer_environment_sha256=str(environment.get("sha256", "")),
+        train_capture_manifest_sha256=str(
+            storage_bundle["train_manifest"]["manifest_sha256"]
+        ),
+        eval_capture_manifest_sha256=str(
+            storage_bundle["eval_manifest"]["manifest_sha256"]
+        ),
+        activation_storage_attestation_sha256=str(
+            storage_bundle["activation"]["attestation_sha256"]
+        ),
+        sae_storage_attestation_sha256=str(
+            storage_bundle["sae"]["attestation_sha256"]
+        ),
+        capture_compatibility_sha256=str(
+            storage_bundle["compatibility"]["compatibility_sha256"]
+        ),
+        smoke_campaign_sha256=smoke_campaign_sha256,
+        smoke_suite_sha256=smoke_suite_sha256,
+        checkpoint_payload_root=str(
+            storage_bundle["layout"]["sae_checkpoint_root"]
+        ),
+        canary_waiver_sha256=canary_gate.get("waiver_sha256"),
+        sealed_recovery_waiver_sha256=canary_gate.get(
+            "recovery_waiver_sha256"
+        ),
+        performance_waiver_sha256=_performance_waiver_sha256(
+            storage_bundle["benchmark"]
+        ),
+    )
+
+
+def _command_sae_begin(args: argparse.Namespace) -> int:
+    """Seal the passed smoke suite and begin its exact SAE operation."""
+
+    config = _config(args)
+    config.validate_production()
+    root = _artifact_root(config, args.artifact_root).resolve()
+    _require_production_artifact_root(root)
+    require_v4_32_runtime()
+    environment = _coordinated_environment()
+    storage_bundle = _load_sae_storage_bundle(
+        root, config, environment=environment
+    )
+    campaign, _ = _build_smoke_campaign_inputs(
+        root,
+        config,
+        environment,
+        storage_bundle=storage_bundle,
+    )
+    runner = _smoke_runner(root, campaign, args.cache_root)
+    suite = None
+    suite_error: str | None = None
+    try:
+        suite = runner.validate_passed_suite()
+    except Exception as error:
+        suite_error = f"{type(error).__name__}: {error}"
+    _collective_raise_if_any(suite_error, purpose="validate passed SAE smoke suite")
+    assert suite is not None
+    _coordinated_sha256(campaign.sha256, purpose="SAE smoke campaign")
+    _coordinated_sha256(suite.sha256, purpose="SAE smoke suite")
+    canary_gate = _consumer_canary_gate(
+        root,
+        train_manifest=storage_bundle["train_manifest"],
+        benchmark_record=storage_bundle["benchmark"],
+    )
+    spec = _operation_spec_from_validated_inputs(
+        config,
+        environment,
+        storage_bundle,
+        canary_gate,
+        smoke_campaign_sha256=campaign.sha256,
+        smoke_suite_sha256=suite.sha256,
+    )
+    control = SAEControl(root)
+    state = control.begin(spec)
+    _coordinated_sha256(spec.sha256, purpose="SAE operation")
+    if _process_context()[0] == 0:
+        print(
+            json.dumps(
+                {
+                    "operation_sha256": spec.sha256,
+                    "state_path": str(control.state_path),
+                    "smoke_campaign_sha256": campaign.sha256,
+                    "smoke_suite_sha256": suite.sha256,
+                    "next_phase": control.next_phase(),
+                    "state_sha256": state["state_sha256"],
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+    return 0
+
+
+def _command_sae_farm(args: argparse.Namespace) -> int:
+    """Run one JAX-free controller supervisor until completion or abort."""
+
+    from moe_sae.sae_farm import run_farm
+    from moe_sae.sae_farm_runtime import (
+        SAELocalSubprocessExecutor,
+        revalidate_phase_artifact,
+    )
+
+    config = _config(args)
+    root = _artifact_root(config, args.artifact_root).resolve()
+    _require_production_artifact_root(root)
+    paths = SAEOperationPaths(root, args.operation_sha256)
+    control = SAEControl(root, args.operation_sha256)
+    control.load_state()
+    executor = SAELocalSubprocessExecutor(args.config, root)
+    result = run_farm(
+        control,
+        paths,
+        executor,
+        revalidate_phase_artifact,
+        lane=args.lane,
+        poll_seconds=args.poll_seconds,
+        rendezvous_timeout_seconds=args.rendezvous_timeout_seconds,
+        completion_timeout_seconds=args.completion_timeout_seconds,
+    )
+    print(json.dumps(dataclasses.asdict(result), indent=2, sort_keys=True))
+    return 0
+
+
+def _command_sae_status(args: argparse.Namespace) -> int:
+    config = _config(args)
+    root = _artifact_root(config, args.artifact_root).resolve()
+    _require_production_artifact_root(root)
+    status = SAEControl(root, args.operation_sha256).status()
+    print(json.dumps(status, indent=2, sort_keys=True))
+    return 0
+
+
+def _command_sae_abort(args: argparse.Namespace) -> int:
+    config = _config(args)
+    root = _artifact_root(config, args.artifact_root).resolve()
+    _require_production_artifact_root(root)
+    control = SAEControl(root, args.operation_sha256)
+    if args.clear:
+        payload: Any = {"cleared": control.clear_abort()}
+    else:
+        payload = control.request_abort(
+            args.reason, requested_by=args.requested_by
+        )
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    return 0
+
+
+def _infer_smoke_cache_root(root: Path, campaign_sha256: str) -> Path:
+    """Recover the bound host-local smoke root, then let the runner validate it."""
+
+    attempts = (
+        root
+        / "sae-smoke"
+        / "campaigns"
+        / campaign_sha256
+        / "conditions"
+        / "00-F"
+        / "attempts"
+    )
+    try:
+        attempt_roots = sorted(attempts.iterdir())
+    except OSError as error:
+        raise RuntimeError(
+            "operation smoke campaign has no F attempt records"
+        ) from error
+    successful_roots = [
+        attempt_root
+        for attempt_root in attempt_roots
+        if not attempt_root.is_symlink()
+        and attempt_root.is_dir()
+        and not (attempt_root / "result.json").is_symlink()
+        and (attempt_root / "result.json").is_file()
+    ]
+    if len(successful_roots) != 1:
+        raise RuntimeError(
+            "operation smoke campaign must have exactly one passed F attempt"
+        )
+    successful_root = successful_roots[0]
+    record = successful_root / "attempt.json"
+    if record.is_symlink() or not record.is_file():
+        raise RuntimeError("passed F smoke attempt record path is invalid")
+    try:
+        value = json.loads(record.read_text(encoding="utf-8"))
+        cache_path = Path(value["identity"]["cache_path"]).expanduser().resolve()
+    except (OSError, KeyError, TypeError, json.JSONDecodeError) as error:
+        raise RuntimeError("cannot infer the operation's smoke cache root") from error
+    expected_suffix = (
+        "sae-smoke",
+        "campaigns",
+        campaign_sha256,
+        "conditions",
+        "00-F",
+        "attempts",
+        successful_root.name,
+        "cache",
+    )
+    if tuple(cache_path.parts[-len(expected_suffix) :]) != expected_suffix:
+        raise RuntimeError("smoke attempt cache path has an unexpected identity")
+    return cache_path.parents[7]
+
+
+def _validated_operation_smoke_hashes(
+    root: Path,
+    config: Gemma4Config,
+    environment: Mapping[str, Any],
+    storage_bundle: Mapping[str, Any],
+    operation_spec: Mapping[str, Any],
+) -> tuple[str, str]:
+    """Rebuild and revalidate the exact smoke suite bound to an operation."""
+
+    campaign, _ = _build_smoke_campaign_inputs(
+        root,
+        config,
+        environment,
+        storage_bundle=storage_bundle,
+    )
+    if operation_spec.get("smoke_campaign_sha256") != campaign.sha256:
+        raise RuntimeError(
+            "SAE operation spec disagrees with validated smoke campaign identity"
+        )
+    cache_root = _infer_smoke_cache_root(root, campaign.sha256)
+    suite = _smoke_runner(root, campaign, cache_root).validate_passed_suite()
+    if operation_spec.get("smoke_suite_sha256") != suite.sha256:
+        raise RuntimeError(
+            "SAE operation spec disagrees with validated smoke suite identity"
+        )
+    return campaign.sha256, suite.sha256
+
+
+def _validate_inherited_sae_phase(
+    args: argparse.Namespace,
+    control: SAEControl,
+) -> dict[str, Any]:
+    """Fence a numerical child to its inherited live lane and active attempt."""
+
+    from moe_sae.sae_farm_runtime import SAE_LEASE_FD_ENV
+
+    raw_fd = os.environ.get(SAE_LEASE_FD_ENV)
+    try:
+        lease_fd = int(raw_fd) if raw_fd is not None else -1
+        inherited = os.fstat(lease_fd)
+    except (OSError, ValueError) as error:
+        raise RuntimeError("sae-phase lacks its inherited live lane lease FD") from error
+    matches: list[str] = []
+    for path in sorted((control.root / "lanes").glob("lane-*.lock")):
+        try:
+            observed = path.stat()
+        except OSError:
+            continue
+        if (observed.st_dev, observed.st_ino) == (inherited.st_dev, inherited.st_ino):
+            matches.append(path.stem.removeprefix("lane-"))
+    if len(matches) != 1:
+        raise RuntimeError("inherited lease FD does not identify exactly one SAE lane")
+    state = control.load_state()
+    phase_record = state["phases"].get(args.phase)
+    if (
+        not isinstance(phase_record, Mapping)
+        or phase_record.get("status") != "running"
+        or phase_record.get("attempt_id") != args.attempt_id
+        or phase_record.get("attempts") != args.attempt_number
+    ):
+        raise RuntimeError("sae-phase does not match the exact active phase attempt")
+    status = control.status()
+    lanes = [
+        item
+        for item in status["lanes"]
+        if item.get("lane_id") == matches[0]
+        and item.get("lease_held") is True
+        and item.get("state") == "running"
+        and item.get("phase") == args.phase
+        and item.get("attempt_id") == args.attempt_id
+    ]
+    if len(lanes) != 1:
+        raise RuntimeError("inherited SAE lane is not live in the active attempt")
+    return {"lease_fd": lease_fd, "lane": lanes[0], "state": state}
+
+
+def _phase_context(args: argparse.Namespace) -> dict[str, Any]:
+    config = _config(args)
+    config.validate_production()
+    root = _artifact_root(config, args.artifact_root).resolve()
+    _require_production_artifact_root(root)
+    paths = SAEOperationPaths(root, args.operation_sha256)
+    control = SAEControl(root, args.operation_sha256)
+    invocation = _validate_inherited_sae_phase(args, control)
+    require_v4_32_runtime()
+    environment = _coordinated_environment()
+    storage_bundle = _load_sae_storage_bundle(
+        root, config, environment=environment
+    )
+    canary_gate = _consumer_canary_gate(
+        root,
+        train_manifest=storage_bundle["train_manifest"],
+        benchmark_record=storage_bundle["benchmark"],
+    )
+    state = _validate_sae_operation(
+        paths,
+        config=config,
+        environment=environment,
+        storage_bundle=storage_bundle,
+        canary_gate=canary_gate,
+    )
+    return {
+        "config": config,
+        "root": root,
+        "paths": paths,
+        "control": control,
+        "invocation": invocation,
+        "environment": environment,
+        "storage_bundle": storage_bundle,
+        "canary_gate": canary_gate,
+        "state": state,
+    }
+
+
+def _phase_datasets(context: Mapping[str, Any]) -> tuple[ArtifactDataset, ArtifactDataset]:
+    root = context["root"]
+    bundle = context["storage_bundle"]
+    layout = bundle["layout"]
+    train = _sealed_dataset(
+        _capture_root(root, "train"),
+        cache_root=layout["capture_cache_root"],
+        cache_max_bytes=layout["capture_cache_max_bytes"],
+        require_resident_cache=True,
+        sealed_manifest=bundle["train_manifest"],
+    )
+    heldout = _sealed_dataset(
+        _capture_root(root, "eval"),
+        cache_root=layout["capture_cache_root"],
+        cache_max_bytes=layout["capture_cache_max_bytes"],
+        require_resident_cache=True,
+        sealed_manifest=bundle["eval_manifest"],
+    )
+    _require_exact_capture(train, context["config"].train_tokens, "training")
+    _require_exact_capture(heldout, context["config"].eval_tokens, "held-out")
+    return train, heldout
+
+
+def _phase_run_record(
+    context: Mapping[str, Any], condition: str, seed: int
+) -> dict[str, Any]:
+    train, _ = _phase_datasets(context)
+    bundle = context["storage_bundle"]
+    record = _load_resume_run(
+        context["root"],
+        context["config"],
+        train,
+        condition,
+        seed,
+        producer_environment_sha256=bundle["producer_environment_sha256"],
+        consumer_environment_sha256=context["environment"]["sha256"],
+        activation_storage_attestation_sha256=bundle["activation"][
+            "attestation_sha256"
+        ],
+        sae_storage_attestation_sha256=bundle["sae"]["attestation_sha256"],
+        capture_compatibility_sha256=bundle["compatibility"][
+            "compatibility_sha256"
+        ],
+        canary_gate=context["canary_gate"],
+        checkpoint_payload_root=bundle["layout"]["sae_checkpoint_root"],
+        operation_paths=context["paths"],
+    )
+    if record is None:
+        raise RuntimeError(f"phase produced no run for {condition}/seed-{seed}")
+    return record
+
+
+def _phase_file_evidence(path: Path, purpose: str) -> dict[str, Any]:
+    value = _coordinator_read_json(path, purpose=purpose)
+    if not isinstance(value, Mapping):
+        raise RuntimeError(f"{purpose} is not an object")
+    return {
+        "path": str(path),
+        "sha256": sha256_json(value),
+    }
+
+
+def _publish_phase_result_collective(
+    paths: SAEOperationPaths,
+    phase: str,
+    evidence: Mapping[str, Any],
+) -> str:
+    from moe_sae.sae_phase_results import publish_phase_result, validate_phase_result
+
+    _coordinated_sha256(sha256_json(evidence), purpose=f"{phase} phase evidence")
+    local_error: str | None = None
+    if _process_context()[0] == 0:
+        try:
+            publish_phase_result(paths, phase, evidence)
+        except Exception as error:
+            local_error = f"{type(error).__name__}: {error}"
+    _collective_raise_if_any(local_error, purpose=f"publish {phase} phase result")
+    _global_barrier(f"gemma4-sae-phase-result-{phase}")
+    digest = validate_phase_result(paths, phase)
+    _coordinated_sha256(digest, purpose=f"{phase} phase result")
+    return digest
+
+
+def _smoke_phase_evidence(context: Mapping[str, Any], condition: str) -> dict[str, Any]:
+    spec = context["state"]["spec"]
+    campaign, _ = _build_smoke_campaign_inputs(
+        context["root"],
+        context["config"],
+        context["environment"],
+        storage_bundle=context["storage_bundle"],
+    )
+    smoke_root = _infer_smoke_cache_root(
+        context["root"], str(spec["smoke_campaign_sha256"])
+    )
+    suite = _smoke_runner(context["root"], campaign, smoke_root).validate_passed_suite()
+    if (
+        campaign.sha256 != spec.get("smoke_campaign_sha256")
+        or suite.sha256 != spec.get("smoke_suite_sha256")
+    ):
+        raise RuntimeError("operation no longer matches its passed smoke suite")
+    selected = next(item for item in suite.conditions if item.condition == condition)
+    return {
+        "kind": "smoke-suite-condition",
+        "operation_sha256": context["paths"].operation_sha256,
+        "campaign_sha256": campaign.sha256,
+        "suite_sha256": suite.sha256,
+        "condition": condition,
+        "condition_attestation": selected.to_mapping(),
+    }
+
+
+def _training_phase_evidence(
+    context: Mapping[str, Any], condition: str, seed: int, *, gate: bool
+) -> dict[str, Any]:
+    config = context["config"]
+    stop_after = config.health_gate_tokens if gate else None
+    train_args = argparse.Namespace(
+        config=str(context["config_path"]),
+        artifact_root=str(context["root"]),
+        operation_sha256=context["paths"].operation_sha256,
+        condition=condition,
+        seed=seed,
+        stop_after_tokens=stop_after,
+        a_capacity=None,
+        reference=False,
+    )
+    _command_train(train_args)
+    record = _phase_run_record(context, condition, seed)
+    expected_tokens = (
+        min(
+            config.train_tokens,
+            math.ceil(config.health_gate_tokens / config.effective_batch_tokens)
+            * config.effective_batch_tokens,
+        )
+        if gate
+        else config.train_tokens
+    )
+    if int(record["tokens_seen"]) != expected_tokens:
+        raise RuntimeError(
+            f"{condition}/seed-{seed} reached {record['tokens_seen']}, "
+            f"expected {expected_tokens}"
+        )
+    run_root = context["paths"].run_root(condition, seed)
+    pointer_name = "latest.json" if gate else "final.json"
+    return {
+        "kind": "training-gate" if gate else "training-final",
+        "operation_sha256": context["paths"].operation_sha256,
+        "condition": condition,
+        "seed": seed,
+        "tokens_seen": int(record["tokens_seen"]),
+        "steps": int(record["steps"]),
+        "run_instance_id": record["run_instance_id"],
+        "run": _phase_file_evidence(run_root / "run.json", "phase run metadata"),
+        "checkpoint_pointer": _phase_file_evidence(
+            run_root / pointer_name, "phase checkpoint pointer"
+        ),
+        "metrics_journal_sha256": record["metrics_journal"]["binding"][
+            "journal_sha256"
+        ],
+        "health": record["health"],
+    }
+
+
+def _evaluation_phase_evidence(
+    context: Mapping[str, Any], condition: str, seed: int
+) -> dict[str, Any]:
+    config = context["config"]
+    eval_args = argparse.Namespace(
+        config=str(context["config_path"]),
+        artifact_root=str(context["root"]),
+        operation_sha256=context["paths"].operation_sha256,
+        reference=False,
+        allow_reference_cost=False,
+    )
+    _command_eval_one(eval_args, config, condition, seed)
+    train, heldout = _phase_datasets(context)
+    run_record = _phase_run_record(context, condition, seed)
+    record = _existing_evaluation(
+        context["root"],
+        config,
+        train,
+        heldout,
+        condition,
+        seed,
+        run_record,
+        operation_paths=context["paths"],
+    )
+    if record is None:
+        raise RuntimeError(f"phase produced no evaluation for {condition}/seed-{seed}")
+    path = context["paths"].evaluation_path(condition, seed)
+    return {
+        "kind": "held-out-evaluation",
+        "operation_sha256": context["paths"].operation_sha256,
+        "condition": condition,
+        "seed": seed,
+        "run_instance_id": record["run_instance_id"],
+        "tokens": int(record["tokens"]),
+        "evaluation": _phase_file_evidence(path, "phase evaluation"),
+    }
+
+
+def _command_sae_phase(args: argparse.Namespace) -> int:
+    """Execute one fenced numerical phase inside a fresh farm child."""
+
+    from moe_sae.sae_phase_results import phase_result_path, validate_phase_result
+
+    context = _phase_context(args)
+    context["config_path"] = Path(args.config).expanduser().resolve()
+    paths = context["paths"]
+    existing_path = phase_result_path(paths, args.phase)
+    if existing_path.exists() or existing_path.is_symlink():
+        digest = validate_phase_result(paths, args.phase)
+        _coordinated_sha256(digest, purpose=f"existing {args.phase} phase result")
+        if _process_context()[0] == 0:
+            print(json.dumps({"phase": args.phase, "result_sha256": digest}))
+        return 0
+
+    if args.phase == "validate-prerequisites":
+        bundle = context["storage_bundle"]
+        evidence: dict[str, Any] = {
+            "kind": "validated-prerequisites",
+            "operation_sha256": paths.operation_sha256,
+            "config_sha256": context["config"].config_hash,
+            "repository_content_sha256": context["environment"][
+                "repository_content_sha256"
+            ],
+            "consumer_environment_sha256": context["environment"]["sha256"],
+            "train_capture_manifest_sha256": bundle["train_manifest"][
+                "manifest_sha256"
+            ],
+            "eval_capture_manifest_sha256": bundle["eval_manifest"][
+                "manifest_sha256"
+            ],
+            "activation_storage_attestation_sha256": bundle["activation"][
+                "attestation_sha256"
+            ],
+            "sae_storage_attestation_sha256": bundle["sae"][
+                "attestation_sha256"
+            ],
+            "capture_compatibility_sha256": bundle["compatibility"][
+                "compatibility_sha256"
+            ],
+            "canary_gate": context["canary_gate"],
+        }
+    elif args.phase.startswith("smoke-"):
+        evidence = _smoke_phase_evidence(context, args.phase.removeprefix("smoke-"))
+    else:
+        match = re.fullmatch(r"(gate|full|eval)-([ABF])-seed-([123])", args.phase)
+        if match is None:
+            if args.phase != "report":
+                raise RuntimeError(f"unsupported SAE phase mapping: {args.phase}")
+            report_args = argparse.Namespace(
+                config=str(context["config_path"]),
+                artifact_root=str(context["root"]),
+                operation_sha256=paths.operation_sha256,
+                harvester=None,
+                output=str(paths.report_path),
+            )
+            _command_report(report_args)
+            report_value = _coordinator_read_json(
+                paths.report_path, purpose="phase efficiency report"
+            )
+            if (
+                not isinstance(report_value, Mapping)
+                or report_value.get("experiment", {}).get("operation_sha256")
+                != paths.operation_sha256
+            ):
+                raise RuntimeError("phase report belongs to another operation")
+            evidence = {
+                "kind": "efficiency-report",
+                "operation_sha256": paths.operation_sha256,
+                "report": _phase_file_evidence(
+                    paths.report_path, "phase efficiency report"
+                ),
+                "status": report_value.get("status"),
+                "headline_eligible": report_value.get("headline_eligible"),
+            }
+        else:
+            kind, condition, raw_seed = match.groups()
+            seed = int(raw_seed)
+            if kind == "gate":
+                if seed != 1:
+                    raise RuntimeError("only seed 1 has an SAE health-gate phase")
+                evidence = _training_phase_evidence(
+                    context, condition, seed, gate=True
+                )
+            elif kind == "full":
+                evidence = _training_phase_evidence(
+                    context, condition, seed, gate=False
+                )
+            else:
+                evidence = _evaluation_phase_evidence(context, condition, seed)
+    digest = _publish_phase_result_collective(paths, args.phase, evidence)
+    if _process_context()[0] == 0:
+        print(
+            json.dumps(
+                {"phase": args.phase, "result_sha256": digest},
+                indent=2,
+                sort_keys=True,
+            )
+        )
+    return 0
 
 
 def _activation_common_child_arguments(args: argparse.Namespace) -> list[str]:
@@ -4760,6 +7396,18 @@ def build_parser() -> argparse.ArgumentParser:
     storage.add_argument("--minimum-bytes-per-second", type=float)
     storage.set_defaults(handler=_command_qualify_storage)
 
+    sae_storage = subparsers.add_parser(
+        "qualify-sae-storage",
+        help="qualify the exact per-controller 100 GiB activation cache",
+    )
+    _add_common(sae_storage)
+    sae_storage.add_argument(
+        "--cache-root",
+        required=True,
+        help="host-private cache path (the same pathname may exist on every host)",
+    )
+    sae_storage.set_defaults(handler=_command_qualify_sae_storage)
+
     preflight = subparsers.add_parser(
         "preflight", help="fail-closed environment validation"
     )
@@ -4911,12 +7559,93 @@ def build_parser() -> argparse.ArgumentParser:
     activation_abort_action.add_argument("--clear", action="store_true")
     activation_abort.set_defaults(handler=_command_activation_abort)
 
+    sae_smoke = subparsers.add_parser(
+        "sae-smoke",
+        help="run one fresh collective full-shape smoke (invoke F, then A, then B)",
+    )
+    _add_common(sae_smoke)
+    sae_smoke.add_argument(
+        "--condition", choices=("F", "A", "B"), required=True
+    )
+    sae_smoke.add_argument(
+        "--cache-root",
+        required=True,
+        help="top-level host-private root for isolated per-attempt smoke caches",
+    )
+    sae_smoke.add_argument("--attempt-id", type=_attempt_id_argument)
+    sae_smoke.set_defaults(handler=_command_sae_smoke)
+
+    sae_begin = subparsers.add_parser(
+        "sae-begin", help="seal the exact F/A/B smoke suite into an SAE operation"
+    )
+    _add_common(sae_begin)
+    sae_begin.add_argument(
+        "--cache-root",
+        required=True,
+        help="the same top-level host-private root used by sae-smoke",
+    )
+    sae_begin.set_defaults(handler=_command_sae_begin)
+
+    sae_farm = subparsers.add_parser(
+        "sae-farm", help="run one durable JAX-free SAE controller supervisor"
+    )
+    _add_common(sae_farm)
+    sae_farm.add_argument(
+        "--operation-sha256", type=_sha256_argument, required=True
+    )
+    sae_farm.add_argument("--lane")
+    sae_farm.add_argument("--poll-seconds", type=float, default=0.25)
+    sae_farm.add_argument(
+        "--rendezvous-timeout-seconds", type=float, default=300.0
+    )
+    sae_farm.add_argument(
+        "--completion-timeout-seconds", type=float, default=300.0
+    )
+    sae_farm.set_defaults(handler=_command_sae_farm)
+
+    sae_status = subparsers.add_parser(
+        "sae-status", help="inspect an SAE operation without importing JAX"
+    )
+    _add_common(sae_status)
+    sae_status.add_argument(
+        "--operation-sha256", type=_sha256_argument, required=True
+    )
+    sae_status.set_defaults(handler=_command_sae_status)
+
+    sae_abort = subparsers.add_parser(
+        "sae-abort", help="request or clear a cooperative SAE boundary stop"
+    )
+    _add_common(sae_abort)
+    sae_abort.add_argument(
+        "--operation-sha256", type=_sha256_argument, required=True
+    )
+    sae_abort_action = sae_abort.add_mutually_exclusive_group(required=True)
+    sae_abort_action.add_argument("--reason")
+    sae_abort_action.add_argument("--clear", action="store_true")
+    sae_abort.add_argument("--requested-by", default="operator")
+    sae_abort.set_defaults(handler=_command_sae_abort)
+
+    sae_phase = subparsers.add_parser("sae-phase", help=argparse.SUPPRESS)
+    _add_common(sae_phase)
+    sae_phase.add_argument(
+        "--operation-sha256", type=_sha256_argument, required=True
+    )
+    sae_phase.add_argument("--phase", choices=SAE_PHASES, required=True)
+    sae_phase.add_argument("--attempt-id", type=_attempt_id_argument, required=True)
+    sae_phase.add_argument("--attempt-number", type=int, required=True)
+    sae_phase.set_defaults(handler=_command_sae_phase)
+
     train_parser = subparsers.add_parser("train", help="train or resume one A/B/F seed")
     _add_common(train_parser)
     train_parser.add_argument("--condition", choices=("A", "B", "F"), required=True)
     train_parser.add_argument("--seed", type=int, choices=(1, 2, 3), required=True)
     train_parser.add_argument("--stop-after-tokens", type=int)
     train_parser.add_argument("--a-capacity", type=int)
+    train_parser.add_argument(
+        "--operation-sha256",
+        type=_sha256_argument,
+        help="immutable SAE operation identity (required unless --reference)",
+    )
     train_parser.add_argument(
         "--reference",
         action="store_true",
@@ -4934,6 +7663,11 @@ def build_parser() -> argparse.ArgumentParser:
     eval_parser.add_argument("--seed", type=int, choices=(1, 2, 3))
     eval_parser.add_argument("--reference", action="store_true")
     eval_parser.add_argument(
+        "--operation-sha256",
+        type=_sha256_argument,
+        help="immutable SAE operation identity (required unless --reference)",
+    )
+    eval_parser.add_argument(
         "--allow-reference-cost", action="store_true", help=argparse.SUPPRESS
     )
     eval_parser.set_defaults(handler=_command_eval)
@@ -4944,6 +7678,9 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common(report)
     report.add_argument("--harvester")
     report.add_argument("--output")
+    report.add_argument(
+        "--operation-sha256", type=_sha256_argument, required=True
+    )
     report.set_defaults(handler=_command_report)
 
     run = subparsers.add_parser(
@@ -4956,6 +7693,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--grain-eval", required=True)
     run.add_argument("--dataset-train-manifest", required=True)
     run.add_argument("--dataset-eval-manifest", required=True)
+    run.add_argument("--operation-sha256", type=_sha256_argument, required=True)
     run.set_defaults(handler=_command_run)
     return parser
 

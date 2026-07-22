@@ -143,6 +143,7 @@ def test_two_process_split_storage_qualification(tmp_path: Path) -> None:
     assert first.require_pass() is first
     assert first.control.flock_correct
     assert first.control.atomic_rename_visible
+    assert first.control.negative_lookup_creation_visible
     assert first.control.disjoint_files_visible
     assert first.local_buffer.directories == (
         str((local / "host-0").resolve()),
@@ -164,6 +165,30 @@ def test_two_process_split_storage_qualification(tmp_path: Path) -> None:
     assert all(entry["generation"] > 0 for entry in first.gcs.objects)
     assert all(len(entry["crc32c"]) == 8 for entry in first.gcs.objects)
     assert list(Path(first.control.work_directory).glob("throughput-*")) == []
+
+
+def test_absent_to_present_probe_rejects_stale_negative_lookup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    original_read_bytes = Path.read_bytes
+
+    def stale_read(path: Path) -> bytes:
+        if path.name == "negative-lookup-created.bin":
+            raise FileNotFoundError(2, "injected stale negative lookup", str(path))
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", stale_read)
+    visible, errors = storage_module._qualify_negative_lookup_creation_visibility(
+        tmp_path,
+        "negative-cache-regression",
+        storage_module.local_coordination_hooks(),
+        0,
+        1,
+    )
+
+    assert not visible
+    assert len(errors) == 1
+    assert "injected stale negative lookup" in errors[0]
 
 
 def test_two_process_qualification_rejects_shared_local_buffer(tmp_path: Path) -> None:
@@ -439,7 +464,7 @@ def test_activation_download_integrity_failure_remains_a_hard_gate(
     )
 
 
-def test_v6_activation_attestation_is_self_hashed_scoped_and_bound(
+def test_v7_activation_attestation_is_self_hashed_scoped_and_bound(
     tmp_path: Path,
 ) -> None:
     config = StoragePlanesQualificationConfig(
@@ -501,6 +526,18 @@ def test_v6_activation_attestation_is_self_hashed_scoped_and_bound(
     )
     with pytest.raises(StorageQualificationError, match="host-local buffer isolation"):
         validate_storage_attestation(isolation_tampered)
+
+    negative_visibility_tampered = copy.deepcopy(payload)
+    negative_visibility_tampered["qualification"]["control"][
+        "negative_lookup_creation_visible"
+    ] = False
+    negative_visibility_tampered["attestation_sha256"] = (
+        storage_module.storage_attestation_digest(negative_visibility_tampered)
+    )
+    with pytest.raises(
+        StorageQualificationError, match="absent-to-present control visibility"
+    ):
+        validate_storage_attestation(negative_visibility_tampered)
 
     local_write_tampered = copy.deepcopy(payload)
     local_write_tampered["qualification"]["local_buffer"]["write"][

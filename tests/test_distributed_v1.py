@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -30,6 +31,7 @@ from moe_sae.distributed import (
     train_distributed,
 )
 from moe_sae.pipeline import ActivationBatch, TrainingConfig
+from moe_sae.metrics_journal import JournalIdentity, MetricsJournal
 from moe_sae.sae import SAEConfig
 
 
@@ -71,6 +73,300 @@ def test_capacity_scan_uses_static_local_microbatches_and_margin() -> None:
     )
     # Each two-row micro gives experts 0/1 a load of two; 10% then round to 8.
     assert capacity == 8
+
+
+def test_checkpoint_control_visibility_retries_enoent_and_stale_contents() -> None:
+    expected = {"tokens_seen": 8, "kind": "latest"}
+    observations: list[object] = [
+        FileNotFoundError("negative lookup"),
+        json.dumps({"tokens_seen": 4, "kind": "latest"}),
+        json.dumps(expected),
+    ]
+    sleeps: list[float] = []
+
+    class DelayedControlPath:
+        def read_text(self, *, encoding: str) -> str:
+            assert encoding == "utf-8"
+            observation = observations.pop(0)
+            if isinstance(observation, Exception):
+                raise observation
+            return str(observation)
+
+        def __str__(self) -> str:
+            return "/shared/latest.json"
+
+    distributed_module._load_exact_checkpoint_control_with_retry(
+        DelayedControlPath(),  # type: ignore[arg-type]
+        expected,
+        timeout_seconds=1.0,
+        poll_seconds=0.1,
+        clock=lambda: 0.0,
+        sleep=sleeps.append,
+    )
+    assert not observations
+    assert sleeps == [0.1, 0.1]
+
+
+def test_pointer_publish_error_reaches_collective_decision_before_raise(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    pointer = make_pointer(
+        kind="latest",
+        payload_uri=str(tmp_path / "payloads" / "runs" / "ignored"),
+        step=1,
+        tokens_seen=2,
+        attempt_id="a" * 32,
+        run_identity={},
+    )
+    decisions: list[bool] = []
+
+    monkeypatch.setattr(jax, "process_index", lambda: 0)
+    monkeypatch.setattr(
+        distributed_module,
+        "_checkpoint_collective_failed",
+        lambda failed: decisions.append(failed) or failed,
+    )
+    monkeypatch.setattr(
+        distributed_module,
+        "publish_pointer",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("write failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="pointer publication"):
+        distributed_module._publish_checkpoint_pointer(tmp_path, pointer)
+    # Preparation succeeded; publication failed.  The local exception was
+    # converted into a collective decision before it was raised.
+    assert decisions == [False, True]
+
+
+def test_pointer_peer_uses_remote_failure_decision_without_visibility_branch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    pointer = make_pointer(
+        kind="latest",
+        payload_uri=str(tmp_path / "payloads" / "runs" / "ignored"),
+        step=1,
+        tokens_seen=2,
+        attempt_id="b" * 32,
+        run_identity={},
+    )
+    remote_decisions = iter((False, True))
+    visibility_called = False
+
+    monkeypatch.setattr(jax, "process_index", lambda: 1)
+    monkeypatch.setattr(
+        distributed_module,
+        "_checkpoint_collective_failed",
+        lambda _failed: next(remote_decisions),
+    )
+
+    def visibility(*_args, **_kwargs):
+        nonlocal visibility_called
+        visibility_called = True
+
+    monkeypatch.setattr(
+        distributed_module, "_load_exact_checkpoint_control_with_retry", visibility
+    )
+    with pytest.raises(RuntimeError, match="pointer publication"):
+        distributed_module._publish_checkpoint_pointer(tmp_path, pointer)
+    assert not visibility_called
+
+
+def test_metrics_journal_peer_receives_coordinator_failure_before_next_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    callback_called = False
+    monkeypatch.setattr(jax, "process_index", lambda: 1)
+    monkeypatch.setattr(
+        distributed_module,
+        "_checkpoint_collective_failed",
+        lambda _failed: True,
+    )
+
+    def callback(_metric):
+        nonlocal callback_called
+        callback_called = True
+
+    with pytest.raises(RuntimeError, match="metrics journal append failed"):
+        distributed_module._append_training_journal_metric(
+            None,
+            object(),  # type: ignore[arg-type]
+            step=1,
+            tokens_seen=2,
+            optimizer_wall_seconds=1.0,
+            metric_callback=callback,
+        )
+    assert not callback_called
+
+
+def test_pointer_visibility_error_is_collectively_decided_before_raise(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    pointer = make_pointer(
+        kind="latest",
+        payload_uri=str(tmp_path / "payloads" / "runs" / "ignored"),
+        step=1,
+        tokens_seen=2,
+        attempt_id="c" * 32,
+        run_identity={},
+    )
+    decisions: list[bool] = []
+    monkeypatch.setattr(jax, "process_index", lambda: 1)
+    monkeypatch.setattr(
+        distributed_module,
+        "_checkpoint_collective_failed",
+        lambda failed: decisions.append(failed) or failed,
+    )
+    monkeypatch.setattr(
+        distributed_module,
+        "_load_exact_checkpoint_control_with_retry",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("visibility timed out")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="pointer visibility"):
+        distributed_module._publish_checkpoint_pointer(tmp_path, pointer)
+    assert decisions == [False, False, True]
+
+
+def test_timing_publish_error_reaches_collective_decision_before_raise(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    decisions: list[bool] = []
+    monkeypatch.setattr(jax, "process_index", lambda: 0)
+    monkeypatch.setattr(
+        distributed_module,
+        "_checkpoint_collective_failed",
+        lambda failed: decisions.append(failed) or failed,
+    )
+    monkeypatch.setattr(
+        distributed_module,
+        "atomic_write_json",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("write failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="timing publication"):
+        distributed_module._publish_checkpoint_timing(
+            tmp_path,
+            checkpoint_identity={"run": "one"},
+            tokens_seen=2,
+            steps=1,
+            optimizer_wall_seconds=1.0,
+            compile_seconds=2.0,
+            checkpoint_seconds=3.0,
+        )
+    assert decisions == [False, True]
+
+
+def test_noncoordinator_checkpoint_read_uses_broadcast_absence_not_local_nfs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from jax.experimental import multihost_utils
+
+    monkeypatch.setattr(jax, "process_index", lambda: 2)
+    monkeypatch.setattr(jax, "process_count", lambda: 4)
+    monkeypatch.setattr(
+        Path,
+        "read_text",
+        lambda *_args, **_kwargs: pytest.fail("noncoordinator read shared NFS"),
+    )
+    monkeypatch.setattr(
+        distributed_module,
+        "_checkpoint_phase_decision",
+        lambda _operation, error: pytest.fail(str(error)) if error else None,
+    )
+
+    def broadcast(value, *, is_source: bool):
+        assert not is_source
+        assert np.asarray(value).shape == (1,)
+        return np.asarray([-1], dtype=np.int32)
+
+    monkeypatch.setattr(multihost_utils, "broadcast_one_to_all", broadcast)
+    assert (
+        distributed_module._coordinator_read_checkpoint_json_if_exists(
+            tmp_path / "latest.json", operation="latest pointer"
+        )
+        is None
+    )
+
+
+def test_checkpoint_timing_resume_uses_coordinator_value_without_exists_branch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    payload = {
+        "run": "one",
+        "tokens_seen": 8,
+        "optimizer_wall_seconds": 1.0,
+        "compile_seconds": 2.0,
+        "checkpoint_seconds": 3.0,
+    }
+    reads: list[Path] = []
+
+    def read(path: Path, *, operation: str):
+        assert operation == "checkpoint timing"
+        reads.append(path)
+        return payload
+
+    monkeypatch.setattr(
+        distributed_module, "_coordinator_read_checkpoint_json_if_exists", read
+    )
+    assert distributed_module._load_checkpoint_timing(
+        tmp_path,
+        checkpoint_identity={"run": "one"},
+        restored_tokens=8,
+    ) == payload
+    assert reads == [tmp_path / "checkpoint_timing.json"]
+
+
+def test_evaluation_restores_training_capacity_then_uses_eval_capacity(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    sae = SAEConfig(
+        "A",
+        hidden_dim=2,
+        num_experts=4,
+        top_routed=2,
+        bank_width=2,
+        k=1,
+        parameter_dtype="float32",
+        warmup_steps=1,
+        total_steps=1,
+    )
+    training = TrainingConfig(
+        sae,
+        seed=1,
+        total_tokens=2,
+        effective_batch_tokens=2,
+        microbatch_tokens=1,
+        checkpoint_every_tokens=2,
+        health_gate_tokens=2,
+        a_capacity=8,
+    )
+    observed: dict[str, int] = {}
+
+    def restore(pointer, template, mesh, restored_config, **kwargs):
+        del pointer, mesh, kwargs
+        observed["restore"] = restored_config.a_capacity
+        return template._replace(tokens_seen=jnp.asarray(2), step=jnp.asarray(1)), {}
+
+    def evaluate(params, source, mean, sae_config, mesh, **kwargs):
+        del params, source, mean, sae_config, mesh
+        observed["evaluate"] = kwargs["a_capacity"]
+        return SimpleNamespace(tokens=2)
+
+    monkeypatch.setattr(distributed_module, "restore_distributed_checkpoint", restore)
+    monkeypatch.setattr(distributed_module, "distributed_evaluate", evaluate)
+    result = evaluate_distributed(
+        tmp_path / "final.json",
+        training,
+        [ActivationBatch(np.ones((2, 2), np.float32), np.zeros((2, 2), np.int32))],
+        np.zeros(2, np.float32),
+        max_tokens=2,
+        evaluation_a_capacity=24,
+    )
+    assert result.tokens == 2
+    assert observed == {"restore": 8, "evaluate": 24}
 
 
 def test_two_dimensional_train_eval_and_a_b_parity_in_subprocess() -> None:
@@ -381,6 +677,8 @@ def test_orbax_interrupted_training_matches_uninterrupted_on_same_mesh(
         require_health_pass=False,
     )
     identity = {"capture_manifest_sha256": "a" * 64}
+    journal_path = tmp_path / "authoritative-metrics.jsonl"
+    journal_identity = JournalIdentity("b" * 32, "B", 7)
     partial = run_distributed_training(
         training,
         [source],
@@ -392,6 +690,8 @@ def test_orbax_interrupted_training_matches_uninterrupted_on_same_mesh(
         stop_after_tokens=2,
         require_health_pass=False,
         checkpoint_identity=identity,
+        metrics_journal_path=journal_path,
+        metrics_journal_identity=journal_identity,
     )
     template = init_distributed_state(jax.random.PRNGKey(7), mesh, sae, distributed)
     restored, timing = restore_distributed_checkpoint(
@@ -402,6 +702,18 @@ def test_orbax_interrupted_training_matches_uninterrupted_on_same_mesh(
         checkpoint_identity=identity,
     )
     assert timing["capture_manifest_sha256"] == "a" * 64
+    # Model the crash window in which an update row was durable but its
+    # checkpoint pointer was not. Resume must discard only this ahead suffix.
+    MetricsJournal(journal_path, journal_identity).append(
+        {
+            "step": 2,
+            "tokens_seen": 4,
+            "valid_tokens": 2,
+            "l0": 1.0,
+            "topk_valid": True,
+            "optimizer_wall_seconds": partial.optimizer_wall_seconds + 999.0,
+        }
+    )
 
     resumed = run_distributed_training(
         training,
@@ -416,6 +728,8 @@ def test_orbax_interrupted_training_matches_uninterrupted_on_same_mesh(
         prior_compile_seconds=partial.compile_seconds,
         prior_checkpoint_seconds=partial.checkpoint_seconds,
         checkpoint_identity=identity,
+        metrics_journal_path=journal_path,
+        metrics_journal_identity=journal_identity,
     )
     for actual, expected in zip(
         jax.tree_util.tree_leaves(resumed.state),
@@ -428,6 +742,28 @@ def test_orbax_interrupted_training_matches_uninterrupted_on_same_mesh(
     )
     assert len(payload_directories) == 1
     assert "tokens-000000000004" in payload_directories[0].name
+    assert resumed.metrics_journal is not None
+    assert resumed.metrics_journal["binding"]["row_count"] == 2
+    assert resumed.metrics_journal["binding"]["last_step"] == 2
+    assert resumed.metrics_journal["binding"]["last_tokens_seen"] == 4
+    journal_records = MetricsJournal(journal_path, journal_identity).records()
+    assert [
+        (record["step"], record["tokens_seen"])
+        for record in journal_records
+    ] == [(1, 2), (2, 4)]
+    assert {
+        "loss",
+        "sse",
+        "sst",
+        "l0",
+        "valid_tokens",
+        "topk_valid",
+        "grad_norm",
+        "clip_coefficient",
+        "learning_rate",
+        "live_fraction",
+        "optimizer_wall_seconds",
+    } <= journal_records[-1].keys()
 
     # A valid latest pointer is authoritative even when the stage-level
     # run.json was not updated before a preemption.
@@ -438,6 +774,8 @@ def test_orbax_interrupted_training_matches_uninterrupted_on_same_mesh(
         checkpoint_dir=tmp_path,
         checkpoint_identity=identity,
         prior_run_timing={"tokens_seen": 0},
+        metrics_journal_path=journal_path,
+        metrics_journal_identity=journal_identity,
     )
     for actual, expected in zip(
         jax.tree_util.tree_leaves(stale_run_json_resume.state),
@@ -445,3 +783,138 @@ def test_orbax_interrupted_training_matches_uninterrupted_on_same_mesh(
         strict=True,
     ):
         np.testing.assert_array_equal(actual, expected)
+
+
+def test_metrics_journal_append_failure_prevents_checkpoint_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sae = SAEConfig(
+        "B",
+        hidden_dim=2,
+        num_experts=2,
+        top_routed=1,
+        bank_width=2,
+        k=1,
+        parameter_dtype="float32",
+        warmup_steps=0,
+        total_steps=1,
+    )
+    training = TrainingConfig(
+        sae,
+        seed=3,
+        total_tokens=2,
+        effective_batch_tokens=2,
+        microbatch_tokens=1,
+        checkpoint_every_tokens=2,
+        health_gate_tokens=2,
+        live_feature_fraction=0.0,
+        loss_ratio_threshold=2.0,
+    )
+    distributed = DistributedConfig(microbatches_per_update=2)
+    mesh = create_mesh(distributed)
+    state = init_distributed_state(jax.random.PRNGKey(3), mesh, sae, distributed)
+    state = state._replace(
+        params=state.params._replace(bias=10.0 * jnp.ones_like(state.params.bias))
+    )
+    journal_path = tmp_path / "training.jsonl"
+    journal_identity = JournalIdentity("c" * 32, "B", 3)
+
+    def fail_append(_self, _record):
+        raise OSError("injected journal failure")
+
+    monkeypatch.setattr(MetricsJournal, "append", fail_append)
+    with pytest.raises(RuntimeError, match="metrics journal append failed"):
+        run_distributed_training(
+            training,
+            [ActivationBatch(np.ones((2, 2), np.float32))],
+            np.zeros(2, np.float32),
+            mesh,
+            state=state,
+            distributed=distributed,
+            checkpoint_dir=tmp_path / "checkpoints",
+            checkpoint_identity={"capture_manifest_sha256": "d" * 64},
+            metrics_journal_path=journal_path,
+            metrics_journal_identity=journal_identity,
+            require_health_pass=False,
+        )
+
+    assert not (tmp_path / "checkpoints" / "latest.json").exists()
+    assert MetricsJournal(journal_path, journal_identity).snapshot().row_count == 0
+
+
+def test_resumed_health_uses_the_entire_metrics_journal_prefix(
+    tmp_path: Path,
+) -> None:
+    sae = SAEConfig(
+        "B",
+        hidden_dim=2,
+        num_experts=2,
+        top_routed=1,
+        bank_width=2,
+        k=1,
+        parameter_dtype="float32",
+        warmup_steps=1,
+        total_steps=2,
+    )
+    training = TrainingConfig(
+        sae,
+        seed=4,
+        total_tokens=4,
+        effective_batch_tokens=2,
+        microbatch_tokens=1,
+        checkpoint_every_tokens=2,
+        health_gate_tokens=2,
+        live_feature_fraction=0.0,
+        loss_ratio_threshold=2.0,
+    )
+    distributed = DistributedConfig(microbatches_per_update=2)
+    mesh = create_mesh(distributed)
+    state = init_distributed_state(jax.random.PRNGKey(4), mesh, sae, distributed)
+    state = state._replace(
+        params=state.params._replace(bias=10.0 * jnp.ones_like(state.params.bias))
+    )
+    source = ActivationBatch(
+        np.asarray([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [-1.0, 1.0]], np.float32)
+    )
+    partial = run_distributed_training(
+        training,
+        [source],
+        np.zeros(2, np.float32),
+        mesh,
+        state=state,
+        distributed=distributed,
+        stop_after_tokens=2,
+        require_health_pass=False,
+    )
+    journal_path = tmp_path / "training.jsonl"
+    journal_identity = JournalIdentity("e" * 32, "B", 4)
+    journal = MetricsJournal(journal_path, journal_identity)
+    journal.append(
+        {
+            "step": 1,
+            "tokens_seen": 2,
+            "valid_tokens": 2,
+            "l0": 1.0,
+            "topk_valid": False,
+            "optimizer_wall_seconds": partial.optimizer_wall_seconds / 2.0,
+        }
+    )
+
+    resumed = run_distributed_training(
+        training,
+        [source],
+        np.zeros(2, np.float32),
+        mesh,
+        state=partial.state,
+        distributed=distributed,
+        prior_optimizer_wall_seconds=partial.optimizer_wall_seconds,
+        metrics_journal_path=journal_path,
+        metrics_journal_identity=journal_identity,
+        require_health_pass=False,
+    )
+
+    assert resumed.metrics_journal is not None
+    assert resumed.metrics_journal["complete_prefix_topk_valid"] is False
+    assert resumed.health is not None
+    assert resumed.health.topk_valid is False
+    assert resumed.health.passed is False

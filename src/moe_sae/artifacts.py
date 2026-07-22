@@ -22,7 +22,6 @@ import contextlib
 import dataclasses
 import glob
 import hashlib
-from importlib import import_module
 import json
 import math
 import os
@@ -1780,9 +1779,12 @@ class ArtifactDataset:
         verify_statistics: bool = True,
         decode_bf16: bool = True,
         cache: ShardCache | None = None,
+        manifest: Mapping[str, Any] | None = None,
     ) -> None:
         self.root = Path(root)
-        self.manifest = load_manifest(self.root)
+        self.manifest = (
+            load_manifest(self.root) if manifest is None else dict(manifest)
+        )
         self.verify_hashes = bool(verify_hashes)
         self.verify_statistics = bool(verify_statistics)
         self.decode_bf16 = bool(decode_bf16)
@@ -1806,15 +1808,33 @@ class ArtifactDataset:
                 f"token range must satisfy 0 <= start <= end <= {self.total_tokens}"
             )
         offset = 0
-        objects = 0
-        bytes_materialized = 0
+        selected: list[Mapping[str, Any]] = []
         for entry in self.manifest["shards"]:
             shard_start = offset
             shard_end = offset + int(entry["tokens"])
             offset = shard_end
             if max(start, shard_start) >= min(end, shard_end):
                 continue
-            path = self._materialize(entry)
+            selected.append(entry)
+
+        remote = [entry["object"] for entry in selected if "object" in entry]
+        remote_paths: dict[tuple[str, int], Path] = {}
+        if remote:
+            if self.cache is None:
+                raise ArtifactError("remote capture has no configured local cache")
+            paths = self.cache.materialize_many(remote, max_workers=4)
+            for value, path in zip(remote, paths, strict=True):
+                identity = object_identity_from_mapping(value)
+                remote_paths[(identity.uri, identity.generation)] = path
+
+        objects = 0
+        bytes_materialized = 0
+        for entry in selected:
+            if "object" in entry:
+                identity = object_identity_from_mapping(entry["object"])
+                path = remote_paths[(identity.uri, identity.generation)]
+            else:
+                path = self._materialize(entry)
             if not path.is_file():
                 raise IntegrityError(f"materialized shard is missing: {path}")
             objects += 1

@@ -138,6 +138,13 @@ def test_host_harvest_compacts_exact_fields_and_publishes(tmp_path):
     assert stored.position.tolist() == [1, 2, 1, 2, 3]
     assert np.all(stored.sequence_id >= 0)
     assert load_manifest(tmp_path)["total_tokens"] == 5
+    publication_status = json.loads(
+        (tmp_path / "telemetry" / "publication-stop-000000000005.json").read_text()
+    )
+    assert publication_status["total_tokens"] == 5
+    assert publication_status["capture_manifest_sha256"] == load_manifest(tmp_path)[
+        "manifest_sha256"
+    ]
     campaign_id = campaign_identity(
         metadata().to_dict(),
         split="train",
@@ -2053,3 +2060,76 @@ def test_sealed_manifest_recovers_measured_failed_publication_attempt(tmp_path):
     assert recovered["ok"] is True
     assert recovered["state"] == "recovered"
     assert recovered["publication_seconds"] >= 3.0
+    assert recovered["total_tokens"] == 5
+    assert recovered["capture_manifest_sha256"] == load_manifest(tmp_path)[
+        "manifest_sha256"
+    ]
+
+
+def test_manifest_visibility_retry_waits_for_enoent_then_checks_identity(tmp_path):
+    expected_metadata = metadata().to_dict()
+    expected_sha256 = "d" * 64
+    visibility = iter((False, False, True))
+    sleeps: list[float] = []
+
+    manifest = harvest_module._load_expected_manifest_with_retry(
+        tmp_path,
+        expected_tokens=5,
+        expected_metadata=expected_metadata,
+        expected_manifest_sha256=expected_sha256,
+        timeout_seconds=1.0,
+        poll_seconds=0.1,
+        path_visible=lambda _path: next(visibility),
+        sleep=sleeps.append,
+        loader=lambda _root: {
+            "total_tokens": 5,
+            "metadata": expected_metadata,
+            "manifest_sha256": expected_sha256,
+        },
+    )
+
+    assert manifest["manifest_sha256"] == expected_sha256
+    assert sleeps == [0.1, 0.1]
+
+
+def test_manifest_visibility_retry_is_bounded_and_never_accepts_wrong_identity(
+    tmp_path,
+):
+    now = [0.0]
+
+    def sleep(seconds: float) -> None:
+        now[0] += seconds
+
+    with pytest.raises(HarvestError, match="bounded retry expired"):
+        harvest_module._load_expected_manifest_with_retry(
+            tmp_path,
+            expected_tokens=5,
+            expected_metadata=metadata().to_dict(),
+            timeout_seconds=0.5,
+            poll_seconds=0.2,
+            clock=lambda: now[0],
+            sleep=sleep,
+            path_visible=lambda _path: False,
+        )
+
+    loader_calls = 0
+
+    def wrong_loader(_root):
+        nonlocal loader_calls
+        loader_calls += 1
+        return {
+            "total_tokens": 5,
+            "metadata": metadata("eval").to_dict(),
+            "manifest_sha256": "d" * 64,
+        }
+
+    with pytest.raises(HarvestError, match="different capture identity"):
+        harvest_module._load_expected_manifest_with_retry(
+            tmp_path,
+            expected_tokens=5,
+            expected_metadata=metadata().to_dict(),
+            expected_manifest_sha256="d" * 64,
+            path_visible=lambda _path: True,
+            loader=wrong_loader,
+        )
+    assert loader_calls == 1
