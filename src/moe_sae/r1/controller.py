@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import re
+import secrets
 import time
 from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
 
@@ -22,6 +23,7 @@ from .control_store import CASConflict, JSONCASStore, VersionedJSON
 from .protocol import (
     AttemptLeaseV1,
     AttemptReceiptV1,
+    CanonicalRecord,
     ContentRefV1,
     HarvestRangeV1,
     ProgressV1,
@@ -29,19 +31,22 @@ from .protocol import (
     SAEJobV1,
     canonical_sha256,
 )
+from .mfu_v2 import PrefixMFURunContractV2
 
 if TYPE_CHECKING:
     from .mfu_authority import (
         ControllerMFUEvidenceRegistryV2,
         TrustedMFUAuthorityPolicyV2,
     )
-    from .mfu_v2 import PrefixMFURunContractV2
 
 
 _HEAD_SCHEMA = "moe-sae.r1.campaign-head.v1"
 _INVENTORY_SCHEMA = "moe-sae.r1.campaign-inventory.v1"
 _SNAPSHOT_SCHEMA = "moe-sae.r1.campaign-snapshot.v1"
 _EVENT_SCHEMA = "moe-sae.r1.campaign-event.v1"
+_MFU_ADMISSION_SCHEMA = "moe-sae.r1.mfu-admission.v1"
+_MFU_ADMISSION_PROOF_SCHEMA = "moe-sae.r1.mfu-admission-proof.v1"
+_MFU_ADMISSION_EVENT_SCHEMA = "moe-sae.r1.mfu-admission-event.v1"
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/+-]*")
 
@@ -579,6 +584,229 @@ class _Head:
 
 
 @dataclass(frozen=True, slots=True)
+class MFUAdmissionV1(CanonicalRecord):
+    """Controller-owned admission of one exact MFU run under a live lease.
+
+    The complete run contract is embedded rather than merely named.  This
+    makes the accepted event self-contained while its canonical digest still
+    provides a compact identity for downstream evidence.  The lease interval
+    is immutable: renewing the same attempt/fence never extends this admission.
+
+    ``controller_challenge`` is presently binding/correlation material only.
+    No trusted measurement channel echoes or authenticates it yet, so neither
+    this record nor :class:`MFUAdmissionProofV1` can authorize production PASS.
+    Closing that challenge-response loop remains a future authority blocker.
+    """
+
+    SCHEMA = _MFU_ADMISSION_SCHEMA
+
+    campaign_id: str
+    work_id: str
+    attempt_id: str
+    executor_id: str
+    fence: int
+    lease_acquired_at_unix_ms: int
+    lease_expires_at_unix_ms: int
+    controller_observed_at_unix_ms: int
+    scientific_identity_sha256: str
+    deployment_identity_sha256: str
+    run_contract: PrefixMFURunContractV2
+    controller_challenge: str
+
+    def __post_init__(self) -> None:
+        _identifier(self.campaign_id, "campaign_id")
+        _identifier(self.work_id, "work_id")
+        _identifier(self.attempt_id, "attempt_id")
+        _identifier(self.executor_id, "executor_id")
+        _integer(self.fence, "fence", minimum=1)
+        acquired = _integer(
+            self.lease_acquired_at_unix_ms,
+            "lease_acquired_at_unix_ms",
+            minimum=0,
+        )
+        expires = _integer(
+            self.lease_expires_at_unix_ms,
+            "lease_expires_at_unix_ms",
+            minimum=1,
+        )
+        observed = _integer(
+            self.controller_observed_at_unix_ms,
+            "controller_observed_at_unix_ms",
+            minimum=0,
+        )
+        if not acquired <= observed < expires:
+            raise CorruptCampaign(
+                "MFU admission was not observed inside the accepted lease interval"
+            )
+        _sha(self.scientific_identity_sha256, "scientific identity")
+        _sha(self.deployment_identity_sha256, "deployment identity")
+        _sha(self.controller_challenge, "controller challenge")
+        if not isinstance(self.run_contract, PrefixMFURunContractV2):
+            raise CorruptCampaign(
+                "MFU admission run contract has the wrong record type"
+            )
+        if self.run_contract.attempt_id != self.attempt_id:
+            raise CorruptCampaign("MFU admission attempt differs from its run contract")
+        if (
+            self.run_contract.scientific_identity.sha256
+            != self.scientific_identity_sha256
+        ):
+            raise CorruptCampaign(
+                "MFU admission scientific identity differs from its run contract"
+            )
+        if (
+            self.run_contract.deployment_identity.sha256
+            != self.deployment_identity_sha256
+        ):
+            raise CorruptCampaign(
+                "MFU admission deployment identity differs from its run contract"
+            )
+
+    @property
+    def run_contract_sha256(self) -> str:
+        return self.run_contract.digest
+
+    @property
+    def window_plan_sha256(self) -> str:
+        return self.run_contract.window_plan.digest
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "schema": self.SCHEMA,
+            "campaign_id": self.campaign_id,
+            "work_id": self.work_id,
+            "attempt_id": self.attempt_id,
+            "executor_id": self.executor_id,
+            "fence": self.fence,
+            "lease_acquired_at_unix_ms": self.lease_acquired_at_unix_ms,
+            "lease_expires_at_unix_ms": self.lease_expires_at_unix_ms,
+            "controller_observed_at_unix_ms": self.controller_observed_at_unix_ms,
+            "scientific_identity_sha256": self.scientific_identity_sha256,
+            "deployment_identity_sha256": self.deployment_identity_sha256,
+            "run_contract": self.run_contract.as_dict(),
+            "controller_challenge": self.controller_challenge,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> MFUAdmissionV1:
+        obj = _versioned_object(
+            value,
+            cls.SCHEMA,
+            (
+                "campaign_id",
+                "work_id",
+                "attempt_id",
+                "executor_id",
+                "fence",
+                "lease_acquired_at_unix_ms",
+                "lease_expires_at_unix_ms",
+                "controller_observed_at_unix_ms",
+                "scientific_identity_sha256",
+                "deployment_identity_sha256",
+                "run_contract",
+                "controller_challenge",
+            ),
+        )
+        try:
+            run_contract = PrefixMFURunContractV2.from_dict(obj["run_contract"])
+        except (ProtocolError, TypeError, ValueError) as error:
+            raise CorruptCampaign(
+                "MFU admission contains an invalid run contract"
+            ) from error
+        return cls(
+            campaign_id=_identifier(obj["campaign_id"], "campaign_id"),
+            work_id=_identifier(obj["work_id"], "work_id"),
+            attempt_id=_identifier(obj["attempt_id"], "attempt_id"),
+            executor_id=_identifier(obj["executor_id"], "executor_id"),
+            fence=_integer(obj["fence"], "fence", minimum=1),
+            lease_acquired_at_unix_ms=_integer(
+                obj["lease_acquired_at_unix_ms"],
+                "lease_acquired_at_unix_ms",
+                minimum=0,
+            ),
+            lease_expires_at_unix_ms=_integer(
+                obj["lease_expires_at_unix_ms"],
+                "lease_expires_at_unix_ms",
+                minimum=1,
+            ),
+            controller_observed_at_unix_ms=_integer(
+                obj["controller_observed_at_unix_ms"],
+                "controller_observed_at_unix_ms",
+                minimum=0,
+            ),
+            scientific_identity_sha256=_sha(
+                obj["scientific_identity_sha256"], "scientific identity"
+            ),
+            deployment_identity_sha256=_sha(
+                obj["deployment_identity_sha256"], "deployment identity"
+            ),
+            run_contract=run_contract,
+            controller_challenge=_sha(
+                obj["controller_challenge"], "controller challenge"
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class MFUAdmissionProofV1(CanonicalRecord):
+    """Portable handle whose authority comes only from accepted-chain replay.
+
+    This proves controller admission, not measurement provenance.  A future
+    closed authority must also require trusted measurement evidence to echo
+    the admitted challenge before this proof can participate in PASS.
+    """
+
+    SCHEMA = _MFU_ADMISSION_PROOF_SCHEMA
+
+    campaign_id: str
+    event_uri: str
+    event_sha256: str
+    event_revision: int
+    admission: MFUAdmissionV1
+
+    def __post_init__(self) -> None:
+        _identifier(self.campaign_id, "campaign_id")
+        _text(self.event_uri, "event_uri")
+        _sha(self.event_sha256, "event")
+        _integer(self.event_revision, "event_revision", minimum=1)
+        if not isinstance(self.admission, MFUAdmissionV1):
+            raise CorruptCampaign("MFU admission proof has the wrong admission type")
+        if self.admission.campaign_id != self.campaign_id:
+            raise CorruptCampaign("MFU admission proof crosses campaign identities")
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "schema": self.SCHEMA,
+            "campaign_id": self.campaign_id,
+            "event_uri": self.event_uri,
+            "event_sha256": self.event_sha256,
+            "event_revision": self.event_revision,
+            "admission": self.admission.as_dict(),
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> MFUAdmissionProofV1:
+        obj = _versioned_object(
+            value,
+            cls.SCHEMA,
+            (
+                "campaign_id",
+                "event_uri",
+                "event_sha256",
+                "event_revision",
+                "admission",
+            ),
+        )
+        return cls(
+            campaign_id=_identifier(obj["campaign_id"], "campaign_id"),
+            event_uri=_text(obj["event_uri"], "event_uri"),
+            event_sha256=_sha(obj["event_sha256"], "event"),
+            event_revision=_integer(obj["event_revision"], "event_revision", minimum=1),
+            admission=MFUAdmissionV1.from_dict(obj["admission"]),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class _Event:
     campaign_id: str
     kind: str
@@ -681,6 +909,10 @@ class _Event:
                 raise CorruptCampaign("initialization event has transition fields")
             if event.revision != 0:
                 raise CorruptCampaign("initialization event revision must be zero")
+        elif event.kind == "MFU_ADMITTED":
+            raise CorruptCampaign(
+                "MFU admission must use the dedicated admission-event schema"
+            )
         elif (
             event.work_id is None
             or event.previous_event is None
@@ -690,6 +922,112 @@ class _Event:
         ):
             raise CorruptCampaign("transition event is missing required fields")
         return event
+
+
+@dataclass(frozen=True, slots=True)
+class _MFUAdmissionEvent:
+    campaign_id: str
+    kind: str
+    revision: int
+    occurred_at_unix_ms: int
+    work_id: str
+    previous_event: _ObjectRef
+    before_snapshot: _ObjectRef
+    after_snapshot: _ObjectRef
+    before_work: _WorkState
+    after_work: _WorkState
+    admission: MFUAdmissionV1
+
+    def __post_init__(self) -> None:
+        if self.kind != "MFU_ADMITTED":
+            raise CorruptCampaign("MFU admission event has an invalid kind")
+        _identifier(self.campaign_id, "campaign_id")
+        _integer(self.revision, "revision", minimum=1)
+        _integer(self.occurred_at_unix_ms, "event timestamp", minimum=0)
+        _identifier(self.work_id, "work_id")
+        if self.before_work != self.after_work:
+            raise CorruptCampaign("MFU admission event must preserve leased work state")
+        if self.before_work.work_id != self.work_id:
+            raise CorruptCampaign("MFU admission event names another work state")
+        if self.before_work.status != "LEASED" or self.before_work.lease is None:
+            raise CorruptCampaign("MFU admission event lacks an active leased state")
+        admission = self.admission
+        lease = self.before_work.lease
+        if admission.campaign_id != self.campaign_id:
+            raise CorruptCampaign("MFU admission event crosses campaign identities")
+        if admission.work_id != self.work_id:
+            raise CorruptCampaign("MFU admission event crosses work identities")
+        if admission.controller_observed_at_unix_ms != self.occurred_at_unix_ms:
+            raise CorruptCampaign("MFU admission and event timestamps differ")
+        if (
+            admission.attempt_id != lease.attempt_id
+            or admission.executor_id != lease.executor_id
+            or admission.fence != lease.fence
+            or admission.lease_acquired_at_unix_ms != lease.acquired_at_unix_ms
+            or admission.lease_expires_at_unix_ms != lease.expires_at_unix_ms
+            or admission.deployment_identity_sha256 != lease.deployment_identity_sha256
+        ):
+            raise CorruptCampaign("MFU admission does not exactly bind the event lease")
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "schema": _MFU_ADMISSION_EVENT_SCHEMA,
+            "campaign_id": self.campaign_id,
+            "kind": self.kind,
+            "revision": self.revision,
+            "occurred_at_unix_ms": self.occurred_at_unix_ms,
+            "work_id": self.work_id,
+            "previous_event": self.previous_event.as_dict(),
+            "before_snapshot": self.before_snapshot.as_dict(),
+            "after_snapshot": self.after_snapshot.as_dict(),
+            "before_work": self.before_work.as_dict(),
+            "after_work": self.after_work.as_dict(),
+            "admission": self.admission.as_dict(),
+        }
+
+    @classmethod
+    def from_dict(cls, value: Any) -> _MFUAdmissionEvent:
+        obj = _versioned_object(
+            value,
+            _MFU_ADMISSION_EVENT_SCHEMA,
+            (
+                "campaign_id",
+                "kind",
+                "revision",
+                "occurred_at_unix_ms",
+                "work_id",
+                "previous_event",
+                "before_snapshot",
+                "after_snapshot",
+                "before_work",
+                "after_work",
+                "admission",
+            ),
+        )
+        return cls(
+            campaign_id=_identifier(obj["campaign_id"], "campaign_id"),
+            kind=_identifier(obj["kind"], "event kind"),
+            revision=_integer(obj["revision"], "revision", minimum=1),
+            occurred_at_unix_ms=_integer(
+                obj["occurred_at_unix_ms"], "event timestamp", minimum=0
+            ),
+            work_id=_identifier(obj["work_id"], "work_id"),
+            previous_event=_ObjectRef.from_dict(
+                obj["previous_event"], "previous_event"
+            ),
+            before_snapshot=_ObjectRef.from_dict(
+                obj["before_snapshot"], "before_snapshot"
+            ),
+            after_snapshot=_ObjectRef.from_dict(
+                obj["after_snapshot"], "after_snapshot"
+            ),
+            before_work=_WorkState.from_dict(obj["before_work"]),
+            after_work=_WorkState.from_dict(obj["after_work"]),
+            admission=MFUAdmissionV1.from_dict(obj["admission"]),
+        )
+
+
+_CampaignEvent = _Event | _MFUAdmissionEvent
 
 
 @dataclass(frozen=True, slots=True)
@@ -741,6 +1079,7 @@ class CampaignView:
 
 ContentVerifier = Callable[[ContentRefV1], bool]
 Clock = Callable[[], int]
+ChallengeFactory = Callable[[], str]
 
 
 class CampaignController:
@@ -753,6 +1092,7 @@ class CampaignController:
         base_uri: str,
         campaign_id: str,
         clock_ms: Clock | None = None,
+        challenge_factory: ChallengeFactory | None = None,
         content_verifier: ContentVerifier | None = None,
         max_cas_retries: int = 8,
     ) -> None:
@@ -762,6 +1102,7 @@ class CampaignController:
         self._base_uri = base_uri.rstrip("/")
         self._campaign_id = _identifier(campaign_id, "campaign_id")
         self._clock_ms = clock_ms or (lambda: time.time_ns() // 1_000_000)
+        self._challenge_factory = challenge_factory or (lambda: secrets.token_hex(32))
         self._content_verifier = content_verifier or (lambda _content: False)
         self._max_cas_retries = _integer(max_cas_retries, "max_cas_retries", minimum=1)
 
@@ -796,6 +1137,201 @@ class CampaignController:
             clock_ns=lambda: self._now() * 1_000_000,
         )
 
+    def admit_mfu_v2(
+        self,
+        *,
+        work_id: str,
+        run_contract: PrefixMFURunContractV2,
+    ) -> MFUAdmissionProofV1:
+        """Atomically admit one exact V2 MFU contract under the active lease.
+
+        An admission becomes authoritative only when its event wins the same
+        generation-matched head transition as the corresponding snapshot
+        revision.  Retries use a fresh controller challenge.  A repeated call
+        for the same lease and exact contract is idempotent; a second contract
+        for that lease is rejected.
+        """
+
+        if not isinstance(run_contract, PrefixMFURunContractV2):
+            raise InvalidReceipt("MFU run contract has the wrong record type")
+        work_id = _identifier(work_id, "work_id")
+        candidate_challenges: set[str] = set()
+        for _attempt in range(self._max_cas_retries):
+            head, version = self._load_head()
+            inventory = self._load_inventory(head.inventory)
+            snapshot = self._load_snapshot(head.snapshot)
+            _view, events = self._replay_accepted(
+                head,
+                inventory,
+                snapshot,
+            )
+            entry = inventory.entry(work_id)
+            before = snapshot.work(work_id)
+            now = self._now()
+            lease = before.lease
+            if before.status != "LEASED" or lease is None:
+                raise LeaseUnavailable("MFU admission requires an active lease")
+            if run_contract.attempt_id != lease.attempt_id:
+                raise StaleAttempt("MFU run attempt does not hold the active lease")
+            if (
+                run_contract.deployment_identity.sha256
+                != lease.deployment_identity_sha256
+            ):
+                raise InvalidReceipt("MFU deployment does not match the active lease")
+            if (
+                run_contract.scientific_identity.sha256
+                != entry.scientific_identity_sha256
+            ):
+                raise InvalidReceipt(
+                    "MFU scientific identity does not match campaign work"
+                )
+
+            existing = self._admission_for_lease(
+                events,
+                work_id=work_id,
+                attempt_id=lease.attempt_id,
+                fence=lease.fence,
+            )
+            if existing is not None:
+                existing_ref, existing_event = existing
+                admitted = existing_event.admission
+                if (
+                    admitted.lease_acquired_at_unix_ms != lease.acquired_at_unix_ms
+                    or admitted.lease_expires_at_unix_ms != lease.expires_at_unix_ms
+                ):
+                    raise InvalidReceipt(
+                        "active lease interval differs from its accepted MFU "
+                        "admission; renewal cannot extend admission authority"
+                    )
+            if now >= lease.expires_at_unix_ms:
+                raise LeaseUnavailable("MFU admission requires an active lease")
+            if existing is not None:
+                existing_ref, existing_event = existing
+                admitted = existing_event.admission
+                if (
+                    admitted.run_contract.canonical_bytes()
+                    != run_contract.canonical_bytes()
+                ):
+                    raise InvalidReceipt(
+                        "active lease already admitted a different MFU run contract"
+                    )
+                return self._admission_proof(existing_ref, existing_event)
+
+            challenge = _sha(
+                self._challenge_factory(),
+                "controller challenge",
+            )
+            accepted_challenges = {
+                event.admission.controller_challenge
+                for _event_ref, event in events
+                if isinstance(event, _MFUAdmissionEvent)
+            }
+            if challenge in candidate_challenges or challenge in accepted_challenges:
+                raise ControllerError("controller challenge source reused an MFU nonce")
+            candidate_challenges.add(challenge)
+            admission = MFUAdmissionV1(
+                campaign_id=self._campaign_id,
+                work_id=work_id,
+                attempt_id=lease.attempt_id,
+                executor_id=lease.executor_id,
+                fence=lease.fence,
+                lease_acquired_at_unix_ms=lease.acquired_at_unix_ms,
+                lease_expires_at_unix_ms=lease.expires_at_unix_ms,
+                controller_observed_at_unix_ms=now,
+                scientific_identity_sha256=entry.scientific_identity_sha256,
+                deployment_identity_sha256=lease.deployment_identity_sha256,
+                run_contract=run_contract,
+                controller_challenge=challenge,
+            )
+            next_snapshot = snapshot.replacing(before)
+            snapshot_ref = self._ref_for("snapshots", next_snapshot.as_dict())
+            event = _MFUAdmissionEvent(
+                campaign_id=self._campaign_id,
+                kind="MFU_ADMITTED",
+                revision=next_snapshot.revision,
+                occurred_at_unix_ms=now,
+                work_id=work_id,
+                previous_event=head.last_event,
+                before_snapshot=head.snapshot,
+                after_snapshot=snapshot_ref,
+                before_work=before,
+                after_work=before,
+                admission=admission,
+            )
+            # Required ordering: event first, snapshot second, authority CAS last.
+            event_ref = self._publish("events", event.as_dict())
+            published_snapshot = self._publish("snapshots", next_snapshot.as_dict())
+            if published_snapshot != snapshot_ref:
+                raise CorruptCampaign("published admission snapshot identity changed")
+            new_head = _Head(
+                campaign_id=self._campaign_id,
+                scientific_identity_sha256=head.scientific_identity_sha256,
+                inventory=head.inventory,
+                snapshot=snapshot_ref,
+                last_event=event_ref,
+                revision=next_snapshot.revision,
+                event_count=head.event_count + 1,
+            )
+            try:
+                self._store.compare_and_swap(
+                    self.head_uri,
+                    version.generation,
+                    new_head.as_dict(),
+                )
+            except CASConflict:
+                continue
+            return self._admission_proof(event_ref, event)
+        raise RetryLimitExceeded(
+            "MFU admission head CAS did not succeed after "
+            f"{self._max_cas_retries} attempts"
+        )
+
+    def verify_mfu_admission_v2(
+        self,
+        proof: MFUAdmissionProofV1,
+        *,
+        work_id: str,
+        run_contract: PrefixMFURunContractV2,
+    ) -> MFUAdmissionV1:
+        """Replay a proof from the accepted head; never trust a bare event URI."""
+
+        if not isinstance(proof, MFUAdmissionProofV1):
+            raise InvalidReceipt("MFU admission proof has the wrong record type")
+        if not isinstance(run_contract, PrefixMFURunContractV2):
+            raise InvalidReceipt("MFU run contract has the wrong record type")
+        work_id = _identifier(work_id, "work_id")
+        if proof.campaign_id != self._campaign_id:
+            raise InvalidReceipt("MFU admission proof belongs to another campaign")
+        if proof.admission.work_id != work_id:
+            raise InvalidReceipt("MFU admission proof belongs to another work item")
+        if (
+            proof.admission.run_contract.canonical_bytes()
+            != run_contract.canonical_bytes()
+        ):
+            raise InvalidReceipt("MFU admission proof names another run contract")
+
+        head, _version = self._load_head()
+        inventory = self._load_inventory(head.inventory)
+        snapshot = self._load_snapshot(head.snapshot)
+        _view, events = self._replay_accepted(head, inventory, snapshot)
+        expected_ref = _ObjectRef(proof.event_uri, proof.event_sha256)
+        for event_ref, event in events:
+            if event_ref != expected_ref:
+                continue
+            if not isinstance(event, _MFUAdmissionEvent):
+                raise InvalidReceipt("proof reference is not an MFU admission event")
+            if event.revision != proof.event_revision:
+                raise InvalidReceipt("MFU admission proof revision is inconsistent")
+            if event.admission.canonical_bytes() != proof.admission.canonical_bytes():
+                raise InvalidReceipt("MFU admission proof payload is inconsistent")
+            if (
+                event.admission.run_contract.canonical_bytes()
+                != run_contract.canonical_bytes()
+            ):
+                raise InvalidReceipt("accepted admission names another run contract")
+            return event.admission
+        raise InvalidReceipt("MFU admission event is not reachable from accepted head")
+
     def predeclare_mfu_v2(
         self,
         *,
@@ -805,35 +1341,24 @@ class CampaignController:
         replica_region: str,
         measurement_not_before_unix_ns: int,
     ) -> ContentRefV1:
-        """Predeclare MFU measurement against the current active lease.
+        """Publish a legacy receipt derived from an accepted admission event.
 
-        This is the production admission seam: attempt, fence, scientific
-        identity, and deployment are taken from accepted controller state,
-        rather than trusted from a benchmark process.
+        The receipt remains available to the protocol oracle, but it grants no
+        authority by itself.  The accepted admission event and replay proof are
+        the fail-closed seam for any future production verifier.
         """
 
         from .mfu_authority import ControllerMFUEvidenceRegistryV2
-        from .mfu_v2 import PrefixMFURunContractV2
 
         if not isinstance(run_contract, PrefixMFURunContractV2):
             raise InvalidReceipt("MFU run contract has the wrong record type")
-        work_id = _identifier(work_id, "work_id")
+        proof = self.admit_mfu_v2(work_id=work_id, run_contract=run_contract)
+        admission = self.verify_mfu_admission_v2(
+            proof,
+            work_id=work_id,
+            run_contract=run_contract,
+        )
         head, version = self._load_head()
-        inventory = self._load_inventory(head.inventory)
-        snapshot = self._load_snapshot(head.snapshot)
-        self._validate_campaign_identity(head, inventory, snapshot)
-        entry = inventory.entry(work_id)
-        state = snapshot.work(work_id)
-        now = self._now()
-        lease = state.lease
-        if state.status != "LEASED" or lease is None or now >= lease.expires_at_unix_ms:
-            raise LeaseUnavailable("MFU preregistration requires an active lease")
-        if run_contract.attempt_id != lease.attempt_id:
-            raise StaleAttempt("MFU run attempt does not hold the active lease")
-        if run_contract.deployment_identity.sha256 != lease.deployment_identity_sha256:
-            raise InvalidReceipt("MFU deployment does not match the active lease")
-        if run_contract.scientific_identity.sha256 != entry.scientific_identity_sha256:
-            raise InvalidReceipt("MFU scientific identity does not match campaign work")
         registry = ControllerMFUEvidenceRegistryV2(
             self._store,
             policy=policy,
@@ -846,11 +1371,11 @@ class CampaignController:
         )
         return registry._predeclare_from_controller(
             run_contract,
-            work_id=work_id,
-            controller_fence=lease.fence,
-            executor_id=lease.executor_id,
-            lease_acquired_at_unix_ns=lease.acquired_at_unix_ms * 1_000_000,
-            lease_expires_at_unix_ns=lease.expires_at_unix_ms * 1_000_000,
+            work_id=admission.work_id,
+            controller_fence=admission.fence,
+            executor_id=admission.executor_id,
+            lease_acquired_at_unix_ns=(admission.lease_acquired_at_unix_ms * 1_000_000),
+            lease_expires_at_unix_ns=(admission.lease_expires_at_unix_ms * 1_000_000),
             measurement_not_before_unix_ns=measurement_not_before_unix_ns,
         )
 
@@ -945,79 +1470,8 @@ class CampaignController:
         head, _version = self._load_head()
         inventory = self._load_inventory(head.inventory)
         accepted_snapshot = self._load_snapshot(head.snapshot)
-        self._validate_campaign_identity(head, inventory, accepted_snapshot)
-
-        reverse_events: list[tuple[_ObjectRef, _Event]] = []
-        event_ref: _ObjectRef | None = head.last_event
-        expected_after = head.snapshot
-        while event_ref is not None:
-            event = self._load_event(event_ref)
-            if event.campaign_id != self._campaign_id:
-                raise CorruptCampaign("event belongs to another campaign")
-            if event.after_snapshot != expected_after:
-                raise CorruptCampaign("event chain has a discontinuous snapshot link")
-            reverse_events.append((event_ref, event))
-            if event.previous_event is None:
-                if event.before_snapshot is not None:
-                    raise CorruptCampaign(
-                        "root event unexpectedly has a prior snapshot"
-                    )
-                event_ref = None
-            else:
-                if event.before_snapshot is None:
-                    raise CorruptCampaign("event chain is missing a prior snapshot")
-                event_ref = event.previous_event
-                expected_after = event.before_snapshot
-            if len(reverse_events) > head.event_count:
-                raise CorruptCampaign("event chain is longer than the head claims")
-        if len(reverse_events) != head.event_count:
-            raise CorruptCampaign("event count does not match the accepted chain")
-
-        events = list(reversed(reverse_events))
-        if not events or events[0][1].kind != "CAMPAIGN_INITIALIZED":
-            raise CorruptCampaign("accepted chain lacks an initialization event")
-        snapshot = _Snapshot(
-            campaign_id=self._campaign_id,
-            scientific_identity_sha256=inventory.scientific_identity_sha256,
-            inventory_sha256=head.inventory.sha256,
-            revision=0,
-            works=tuple(_WorkState.pending(item.work_id) for item in inventory.entries),
-        )
-        initial_ref = self._ref_for("snapshots", snapshot.as_dict())
-        if events[0][1].after_snapshot != initial_ref:
-            raise CorruptCampaign("initialization event does not name initial state")
-
-        previous_event_ref = events[0][0]
-        previous_snapshot_ref = initial_ref
-        for current_event_ref, event in events[1:]:
-            if event.previous_event != previous_event_ref:
-                raise CorruptCampaign("event predecessor reference is invalid")
-            if event.before_snapshot != previous_snapshot_ref:
-                raise CorruptCampaign("event before-snapshot reference is invalid")
-            if event.revision != snapshot.revision + 1:
-                raise CorruptCampaign("event revision is non-contiguous")
-            if (
-                event.work_id is None
-                or event.before_work is None
-                or event.after_work is None
-            ):
-                raise CorruptCampaign("transition event lacks a work state")
-            if snapshot.work(event.work_id) != event.before_work:
-                raise CorruptCampaign("event before-work state does not replay")
-            if event.after_work.work_id != event.work_id:
-                raise CorruptCampaign("event after-work state belongs to another item")
-            snapshot = snapshot.replacing(event.after_work)
-            after_ref = self._ref_for("snapshots", snapshot.as_dict())
-            if event.after_snapshot != after_ref:
-                raise CorruptCampaign("event after-work state does not match snapshot")
-            previous_event_ref = current_event_ref
-            previous_snapshot_ref = after_ref
-
-        if snapshot != accepted_snapshot or previous_snapshot_ref != head.snapshot:
-            raise CorruptCampaign("replayed state does not match accepted snapshot")
-        if snapshot.revision != head.revision:
-            raise CorruptCampaign("replayed revision does not match head")
-        return self._view(head, snapshot)
+        view, _events = self._replay_accepted(head, inventory, accepted_snapshot)
+        return view
 
     def acquire(
         self,
@@ -1447,8 +1901,153 @@ class CampaignController:
             raise CorruptCampaign("snapshot belongs to another campaign")
         return snapshot
 
-    def _load_event(self, reference: _ObjectRef) -> _Event:
-        return _Event.from_dict(self._read_ref(reference))
+    def _load_event(self, reference: _ObjectRef) -> _CampaignEvent:
+        value = self._read_ref(reference)
+        schema = value.get("schema")
+        if schema == _EVENT_SCHEMA:
+            return _Event.from_dict(value)
+        if schema == _MFU_ADMISSION_EVENT_SCHEMA:
+            return _MFUAdmissionEvent.from_dict(value)
+        raise CorruptCampaign(f"unsupported campaign event schema: {schema!r}")
+
+    def _replay_accepted(
+        self,
+        head: _Head,
+        inventory: _Inventory,
+        accepted_snapshot: _Snapshot,
+    ) -> tuple[CampaignView, tuple[tuple[_ObjectRef, _CampaignEvent], ...]]:
+        self._validate_campaign_identity(head, inventory, accepted_snapshot)
+
+        reverse_events: list[tuple[_ObjectRef, _CampaignEvent]] = []
+        event_ref: _ObjectRef | None = head.last_event
+        expected_after = head.snapshot
+        while event_ref is not None:
+            event = self._load_event(event_ref)
+            if event.campaign_id != self._campaign_id:
+                raise CorruptCampaign("event belongs to another campaign")
+            if event.after_snapshot != expected_after:
+                raise CorruptCampaign("event chain has a discontinuous snapshot link")
+            reverse_events.append((event_ref, event))
+            if event.previous_event is None:
+                if event.before_snapshot is not None:
+                    raise CorruptCampaign(
+                        "root event unexpectedly has a prior snapshot"
+                    )
+                event_ref = None
+            else:
+                if event.before_snapshot is None:
+                    raise CorruptCampaign("event chain is missing a prior snapshot")
+                event_ref = event.previous_event
+                expected_after = event.before_snapshot
+            if len(reverse_events) > head.event_count:
+                raise CorruptCampaign("event chain is longer than the head claims")
+        if len(reverse_events) != head.event_count:
+            raise CorruptCampaign("event count does not match the accepted chain")
+
+        events = tuple(reversed(reverse_events))
+        if (
+            not events
+            or not isinstance(events[0][1], _Event)
+            or events[0][1].kind != "CAMPAIGN_INITIALIZED"
+        ):
+            raise CorruptCampaign("accepted chain lacks an initialization event")
+        snapshot = _Snapshot(
+            campaign_id=self._campaign_id,
+            scientific_identity_sha256=inventory.scientific_identity_sha256,
+            inventory_sha256=head.inventory.sha256,
+            revision=0,
+            works=tuple(_WorkState.pending(item.work_id) for item in inventory.entries),
+        )
+        initial_ref = self._ref_for("snapshots", snapshot.as_dict())
+        if events[0][1].after_snapshot != initial_ref:
+            raise CorruptCampaign("initialization event does not name initial state")
+
+        previous_event_ref = events[0][0]
+        previous_snapshot_ref = initial_ref
+        previous_occurred_at = events[0][1].occurred_at_unix_ms
+        admission_keys: set[tuple[str, str, int]] = set()
+        challenges: set[str] = set()
+        for current_event_ref, event in events[1:]:
+            if event.previous_event != previous_event_ref:
+                raise CorruptCampaign("event predecessor reference is invalid")
+            if event.before_snapshot != previous_snapshot_ref:
+                raise CorruptCampaign("event before-snapshot reference is invalid")
+            if event.revision != snapshot.revision + 1:
+                raise CorruptCampaign("event revision is non-contiguous")
+            if event.occurred_at_unix_ms < previous_occurred_at:
+                raise CorruptCampaign("event timestamps regress in accepted order")
+            if (
+                event.work_id is None
+                or event.before_work is None
+                or event.after_work is None
+            ):
+                raise CorruptCampaign("transition event lacks a work state")
+            if snapshot.work(event.work_id) != event.before_work:
+                raise CorruptCampaign("event before-work state does not replay")
+            if event.after_work.work_id != event.work_id:
+                raise CorruptCampaign("event after-work state belongs to another item")
+            if isinstance(event, _MFUAdmissionEvent):
+                admission = event.admission
+                if (
+                    admission.scientific_identity_sha256
+                    != inventory.entry(event.work_id).scientific_identity_sha256
+                ):
+                    raise CorruptCampaign(
+                        "MFU admission scientific identity differs from inventory"
+                    )
+                key = (event.work_id, admission.attempt_id, admission.fence)
+                if key in admission_keys:
+                    raise CorruptCampaign("lease has multiple accepted MFU admissions")
+                if admission.controller_challenge in challenges:
+                    raise CorruptCampaign("MFU admission challenge was reused")
+                admission_keys.add(key)
+                challenges.add(admission.controller_challenge)
+            snapshot = snapshot.replacing(event.after_work)
+            after_ref = self._ref_for("snapshots", snapshot.as_dict())
+            if event.after_snapshot != after_ref:
+                raise CorruptCampaign("event after-work state does not match snapshot")
+            previous_event_ref = current_event_ref
+            previous_snapshot_ref = after_ref
+            previous_occurred_at = event.occurred_at_unix_ms
+
+        if snapshot != accepted_snapshot or previous_snapshot_ref != head.snapshot:
+            raise CorruptCampaign("replayed state does not match accepted snapshot")
+        if snapshot.revision != head.revision:
+            raise CorruptCampaign("replayed revision does not match head")
+        return self._view(head, snapshot), events
+
+    @staticmethod
+    def _admission_for_lease(
+        events: Sequence[tuple[_ObjectRef, _CampaignEvent]],
+        *,
+        work_id: str,
+        attempt_id: str,
+        fence: int,
+    ) -> tuple[_ObjectRef, _MFUAdmissionEvent] | None:
+        for event_ref, event in events:
+            if not isinstance(event, _MFUAdmissionEvent):
+                continue
+            admission = event.admission
+            if (
+                admission.work_id == work_id
+                and admission.attempt_id == attempt_id
+                and admission.fence == fence
+            ):
+                return event_ref, event
+        return None
+
+    @staticmethod
+    def _admission_proof(
+        event_ref: _ObjectRef,
+        event: _MFUAdmissionEvent,
+    ) -> MFUAdmissionProofV1:
+        return MFUAdmissionProofV1(
+            campaign_id=event.campaign_id,
+            event_uri=event_ref.uri,
+            event_sha256=event_ref.sha256,
+            event_revision=event.revision,
+            admission=event.admission,
+        )
 
     def _validate_campaign_identity(
         self,
@@ -1558,6 +2157,8 @@ __all__ = [
     "InvalidProgress",
     "InvalidReceipt",
     "LeaseUnavailable",
+    "MFUAdmissionProofV1",
+    "MFUAdmissionV1",
     "RetryLimitExceeded",
     "StaleAttempt",
     "WorkNotFound",

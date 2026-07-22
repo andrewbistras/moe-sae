@@ -14,8 +14,9 @@ the following are implemented and exercised against real artifacts:
 
 - an operator-owned factory that binds exact parser implementations and their
   image/code attestations, rather than trusting a parser's self-reported ID;
-- an atomic controller MFU-admission event that the authority replays to bind
-  campaign, work, attempt, executor, fence, lease, and server-stamped ordering;
+- production deployment of the implemented atomic MFU-admission event under a
+  separate controller principal, with trusted server-time provenance and a
+  trace/parser path that echoes its accepted event digest and challenge;
 - strict semantic parsing and cross-linking of scientific, implementation, and
   deployment identities;
 - bounded, streaming parsers for real HLO, Xprof, input, routing-capacity,
@@ -25,6 +26,14 @@ the following are implemented and exercised against real artifacts:
 
 Synthetic parser fixtures and green protocol tests do not satisfy these
 requirements and cannot be cited as a production MFU pass.
+
+The protocol oracle now commits admission through the immutable event,
+snapshot, and generation-matched head CAS; accepted-chain replay binds the
+campaign, work, attempt, executor, fence, exact lease interval, full run
+contract, and controller challenge. Renewal cannot extend that admitted
+interval. This closes the state-machine race structurally, but the challenge
+is only correlation material until a separately trusted controller and real
+measurement parsers prove the executor observed it after admission.
 
 ## The claim we are trying to earn
 

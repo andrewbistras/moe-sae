@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import base64
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from fractions import Fraction
 import hashlib
+import threading
 from typing import Any, Mapping
 
 import pytest
@@ -11,7 +13,7 @@ import pytest
 import moe_sae.r1 as r1
 import moe_sae.r1.mfu_authority as a
 import moe_sae.r1.mfu_v2 as m
-from moe_sae.r1.control_store import MemoryJSONCASStore
+from moe_sae.r1.control_store import CASConflict, MemoryJSONCASStore
 from moe_sae.r1.controller import (
     CampaignController,
     InvalidReceipt,
@@ -21,8 +23,11 @@ from moe_sae.r1.controller import (
 from moe_sae.r1.flops import deepseek_r1_prefix_flop_coefficients
 from moe_sae.r1.image_protocol import DeviceInventoryV1, HostAttestationV1
 from moe_sae.r1.protocol import (
+    AttemptReceiptV1,
     ContentRefV1,
+    CostLedgerV1,
     HarvestRangeV1,
+    ProgressV1,
     RegionalReplicaV1,
     canonical_sha256,
     parse_json,
@@ -1131,6 +1136,7 @@ def _build_fixture(
         base_uri="gs://trusted-control",
         campaign_id=f"mfu-campaign-{salt}",
         clock_ms=lambda: registered_ns // 1_000_000,
+        challenge_factory=lambda: _sha(f"controller-challenge-{salt}"),
         content_verifier=lambda _content: True,
     )
     work = _harvest(run.scientific_identity.sha256)
@@ -1823,6 +1829,605 @@ def test_controller_active_lease_admission_rejects_unowned_runs() -> None:
         )
 
 
+class _AdmissionTracingStore:
+    def __init__(self) -> None:
+        self.delegate = MemoryJSONCASStore()
+        self.calls: list[tuple[str, str]] = []
+        self.conflicts_remaining = 0
+        self.barrier: threading.Barrier | None = None
+        self._barrier_calls = 0
+        self._lock = threading.Lock()
+
+    def read(self, uri: str) -> Any:
+        return self.delegate.read(uri)
+
+    def create(self, uri: str, value: Any) -> Any:
+        self.calls.append(("create", uri))
+        return self.delegate.create(uri, value)
+
+    def compare_and_swap(
+        self,
+        uri: str,
+        expected_generation: int,
+        value: Any,
+    ) -> Any:
+        self.calls.append(("cas", uri))
+        barrier: threading.Barrier | None = None
+        with self._lock:
+            if self.barrier is not None and self._barrier_calls < 2:
+                self._barrier_calls += 1
+                barrier = self.barrier
+            if self.conflicts_remaining:
+                self.conflicts_remaining -= 1
+                current = self.delegate.read(uri)
+                raise CASConflict(
+                    uri,
+                    expected_generation=expected_generation,
+                    actual_generation=(None if current is None else current.generation),
+                )
+        if barrier is not None:
+            barrier.wait(timeout=5)
+        return self.delegate.compare_and_swap(uri, expected_generation, value)
+
+    def put_immutable(self, uri: str, value: Any) -> Any:
+        self.calls.append(("immutable", uri))
+        return self.delegate.put_immutable(uri, value)
+
+
+class _OrderedAdmissionRaceStore(_AdmissionTracingStore):
+    """Force one of two distinct transition kinds to win their first CAS."""
+
+    def __init__(self, *, first_kind: str) -> None:
+        super().__init__()
+        self.first_kind = first_kind
+        self.race_enabled = False
+        self._race_arrivals = 0
+        self._race_barrier = threading.Barrier(2)
+        self._first_finished = threading.Event()
+
+    def compare_and_swap(
+        self,
+        uri: str,
+        expected_generation: int,
+        value: Any,
+    ) -> Any:
+        self.calls.append(("cas", uri))
+        participate = False
+        with self._lock:
+            if self.race_enabled and self._race_arrivals < 2:
+                self._race_arrivals += 1
+                participate = True
+        if not participate:
+            return self.delegate.compare_and_swap(uri, expected_generation, value)
+
+        event_ref = value["last_event"]
+        event_version = self.delegate.read(event_ref["uri"])
+        assert event_version is not None
+        event_kind = event_version.decoded()["kind"]
+        self._race_barrier.wait(timeout=5)
+        if event_kind == self.first_kind:
+            try:
+                return self.delegate.compare_and_swap(
+                    uri,
+                    expected_generation,
+                    value,
+                )
+            finally:
+                self._first_finished.set()
+        assert self._first_finished.wait(timeout=5)
+        return self.delegate.compare_and_swap(uri, expected_generation, value)
+
+
+def _fresh_admission_controller(
+    run: m.PrefixMFURunContractV2,
+    *,
+    store: Any,
+    campaign_id: str,
+    now_ms: list[int],
+    challenge: str | None = None,
+    challenge_factory: Any | None = None,
+    lease_duration_ms: int = 10_000,
+) -> tuple[CampaignController, HarvestRangeV1]:
+    if (challenge is None) == (challenge_factory is None):
+        raise ValueError("supply exactly one deterministic challenge source")
+    controller = CampaignController(
+        store,
+        base_uri="gs://atomic-admission-control",
+        campaign_id=campaign_id,
+        clock_ms=lambda: now_ms[0],
+        challenge_factory=(
+            challenge_factory if challenge_factory is not None else lambda: challenge
+        ),
+        content_verifier=lambda _content: True,
+    )
+    work = _harvest(run.scientific_identity.sha256)
+    controller.initialize((work,))
+    controller.acquire(
+        work.work_id,
+        attempt_id=run.attempt_id,
+        executor_id="mfu-admission-executor",
+        deployment_identity_sha256=run.deployment_identity.sha256,
+        lease_duration_ms=lease_duration_ms,
+    )
+    return controller, work
+
+
+def test_atomic_mfu_admission_binds_exact_lease_run_time_and_challenge() -> None:
+    fixture = _build_fixture(salt="atomic-admission-fields")
+    store = _AdmissionTracingStore()
+    now_ms = [BASE_START_NS // 1_000_000 - 20_000]
+    challenge = "1" * 64
+    controller, work = _fresh_admission_controller(
+        fixture.run,
+        store=store,
+        campaign_id="atomic-admission-fields",
+        now_ms=now_ms,
+        challenge=challenge,
+    )
+    before = controller.view()
+    lease = before.work(work.work_id).lease
+    assert lease is not None
+    store.calls.clear()
+
+    proof = controller.admit_mfu_v2(
+        work_id=work.work_id,
+        run_contract=fixture.run,
+    )
+    admission = controller.verify_mfu_admission_v2(
+        proof,
+        work_id=work.work_id,
+        run_contract=fixture.run,
+    )
+    after = controller.replay()
+
+    assert admission.campaign_id == "atomic-admission-fields"
+    assert admission.work_id == work.work_id
+    assert admission.attempt_id == lease.attempt_id == fixture.run.attempt_id
+    assert admission.executor_id == lease.executor_id
+    assert admission.fence == lease.fence
+    assert admission.lease_acquired_at_unix_ms == lease.acquired_at_unix_ms
+    assert admission.lease_expires_at_unix_ms == lease.expires_at_unix_ms
+    assert admission.controller_observed_at_unix_ms == now_ms[0]
+    assert (
+        admission.scientific_identity_sha256 == fixture.run.scientific_identity.sha256
+    )
+    assert (
+        admission.deployment_identity_sha256 == fixture.run.deployment_identity.sha256
+    )
+    assert admission.run_contract.canonical_bytes() == fixture.run.canonical_bytes()
+    assert admission.run_contract_sha256 == fixture.run.digest
+    assert admission.window_plan_sha256 == fixture.run.window_plan.digest
+    assert admission.controller_challenge == challenge
+    assert after.revision == before.revision + 1
+    assert after.event_count == before.event_count + 1
+    assert after.work(work.work_id) == before.work(work.work_id)
+    assert r1.MFUAdmissionProofV1.from_dict(proof.as_dict()) == proof
+    assert [kind for kind, _uri in store.calls] == [
+        "immutable",
+        "immutable",
+        "cas",
+    ]
+    assert "/events/" in store.calls[0][1]
+    assert "/snapshots/" in store.calls[1][1]
+    assert store.calls[2][1] == controller.head_uri
+
+
+def test_concurrent_identical_admissions_resolve_to_one_accepted_event() -> None:
+    fixture = _build_fixture(salt="atomic-admission-concurrency")
+    store = _AdmissionTracingStore()
+    now_ms = [BASE_START_NS // 1_000_000 - 20_000]
+    owner, work = _fresh_admission_controller(
+        fixture.run,
+        store=store,
+        campaign_id="atomic-admission-concurrency",
+        now_ms=now_ms,
+        challenge="a" * 64,
+    )
+    before = owner.view()
+    first = CampaignController(
+        store,
+        base_uri="gs://atomic-admission-control",
+        campaign_id="atomic-admission-concurrency",
+        clock_ms=lambda: now_ms[0],
+        challenge_factory=lambda: "a" * 64,
+    )
+    second = CampaignController(
+        store,
+        base_uri="gs://atomic-admission-control",
+        campaign_id="atomic-admission-concurrency",
+        clock_ms=lambda: now_ms[0],
+        challenge_factory=lambda: "b" * 64,
+    )
+    store.barrier = threading.Barrier(2)
+
+    def admit(controller: CampaignController) -> r1.MFUAdmissionProofV1:
+        return controller.admit_mfu_v2(
+            work_id=work.work_id,
+            run_contract=fixture.run,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        proofs = tuple(executor.map(admit, (first, second)))
+
+    assert proofs[0] == proofs[1]
+    accepted = owner.replay()
+    assert accepted.revision == before.revision + 1
+    assert accepted.event_count == before.event_count + 1
+    assert (
+        owner.verify_mfu_admission_v2(
+            proofs[0], work_id=work.work_id, run_contract=fixture.run
+        )
+        == proofs[0].admission
+    )
+
+
+def test_concurrent_different_contracts_accept_exactly_one() -> None:
+    fixture = _build_fixture(salt="atomic-admission-contract-race")
+    alternate_implementation = _identity(
+        fixture.store,
+        "alternate-implementation",
+        m.MEDIA_IMPLEMENTATION_IDENTITY_V2,
+    )
+    alternate_run = replace(
+        fixture.run,
+        implementation_identity=alternate_implementation,
+    )
+    store = _AdmissionTracingStore()
+    now_ms = [BASE_START_NS // 1_000_000 - 20_000]
+    owner, work = _fresh_admission_controller(
+        fixture.run,
+        store=store,
+        campaign_id="atomic-admission-contract-race",
+        now_ms=now_ms,
+        challenge="6" * 64,
+    )
+    before = owner.view()
+    first = CampaignController(
+        store,
+        base_uri="gs://atomic-admission-control",
+        campaign_id="atomic-admission-contract-race",
+        clock_ms=lambda: now_ms[0],
+        challenge_factory=lambda: "6" * 64,
+    )
+    second = CampaignController(
+        store,
+        base_uri="gs://atomic-admission-control",
+        campaign_id="atomic-admission-contract-race",
+        clock_ms=lambda: now_ms[0],
+        challenge_factory=lambda: "7" * 64,
+    )
+    store.barrier = threading.Barrier(2)
+
+    def admit(
+        controller: CampaignController,
+        run: m.PrefixMFURunContractV2,
+    ) -> r1.MFUAdmissionProofV1 | InvalidReceipt:
+        try:
+            return controller.admit_mfu_v2(
+                work_id=work.work_id,
+                run_contract=run,
+            )
+        except InvalidReceipt as error:
+            return error
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = tuple(
+            executor.map(
+                lambda pair: admit(*pair),
+                ((first, fixture.run), (second, alternate_run)),
+            )
+        )
+
+    proofs = tuple(item for item in results if isinstance(item, r1.MFUAdmissionProofV1))
+    errors = tuple(item for item in results if isinstance(item, InvalidReceipt))
+    assert len(proofs) == len(errors) == 1
+    assert "different MFU run contract" in str(errors[0])
+    assert owner.replay().revision == before.revision + 1
+    admitted_run = proofs[0].admission.run_contract
+    assert (
+        owner.verify_mfu_admission_v2(
+            proofs[0],
+            work_id=work.work_id,
+            run_contract=admitted_run,
+        )
+        == proofs[0].admission
+    )
+
+
+def test_admission_winning_renewal_race_is_not_extended_by_renewed_lease() -> None:
+    fixture = _build_fixture(salt="atomic-admission-renewal-race")
+    store = _OrderedAdmissionRaceStore(first_kind="MFU_ADMITTED")
+    now_ms = [BASE_START_NS // 1_000_000 - 20_000]
+    controller, work = _fresh_admission_controller(
+        fixture.run,
+        store=store,
+        campaign_id="atomic-admission-renewal-race",
+        now_ms=now_ms,
+        challenge="8" * 64,
+        lease_duration_ms=10,
+    )
+    lease = controller.view().work(work.work_id).lease
+    assert lease is not None
+    now_ms[0] += 1
+    before = controller.view()
+    store.race_enabled = True
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        admission_future = executor.submit(
+            controller.admit_mfu_v2,
+            work_id=work.work_id,
+            run_contract=fixture.run,
+        )
+        renewal_future = executor.submit(
+            controller.renew,
+            lease,
+            lease_duration_ms=20,
+        )
+        proof = admission_future.result()
+        renewed = renewal_future.result()
+
+    assert proof.admission.lease_expires_at_unix_ms == lease.expires_at_unix_ms
+    assert renewed.expires_at_unix_ms > proof.admission.lease_expires_at_unix_ms
+    assert controller.replay().revision == before.revision + 2
+    with pytest.raises(InvalidReceipt, match="renewal cannot extend"):
+        controller.admit_mfu_v2(
+            work_id=work.work_id,
+            run_contract=fixture.run,
+        )
+    now_ms[0] = renewed.expires_at_unix_ms
+    with pytest.raises(InvalidReceipt, match="renewal cannot extend"):
+        controller.admit_mfu_v2(
+            work_id=work.work_id,
+            run_contract=fixture.run,
+        )
+    # Historical verification proves only the original admitted interval.
+    assert (
+        controller.verify_mfu_admission_v2(
+            proof,
+            work_id=work.work_id,
+            run_contract=fixture.run,
+        )
+        == proof.admission
+    )
+
+
+@pytest.mark.parametrize(
+    ("first_kind", "admission_succeeds"),
+    (("MFU_ADMITTED", True), ("WORK_COMMITTED", False)),
+)
+def test_admission_commit_race_is_fenced_by_accepted_event_order(
+    first_kind: str,
+    admission_succeeds: bool,
+) -> None:
+    fixture = _build_fixture(salt=f"atomic-admission-commit-race-{first_kind}")
+    store = _OrderedAdmissionRaceStore(first_kind=first_kind)
+    now_ms = [BASE_START_NS // 1_000_000 - 20_000]
+    controller, work = _fresh_admission_controller(
+        fixture.run,
+        store=store,
+        campaign_id=f"atomic-admission-commit-race-{first_kind.lower()}",
+        now_ms=now_ms,
+        challenge="9" * 64,
+    )
+    lease = controller.view().work(work.work_id).lease
+    assert lease is not None
+    controller.record_progress(
+        ProgressV1(
+            work_id=work.work_id,
+            attempt_id=lease.attempt_id,
+            fence=lease.fence,
+            sequence=1,
+            phase="benchmark",
+            completed_units=1,
+            total_units=1,
+            updated_at_unix_ms=now_ms[0],
+        )
+    )
+    receipt = AttemptReceiptV1(
+        work_id=work.work_id,
+        attempt_id=lease.attempt_id,
+        fence=lease.fence,
+        final_progress_sequence=1,
+        outcome="SUCCEEDED",
+        outputs=(fixture.run.executable,),
+        cost=CostLedgerV1(
+            successful_chip_seconds=1.0,
+            attempted_chip_seconds=1.0,
+            compilation_chip_seconds=0.0,
+            checkpoint_seconds=0.0,
+            queue_seconds=0.0,
+            egress_bytes=0,
+            replayed_units=0,
+        ),
+        termination_reason=None,
+        finished_at_unix_ms=now_ms[0],
+    )
+    before = controller.view()
+    store.race_enabled = True
+
+    def admit() -> r1.MFUAdmissionProofV1 | LeaseUnavailable:
+        try:
+            return controller.admit_mfu_v2(
+                work_id=work.work_id,
+                run_contract=fixture.run,
+            )
+        except LeaseUnavailable as error:
+            return error
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        admission_future = executor.submit(admit)
+        commit_future = executor.submit(controller.commit, receipt)
+        admission_result = admission_future.result()
+        assert commit_future.result() == receipt
+
+    accepted = controller.replay()
+    assert accepted.work(work.work_id).status == "COMMITTED"
+    if admission_succeeds:
+        assert isinstance(admission_result, r1.MFUAdmissionProofV1)
+        assert accepted.revision == before.revision + 2
+        assert (
+            controller.verify_mfu_admission_v2(
+                admission_result,
+                work_id=work.work_id,
+                run_contract=fixture.run,
+            )
+            == admission_result.admission
+        )
+    else:
+        assert isinstance(admission_result, LeaseUnavailable)
+        assert accepted.revision == before.revision + 1
+
+
+def test_cas_loser_admission_is_unreachable_and_retry_uses_fresh_challenge() -> None:
+    fixture = _build_fixture(salt="atomic-admission-cas-loser")
+    store = _AdmissionTracingStore()
+    now_ms = [BASE_START_NS // 1_000_000 - 20_000]
+    challenges = iter(("1" * 64, "2" * 64))
+    controller, work = _fresh_admission_controller(
+        fixture.run,
+        store=store,
+        campaign_id="atomic-admission-cas-loser",
+        now_ms=now_ms,
+        challenge_factory=challenges.__next__,
+    )
+    store.calls.clear()
+    store.conflicts_remaining = 1
+
+    proof = controller.admit_mfu_v2(
+        work_id=work.work_id,
+        run_contract=fixture.run,
+    )
+    event_uris = [
+        uri for kind, uri in store.calls if kind == "immutable" and "/events/" in uri
+    ]
+    assert len(event_uris) == 2
+    assert proof.event_uri == event_uris[1]
+    assert proof.admission.controller_challenge == "2" * 64
+
+    orphan = store.delegate.read(event_uris[0])
+    assert orphan is not None
+    orphan_value = orphan.decoded()
+    orphan_admission = r1.MFUAdmissionV1.from_dict(orphan_value["admission"])
+    orphan_proof = r1.MFUAdmissionProofV1(
+        campaign_id=orphan_admission.campaign_id,
+        event_uri=event_uris[0],
+        event_sha256=orphan.sha256,
+        event_revision=orphan_value["revision"],
+        admission=orphan_admission,
+    )
+    with pytest.raises(InvalidReceipt, match="not reachable"):
+        controller.verify_mfu_admission_v2(
+            orphan_proof,
+            work_id=work.work_id,
+            run_contract=fixture.run,
+        )
+    assert (
+        controller.verify_mfu_admission_v2(
+            proof, work_id=work.work_id, run_contract=fixture.run
+        )
+        == proof.admission
+    )
+
+
+def test_mfu_admission_rejects_expired_and_stale_leases_but_replays_history() -> None:
+    fixture = _build_fixture(salt="atomic-admission-stale")
+    store = MemoryJSONCASStore()
+    now_ms = [BASE_START_NS // 1_000_000 - 20_000]
+    controller, work = _fresh_admission_controller(
+        fixture.run,
+        store=store,
+        campaign_id="atomic-admission-stale",
+        now_ms=now_ms,
+        challenge="3" * 64,
+        lease_duration_ms=5,
+    )
+    proof = controller.admit_mfu_v2(
+        work_id=work.work_id,
+        run_contract=fixture.run,
+    )
+    now_ms[0] += 5
+    with pytest.raises(LeaseUnavailable, match="active lease"):
+        controller.admit_mfu_v2(
+            work_id=work.work_id,
+            run_contract=fixture.run,
+        )
+    controller.expire_and_requeue(work.work_id)
+    takeover = replace(fixture.run, attempt_id="takeover-attempt")
+    controller.acquire(
+        work.work_id,
+        attempt_id=takeover.attempt_id,
+        executor_id="takeover-executor",
+        deployment_identity_sha256=takeover.deployment_identity.sha256,
+        lease_duration_ms=10_000,
+    )
+    with pytest.raises(StaleAttempt, match="active lease"):
+        controller.admit_mfu_v2(
+            work_id=work.work_id,
+            run_contract=fixture.run,
+        )
+    assert (
+        controller.verify_mfu_admission_v2(
+            proof, work_id=work.work_id, run_contract=fixture.run
+        )
+        == proof.admission
+    )
+    with pytest.raises(InvalidReceipt, match="another run contract"):
+        controller.verify_mfu_admission_v2(
+            proof, work_id=work.work_id, run_contract=takeover
+        )
+
+
+def test_mfu_admission_replay_rejects_cross_campaign_and_tampered_proofs() -> None:
+    fixture = _build_fixture(salt="atomic-admission-replay")
+    store = MemoryJSONCASStore()
+    now_ms = [BASE_START_NS // 1_000_000 - 20_000]
+    controller, work = _fresh_admission_controller(
+        fixture.run,
+        store=store,
+        campaign_id="atomic-admission-replay",
+        now_ms=now_ms,
+        challenge="4" * 64,
+    )
+    proof = controller.admit_mfu_v2(
+        work_id=work.work_id,
+        run_contract=fixture.run,
+    )
+    other = CampaignController(
+        store,
+        base_uri="gs://atomic-admission-control",
+        campaign_id="other-campaign",
+        clock_ms=lambda: now_ms[0],
+    )
+    with pytest.raises(InvalidReceipt, match="another campaign"):
+        other.verify_mfu_admission_v2(
+            proof, work_id=work.work_id, run_contract=fixture.run
+        )
+    with pytest.raises(InvalidReceipt, match="another work item"):
+        controller.verify_mfu_admission_v2(
+            proof,
+            work_id="wrong-work",
+            run_contract=fixture.run,
+        )
+
+    wrong_reference = replace(proof, event_sha256="0" * 64)
+    with pytest.raises(InvalidReceipt, match="not reachable"):
+        controller.verify_mfu_admission_v2(
+            wrong_reference,
+            work_id=work.work_id,
+            run_contract=fixture.run,
+        )
+    tampered_admission = replace(
+        proof.admission,
+        controller_challenge="5" * 64,
+    )
+    with pytest.raises(InvalidReceipt, match="payload is inconsistent"):
+        controller.verify_mfu_admission_v2(
+            replace(proof, admission=tampered_admission),
+            work_id=work.work_id,
+            run_contract=fixture.run,
+        )
+
+
 def test_public_facade_keeps_v1_and_v2_authority_surfaces_side_by_side() -> None:
     assert r1.MFUQualificationV1 is not r1.PrefixMFUQualificationV2
     assert (
@@ -1831,3 +2436,4 @@ def test_public_facade_keeps_v1_and_v2_authority_surfaces_side_by_side() -> None
     )
     assert r1.ProductionMFUEvidenceAuthorityV2 is a.ProductionMFUEvidenceAuthorityV2
     assert r1.MFUReportConsumerV2 is a.MFUReportConsumerV2
+    assert r1.MFUAdmissionV1 is not r1.MFUAdmissionProofV1

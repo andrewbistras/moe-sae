@@ -11,6 +11,7 @@ from moe_sae.r1.controller import (
     CampaignConflict,
     CampaignController,
     ContentVerificationFailed,
+    CorruptCampaign,
     InvalidProgress,
     InvalidReceipt,
     LeaseUnavailable,
@@ -547,3 +548,15 @@ def test_replay_follows_head_chain_after_full_lifecycle() -> None:
     assert replayed.event_count == 7
     assert replayed.work(first_work.work_id).status == "PENDING"
     assert replayed.work(second_work.work_id).status == "COMMITTED"
+
+
+def test_replay_rejects_regressing_accepted_event_timestamps() -> None:
+    controller, _store, clock = _controller()
+    work = _harvest()
+    controller.initialize((work,))
+    clock.now_ms -= 1
+
+    _acquire(controller, work.work_id)
+
+    with pytest.raises(CorruptCampaign, match="timestamps regress"):
+        controller.replay()
