@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 import sys
@@ -21,6 +22,7 @@ from moe_sae.checkpointing import (
 )
 from moe_sae.distributed import (
     DistributedConfig,
+    _validate_exact_distributed_l0,
     create_mesh,
     evaluate_distributed,
     init_distributed_state,
@@ -73,6 +75,37 @@ def test_capacity_scan_uses_static_local_microbatches_and_margin() -> None:
     )
     # Each two-row micro gives experts 0/1 a load of two; 10% then round to 8.
     assert capacity == 8
+
+
+def test_exact_distributed_l0_uses_integer_counts_not_tpu_float_ratio() -> None:
+    # This was the scalar result observed on the v4-32 final production batch.
+    # It lies outside the former 1e-6 tolerance despite exact integer counts.
+    observed_tpu_ratio = 63.999996185302734
+    assert not math.isclose(observed_tpu_ratio, 64.0, rel_tol=0.0, abs_tol=1e-6)
+
+    _validate_exact_distributed_l0(
+        l0_sum=794_624,
+        valid_tokens=12_416,
+        k=64,
+    )
+
+
+@pytest.mark.parametrize(
+    ("l0_sum", "valid_tokens", "message"),
+    [
+        (794_623, 12_416, "selected=794623"),
+        (0, 0, "zero scientific tokens"),
+    ],
+)
+def test_exact_distributed_l0_rejects_real_count_mismatches(
+    l0_sum: int, valid_tokens: int, message: str
+) -> None:
+    with pytest.raises(RuntimeError, match=message):
+        _validate_exact_distributed_l0(
+            l0_sum=l0_sum,
+            valid_tokens=valid_tokens,
+            k=64,
+        )
 
 
 def test_checkpoint_control_visibility_retries_enoent_and_stale_contents() -> None:
@@ -476,6 +509,118 @@ for condition in ("B", "A"):
     environment["XLA_FLAGS"] = "--xla_force_host_platform_device_count=4"
     completed = subprocess.run(
         [sys.executable, "-c", script],
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=120,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_two_dimensional_partial_final_batch_preserves_exact_l0_in_subprocess(
+    tmp_path: Path,
+) -> None:
+    """The masked production tail must not fail the exact-L0 invariant."""
+
+    script = r"""
+import jax
+import jax.numpy as jnp
+import numpy as np
+import sys
+from pathlib import Path
+
+import moe_sae.distributed as distributed_module
+from moe_sae.distributed import (
+    DistributedConfig,
+    create_mesh,
+    run_distributed_training,
+    shard_train_state,
+)
+from moe_sae.metrics_journal import JournalIdentity, MetricsJournal
+from moe_sae.pipeline import ActivationBatch, TrainingConfig
+from moe_sae.sae import SAEConfig, init_train_state
+
+
+def save_checkpoint_without_orbax(path, *_args, **_kwargs):
+    # The base test environment deliberately excludes the TPU/Orbax extra.  We
+    # still exercise the complete journal -> latest -> final control-plane path.
+    payload = Path(str(path))
+    payload.mkdir(parents=True)
+    (payload / "commit_success.txt").write_text("ok", encoding="utf-8")
+
+
+distributed_module.save_distributed_checkpoint = save_checkpoint_without_orbax
+
+total_tokens = 16_384 + 12_416
+root = Path(sys.argv[1])
+x = np.ones((total_tokens, 4), np.float32)
+route_patterns = np.asarray([[0, 1], [2, 3]], np.int32)
+routes = route_patterns[np.arange(total_tokens) % 2]
+distributed = DistributedConfig(
+    data_axis_size=2, feature_axis_size=2, microbatches_per_update=4
+)
+mesh = create_mesh(distributed)
+sae = SAEConfig(
+    "A",
+    hidden_dim=4,
+    num_experts=4,
+    top_routed=2,
+    bank_width=64,
+    k=64,
+    parameter_dtype="float32",
+    warmup_steps=1,
+    total_steps=2,
+)
+training = TrainingConfig(
+    sae,
+    seed=0,
+    total_tokens=total_tokens,
+    effective_batch_tokens=16_384,
+    microbatch_tokens=4_096,
+    checkpoint_every_tokens=total_tokens,
+    health_gate_tokens=16_384,
+    live_feature_fraction=0,
+    loss_ratio_threshold=10,
+    a_capacity=4_096,
+)
+state = init_train_state(jax.random.PRNGKey(0), sae)
+state = state._replace(
+    params=state.params._replace(bias=jnp.ones_like(state.params.bias))
+)
+result = run_distributed_training(
+    training,
+    [ActivationBatch(x, routes)],
+    np.zeros(4, np.float32),
+    mesh,
+    state=shard_train_state(state, mesh, sae, distributed),
+    distributed=distributed,
+    a_capacity=4_096,
+    checkpoint_dir=root / "checkpoints",
+    checkpoint_identity={"capture_manifest_sha256": "a" * 64},
+    metrics_journal_path=root / "metrics.jsonl",
+    metrics_journal_identity=JournalIdentity("b" * 32, "A", 0),
+    require_health_pass=False,
+)
+assert int(result.state.step) == 2
+assert int(result.state.tokens_seen) == total_tokens
+assert [int(metric.valid_tokens) for metric in result.metrics] == [16_384, 12_416]
+assert [float(metric.l0) for metric in result.metrics] == [64.0, 64.0]
+assert result.metrics_journal is not None
+assert result.metrics_journal["complete_prefix_exact_l0"] is True
+assert result.metrics_journal["complete_prefix_topk_valid"] is True
+assert result.metrics_journal["binding"]["last_tokens_seen"] == total_tokens
+assert result.final_checkpoint is not None
+assert Path(result.final_checkpoint).is_file()
+records = MetricsJournal(
+    root / "metrics.jsonl", JournalIdentity("b" * 32, "A", 0)
+).records()
+assert records[-1]["valid_tokens"] == 12_416
+assert records[-1]["l0"] == 64.0
+"""
+    environment = dict(os.environ)
+    environment["XLA_FLAGS"] = "--xla_force_host_platform_device_count=4"
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path)],
         env=environment,
         text=True,
         capture_output=True,

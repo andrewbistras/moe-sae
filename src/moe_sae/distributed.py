@@ -109,6 +109,28 @@ class DistributedLossAux(NamedTuple):
     capacity_overflow: jax.Array
 
 
+def _validate_exact_distributed_l0(
+    *, l0_sum: int, valid_tokens: int, k: int
+) -> None:
+    """Validate TopK cardinality from exact counts, never a floating ratio.
+
+    TPU float32 division can round an exactly integral quotient by one ULP.  In
+    particular, the production tail has ``794624 / 12416 == 64`` but was
+    observed as ``63.999996`` on TPU v4.  Both source values are small exact
+    integers, so their equality is the authoritative invariant.
+    """
+
+    if valid_tokens <= 0:
+        raise RuntimeError("distributed update contained zero scientific tokens")
+    expected = valid_tokens * k
+    if l0_sum != expected:
+        raise RuntimeError(
+            "distributed TopK selected an unexpected number of features: "
+            f"selected={l0_sum}, valid_tokens={valid_tokens}, k={k}, "
+            f"expected={expected}; no update was accepted"
+        )
+
+
 @dataclass(frozen=True)
 class DistributedRunTiming:
     compile_seconds: float
@@ -674,8 +696,20 @@ class DistributedTrainer:
                 batch.valid_mask,
                 mean,
             )
-            l0 = aux.l0_sum.astype(jnp.float32) / jnp.maximum(
+            l0_ratio = aux.l0_sum.astype(jnp.float32) / jnp.maximum(
                 aux.valid_tokens.astype(jnp.float32), 1.0
+            )
+            exact_l0_counts = (
+                aux.l0_sum
+                == aux.valid_tokens * jnp.asarray(sae_config.k, aux.l0_sum.dtype)
+            )
+            # Canonicalize a proven-exact result.  Keeping the raw ratio for a
+            # mismatch preserves useful diagnostics without allowing TPU
+            # division rounding to poison the journal or downstream health gate.
+            l0 = jnp.where(
+                exact_l0_counts,
+                jnp.asarray(sae_config.k, jnp.float32),
+                l0_ratio,
             )
             state, metrics = apply_gradients(
                 state,
@@ -753,8 +787,13 @@ class DistributedTrainer:
         )
         executable = self._compiled if self._executable is None else self._executable
         new_state, metrics, aux = executable(state, batch, mean_array)
-        capacity_overflow, topk_valid, l0, valid_tokens = jax.device_get(
-            (aux.capacity_overflow, aux.topk_valid, metrics.l0, aux.valid_tokens)
+        capacity_overflow, topk_valid, l0_sum, valid_tokens = jax.device_get(
+            (
+                aux.capacity_overflow,
+                aux.topk_valid,
+                aux.l0_sum,
+                aux.valid_tokens,
+            )
         )
         if bool(capacity_overflow):
             raise RuntimeError(
@@ -766,10 +805,11 @@ class DistributedTrainer:
                 "fewer than k strictly positive features on a scientific token; "
                 "no update was accepted"
             )
-        if int(valid_tokens) <= 0:
-            raise RuntimeError("distributed update contained zero scientific tokens")
-        if not math.isclose(float(l0), self.sae_config.k, rel_tol=0, abs_tol=1e-6):
-            raise RuntimeError("distributed TopK produced an unexpected L0")
+        _validate_exact_distributed_l0(
+            l0_sum=int(l0_sum),
+            valid_tokens=int(valid_tokens),
+            k=self.sae_config.k,
+        )
         finite = jax.device_get(
             jnp.isfinite(metrics.loss)
             & jnp.isfinite(metrics.grad_norm)
