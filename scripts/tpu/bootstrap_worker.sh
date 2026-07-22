@@ -292,13 +292,13 @@ mount_control_plane() {
     )
     [[ "$actual_source" == "$expected_source" ]] || \
       die "artifact root is mounted from '$actual_source'; expected '$expected_source'"
-    if ! has_positive_lookup_cache "$mount_options"; then
-      log "unmounting NFS control plane before enabling lookupcache=positive"
+    if ! has_correctness_first_nfs_options "$mount_options"; then
+      log "unmounting NFS control plane before enabling noac,lookupcache=none"
       # NFS-specific cache policy is not reliably changed by a generic remount.
       # Bootstrap runs before any workload, so a normal unmount must succeed;
       # never use force/lazy unmount because that could split control-plane state.
       sudo umount "$artifact_root"
-      sudo mount -t nfs -o rw,hard,timeo=600,retrans=2,lookupcache=positive \
+      sudo mount -t nfs -o rw,hard,timeo=600,retrans=2,noac,lookupcache=none \
         "$expected_source" "$artifact_root"
       IFS=' ' read -r actual_source filesystem_type mount_options < <(
         findmnt -rn -o SOURCE,FSTYPE,OPTIONS --mountpoint "$artifact_root"
@@ -313,7 +313,7 @@ mount_control_plane() {
       die "unmounted artifact root is not empty: $artifact_root"
     fi
     log "mounting NFS control plane $expected_source at $artifact_root"
-    sudo mount -t nfs -o rw,hard,timeo=600,retrans=2,lookupcache=positive \
+    sudo mount -t nfs -o rw,hard,timeo=600,retrans=2,noac,lookupcache=none \
       "$expected_source" "$artifact_root"
     IFS=' ' read -r actual_source filesystem_type mount_options < <(
       findmnt -rn -o SOURCE,FSTYPE,OPTIONS --mountpoint "$artifact_root"
@@ -326,8 +326,8 @@ mount_control_plane() {
   esac
   [[ "$actual_source" == "$expected_source" ]] || \
     die "mounted NFS source is '$actual_source'; expected '$expected_source'"
-  has_positive_lookup_cache "$mount_options" || \
-    die "NFS control plane must be mounted with lookupcache=positive"
+  has_correctness_first_nfs_options "$mount_options" || \
+    die "NFS control plane requires hard,noac,lookupcache=none and remote locking"
 
   if [[ ! -w "$artifact_root" ]]; then
     sudo chown "$(id -u):$(id -g)" "$artifact_root"
@@ -348,12 +348,20 @@ has_mount_option() {
   [[ ",$options," == *",$required,"* ]]
 }
 
-has_positive_lookup_cache() {
+has_correctness_first_nfs_options() {
   local options=$1
-  # util-linux/findmnt renders the kernel's accepted "positive" value as
-  # either lookupcache=positive or the abbreviated lookupcache=pos.
-  has_mount_option "$options" lookupcache=positive || \
-    has_mount_option "$options" lookupcache=pos
+  # This mount is a tiny correctness-first control plane, not a bulk-data path.
+  # Both attribute and positive/negative dentry caching must be disabled so a
+  # status replacement or newly published release is immediately revalidated
+  # against the server on every controller.
+  has_mount_option "$options" hard && \
+    has_mount_option "$options" noac && \
+    has_mount_option "$options" lookupcache=none && \
+    ! has_mount_option "$options" soft && \
+    ! has_mount_option "$options" softerr && \
+    ! has_mount_option "$options" nolock && \
+    ! has_mount_option "$options" local_lock=all && \
+    ! has_mount_option "$options" local_lock=flock
 }
 
 validate_local_buffer_filesystem() {

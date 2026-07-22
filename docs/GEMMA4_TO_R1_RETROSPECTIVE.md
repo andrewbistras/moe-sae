@@ -1,20 +1,22 @@
 # From Gemma 4 to DeepSeek-R1: evidence, debt, and the next system
 
 **Snapshot:** 2026-07-22, after the Gemma 4 train and held-out activation
-captures were sealed, but before the final nine SAE runs and exploratory
-efficiency result. This is a candid engineering retrospective and a design
-input for the R1 replication. It is not a claim that the Gemma experiment is
-scientifically complete. Because the hard harvester-MFU gate and the real-data
-canary gates were waived, this campaign can compute the planned G/C statistic
-but cannot become preregistered or headline-ready retroactively, regardless of
-how favorable that statistic is.
+captures were sealed and the first identity-sealed SAE farm operation was
+launched, but before the final nine SAE runs and exploratory efficiency
+result. This is a candid engineering retrospective and a design input for the
+R1 replication. It is not a claim that the Gemma experiment is scientifically
+complete. Because the hard harvester-MFU gate and the real-data canary gates
+were waived, this campaign can compute the planned G/C statistic but cannot
+become preregistered or headline-ready retroactively, regardless of how
+favorable that statistic is.
 
 The words below have deliberately different meanings:
 
 - **Observed** means a production record, immutable object, or direct runtime
   inspection exists.
 - **Committed** means the behavior is represented in Git at or before
-  `45a15f028751932f00b521e35fd894e68a38b165`.
+  `c8ef28d01b4610ab3ba7328e91806277e86e28e5`, the exact clean commit deployed
+  for the sealed SAE operation.
 - **In progress** means a repair exists only in the current worktree or
   operator artifacts and must not be treated as a released capability.
 - **Inference** means the explanation is consistent with the evidence but has
@@ -25,6 +27,12 @@ The words below have deliberately different meanings:
 This distinction matters. The project repeatedly benefited from refusing to
 turn a successful recovery into a retroactive claim that the original gate had
 passed.
+
+For clarity, sections describing **what happened** and the evidence ledger are
+claims about the Gemma run. “In progress” paragraphs describe the current
+operator state and are not production capabilities. The R1 architecture and
+acceptance sections are requirements or proposals, not claims that the current
+repository already implements them.
 
 ## Executive conclusion
 
@@ -90,9 +98,10 @@ to the text-only base/PT `google/gemma-4-26B-A4B`: 30 blocks, width 2,816,
 
 Commit `85ed074` replaced the governed multimodal surface with A/B/F and the
 planned G/C metric. Commit `1e84111` introduced split storage. Commits from
-`0600f5d` through `45a15f0` then hardened staging, conversion, supervision,
-capture sharding, transfers, topology handling, timing, profiling, and the
-auditable MFU exception. The intended experiment is documented in
+`0600f5d` through `c8ef28d` then hardened staging, conversion, supervision,
+capture sharding, transfers, topology handling, timing, profiling, the
+auditable MFU exception, resident-cache lifecycle, and the canary/storage
+identity chain. The intended experiment is documented in
 [`EXPERIMENT.md`](EXPERIMENT.md), while [`ARCHIVE.md`](ARCHIVE.md) records the
 historical boundary.
 
@@ -343,17 +352,25 @@ use. The progression was therefore 128 GiB overqualification, 24 GiB
 stage-correct qualification, then a missed downstream 100 GiB requirement.
 
 The first dedicated SAE-cache qualification then passed its own contract:
-73.66 GB per controller (294.64 GB aggregate) of `/dev/shm` data were downloaded
-and verified at 4.946 GB/s aggregate. About
+approximately 73.66 GB **per TPU worker host**, or 294.64 GB aggregate across
+the four hosts, were downloaded into `/dev/shm` and verified. The
+first pass measured 4.946 GB/s aggregate. About
 20 seconds after the foreground qualifier's SSH sessions exited, however, the
 cache vanished. Runtime inspection found `systemd-logind` configured with
 `RemoveIPC=yes` and the production user with `Linger=no`. A controlled
 four-worker comparison enabled linger only on worker 0: its owned `/dev/shm`
 sentinel survived the disconnect interval, while the otherwise matching
 sentinels on workers 1--3 vanished. Enabling `Linger=yes` on all four workers
-therefore became a prerequisite to requalification. The passed throughput and
-hash proof had been valid; the target runtime invalidated its resident bytes
-after the process boundary.
+therefore became a prerequisite to requalification. Commit `0d6c9d9` made
+that lifecycle requirement executable: bootstrap enables linger,
+`qualify-sae-storage` checks its exact state, and later cache consumers check
+it again rather than trusting a stale preflight result. The final cold
+qualification populated 101 files and approximately 73.660 GB on each VM,
+294,641,388,480 bytes aggregate, at 5.778982523 GB/s; it left
+141,341,712,384 bytes free on every VM and produced attestation
+`d3de23d2b022ee522e1be273b236f3c156ea17188b9e0ffcc0319c3d15ec5c75`.
+The passed original throughput and hash proof had been valid; the target
+runtime had invalidated its resident bytes after the process boundary.
 
 After that repair, the first `sae-begin` attempt exposed a different boundary
 bug before an operation was created. The durable canary `CampaignSummary` v2
@@ -367,27 +384,102 @@ that really belong to `CampaignSummary`, then separately requires the exact
 bound storage file, verifies its canonical self-hash, and requires equality
 across the waiver and sealed manifest.
 
+Commit `c8ef28d` repaired the canary validator against the real schema and was
+deployed cleanly. The final c8-bound F/A/B full-shape smoke suite performed one
+16,384-token update per condition, saved Orbax state, and restored it in a
+fresh process. The sealed production operation is
+`e74bc0ca6e21b6e15b61b3ae14606ec6e5d5e5dcd3501b4cc017983e980b5769`.
+
 The Stage-8 hardening implementation preserves the immutable activation
 attestation, adds a separate SAE-storage attestation for bounded `/dev/shm` and
 Orbax paths, and adds a producer/consumer compatibility proof. That
 compatibility proof is a transitional allowlist of selected full-file and AST
 symbol hashes; despite its broad module description, it principally binds the
 capture producer/schema semantics and is not a substitute for golden numerical
-compatibility tests. It was committed and its full-shape F/A/B smoke suite
-passed under consumer commit `67bb7f7`; the later cache-lifecycle repair
-correctly requires a new identity-bound smoke suite and storage qualification.
+compatibility tests. Earlier smoke under `67bb7f7` was correctly invalidated
+by later consumer-identity changes; the c8-bound smoke and storage
+qualification replaced it rather than reusing it by assertion.
 
 The metrics journal repair is more concrete: rows are bound to one
 `(run_instance_id, condition, seed)`, require strictly increasing optimizer
 step and scientific-token counts, are flushed and `fsync`ed, and on resume may
 atomically remove only the suffix ahead of the exact checkpoint boundary. The
 checkpoint remains authoritative. This removes the earlier blind-append
-rollback risk. Full-shape A/B/F smoke and exact Orbax restore passed once on
-the production TPU; interrupted full-run resume and the SAE farm remain in
-qualification. Farm stress testing has
-already exposed abort-classification and peer-release races. The repair itself
-has added several thousand lines, reinforcing the need to split orchestration
-before R1.
+rollback risk. Full-shape A/B/F smoke and exact Orbax restore passed on the
+production TPU; interrupted full-run resume remains unproven. Farm stress
+testing had already exposed abort-classification and peer-release races. The
+repair itself added several thousand lines, reinforcing the need to split
+orchestration before R1.
+
+The first launch of the sealed farm operation found one more fresh-process
+boundary. `SAELocalSubprocessExecutor` called `Path.resolve()` on
+`sys.executable`. That dereferenced the repository virtual-environment symlink
+to uv's base Python, so every `validate-prerequisites` child started outside
+the venv and could import neither `moe_sae` nor JAX. All four attempt-1 failures
+were retained immutably; parent processes exited cleanly and released their
+leases. No scientific update ran.
+
+The immediate recovery was deliberately a bodge: on every VM the operator made
+the ignored `.venv/bin/python-sae-farm` a hard link to the same interpreter
+binary and relaunched the unchanged sealed c8 operation through that in-venv
+path. CPython then discovered the intended venv without changing the Git tree
+or operation identity. The binary SHA-256 was identical on all four VMs and
+the recovery was appended to each outer log. Attempt 2 reached four matching,
+live prerequisite-validation lanes and durably passed that phase. A durable
+source repair now keeps the absolute launcher path without resolving its
+symlink, with a regression test, but it is **not part of the c8 operation**.
+The hard link is an expedient recovery artifact, not a supported launcher
+design.
+
+The next failure was the shared control plane itself. Attempt 2 committed the
+same passing prerequisite digest on all four controllers, but the final
+`supervisor-complete.json` was never created. Three parents exited while the
+fourth waited the full 300-second completion bound. Their last heartbeat times
+were staggered across the Linux NFSv3 default 30--60 second attribute-cache
+window even though each process was still replacing its lane JSON. The mount's
+`lookupcache=positive` policy had fixed absent-to-present lookups but had not
+disabled positive-name or attribute caching. No numerical training child or
+metrics journal existed.
+
+An intermediate `actimeo=1` mount let the already-passed prerequisite be
+revalidated and let `smoke-F` pass, but the following boundary split: worker 0
+reported a live status without its kernel lease while workers 1--3 reported
+stale lane locks. The controllers were then fully remounted with
+`noac,lookupcache=none`. A purpose-built four-host probe passed 64 successive
+atomic replacements with exact one-read observation on all three peers and
+also proved that a remotely held nonblocking `flock` was denied and could be
+reacquired after release. Its receipt SHA-256 is
+`5708c71e09a7a266508f1b042df49165d4cf0d173b705f17b39ffc0fa8d937a2`.
+
+That probe isolated a second problem rather than vindicating the farm. Two
+fresh supervisor sessions still died at resume boundaries before any child or
+SAE update. `/proc` stacks showed 30--60 second waits in `nlmclnt_block` and NFS
+lookup RPCs. The farm had been taking roughly 80 full status snapshots per
+second at boundaries while force-writing roughly 80 `fsync`ed heartbeats per
+second; every snapshot probed remote lane locks on every controller. It
+therefore generated order-of-magnitude 1,000 NLM operations per second and
+then interpreted the delays it created as peer death. Fresh lease-less
+terminal history was also classified as a vanished active lane, making clean
+restart unnecessarily brittle.
+
+The current repair makes the control mount correctness-first
+(`hard,noac,lookupcache=none`, remote locks only), reduces control polling to
+five seconds, publishes unchanged heartbeats at most every 30 seconds, derives
+a 130-second stale bound and 520-second finite rendezvous bound, serializes
+heartbeat writes per lease, and excludes released terminal history from the
+vanished-live test. It also includes the durable venv-launcher repair. These
+changes require a new clean deployment, resident-cache qualification, smoke
+suite, and operation identity; they are not retroactively part of
+`e74bc0…b5769`. That operation passed only prerequisites and `smoke-F`. It ran
+zero SAE optimizer updates and is retained as an amelioration ledger, not a
+partial scientific result.
+
+The farm also lacks a numerical-progress watchdog. Its outer heartbeat can
+remain healthy while a child is stuck in XLA compilation, an optimizer step,
+or another long-running numerical call. Current monitoring must therefore
+inspect the metrics journal and scientific-token/step progress as well as the
+lease heartbeat. R1 requires a cloud-resident phase-specific progress monitor,
+bounded compile/step deadlines, and an incident record before automated retry.
 
 The final SAE metric is still pending. When all nine runs, evaluation, and
 reporting complete, this document may record the exploratory G/C result, but
@@ -516,6 +608,18 @@ relative A/B/F quality had yet been inspected.
     deleted until a complete immutable evidence export is copied to GCS and
     independently verified.
 
+14. **The farm's child launcher escaped its virtual environment.** Resolving
+    the `sys.executable` symlink changed an in-venv launcher into uv's base
+    interpreter. Four fresh-process prerequisite children therefore failed at
+    import before scientific work. The state machine preserved the failed
+    attempt and released leases correctly, but only production launch exposed
+    the launcher bug.
+
+15. **Supervisor liveness was not numerical progress.** Lease and outer-parent
+    heartbeats do not prove that a phase is compiling, stepping, or advancing
+    scientific tokens. A stuck child can look operationally alive until a
+    human correlates the phase journal and process telemetry.
+
 ## Bodges and waivers that must not become architecture
 
 These actions were reasonable under a ten-day deadline. They are listed so
@@ -535,6 +639,7 @@ that “it worked once” does not silently turn them into policy.
 | Keep Filestore as the coordination root | familiar locks, rename, and shared paths | it is zonal, client-cached, and unsuitable for globally distributed executors |
 | Use `/dev/shm` as an emergency SAE cache | sufficient fast capacity already existed | it is volatile and competes with process memory; capacity must be qualified per image/topology |
 | Enable user linger live during diagnosis | stopped `RemoveIPC=yes` from clearing worker 0's sentinel at SSH teardown | lifecycle policy belongs in the baked image and its acceptance suite, not an emergency mutation under allocation |
+| Launch the sealed farm through an ignored hard-linked interpreter | preserved the already sealed c8 identity while restoring correct venv discovery | it is untracked per-host state, is absent on replacement workers, and hides the source bug unless the failed attempt ledger is read |
 | Use the operator's email in a waiver | established a human audit identity | identity is not notification; it sent no message and grants no control |
 | Run the repair agent from the laptop | enabled rapid interactive diagnosis | detached jobs survive disconnection, but nobody diagnoses, alerts, or repairs when the laptop session disappears |
 
@@ -546,6 +651,17 @@ that “it worked once” does not silently turn them into policy.
   environment hash. A later storage-only fix can therefore reject perfectly
   valid activation bytes. Scientific identity, implementation identity, and
   deployment identity need separate schemas and explicit compatibility edges.
+
+- **Storage qualification is selected through an environment-coupled name.**
+  The current scheme cannot cleanly retain several valid qualifications for
+  the same immutable cache content under different accepted deployment
+  identities. A small launcher-only change can force another 294.64 GB cold
+  transfer merely to produce the filename the new environment expects. Spot
+  replacement needs content-addressed qualification objects keyed by the
+  cache inventory, storage contract, image/runtime lifecycle, topology, and
+  measured host, plus an explicit immutable selector. Consumers must verify
+  the selected proof and current local bytes; they must never infer validity
+  from “the latest” file or repository commit alone.
 
 - **Process-major layouts are topology assumptions.** JAX process indices are
   useful execution identities, not stable corpus owners. A replacement slice
@@ -586,8 +702,22 @@ that “it worked once” does not silently turn them into policy.
 - **Cache qualification did not bind the user-session lifecycle.** The
   qualifier proved capacity, hashes, inventory, and speed, but not survival
   after the last SSH session. A fresh-process farm makes that boundary part of
-  data availability. Until the runtime image proves `Linger=yes` and a
-  disconnect-survival probe, a resident `/dev/shm` attestation is incomplete.
+  data availability. The Gemma repair now checks `Linger=yes` during
+  qualification and rechecks it at cache consumption; R1 must additionally
+  bind a disconnect-survival probe to the accepted image/runtime identity. A
+  startup check is evidence about that instant, not a permanent promise.
+
+- **Farm child launch still depends on a per-host ignored hard link.** The
+  source-level symlink-preserving launcher repair is tested locally but is not
+  part of the deployed c8 operation. A replacement Gemma worker would need the
+  recovery artifact recreated. R1 must launch from a baked, canonical entry
+  point whose venv identity is tested in a genuinely fresh process.
+
+- **There is no numerical-progress watchdog.** Farm heartbeats prove that the
+  supervisor is alive, not that optimizer step, token count, compilation, or
+  checkpoint progress is advancing. A cloud scheduler needs phase-specific
+  deadlines and progress counters, with stack/profile capture and fencing
+  before retry.
 
 - **The prefix adapter depends on private MaxText/NNX structure.** It
   duck-types unscanned layer and MoE fields and relies on pinned Flax NNX
@@ -707,7 +837,8 @@ that “it worked once” does not silently turn them into policy.
    collectives, checkpoint restore, router parity, preemption, and storage
    publication need real-slice acceptance tests. So do login/session teardown,
    detached-parent survival, and host-cache survival across fresh-process
-   handoff. Unit parity remains necessary, but it is not deployment
+   handoff. The same lifecycle condition must be rechecked when the cache is
+   consumed. Unit parity remains necessary, but it is not deployment
    qualification.
 
 9. **Every emergency path must be promoted or retired.** A successful wrapper
@@ -725,6 +856,11 @@ that “it worked once” does not silently turn them into policy.
     never emitted. Build waiver, recovery, and migration tests from the actual
     versioned record type, and separately validate identities that belong to
     adjacent artifacts.
+
+12. **A heartbeat is not a progress oracle.** Every long phase needs a frozen
+    definition of progress, a reasonable no-progress interval, and a bounded
+    diagnostic/retry transition. The monitor must distinguish a long expected
+    compile from a wedged compile using phase evidence, not operator intuition.
 
 ## Target architecture for DeepSeek-R1 on multi-region v6e-64
 
@@ -936,6 +1072,17 @@ temporaries, model/runtime pressure, and skew. They are only sizing inputs,
 even though a four-chip v6e VM is documented with 720 GB host RAM; the
 qualifier must measure actual free memory and enforce a safety margin.
 
+Publish each storage qualification as an immutable content-addressed object.
+Its identity must cover the exact cache inventory, content hashes, stage
+contract, image/runtime lifecycle, topology, host measurements, throughput
+method, and disconnect-survival result. Select it through an explicit CAS
+record bound into the operation; never encode “current environment” into a
+single expected filename and never overwrite an old qualification. On every
+Spot replacement, consumers recheck host lifecycle, free capacity, and local
+content before use. They may reuse the immutable inventory proof, but they
+must produce a new host/deployment qualification rather than trusting bytes
+that existed on the preempted slice.
+
 Checkpoint payloads use unique attempt prefixes. A `latest` record is an
 object-store CAS update published only after Orbax finalization and a
 cross-process restore check. Never overwrite a payload. Never delete the prior
@@ -978,8 +1125,9 @@ tokens and not the default broadly privileged Compute account.
 3. **Build the object-store controller.** Implement fenced leases, immutable
    attempt logs, CAS state transitions, orphan adoption, stale-attempt
    rejection, regional quota/capacity discovery, budget stops, abandoned-
-   attempt garbage collection, phone alerts, and whole-slice restart. Prove it
-   with fake workers and forced races before using TPU.
+   attempt garbage collection, phase-specific numerical-progress watchdogs,
+   phone alerts, and whole-slice restart. Prove it with fake workers, hung
+   children, and forced races before using TPU.
 
 4. **Build and publish the immutable TPU environment.** For Compute Engine,
    bake the custom TPU OS image and optionally its OCI workload layer; replicate
@@ -1070,7 +1218,12 @@ tokens and not the default broadly privileged Compute account.
 - The baked runtime identity reports `Linger=yes` for the service user on every
   VM, and a disconnect test proves that both a detached controller and owned
   host-cache sentinel survive beyond the image's logind cleanup interval.
+  Every cache-consuming phase rechecks the live lifecycle setting and exact
+  local cache inventory before opening scientific input.
 - One static compile serves all measured steps; no hidden recompilation occurs.
+- Every long-running phase exports a monotonic progress counter. A frozen
+  no-progress policy captures diagnostics, fences the attempt, and either
+  retries or halts; an outer heartbeat alone is never accepted as progress.
 - Peak per-chip HBM retains at least a measured safety margin (default 15%) and
   no host approaches tmpfs/DRAM exhaustion.
 - A roofline-derived useful-prefix MFU floor is frozen before production. A
@@ -1087,6 +1240,10 @@ tokens and not the default broadly privileged Compute account.
 - Concurrent uploads are conditional and content-addressed. Seal proves exact
   total, contiguous ranges, no duplicates, and every regional replica's
   identity.
+- Storage/cache qualifications are immutable and content-addressed, selected
+  explicitly by the operation, and scoped to content, stage, runtime lifecycle,
+  topology, and host. A replacement Spot slice must publish a fresh host proof
+  even when it consumes the same logical cache inventory.
 - Forced preemption at each publication boundary loses at most the documented
   uncommitted interval and cannot create an accepted duplicate or gap.
 - Stale fence tokens cannot update campaign state after lease takeover.
@@ -1195,11 +1352,15 @@ are still waste.
 | cached production input path | observed | roughly 20.3k tokens/s; input wait below 2% |
 | NFS publication protocol | **failed repeatedly** | waiver/start-release visibility incidents and negative-dentry split after successful 50M seal |
 | immutable capture recovery | observed | no train recapture; exact wrapper/waiver bindings retained |
-| `/dev/shm` lifecycle across SSH exit | **failed, repaired, and verified live** | original 73.66 GB/controller cache vanished; final all-worker `Linger=yes` disconnect probes and a 294.64 GB requalification survived SSH teardown |
-| canary/recovery evidence chain | **intact; consumer validator repaired** | first `sae-begin` failed closed on a field absent from real `CampaignSummary`; exact waiver/storage/manifest chain independently recomputed and tested |
+| `/dev/shm` lifecycle across SSH exit | **failed, then committed, requalified, and rechecked** | original ~73.66 GB/VM cache vanished; `0d6c9d9` enables/checks linger, all-worker disconnect probes passed, and the final 294,641,388,480-byte cold qualification measured 5.778982523 GB/s with attestation `d3de23…c5c75` |
+| canary/recovery evidence chain | **intact; committed validator repair deployed** | `c8ef28d` validates the exact bound storage file, canonical self-hash, waiver, and sealed-manifest identity against the real `CampaignSummary` schema |
 | complete experiment evidence independent of Filestore | **not yet established** | immutable GCS payloads exist; control/evidence export and reconstruction remain required |
-| SAE storage and producer/consumer compatibility | implementation committed; final identity requalification pending | separate attestation passed twice and selected-code compatibility remained exact; the canary-validator commit requires one final consumer identity |
+| SAE storage and producer/consumer compatibility | **final c8 identity qualified** | storage attestation `d3de23…c5c75`; c8-bound full-shape F/A/B suite completed one 16,384-token update plus Orbax save/fresh restore per condition |
 | checkpoint-reconciled metrics journal | committed and smoke-qualified | identity-bound, monotonic, `fsync`ed implementation passed full-shape save/restore; interrupted full-run validation remains pending |
+| first sealed SAE farm launch | **failed closed before training** | attempt 1 retains the base-Python import failure; the hard-link recovery passed prerequisites and `smoke-F`, but repeated completion/boundary sessions exposed NFS cache and NLM-poll storms; operation `e74bc0…b5769` ran zero SAE updates |
+| NFS farm-control qualification | **probe passed; original farm protocol failed** | `noac,lookupcache=none` passed 64 cross-host replacements plus remote-lock exclusion (`5708c…937a2`), while `/proc` then showed 30--60s NLM/lookup stalls caused by the farm's own high-rate polling |
+| durable farm control/launcher repair | **current clean-deployment candidate; not part of c8 operation** | venv symlink is preserved; NFS mount is correctness-first; polling/heartbeat/freshness bounds are derived and low-rate; heartbeat writes are serialized; released terminal records are quiescent; new qualification/smokes/operation are mandatory |
+| numerical-progress watchdog | **not implemented** | farm lease/parent heartbeats can remain healthy without optimizer-step or scientific-token progress |
 | nine final SAE runs and exploratory G/C | **not yet established** | must not be inferred from capture success |
 | original-contract headline eligibility | **permanently false** | hard MFU and canary gates were waived, not passed |
 

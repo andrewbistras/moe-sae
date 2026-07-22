@@ -30,11 +30,13 @@ from datetime import datetime, timezone
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import platform
 import re
 import tempfile
+import threading
 import time
 from typing import Any, Literal
 
@@ -68,11 +70,28 @@ ABORT_SCHEMA = "gemma4-sae-operator-abort-v1"
 STATUS_SCHEMA = "gemma4-sae-operator-status-v1"
 
 EXPECTED_LANES = 4
-LANE_FRESH_SECONDS = 60.0
-HEARTBEAT_INTERVAL_SECONDS = 10.0
-RENDEZVOUS_TIMEOUT_SECONDS = 300.0
-LANE_STATUS_PUBLICATION_GRACE_SECONDS = 10.0
-LANE_STATUS_PUBLICATION_POLL_SECONDS = 0.05
+# NFSv3 control objects are deliberately polled slowly.  A non-blocking remote
+# ``flock`` still traverses the Network Lock Manager and can stall for tens of
+# seconds during server/client recovery.  Four supervisors polling four lane
+# locks at the old 250 ms cadence created enough NLM traffic to cause the very
+# heartbeat delays the watchdog was meant to detect.
+CONTROL_POLL_SECONDS = 5.0
+HEARTBEAT_INTERVAL_SECONDS = 30.0
+MISSED_HEARTBEATS_BEFORE_STALE = 4
+HEARTBEAT_OBSERVATION_POLLS = 2
+LANE_FRESH_SECONDS = (
+    MISSED_HEARTBEATS_BEFORE_STALE * HEARTBEAT_INTERVAL_SECONDS
+    + HEARTBEAT_OBSERVATION_POLLS * CONTROL_POLL_SECONDS
+)
+# Startup publication may itself cross one 30--60 second NLM recovery stall.
+# Three normal heartbeat intervals preserve a bounded, fail-closed wait without
+# mistaking that transient for an owner that never published its lease ID.
+LANE_STATUS_PUBLICATION_GRACE_SECONDS = 3 * HEARTBEAT_INTERVAL_SECONDS
+LANE_STATUS_PUBLICATION_POLL_SECONDS = 1.0
+# A four-lane boundary can observe several independent recovery stalls.  Keep
+# the deadline finite, but make it four complete freshness windows rather than
+# an unrelated magic number.
+RENDEZVOUS_TIMEOUT_SECONDS = 4 * LANE_FRESH_SECONDS
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _ATTEMPT_RE = re.compile(r"[0-9a-f]{32}")
@@ -85,6 +104,12 @@ _ACTIVE_LANE_STATES = {
     "succeeded",
     "failed",
     "aborted",
+}
+_IN_PROGRESS_LANE_STATES = {
+    "starting",
+    "ready-to-begin",
+    "ready",
+    "running",
 }
 _TERMINAL_LANE_STATES = {"succeeded", "failed", "aborted"}
 _PHASE_STATUSES = {"pending", "running", "passed", "failed", "aborted"}
@@ -120,6 +145,17 @@ class SAEPhaseAlreadyPassed(SAEOperatorError):
 
 class SAEPeerFailure(SAEOperatorError):
     """A member of the active four-controller attempt failed or disappeared."""
+
+
+def _validate_poll_seconds(value: float) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value <= 0.0
+    ):
+        raise ValueError("poll_seconds must be finite and positive")
+    return float(value)
 
 
 def _utc_now() -> str:
@@ -369,6 +405,11 @@ class SAEControl:
         self._heartbeat_cache: dict[
             str, tuple[tuple[Any, ...], float, dict[str, Any]]
         ] = {}
+        # A delayed hard-NFS write must never land after a newer state.  Every
+        # heartbeat for one lease has one in-process writer order, so a main
+        # thread publishing ``succeeded`` waits behind any stalled background
+        # ``running`` write and necessarily becomes the final record.
+        self._heartbeat_locks: dict[str, threading.Lock] = {}
         if operation_sha256 is not None:
             self.attach(operation_sha256)
 
@@ -591,36 +632,40 @@ class SAEControl:
             result_sha256,
             canonical_sha256(detail_value),
         )
-        now = time.time()
-        cached = self._heartbeat_cache.get(lease.lease_id)
-        if (
-            not force
-            and cached is not None
-            and cached[0] == cache_key
-            and now - cached[1] < HEARTBEAT_INTERVAL_SECONDS
-        ):
-            return cached[2]
-        payload: dict[str, Any] = {
-            "schema_version": LANE_SCHEMA,
-            "operation_sha256": self.operation_sha256,
-            "lane_id": lease.lane_id,
-            "lease_id": lease.lease_id,
-            "hostname": lease.hostname,
-            "pid": os.getpid(),
-            "state": state,
-            "phase": phase,
-            "attempt_id": attempt_id,
-            "result_sha256": result_sha256,
-            "detail": detail_value,
-            "heartbeat_unix": now,
-            "heartbeat_at": _utc_now(),
-        }
-        payload["lane_status_sha256"] = _self_hash(
-            payload, "lane_status_sha256"
+        heartbeat_lock = self._heartbeat_locks.setdefault(
+            lease.lease_id, threading.Lock()
         )
-        _atomic_json(lease.status_path, payload)
-        self._heartbeat_cache[lease.lease_id] = (cache_key, now, payload)
-        return payload
+        with heartbeat_lock:
+            now = time.time()
+            cached = self._heartbeat_cache.get(lease.lease_id)
+            if (
+                not force
+                and cached is not None
+                and cached[0] == cache_key
+                and now - cached[1] < HEARTBEAT_INTERVAL_SECONDS
+            ):
+                return cached[2]
+            payload: dict[str, Any] = {
+                "schema_version": LANE_SCHEMA,
+                "operation_sha256": self.operation_sha256,
+                "lane_id": lease.lane_id,
+                "lease_id": lease.lease_id,
+                "hostname": lease.hostname,
+                "pid": os.getpid(),
+                "state": state,
+                "phase": phase,
+                "attempt_id": attempt_id,
+                "result_sha256": result_sha256,
+                "detail": detail_value,
+                "heartbeat_unix": now,
+                "heartbeat_at": _utc_now(),
+            }
+            payload["lane_status_sha256"] = _self_hash(
+                payload, "lane_status_sha256"
+            )
+            _atomic_json(lease.status_path, payload)
+            self._heartbeat_cache[lease.lease_id] = (cache_key, now, payload)
+            return payload
 
     def begin_phase(
         self,
@@ -628,28 +673,30 @@ class SAEControl:
         phase: str,
         *,
         timeout_seconds: float = RENDEZVOUS_TIMEOUT_SECONDS,
+        poll_seconds: float = CONTROL_POLL_SECONDS,
     ) -> SAEPhaseAttempt:
         """Form a fresh four-lane cohort and select/create its phase attempt."""
 
         self._validate_phase(phase)
+        poll_seconds = _validate_poll_seconds(poll_seconds)
         abort = self.pending_abort()
         if abort is not None:
             raise SAEAbortRequested(
                 f"SAE operation is stopped at a phase boundary: {abort['reason']}"
             )
-        deadline = time.time() + timeout_seconds
+        deadline = time.monotonic() + timeout_seconds
         ready: list[dict[str, Any]] = []
         while True:
             self.heartbeat(lease, "ready-to-begin", phase=phase)
             ready = self._ready_begin_cohort(phase)
             if len(ready) == EXPECTED_LANES:
                 break
-            if time.time() >= deadline:
+            if time.monotonic() >= deadline:
                 raise SAEOperatorError(
                     f"phase-begin rendezvous timed out with "
                     f"{len(ready)}/{EXPECTED_LANES} lanes for {phase}"
                 )
-            time.sleep(0.1)
+            time.sleep(poll_seconds)
 
         members = self._members(ready)
         cohort_sha256 = canonical_sha256(members)
@@ -680,11 +727,11 @@ class SAEControl:
                 raise SAEPhaseAlreadyPassed(
                     f"phase {phase} already passed; validate its result before skipping"
                 )
-            if time.time() >= deadline:
+            if time.monotonic() >= deadline:
                 raise SAEOperatorError(
                     f"coordinator did not publish a matching attempt for {phase}"
                 )
-            time.sleep(0.1)
+            time.sleep(poll_seconds)
         assert attempt is not None
         self.heartbeat(
             lease,
@@ -693,7 +740,12 @@ class SAEControl:
             attempt_id=attempt.attempt_id,
             force=True,
         )
-        self.rendezvous_attempt(lease, attempt, timeout_seconds=timeout_seconds)
+        self.rendezvous_attempt(
+            lease,
+            attempt,
+            timeout_seconds=timeout_seconds,
+            poll_seconds=poll_seconds,
+        )
         return attempt
 
     def rendezvous_attempt(
@@ -702,10 +754,12 @@ class SAEControl:
         attempt: SAEPhaseAttempt,
         *,
         timeout_seconds: float = RENDEZVOUS_TIMEOUT_SECONDS,
+        poll_seconds: float = CONTROL_POLL_SECONDS,
     ) -> dict[str, Any]:
         """Release only the exact attempt cohort into its numerical child."""
 
-        deadline = time.time() + timeout_seconds
+        poll_seconds = _validate_poll_seconds(poll_seconds)
+        deadline = time.monotonic() + timeout_seconds
         while True:
             self.heartbeat(
                 lease,
@@ -737,12 +791,12 @@ class SAEControl:
                 raise SAEPeerFailure(
                     f"a controller failed before {attempt.phase} started"
                 )
-            if time.time() >= deadline:
+            if time.monotonic() >= deadline:
                 raise SAEOperatorError(
                     f"attempt rendezvous timed out with "
                     f"{len(records)}/{EXPECTED_LANES} lanes for {attempt.phase}"
                 )
-            time.sleep(0.1)
+            time.sleep(poll_seconds)
 
     def require_attempt_peers_healthy(
         self, lease: SAELaneLease, attempt: SAEPhaseAttempt
@@ -800,10 +854,12 @@ class SAEControl:
         attempt: SAEPhaseAttempt,
         *,
         timeout_seconds: float = RENDEZVOUS_TIMEOUT_SECONDS,
+        poll_seconds: float = CONTROL_POLL_SECONDS,
     ) -> SAEAttemptOutcome:
         """Commit the exact four-lane verdict and advance/fail the phase."""
 
-        deadline = time.time() + timeout_seconds
+        poll_seconds = _validate_poll_seconds(poll_seconds)
+        deadline = time.monotonic() + timeout_seconds
         while True:
             records = self._attempt_lanes(attempt)
             terminal = [
@@ -811,12 +867,12 @@ class SAEControl:
             ]
             if len(records) == EXPECTED_LANES and len(terminal) == EXPECTED_LANES:
                 break
-            if time.time() >= deadline:
+            if time.monotonic() >= deadline:
                 raise SAEOperatorError(
                     f"attempt completion timed out with "
                     f"{len(terminal)}/{EXPECTED_LANES} verdicts for {attempt.phase}"
                 )
-            time.sleep(0.1)
+            time.sleep(poll_seconds)
 
         successful = [item for item in records if item["state"] == "succeeded"]
         result_sha256: str | None = None
@@ -973,7 +1029,7 @@ class SAEControl:
             for item in lanes
             if not item["lease_held"]
             and not item["stale"]
-            and item["state"] in _ACTIVE_LANE_STATES
+            and item["state"] in _IN_PROGRESS_LANE_STATES
         ]
         active_keys = {
             (item.get("phase"), item.get("attempt_id"))
@@ -1145,7 +1201,7 @@ class SAEControl:
             for item in observed
             if not item["lease_held"]
             and not item["stale"]
-            and item["state"] in _ACTIVE_LANE_STATES
+            and item["state"] in _IN_PROGRESS_LANE_STATES
         ]
         if vanished:
             raise SAEPeerFailure("a live lane status has no kernel lease")

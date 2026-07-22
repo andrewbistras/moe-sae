@@ -204,5 +204,13 @@ self-hashed parity attestation, checkpoint inventory digest, storage
 attestation, and C4 manifest fingerprints are bound through the resulting
 benchmark, capture, campaign, checkpoint, and report metadata.
 
+The NFSv3 control mount is deliberately correctness-first: bootstrap requires
+`hard,noac,lookupcache=none` with remote locking, while bulk activations and
+Orbax payloads stay in GCS.
+The SAE farm uses a five-second remote-control poll cadence, 30-second
+heartbeats, a derived 130-second freshness window, and finite 520-second
+rendezvous bounds. These defaults avoid turning four-controller lane inspection
+into an NLM request storm without weakening the lock/status fail-closed checks.
+
 Read [`docs/EXPERIMENT.md`](docs/EXPERIMENT.md) for the scientific contract and
 [`docs/RUNBOOK.md`](docs/RUNBOOK.md) for the fail-closed execution sequence.

@@ -82,7 +82,12 @@ from moe_sae.runtime import (
     require_v4_32_runtime,
     run_preflight,
 )
-from moe_sae.sae_operator import SAEControl, SAE_PHASES
+from moe_sae.sae_operator import (
+    CONTROL_POLL_SECONDS,
+    RENDEZVOUS_TIMEOUT_SECONDS,
+    SAEControl,
+    SAE_PHASES,
+)
 from moe_sae.sae_paths import SAEOperationPaths
 from moe_sae.storage import (
     ACTIVATION_CAPTURE_SCOPE,
@@ -116,6 +121,18 @@ def _attempt_id_argument(value: str) -> str:
             "must be a lowercase 32-character attempt ID"
         )
     return value
+
+
+def _sae_control_poll_argument(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be a number") from error
+    if not math.isfinite(parsed) or parsed < CONTROL_POLL_SECONDS:
+        raise argparse.ArgumentTypeError(
+            f"must be at least {CONTROL_POLL_SECONDS:g}s on shared NFS"
+        )
+    return parsed
 
 
 def _config(args: argparse.Namespace) -> Gemma4Config:
@@ -7673,12 +7690,24 @@ def build_parser() -> argparse.ArgumentParser:
         "--operation-sha256", type=_sha256_argument, required=True
     )
     sae_farm.add_argument("--lane")
-    sae_farm.add_argument("--poll-seconds", type=float, default=0.25)
     sae_farm.add_argument(
-        "--rendezvous-timeout-seconds", type=float, default=300.0
+        "--poll-seconds",
+        type=_sae_control_poll_argument,
+        default=CONTROL_POLL_SECONDS,
+        help=(
+            "NFS control/status poll cadence and local child-exit check cadence "
+            f"(default: {CONTROL_POLL_SECONDS:g}s; do not lower on shared NFS)"
+        ),
     )
     sae_farm.add_argument(
-        "--completion-timeout-seconds", type=float, default=300.0
+        "--rendezvous-timeout-seconds",
+        type=float,
+        default=RENDEZVOUS_TIMEOUT_SECONDS,
+    )
+    sae_farm.add_argument(
+        "--completion-timeout-seconds",
+        type=float,
+        default=RENDEZVOUS_TIMEOUT_SECONDS,
     )
     sae_farm.set_defaults(handler=_command_sae_farm)
 

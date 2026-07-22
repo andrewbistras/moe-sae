@@ -1171,7 +1171,10 @@ test \"\$(git rev-parse HEAD)\" = '$PROJECT_COMMIT'
 test -z \"\$(git status --porcelain=v1 --untracked-files=all)\"
 test -x '$REMOTE_UV'
 test \"\$(loginctl show-user \"\$(id -un)\" -p Linger --value)\" = yes
-findmnt -rn -o OPTIONS --mountpoint '$ARTIFACT_ROOT' | tr ',' '\n' | grep -qx 'lookupcache=positive'
+findmnt -rn -o OPTIONS --mountpoint '$ARTIFACT_ROOT' | tr ',' '\n' | grep -qx 'hard'
+findmnt -rn -o OPTIONS --mountpoint '$ARTIFACT_ROOT' | tr ',' '\n' | grep -qx 'noac'
+findmnt -rn -o OPTIONS --mountpoint '$ARTIFACT_ROOT' | tr ',' '\n' | grep -qx 'lookupcache=none'
+! findmnt -rn -o OPTIONS --mountpoint '$ARTIFACT_ROOT' | tr ',' '\n' | grep -Eq '^(soft|softerr|nolock|local_lock=(all|flock))$'
 test \"\$(findmnt -rn -o SOURCE --mountpoint '$ARTIFACT_ROOT')\" = '$NFS_SERVER:$NFS_EXPORT'
 test -d '$LOCAL_BUFFER_ROOT'
 printf 'READY %s %s\\n' \"\$(hostname -s)\" \"\$(git rev-parse HEAD)\""
@@ -1191,7 +1194,9 @@ same collective command on all four.
 - [ ] The deployer finished successfully on all four controllers.
 - [ ] Every checkout is clean and at the same full `PROJECT_COMMIT`.
 - [ ] NFS is mounted directly at the production artifact root on all four with
-  `lookupcache=positive`.
+  `hard,noac,lookupcache=none` and remote locking (`nolock`, `local_lock=all`,
+  and `local_lock=flock` are forbidden). This is a correctness-first control
+  mount; activation shards and checkpoints remain in GCS.
 - [ ] The exact conversion handoff is present on the shared mount.
 
 ## Stage 4 — qualify all three storage planes
@@ -1746,7 +1751,11 @@ JAX. It holds one kernel-backed lane lease for its lifetime and starts every
 numerical phase in a fresh process while passing that lease only as a fencing
 witness. Four matching lanes must rendezvous before a phase can run; a child
 exit code alone cannot pass a phase because the parent independently validates
-its immutable result envelope.
+its immutable result envelope. The farm polls NFS control/lock state every five
+seconds and publishes an unchanged heartbeat at most every 30 seconds. Do not
+lower `--poll-seconds` on the shared NFS mount: a non-blocking remote `flock`
+still invokes the NFSv3 Network Lock Manager, and aggressive polling can stall
+all four clients.
 
 The fixed order is:
 
@@ -1792,6 +1801,16 @@ gcloud compute tpus tpu-vm ssh "$TPU_NAME" \
       --artifact-root '$ARTIFACT_ROOT' \
       --operation-sha256 '$OPERATION_SHA256'"
 ```
+
+For routine monitoring, run this command no more than once every 30 seconds.
+The supervisors already perform their own five-second health checks; a tighter
+external status loop adds NFS/NLM load without improving the fail-closed
+decision. Heartbeats are declared stale only after 130 seconds (four missed
+30-second publications plus two control-poll observations), and phase
+rendezvous/completion waits remain finitely bounded at 520 seconds. A fresh
+in-progress status without its lock still fails immediately; released terminal
+records are durable history. These margins cover control-plane stalls, not dead
+or split supervisors.
 
 Also inspect all four parent processes and their recent outer logs:
 

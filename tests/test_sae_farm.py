@@ -4,6 +4,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 import fcntl
 import hashlib
+import inspect
 from pathlib import Path
 import threading
 import time
@@ -11,6 +12,7 @@ from typing import Any
 
 import pytest
 
+import moe_sae.sae_operator as sae_operator_module
 from moe_sae.sae_farm import (
     SAEChildExit,
     SAEFarmError,
@@ -19,12 +21,24 @@ from moe_sae.sae_farm import (
     run_farm,
 )
 from moe_sae.sae_operator import (
+    CONTROL_POLL_SECONDS,
     EXPECTED_LANES,
+    HEARTBEAT_INTERVAL_SECONDS,
+    RENDEZVOUS_TIMEOUT_SECONDS,
     SAEControl,
     SAEOperationSpec,
     SAE_PHASES,
 )
 from moe_sae.sae_paths import SAEOperationPaths
+
+
+@pytest.fixture(autouse=True)
+def _fast_local_startup_lock_poll(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Local tmp_path locks need no NFSv3 recovery backoff."""
+
+    monkeypatch.setattr(
+        sae_operator_module, "LANE_STATUS_PUBLICATION_POLL_SECONDS", 0.001
+    )
 
 
 def digest(character: str) -> str:
@@ -65,6 +79,23 @@ def operation(tmp_path: Path) -> tuple[list[SAEControl], SAEOperationPaths]:
         SAEControl(tmp_path, spec.sha256) for _ in range(EXPECTED_LANES)
     ]
     return controls, SAEOperationPaths(tmp_path, spec.sha256)
+
+
+def test_farm_defaults_use_the_nfs_safe_control_cadence() -> None:
+    parameters = inspect.signature(run_farm).parameters
+    assert parameters["poll_seconds"].default == CONTROL_POLL_SECONDS
+    assert (
+        parameters["heartbeat_interval_seconds"].default
+        == HEARTBEAT_INTERVAL_SECONDS
+    )
+    assert (
+        parameters["rendezvous_timeout_seconds"].default
+        == RENDEZVOUS_TIMEOUT_SECONDS
+    )
+    assert (
+        parameters["completion_timeout_seconds"].default
+        == RENDEZVOUS_TIMEOUT_SECONDS
+    )
 
 
 @dataclass

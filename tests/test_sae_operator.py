@@ -13,7 +13,14 @@ import pytest
 
 import moe_sae.sae_operator as sae_operator_module
 from moe_sae.sae_operator import (
+    CONTROL_POLL_SECONDS,
     EXPECTED_LANES,
+    HEARTBEAT_INTERVAL_SECONDS,
+    HEARTBEAT_OBSERVATION_POLLS,
+    LANE_FRESH_SECONDS,
+    LANE_STATUS_PUBLICATION_GRACE_SECONDS,
+    MISSED_HEARTBEATS_BEFORE_STALE,
+    RENDEZVOUS_TIMEOUT_SECONDS,
     SAEAbortRequested,
     SAEControl,
     SAELaneLeaseHeld,
@@ -27,6 +34,15 @@ from moe_sae.sae_operator import (
     SAETamperError,
     canonical_sha256,
 )
+
+
+@pytest.fixture(autouse=True)
+def _fast_local_startup_lock_poll(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Local tmp_path locks need no NFSv3 recovery backoff."""
+
+    monkeypatch.setattr(
+        sae_operator_module, "LANE_STATUS_PUBLICATION_POLL_SECONDS", 0.001
+    )
 
 
 def digest(character: str) -> str:
@@ -73,7 +89,10 @@ def begin_on_all(control: SAEControl, leases, phase: str):
         attempts = list(
             executor.map(
                 lambda lease: control.begin_phase(
-                    lease, phase, timeout_seconds=3.0
+                    lease,
+                    phase,
+                    timeout_seconds=3.0,
+                    poll_seconds=0.001,
                 ),
                 leases,
             )
@@ -137,6 +156,63 @@ def test_operation_spec_hash_binds_the_exact_fixed_plan(tmp_path: Path) -> None:
     ).sha256 != spec.sha256
     assert operation_spec(smoke_campaign_sha256=digest("d")).sha256 != spec.sha256
     assert operation_spec(smoke_suite_sha256=digest("d")).sha256 != spec.sha256
+
+
+def test_nfs_control_timing_budget_is_derived_and_bounded() -> None:
+    assert CONTROL_POLL_SECONDS >= 5.0
+    assert HEARTBEAT_INTERVAL_SECONDS >= 4.0 * CONTROL_POLL_SECONDS
+    assert LANE_FRESH_SECONDS == (
+        MISSED_HEARTBEATS_BEFORE_STALE * HEARTBEAT_INTERVAL_SECONDS
+        + HEARTBEAT_OBSERVATION_POLLS * CONTROL_POLL_SECONDS
+    )
+    assert LANE_STATUS_PUBLICATION_GRACE_SECONDS >= (
+        2.0 * HEARTBEAT_INTERVAL_SECONDS
+    )
+    assert RENDEZVOUS_TIMEOUT_SECONDS >= 4.0 * LANE_FRESH_SECONDS
+
+
+def test_phase_rendezvous_uses_requested_poll_and_times_out_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    control = control_for(tmp_path)
+    monotonic = 0.0
+    sleeps: list[float] = []
+
+    def fake_monotonic() -> float:
+        return monotonic
+
+    def fake_sleep(seconds: float) -> None:
+        nonlocal monotonic
+        sleeps.append(seconds)
+        monotonic += seconds
+
+    monkeypatch.setattr(sae_operator_module.time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(sae_operator_module.time, "sleep", fake_sleep)
+
+    with control.lane_lease("controller-0") as lease:
+        with pytest.raises(SAEOperatorError, match="rendezvous timed out"):
+            control.begin_phase(
+                lease,
+                SAE_PHASES[0],
+                timeout_seconds=1.0,
+                poll_seconds=CONTROL_POLL_SECONDS,
+            )
+
+    assert sleeps == [CONTROL_POLL_SECONDS]
+
+
+@pytest.mark.parametrize("poll_seconds", (0.0, -1.0, float("inf"), float("nan")))
+def test_phase_rendezvous_rejects_invalid_polling(
+    tmp_path: Path, poll_seconds: float
+) -> None:
+    control = control_for(tmp_path)
+    with control.lane_lease("controller-0") as lease:
+        with pytest.raises(ValueError, match="poll_seconds"):
+            control.begin_phase(
+                lease,
+                SAE_PHASES[0],
+                poll_seconds=poll_seconds,
+            )
 
 
 def test_operation_spec_rejects_invalid_sealed_recovery_waiver() -> None:
@@ -239,6 +315,20 @@ def test_lease_exception_preserves_a_committed_aborted_lane_verdict(
     assert len(lanes) == EXPECTED_LANES
     assert {lane["state"] for lane in lanes} == {"aborted"}
     assert {lane["attempt_id"] for lane in lanes} == {attempt.attempt_id}
+    assert control.status()["vanished_lanes"] == []
+    assert control.status()["campaign_status"] == "aborted"
+
+    # A released terminal record is durable history, not a fresh vanished
+    # supervisor.  A new exact four-lane cohort can retry immediately without
+    # waiting for the freshness window to expire.
+    with ExitStack() as stack:
+        restarted = acquire_lanes(stack, control)
+        retry = begin_on_all(control, restarted, phase)
+        assert retry.attempt_number == 2
+        publish_all(control, restarted, retry)
+        assert control.finalize_attempt(
+            retry, timeout_seconds=1.0, poll_seconds=0.001
+        ).outcome == "passed"
 
 
 def test_interrupted_running_attempt_restarts_only_after_old_lanes_release(
@@ -384,7 +474,7 @@ def test_stale_kernel_held_lane_is_reported_as_orphan_and_blocks_progress(
 ) -> None:
     control = control_for(tmp_path)
     with control.lane_lease("controller-0"):
-        future = time.time() + 61.0
+        future = time.time() + LANE_FRESH_SECONDS + 1.0
         with mock.patch("moe_sae.sae_operator.time.time", return_value=future):
             status = control.status()
             assert status["campaign_status"] == "orphaned"
@@ -491,6 +581,54 @@ def test_lane_observer_never_pairs_reacquired_lock_with_previous_status(
         assert observed["lease_held"] is True
         release_lane.set()
         assert owner.result(timeout=2.0) == observed["lease_id"]
+
+
+def test_blocked_running_heartbeat_cannot_regress_terminal_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    control = control_for(tmp_path)
+    running_write_entered = threading.Event()
+    allow_running_write = threading.Event()
+    original_atomic_json = sae_operator_module._atomic_json
+
+    def blocked_atomic_json(path: Path, payload) -> None:
+        if payload.get("state") == "running" and not running_write_entered.is_set():
+            running_write_entered.set()
+            assert allow_running_write.wait(2.0)
+        original_atomic_json(path, payload)
+
+    monkeypatch.setattr(sae_operator_module, "_atomic_json", blocked_atomic_json)
+
+    with control.lane_lease("controller-0") as lease:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            running = executor.submit(
+                control.heartbeat,
+                lease,
+                "running",
+                phase=SAE_PHASES[0],
+                attempt_id="a" * 32,
+                force=True,
+            )
+            assert running_write_entered.wait(2.0)
+            terminal = executor.submit(
+                control.heartbeat,
+                lease,
+                "succeeded",
+                phase=SAE_PHASES[0],
+                attempt_id="a" * 32,
+                result_sha256=digest("b"),
+                force=True,
+            )
+            with pytest.raises(FutureTimeoutError):
+                terminal.result(timeout=0.05)
+            allow_running_write.set()
+            running.result(timeout=2.0)
+            terminal.result(timeout=2.0)
+
+        observed = control._read_lane_if_valid(lease.status_path)
+        assert observed is not None
+        assert observed["state"] == "succeeded"
+        assert observed["result_sha256"] == digest("b")
 
 
 def test_held_lane_without_status_fails_after_bounded_publication_grace(

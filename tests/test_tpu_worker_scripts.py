@@ -124,26 +124,41 @@ def test_bootstrap_rejects_nonexact_linger_status() -> None:
     assert "expected exactly 'yes'" in completed.stderr
 
 
-def test_bootstrap_disables_negative_nfs_lookup_caching() -> None:
+def test_bootstrap_disables_all_nfs_attribute_and_lookup_caching() -> None:
     bootstrap = (SCRIPT_ROOT / "bootstrap_worker.sh").read_text()
 
-    assert "rw,hard,timeo=600,retrans=2,lookupcache=positive" in bootstrap
+    assert "rw,hard,timeo=600,retrans=2,noac,lookupcache=none" in bootstrap
     assert 'sudo umount "$artifact_root"' in bootstrap
-    assert "remount,lookupcache=positive" not in bootstrap
-    assert 'has_positive_lookup_cache "$mount_options" ||' in bootstrap
+    assert "remount,noac,lookupcache=none" not in bootstrap
+    assert 'has_correctness_first_nfs_options "$mount_options" ||' in bootstrap
 
 
-def test_bootstrap_accepts_findmnt_positive_lookup_cache_spellings() -> None:
-    for spelling in ("lookupcache=positive", "lookupcache=pos"):
-        result = _run_bootstrap_function(
-            f"has_positive_lookup_cache 'rw,hard,{spelling}'"
+def test_bootstrap_requires_both_correctness_first_nfs_cache_options() -> None:
+    for safe in (
+        "rw,hard,noac,lookupcache=none",
+        "rw,hard,noac,lookupcache=none,local_lock=none",
+    ):
+        accepted = _run_bootstrap_function(
+            f"has_correctness_first_nfs_options '{safe}'"
         )
-        assert result.returncode == 0, result.stderr
+        assert accepted.returncode == 0, accepted.stderr
 
-    missing = _run_bootstrap_function(
-        "has_positive_lookup_cache 'rw,hard,lookupcache=all'"
-    )
-    assert missing.returncode != 0
+    for unsafe in (
+        "rw,hard,lookupcache=none",
+        "rw,hard,noac,lookupcache=positive",
+        "rw,hard,noac,lookupcache=pos",
+        "rw,hard,noac,lookupcache=all",
+        "rw,soft,noac,lookupcache=none",
+        "rw,hard,soft,noac,lookupcache=none",
+        "rw,hard,softerr,noac,lookupcache=none",
+        "rw,hard,nolock,noac,lookupcache=none",
+        "rw,hard,noac,lookupcache=none,local_lock=all",
+        "rw,hard,noac,lookupcache=none,local_lock=flock",
+    ):
+        rejected = _run_bootstrap_function(
+            f"has_correctness_first_nfs_options '{unsafe}'"
+        )
+        assert rejected.returncode != 0
 
 
 def _run_bootstrap_function(command: str) -> subprocess.CompletedProcess[str]:

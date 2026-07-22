@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+import moe_sae.sae_farm_runtime as farm_runtime
 from moe_sae.sae_farm import SAEPhaseInvocation
 from moe_sae.sae_farm_runtime import (
     SAEChildLaunchError,
@@ -111,7 +112,7 @@ def test_executor_passes_exact_argv_environment_descriptor_and_session(
         handle = executor(invocation)
 
         assert captured["command"] == (
-            str(Path(os.sys.executable).resolve()),
+            str(Path(os.path.abspath(os.sys.executable))),
             "-m",
             "moe_sae.cli",
             "sae-phase",
@@ -134,6 +135,7 @@ def test_executor_passes_exact_argv_environment_descriptor_and_session(
         assert captured["env"]["MOE_SAE_CHILD_SENTINEL"] == "added"
         assert captured["start_new_session"] is True
         assert captured["shell"] is False
+        assert "cwd" not in captured
         assert captured["stdin"] is subprocess.DEVNULL
         assert not captured["stdout"].closed
         assert not captured["stderr"].closed
@@ -149,6 +151,39 @@ def test_executor_passes_exact_argv_environment_descriptor_and_session(
         assert handle.stderr_path.read_bytes() == b"phase stderr\n"
         assert handle.stdout_path != handle.stderr_path
         assert invocation.paths.operation_root in handle.stdout_path.parents
+    finally:
+        os.close(lease_fd)
+
+
+def test_executor_preserves_virtual_environment_python_launcher_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    invocation, lease_fd, config = setup_invocation(tmp_path)
+    launcher = tmp_path / "project-environment" / "bin" / "python"
+    launcher.parent.mkdir(parents=True)
+    launcher.symlink_to(Path(os.sys.executable).resolve())
+    assert launcher.resolve() != launcher.absolute()
+    process = FakeProcess(returncode=0)
+    captured: dict[str, Any] = {}
+
+    def popen(command: tuple[str, ...], **kwargs: Any) -> FakeProcess:
+        captured["command"] = command
+        captured.update(kwargs)
+        return process
+
+    monkeypatch.setattr(farm_runtime.sys, "executable", str(launcher))
+    monkeypatch.setattr(farm_runtime.subprocess, "Popen", popen)
+    try:
+        handle = SAELocalSubprocessExecutor(
+            config, invocation.paths.artifact_root
+        )(invocation)
+
+        assert captured["command"][0] == str(launcher.absolute())
+        assert captured["command"][0] != str(launcher.resolve())
+        assert captured["command"][1:4] == ("-m", "moe_sae.cli", "sae-phase")
+        assert "cwd" not in captured
+        assert captured["pass_fds"] == (lease_fd,)
+        assert handle.poll() is not None
     finally:
         os.close(lease_fd)
 

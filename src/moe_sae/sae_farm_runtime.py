@@ -69,6 +69,25 @@ def _resolved_file(path: str | Path, name: str, *, executable: bool = False) -> 
     return selected
 
 
+def _python_launcher(path: str | Path) -> Path:
+    """Return an absolute Python launcher path without resolving symlinks.
+
+    A virtual environment's ``bin/python`` is normally a symlink to its base
+    interpreter.  CPython uses the launcher location to discover
+    ``pyvenv.cfg``; resolving that symlink therefore escapes the environment
+    and can make the installed ``moe_sae`` package unavailable to a child.
+    """
+
+    selected = Path(os.path.abspath(Path(path).expanduser()))
+    if not selected.is_file():
+        raise ValueError(
+            f"python_executable must name an existing regular file: {selected}"
+        )
+    if not os.access(selected, os.X_OK):
+        raise ValueError(f"python_executable is not executable: {selected}")
+    return selected
+
+
 def _environment(overrides: Mapping[str, str] | None) -> dict[str, str]:
     result = dict(os.environ)
     if overrides is None:
@@ -353,10 +372,12 @@ class SAELocalSubprocessExecutor:
             raise ValueError(
                 f"artifact_root must name an existing directory: {self.artifact_root}"
             )
-        self.python_executable = _resolved_file(
-            python_executable or sys.executable,
-            "python_executable",
-            executable=True,
+        # Preserve the environment launcher rather than resolving it to the
+        # uv-managed base interpreter.  Phase children must use the already
+        # synchronized project environment directly; they never invoke uv or
+        # perform dependency resolution themselves.
+        self.python_executable = _python_launcher(
+            python_executable or sys.executable
         )
         self._base_environment = _environment(environment_overrides)
         self._termination_grace_seconds = _positive_seconds(

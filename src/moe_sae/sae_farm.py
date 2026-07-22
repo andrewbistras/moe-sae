@@ -29,6 +29,7 @@ import time
 from typing import Any, Literal, Protocol
 
 from moe_sae.sae_operator import (
+    CONTROL_POLL_SECONDS,
     EXPECTED_LANES,
     HEARTBEAT_INTERVAL_SECONDS,
     RENDEZVOUS_TIMEOUT_SECONDS,
@@ -234,6 +235,7 @@ def _rendezvous_numerical_launch(
     attempt: SAEPhaseAttempt,
     *,
     timeout_seconds: float,
+    poll_seconds: float,
 ) -> None:
     """Prove all four begin calls returned before any child can finish.
 
@@ -264,7 +266,6 @@ def _rendezvous_numerical_launch(
             phase=attempt.phase,
             attempt_id=attempt.attempt_id,
             detail=ready_detail,
-            force=True,
         )
         try:
             records = control.require_attempt_peers_healthy(lease, attempt)
@@ -291,7 +292,7 @@ def _rendezvous_numerical_launch(
                 f"numerical launch rendezvous timed out for {attempt.phase}/"
                 f"{attempt.attempt_id}"
             )
-        time.sleep(0.05)
+        time.sleep(poll_seconds)
 
 
 def _completion_payload(
@@ -334,6 +335,7 @@ def _rendezvous_completion_observed(
     local_result_sha256: str | None,
     local_detail: Mapping[str, Any] | None,
     timeout_seconds: float,
+    poll_seconds: float,
 ) -> dict[str, Any]:
     """Keep terminal state stable until every supervisor observes the commit."""
 
@@ -376,7 +378,6 @@ def _rendezvous_completion_observed(
             attempt_id=attempt.attempt_id,
             result_sha256=local_result_sha256,
             detail=ready_detail,
-            force=True,
         )
         status = control.status()
         if status["orphaned_lanes"]:
@@ -415,7 +416,7 @@ def _rendezvous_completion_observed(
                 f"completion-observed rendezvous timed out for {attempt.phase}/"
                 f"{attempt.attempt_id}"
             )
-        time.sleep(0.05)
+        time.sleep(poll_seconds)
 
 
 @contextmanager
@@ -548,7 +549,8 @@ def _peer_terminal_outcome(
     control: SAEControl,
     attempt: SAEPhaseAttempt,
     *,
-    observation_timeout_seconds: float = 1.0,
+    observation_timeout_seconds: float,
+    poll_seconds: float,
 ) -> tuple[Literal["failed", "aborted"], dict[str, Any]]:
     """Classify a peer event from a stable exact-cohort terminal observation.
 
@@ -589,7 +591,7 @@ def _peer_terminal_outcome(
             return "aborted", {"decision": "explicit-abort", **observation}
         if time.monotonic() >= deadline:
             return "failed", {"decision": "observation-timeout", **observation}
-        time.sleep(0.01)
+        time.sleep(poll_seconds)
 
 
 def _collective_finish(
@@ -604,6 +606,7 @@ def _collective_finish(
     child_is_live: bool,
     completion_timeout_seconds: float,
     heartbeat_interval_seconds: float,
+    poll_seconds: float,
 ) -> SAEAttemptOutcome:
     """Publish locally, commit four-lane verdict, then optionally terminate."""
 
@@ -627,7 +630,9 @@ def _collective_finish(
     ):
         try:
             finalized = control.finalize_attempt(
-                attempt, timeout_seconds=completion_timeout_seconds
+                attempt,
+                timeout_seconds=completion_timeout_seconds,
+                poll_seconds=poll_seconds,
             )
         except BaseException as error:
             finalize_error = error
@@ -654,6 +659,7 @@ def _collective_finish(
                 local_result_sha256=result_sha256,
                 local_detail=detail,
                 timeout_seconds=completion_timeout_seconds,
+                poll_seconds=poll_seconds,
             )
         except BaseException as error:
             completion_error = error
@@ -714,6 +720,7 @@ def _run_phase(
             lease,
             attempt,
             timeout_seconds=launch_timeout_seconds,
+            poll_seconds=poll_seconds,
         )
     except BaseException as error:
         return _collective_finish(
@@ -727,6 +734,7 @@ def _run_phase(
             child_is_live=False,
             completion_timeout_seconds=completion_timeout_seconds,
             heartbeat_interval_seconds=heartbeat_interval_seconds,
+            poll_seconds=poll_seconds,
         )
 
     with _running_heartbeats(
@@ -745,7 +753,10 @@ def _run_phase(
                     control.require_attempt_peers_healthy(lease, attempt)
                 except SAEPeerFailure as error:
                     outcome, peer_observation = _peer_terminal_outcome(
-                        control, attempt
+                        control,
+                        attempt,
+                        observation_timeout_seconds=2.0 * poll_seconds,
+                        poll_seconds=poll_seconds,
                     )
                     detail = _detail(
                         error,
@@ -797,6 +808,7 @@ def _run_phase(
         child_is_live=child_is_live,
         completion_timeout_seconds=completion_timeout_seconds,
         heartbeat_interval_seconds=heartbeat_interval_seconds,
+        poll_seconds=poll_seconds,
     )
 
 
@@ -828,6 +840,7 @@ def _rendezvous_phase_boundary(
     *,
     timeout_seconds: float,
     expected_members: tuple[dict[str, str], ...] | None,
+    poll_seconds: float,
 ) -> tuple[dict[str, str], ...]:
     """Move all four lanes off the prior terminal state before phase begin.
 
@@ -839,7 +852,7 @@ def _rendezvous_phase_boundary(
 
     deadline = time.monotonic() + timeout_seconds
     while True:
-        control.heartbeat(lease, "starting", force=True)
+        control.heartbeat(lease, "starting")
         status = control.status()
         if status["orphaned_lanes"]:
             raise SAEFarmError(
@@ -886,7 +899,7 @@ def _rendezvous_phase_boundary(
                 f"phase-boundary rendezvous timed out with "
                 f"{len(compatible)}/{EXPECTED_LANES} compatible lanes for {phase}"
             )
-        time.sleep(0.05)
+        time.sleep(poll_seconds)
 
 
 def _skip_payload(
@@ -914,6 +927,7 @@ def _rendezvous_skip_observed(
     members: tuple[dict[str, str], ...],
     *,
     timeout_seconds: float,
+    poll_seconds: float,
 ) -> None:
     """Keep a resume cohort together after exact passed-artifact validation."""
 
@@ -939,7 +953,7 @@ def _rendezvous_skip_observed(
     while True:
         if _validate_supervisor_release(release_path, expected):
             return
-        control.heartbeat(lease, "starting", detail=ready_detail, force=True)
+        control.heartbeat(lease, "starting", detail=ready_detail)
         status = control.status()
         if status["orphaned_lanes"]:
             raise SAEFarmError(f"skip cohort is orphaned at {phase}")
@@ -966,7 +980,7 @@ def _rendezvous_skip_observed(
             raise SAEFarmError(
                 f"skip-observed rendezvous timed out for {phase}"
             )
-        time.sleep(0.05)
+        time.sleep(poll_seconds)
 
 
 def _validate_timing(name: str, value: float, *, allow_zero: bool = False) -> float:
@@ -984,10 +998,10 @@ def run_farm(
     revalidator: SAEArtifactRevalidator,
     *,
     lane: str | None = None,
-    poll_seconds: float = 0.25,
+    poll_seconds: float = CONTROL_POLL_SECONDS,
     rendezvous_timeout_seconds: float = RENDEZVOUS_TIMEOUT_SECONDS,
     completion_timeout_seconds: float = RENDEZVOUS_TIMEOUT_SECONDS,
-    heartbeat_interval_seconds: float = HEARTBEAT_INTERVAL_SECONDS / 2.0,
+    heartbeat_interval_seconds: float = HEARTBEAT_INTERVAL_SECONDS,
 ) -> SAEFarmResult:
     """Run or exactly resume the fixed SAE campaign on one controller.
 
@@ -1004,7 +1018,7 @@ def run_farm(
         raise SAEFarmError("control and paths name different SAE operations")
     if control.artifact_root != paths.artifact_root:
         raise SAEFarmError("control and paths use different artifact roots")
-    poll_seconds = _validate_timing("poll_seconds", poll_seconds, allow_zero=True)
+    poll_seconds = _validate_timing("poll_seconds", poll_seconds)
     rendezvous_timeout_seconds = _validate_timing(
         "rendezvous_timeout_seconds", rendezvous_timeout_seconds
     )
@@ -1031,6 +1045,7 @@ def run_farm(
                 phase,
                 timeout_seconds=rendezvous_timeout_seconds,
                 expected_members=session_members,
+                poll_seconds=poll_seconds,
             )
 
             while True:
@@ -1050,6 +1065,7 @@ def run_farm(
                         digest,
                         session_members,
                         timeout_seconds=rendezvous_timeout_seconds,
+                        poll_seconds=poll_seconds,
                     )
                     skipped.append(phase)
                     break
@@ -1058,6 +1074,7 @@ def run_farm(
                         lease,
                         phase,
                         timeout_seconds=rendezvous_timeout_seconds,
+                        poll_seconds=poll_seconds,
                     )
                 except SAEPhaseAlreadyPassed:
                     # Another lane may commit while this one crosses the state

@@ -40,7 +40,12 @@ from moe_sae.runtime import (
     V4_32_BF16_PEAK_FLOPS,
     BenchmarkObservation,
 )
-from moe_sae.sae_operator import SAEControl, SAEOperationSpec
+from moe_sae.sae_operator import (
+    CONTROL_POLL_SECONDS,
+    RENDEZVOUS_TIMEOUT_SECONDS,
+    SAEControl,
+    SAEOperationSpec,
+)
 from moe_sae.sae_paths import SAEOperationPaths
 from moe_sae.storage import (
     MINIMUM_ACTIVATION_GCS_DOWNLOAD_BYTES_PER_SECOND,
@@ -613,6 +618,26 @@ def test_single_cli_exposes_exact_subcommands():
 )
 def test_sae_control_commands_dispatch_to_exact_handlers(argv, handler):
     assert build_parser().parse_args(argv).handler is handler
+
+
+def test_sae_farm_cli_defaults_to_nfs_safe_polling_and_timeouts() -> None:
+    args = build_parser().parse_args(
+        ["sae-farm", "--operation-sha256", "a" * 64]
+    )
+    assert args.poll_seconds == CONTROL_POLL_SECONDS
+    assert args.rendezvous_timeout_seconds == RENDEZVOUS_TIMEOUT_SECONDS
+    assert args.completion_timeout_seconds == RENDEZVOUS_TIMEOUT_SECONDS
+
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(
+            [
+                "sae-farm",
+                "--operation-sha256",
+                "a" * 64,
+                "--poll-seconds",
+                str(CONTROL_POLL_SECONDS / 10.0),
+            ]
+        )
 
 
 def test_smoke_process_ranges_are_exact_disjoint_full_batch():
