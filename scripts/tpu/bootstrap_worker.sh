@@ -196,6 +196,21 @@ install_system_packages() {
     ca-certificates curl git jq nfs-common tmux util-linux
 }
 
+ensure_deployment_user_linger() {
+  local deployment_user
+  local linger
+
+  deployment_user=$(id -un)
+  [[ -n "$deployment_user" ]] || die "could not identify the deployment user"
+  require_command loginctl
+  log "enabling systemd linger for $deployment_user so logind RemoveIPC cannot purge /dev/shm caches after SSH logout"
+  sudo -n loginctl enable-linger "$deployment_user"
+  linger=$(loginctl show-user "$deployment_user" -p Linger --value)
+  [[ "$linger" == "yes" ]] || \
+    die "systemd linger for $deployment_user is '$linger'; expected exactly 'yes'"
+  log "systemd linger is enabled for $deployment_user"
+}
+
 verify_worker_identity() {
   local actual_service_account=''
   local attempt
@@ -519,6 +534,7 @@ main() {
   require_command realpath
   load_config "$config_file"
   install_system_packages
+  ensure_deployment_user_linger
   require_command findmnt
   require_command mountpoint
   verify_worker_identity

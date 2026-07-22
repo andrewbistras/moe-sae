@@ -76,6 +76,54 @@ def test_bootstrap_gates_activation_capacity_before_and_after_dependencies() -> 
     assert before < install < after
 
 
+def test_bootstrap_enables_and_exactly_verifies_deployment_user_linger() -> None:
+    bootstrap = (SCRIPT_ROOT / "bootstrap_worker.sh").read_text()
+    function_start = bootstrap.index("ensure_deployment_user_linger() {")
+    function_body = bootstrap[
+        function_start : bootstrap.index(
+            "\n}\n\nverify_worker_identity()", function_start
+        )
+    ]
+
+    assert "deployment_user=$(id -un)" in function_body
+    assert 'sudo -n loginctl enable-linger "$deployment_user"' in function_body
+    assert 'loginctl show-user "$deployment_user" -p Linger --value' in function_body
+    assert '[[ "$linger" == "yes" ]]' in function_body
+
+
+def test_bootstrap_enables_linger_before_local_buffer_capability() -> None:
+    bootstrap = (SCRIPT_ROOT / "bootstrap_worker.sh").read_text()
+    main_body = bootstrap[bootstrap.index("main() {") :]
+
+    packages = main_body.index("install_system_packages")
+    linger = main_body.index("ensure_deployment_user_linger")
+    local_buffer = main_body.index("prepare_local_buffer")
+    assert packages < linger < local_buffer
+
+
+def test_bootstrap_linger_setup_is_idempotent_when_status_is_exact_yes() -> None:
+    completed = _run_bootstrap_function(
+        "id() { printf 'deployment-user\\n'; }; "
+        "sudo() { return 0; }; "
+        "loginctl() { printf 'yes\\n'; }; "
+        "ensure_deployment_user_linger; ensure_deployment_user_linger"
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_bootstrap_rejects_nonexact_linger_status() -> None:
+    completed = _run_bootstrap_function(
+        "id() { printf 'deployment-user\\n'; }; "
+        "sudo() { return 0; }; "
+        "loginctl() { printf 'yes \\n'; }; "
+        "ensure_deployment_user_linger"
+    )
+
+    assert completed.returncode != 0
+    assert "expected exactly 'yes'" in completed.stderr
+
+
 def test_bootstrap_disables_negative_nfs_lookup_caching() -> None:
     bootstrap = (SCRIPT_ROOT / "bootstrap_worker.sh").read_text()
 

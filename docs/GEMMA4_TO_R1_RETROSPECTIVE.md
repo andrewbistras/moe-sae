@@ -342,22 +342,37 @@ did have roughly 200 GiB of `/dev/shm`, and each train partition was only about
 use. The progression was therefore 128 GiB overqualification, 24 GiB
 stage-correct qualification, then a missed downstream 100 GiB requirement.
 
-The current **uncommitted** Stage-8 worktree preserves the immutable activation
+The first dedicated SAE-cache qualification then passed its own contract:
+73.66 GB per controller (294.64 GB aggregate) of `/dev/shm` data were downloaded
+and verified at 4.946 GB/s aggregate. About
+20 seconds after the foreground qualifier's SSH sessions exited, however, the
+cache vanished. Runtime inspection found `systemd-logind` configured with
+`RemoveIPC=yes` and the production user with `Linger=no`. A controlled
+four-worker comparison enabled linger only on worker 0: its owned `/dev/shm`
+sentinel survived the disconnect interval, while the otherwise matching
+sentinels on workers 1--3 vanished. Enabling `Linger=yes` on all four workers
+therefore became a prerequisite to requalification. The passed throughput and
+hash proof had been valid; the target runtime invalidated its resident bytes
+after the process boundary.
+
+The Stage-8 hardening implementation preserves the immutable activation
 attestation, adds a separate SAE-storage attestation for bounded `/dev/shm` and
 Orbax paths, and adds a producer/consumer compatibility proof. That
 compatibility proof is a transitional allowlist of selected full-file and AST
 symbol hashes; despite its broad module description, it principally binds the
 capture producer/schema semantics and is not a substitute for golden numerical
-compatibility tests.
+compatibility tests. It was committed and its full-shape F/A/B smoke suite
+passed under consumer commit `67bb7f7`; the later cache-lifecycle repair
+correctly requires a new identity-bound smoke suite and storage qualification.
 
 The metrics journal repair is more concrete: rows are bound to one
 `(run_instance_id, condition, seed)`, require strictly increasing optimizer
 step and scientific-token counts, are flushed and `fsync`ed, and on resume may
 atomically remove only the suffix ahead of the exact checkpoint boundary. The
 checkpoint remains authoritative. This removes the earlier blind-append
-rollback risk in the current worktree, but it is not yet committed or validated
-in an interrupted production TPU run. Full-shape A/B/F smoke, exact Orbax
-restore, and the SAE farm remain in qualification; farm stress testing has
+rollback risk. Full-shape A/B/F smoke and exact Orbax restore passed once on
+the production TPU; interrupted full-run resume and the SAE farm remain in
+qualification. Farm stress testing has
 already exposed abort-classification and peer-release races. The repair itself
 has added several thousand lines, reinforcing the need to split orchestration
 before R1.
@@ -468,7 +483,14 @@ relative A/B/F quality had yet been inspected.
     expose real device ordering, MaxText layer metadata, NFS lookup behavior,
     TPU compile behavior, or multi-host ownership.
 
-11. **The experiment evidence was split across durability domains.** A 1 TiB
+11. **The target login lifecycle destroyed qualified state.** `nohup` and a
+    successful `/dev/shm` qualifier did not protect user-owned IPC state after
+    the last SSH session exited. `RemoveIPC=yes` plus `Linger=no` turned a
+    clean 73.66 GB cache into missing input between fresh processes. This is
+    target-runtime lifecycle debt, not a GCS-throughput or cache-integrity
+    failure.
+
+12. **The experiment evidence was split across durability domains.** A 1 TiB
     minimum Basic HDD Filestore volume carried a small amount of authoritative
     control data while GCS carried the bulk objects. Filestore remained zonal,
     separately billed (quoted during operation at about $0.27/hour), and
@@ -494,6 +516,7 @@ that “it worked once” does not silently turn them into policy.
 | Recover sealing with a second wrapper | NFS split after the data were already sealed | recovery policy belongs in the state machine and must use immutable bindings |
 | Keep Filestore as the coordination root | familiar locks, rename, and shared paths | it is zonal, client-cached, and unsuitable for globally distributed executors |
 | Use `/dev/shm` as an emergency SAE cache | sufficient fast capacity already existed | it is volatile and competes with process memory; capacity must be qualified per image/topology |
+| Enable user linger live during diagnosis | stopped `RemoveIPC=yes` from clearing worker 0's sentinel at SSH teardown | lifecycle policy belongs in the baked image and its acceptance suite, not an emergency mutation under allocation |
 | Use the operator's email in a waiver | established a human audit identity | identity is not notification; it sent no message and grants no control |
 | Run the repair agent from the laptop | enabled rapid interactive diagnosis | detached jobs survive disconnection, but nobody diagnoses, alerts, or repairs when the laptop session disappears |
 
@@ -541,6 +564,12 @@ that “it worked once” does not silently turn them into policy.
 - **Hard-coded byte gates age badly.** A fixed 100 GiB cache and 128 GiB free-
   space gate did not match 100 GiB boot disks, even though volatile RAM could
   safely hold the actual partition.
+
+- **Cache qualification did not bind the user-session lifecycle.** The
+  qualifier proved capacity, hashes, inventory, and speed, but not survival
+  after the last SSH session. A fresh-process farm makes that boundary part of
+  data availability. Until the runtime image proves `Linger=yes` and a
+  disconnect-survival probe, a resident `/dev/shm` attestation is incomplete.
 
 - **The prefix adapter depends on private MaxText/NNX structure.** It
   duck-types unscanned layer and MoE fields and relies on pinned Flax NNX
@@ -658,8 +687,10 @@ that “it worked once” does not silently turn them into policy.
 
 8. **Target-runtime tests are part of implementation.** Device ordering,
    collectives, checkpoint restore, router parity, preemption, and storage
-   publication need real-slice acceptance tests. Unit parity remains necessary,
-   but it is not deployment qualification.
+   publication need real-slice acceptance tests. So do login/session teardown,
+   detached-parent survival, and host-cache survival across fresh-process
+   handoff. Unit parity remains necessary, but it is not deployment
+   qualification.
 
 9. **Every emergency path must be promoted or retired.** A successful wrapper
    becomes a reviewed state-machine transition with tests, or it is explicitly
@@ -835,6 +866,16 @@ any OCI digest in one software inventory. Replicate regional image artifacts
 if pull time or egress warrants it. Startup may mount scratch, fetch identities,
 and launch; it may not apt-upgrade or reboot.
 
+Image acceptance must also prove the runtime user's lifecycle. Bake
+`loginctl enable-linger` (or an equivalently explicit service-owned lifetime)
+into provisioning and require `loginctl show-user <runtime-user> -p Linger`
+to return `yes` on every VM. Create an owned `/dev/shm` sentinel, disconnect
+the final administrative session, wait beyond the image's logind cleanup
+interval, reconnect, and prove both the sentinel and detached controller
+survived before accepting the image. This is required even if the image keeps
+`RemoveIPC=yes` as a sensible default for non-lingering users. An OCI workload
+image alone does not prove the host-side lifecycle.
+
 Use three identities:
 
 1. **Scientific identity:** model/checkpoint tensor digest, tokenizer, corpus
@@ -919,8 +960,9 @@ tokens and not the default broadly privileged Compute account.
 4. **Build and publish the immutable TPU environment.** For Compute Engine,
    bake the custom TPU OS image and optionally its OCI workload layer; replicate
    artifacts regionally. Test it on a small v6e slice with a synthetic/tiny
-   model. Target cold worker readiness in minutes, with no package mutation or
-   reboot.
+   model. Prove `Linger=yes`, detached-controller survival, and `/dev/shm`
+   sentinel survival after the last SSH session exits. Target cold worker
+   readiness in minutes, with no package mutation or reboot.
 
 5. **Pin and convert R1.** Select an exact current MaxText commit that contains
    R1-0528/DeepSeek 671B support. Freeze the exact source revision and FP8-to-
@@ -1001,6 +1043,9 @@ tokens and not the default broadly privileged Compute account.
 
 - All 16 VMs join or the attempt does no scientific work. A partial slice
   cannot publish accepted output.
+- The baked runtime identity reports `Linger=yes` for the service user on every
+  VM, and a disconnect test proves that both a detached controller and owned
+  host-cache sentinel survive beyond the image's logind cleanup interval.
 - One static compile serves all measured steps; no hidden recompilation occurs.
 - Peak per-chip HBM retains at least a measured safety margin (default 15%) and
   no host approaches tmpfs/DRAM exhaustion.
@@ -1126,6 +1171,7 @@ are still waste.
 | cached production input path | observed | roughly 20.3k tokens/s; input wait below 2% |
 | NFS publication protocol | **failed repeatedly** | waiver/start-release visibility incidents and negative-dentry split after successful 50M seal |
 | immutable capture recovery | observed | no train recapture; exact wrapper/waiver bindings retained |
+| `/dev/shm` lifecycle across SSH exit | **failed and isolated; remediation required** | 73.66 GB passed at 4.946 GB/s then vanished after about 20s; worker-0 `Linger=yes` sentinel survived while workers 1--3 `Linger=no` sentinels vanished |
 | complete experiment evidence independent of Filestore | **not yet established** | immutable GCS payloads exist; control/evidence export and reconstruction remain required |
 | SAE storage and producer/consumer compatibility | in progress | separate attestation and selected-code compatibility proof exist only in worktree |
 | checkpoint-reconciled metrics journal | in progress | identity-bound, monotonic, `fsync`ed implementation and tests exist in worktree; interrupted TPU validation pending |

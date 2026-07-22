@@ -288,6 +288,169 @@ def test_sae_storage_attestation_path_is_consumer_environment_versioned(
         cli_module._sae_storage_attestation_path(tmp_path, "not-a-digest")
 
 
+def test_sae_resident_cache_runtime_requires_exact_linger_yes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[tuple[str, ...], dict[str, object]]] = []
+
+    def run(command, **kwargs):
+        calls.append((tuple(command), kwargs))
+        return SimpleNamespace(returncode=0, stdout="yes\n", stderr="")
+
+    monkeypatch.setattr(cli_module.os, "getuid", lambda: 1234)
+    monkeypatch.setattr(
+        cli_module.pwd,
+        "getpwuid",
+        lambda uid: SimpleNamespace(pw_name="sae-runner") if uid == 1234 else None,
+    )
+    monkeypatch.setattr(cli_module.subprocess, "run", run)
+
+    cache_root = Path("/dev/shm/moe-sae-sae-cache")
+    assert cli_module._require_lingering_sae_cache_runtime(cache_root) == cache_root
+    assert calls == [
+        (
+            (
+                "loginctl",
+                "show-user",
+                "sae-runner",
+                "-p",
+                "Linger",
+                "--value",
+            ),
+            {
+                "check": False,
+                "capture_output": True,
+                "text": True,
+                "timeout": cli_module._LOGINCTL_LINGER_TIMEOUT_SECONDS,
+            },
+        )
+    ]
+
+
+def test_sae_resident_cache_runtime_rejects_non_shm_path_before_loginctl(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(
+        cli_module.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("loginctl ran for an invalid path"),
+    )
+
+    with pytest.raises(RuntimeError, match="strictly below the direct /dev/shm"):
+        cli_module._require_lingering_sae_cache_runtime(tmp_path / "cache")
+
+
+def test_sae_resident_cache_runtime_rejects_disabled_lingering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli_module.os, "getuid", lambda: 1234)
+    monkeypatch.setattr(
+        cli_module.pwd,
+        "getpwuid",
+        lambda _uid: SimpleNamespace(pw_name="sae-runner"),
+    )
+    monkeypatch.setattr(
+        cli_module.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0, stdout="no\n", stderr=""
+        ),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"output exactly 'yes\\n'.*enable-linger sae-runner",
+    ):
+        cli_module._require_lingering_sae_cache_runtime(
+            "/dev/shm/moe-sae-sae-cache"
+        )
+
+
+def test_sae_resident_cache_runtime_rejects_malformed_yes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli_module.os, "getuid", lambda: 1234)
+    monkeypatch.setattr(
+        cli_module.pwd,
+        "getpwuid",
+        lambda _uid: SimpleNamespace(pw_name="sae-runner"),
+    )
+    monkeypatch.setattr(
+        cli_module.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0, stdout="yes \n", stderr=""
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match=r"output exactly 'yes\\n'"):
+        cli_module._require_lingering_sae_cache_runtime(
+            "/dev/shm/moe-sae-sae-cache"
+        )
+
+
+def test_sae_storage_linger_gate_precedes_attestation_reuse(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    events: list[str] = []
+    config = Gemma4Config()
+
+    monkeypatch.setattr(cli_module, "_config", lambda _args: config)
+    monkeypatch.setattr(cli_module, "_artifact_root", lambda *_args: tmp_path)
+    monkeypatch.setattr(
+        cli_module, "_require_production_artifact_root", lambda _root: None
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "require_v4_32_runtime",
+        lambda: events.append("topology"),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_require_lingering_sae_cache_runtime",
+        lambda path: events.append("linger") or Path(path),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_collective_raise_if_any",
+        lambda error, *, purpose: events.append(
+            f"collective:{purpose}:{error or 'pass'}"
+        ),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_coordinated_environment",
+        lambda: events.append("environment") or {"sha256": "e" * 64},
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_coordinator_read_json_if_exists",
+        lambda *_args, **_kwargs: events.append("attestation") or {},
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_load_sae_storage_bundle",
+        lambda *_args: events.append("reuse") or {"sae": {}},
+    )
+    monkeypatch.setattr(cli_module, "_process_context", lambda: (1, 4))
+
+    args = SimpleNamespace(
+        config=str(cli_module.DEFAULT_CONFIG),
+        artifact_root=None,
+        cache_root="/dev/shm/moe-sae-sae-cache",
+    )
+    assert cli_module._command_qualify_sae_storage(args) == 0
+    assert events == [
+        "topology",
+        "linger",
+        "collective:SAE resident-cache runtime:pass",
+        "environment",
+        "attestation",
+        "reuse",
+        "collective:reuse immutable SAE storage attestation:pass",
+    ]
+
+
 def test_coordinator_json_wait_allows_only_declared_coordinator_owned_values(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

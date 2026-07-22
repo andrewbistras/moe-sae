@@ -12,6 +12,13 @@ validation data are sealed in GCS, Gemma has been converted from one immutable
 Hugging Face commit, logit parity has passed, and you have recorded the six
 locations/digests needed by the TPU stages.
 
+Stage 1 also freezes one target-runtime lifecycle requirement: the TPU OS image
+and bootstrap must support systemd user lingering, and the production user must
+later prove `Linger=yes` on every controller. This is a hard prerequisite for
+host-RAM caches and detached supervisors; it is not an optional convenience.
+Do not select an image or access policy that prevents the bootstrap from
+enabling and verifying it.
+
 Your v4-32 is covered by the TRC allocation. That removes TPU cost anxiety, but
 it does not change this preparation or any acceptance gate. Use the project,
 zone, service account, and provisioning process in the TRC award. Do not create
@@ -629,6 +636,8 @@ can still be billed.
 - [ ] Hugging Face/MaxText parity passed at `max_kl_div <= 0.03`.
 - [ ] `MODEL_CHECKPOINT` and the 64-character `CHECKPOINT_SHA256` are saved.
 - [ ] The exact `conversion.json` is preserved for the shared control plane.
+- [ ] The target TPU image/bootstrap plan can enable and verify systemd
+  `Linger=yes` for the production user on every controller.
 - [ ] No TFDS build, Dataflow job, full-C4 download, or TPU allocation was
   needed for Stage 1.
 
@@ -1058,11 +1067,19 @@ checks out only `PROJECT_COMMIT`. No GitHub username, password, PAT, or HF token
 is sent to the TPU. On every worker, the bootstrap then:
 
 1. verifies the metadata service account and GCS access;
-2. installs only the small OS toolset, pinned `uv`, and Python 3.12;
-3. installs the frozen TPU dependency set and verifies the MaxText commit;
-4. mounts `$NFS_SERVER:$NFS_EXPORT` **directly** at
+2. enables systemd lingering for the production user and refuses to continue
+   unless `loginctl` reports `Linger=yes`;
+3. installs only the small OS toolset, pinned `uv`, and Python 3.12;
+4. installs the frozen TPU dependency set and verifies the MaxText commit;
+5. mounts `$NFS_SERVER:$NFS_EXPORT` **directly** at
    `$TPU_PROJECT_ROOT/artifacts/gemma4_v1/production`;
-5. validates, creates, and writes only the explicit `LOCAL_BUFFER_ROOT`.
+6. validates, creates, and writes only the explicit `LOCAL_BUFFER_ROOT`.
+
+The linger gate is required even when `nohup` appears to preserve a process.
+On the observed TPU image, `systemd-logind` had `RemoveIPC=yes`; when the last
+non-lingering SSH session ended, it removed user-owned `/dev/shm` state. A
+detached parent and its later fresh numerical children therefore cannot rely
+on a qualified resident cache unless the user remains lingered.
 
 The artifact path must be the NFS mountpoint itself, not a symlink to some
 other mount. Production path validation resolves symlinks and rejects a mount
@@ -1153,6 +1170,7 @@ cd '$TPU_PROJECT_ROOT'
 test \"\$(git rev-parse HEAD)\" = '$PROJECT_COMMIT'
 test -z \"\$(git status --porcelain=v1 --untracked-files=all)\"
 test -x '$REMOTE_UV'
+test \"\$(loginctl show-user \"\$(id -un)\" -p Linger --value)\" = yes
 findmnt -rn -o OPTIONS --mountpoint '$ARTIFACT_ROOT' | tr ',' '\n' | grep -qx 'lookupcache=positive'
 test \"\$(findmnt -rn -o SOURCE --mountpoint '$ARTIFACT_ROOT')\" = '$NFS_SERVER:$NFS_EXPORT'
 test -d '$LOCAL_BUFFER_ROOT'
@@ -1167,6 +1185,8 @@ same collective command on all four.
 
 - [ ] All four inventory sections were inspected before scratch was selected.
 - [ ] The same service account and numeric user identity appear on all workers.
+- [ ] `loginctl` reports `Linger=yes` for the production user on all four
+  controllers.
 - [ ] Every selected host-local filesystem has at least 24 GiB free after bootstrap.
 - [ ] The deployer finished successfully on all four controllers.
 - [ ] Every checkout is clean and at the same full `PROJECT_COMMIT`.
@@ -1522,6 +1542,39 @@ written. Its SHA is already embedded in every capture shard and campaign
 record. The SAE smoke suite and resident-cache qualification add new immutable
 proofs; neither replaces the producer proof.
 
+Before creating either cache, re-prove the login lifecycle on the exact
+deployment. This gate exists because one observed qualification successfully
+verified 73.66 GB in `/dev/shm` at 4.946 GB/s, yet the cache disappeared about
+20 seconds after the qualifier's SSH sessions exited. The image used
+`RemoveIPC=yes` and the production user had no linger. In a controlled
+comparison, a worker with `Linger=yes` retained its `/dev/shm` sentinel while
+the three otherwise matching non-lingering workers lost theirs.
+
+Run a real disconnect boundary, not just a configuration read:
+
+```zsh
+export SAE_LINGER_SENTINEL="/dev/shm/moe-sae-linger-$PROJECT_COMMIT"
+
+tpu_all "set -eu
+test \"\$(loginctl show-user \"\$(id -un)\" -p Linger --value)\" = yes
+test ! -e '$SAE_LINGER_SENTINEL'
+printf '%s\n' '$PROJECT_COMMIT' > '$SAE_LINGER_SENTINEL'"
+
+# The first collective SSH command has now exited. Wait beyond the observed
+# approximately 20-second logind cleanup window, then reconnect independently.
+sleep 30
+
+tpu_all "set -eu
+test \"\$(loginctl show-user \"\$(id -un)\" -p Linger --value)\" = yes
+test \"\$(cat '$SAE_LINGER_SENTINEL')\" = '$PROJECT_COMMIT'
+rm -- '$SAE_LINGER_SENTINEL'"
+```
+
+All four second connections must pass. If any sentinel vanishes, stop and fix
+the image/bootstrap lifecycle before smoke or cache qualification. `nohup`, a
+fast reconnect, or a previously successful storage attestation is not a
+substitute for this test.
+
 ### 8.1 Run full-shape smokes in the exact order F, A, B
 
 Define two different host-private paths on the Mac. They may have identical
@@ -1602,8 +1655,14 @@ attestation; diagnose it and use a new empty cache path.
 From this point through the final report, do not clean `$SAE_CACHE_ROOT`, reboot
 a controller, redeploy, or let another job consume its `/dev/shm` headroom. The
 runtime is resident-only and never silently refills a missing object. Loss of
-one qualified file invalidates this deployment; stop rather than treating the
-old attestation as permission to continue.
+one qualified file invalidates this deployment; `Linger=yes` does not soften
+that rule. Stop rather than treating the old attestation as permission to
+continue or refilling the old path under the old proof. The v1 attestation is
+keyed by consumer environment, so same-environment requalification is not a
+supported recovery path. Preserve the old proof and deploy an audited new
+consumer environment before qualifying a fresh empty cache and sealing a new
+operation identity. Replace this limitation with explicitly selected,
+content-addressed cache attestations before the Spot R1 campaign.
 
 ### 8.3 Seal the operation and record its exact SHA
 

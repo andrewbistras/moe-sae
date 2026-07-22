@@ -13,6 +13,7 @@ import json
 import math
 import os
 from pathlib import Path
+import pwd
 import re
 import signal
 import stat
@@ -100,6 +101,7 @@ _COORDINATOR_JSON_VISIBILITY_TIMEOUT_SECONDS = 15.0
 _COORDINATOR_JSON_VISIBILITY_POLL_SECONDS = 0.05
 _COLLECTIVE_ERROR_BYTES = 4096
 _COORDINATOR_BROADCAST_MAX_BYTES = 64 * 1024**2
+_LOGINCTL_LINGER_TIMEOUT_SECONDS = 5.0
 
 
 def _sha256_argument(value: str) -> str:
@@ -170,6 +172,69 @@ def _sae_storage_attestation_path(
         / "sae-storage"
         / f"{consumer_environment_sha256}.json"
     )
+
+
+def _require_lingering_sae_cache_runtime(cache_root: str | Path) -> Path:
+    """Require a reboot-scoped cache whose owning user survives SSH exit."""
+
+    selected = Path(cache_root).expanduser()
+    direct_shm = Path("/dev/shm").resolve()
+    resolved = selected.resolve()
+    try:
+        relative = resolved.relative_to(direct_shm)
+    except ValueError as error:
+        raise RuntimeError(
+            "SAE resident cache root must be an absolute path strictly below "
+            f"the direct /dev/shm mount; got {selected}"
+        ) from error
+    if not selected.is_absolute() or not relative.parts:
+        raise RuntimeError(
+            "SAE resident cache root must be an absolute path strictly below "
+            f"the direct /dev/shm mount; got {selected}"
+        )
+
+    user = pwd.getpwuid(os.getuid()).pw_name
+    command = (
+        "loginctl",
+        "show-user",
+        user,
+        "-p",
+        "Linger",
+        "--value",
+    )
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=_LOGINCTL_LINGER_TIMEOUT_SECONDS,
+        )
+    except FileNotFoundError as error:
+        raise RuntimeError(
+            "cannot verify systemd user lingering because loginctl is unavailable"
+        ) from error
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(
+            "timed out after "
+            f"{_LOGINCTL_LINGER_TIMEOUT_SECONDS:g}s while verifying systemd "
+            f"user lingering for {user}"
+        ) from error
+    if result.returncode != 0:
+        detail = result.stderr.strip() or "no diagnostic output"
+        raise RuntimeError(
+            f"loginctl could not verify systemd user lingering for {user} "
+            f"(exit {result.returncode}): {detail}"
+        )
+    observed = result.stdout
+    if observed != "yes\n":
+        raise RuntimeError(
+            f"systemd user lingering is not enabled for {user}: expected "
+            f"loginctl output exactly 'yes\\n', got {observed!r}; run "
+            f"`sudo loginctl enable-linger {user}` on every controller before "
+            "SAE cache qualification"
+        )
+    return resolved
 
 
 def _validate_gcs_storage_roots(
@@ -652,6 +717,7 @@ def _load_sae_storage_bundle(
 
     train_manifest: dict[str, Any] | None = None
     eval_manifest: dict[str, Any] | None = None
+    layout: dict[str, Any] | None = None
     producer_environment_sha256 = ""
     checkpoint_sha256 = ""
     conversion_sha256 = ""
@@ -670,6 +736,8 @@ def _load_sae_storage_bundle(
             expected_local_device_count=local_device_count,
             expected_global_device_count=global_device_count,
         )
+        layout = _sae_storage_layout(activation, sae)
+        _require_lingering_sae_cache_runtime(layout["capture_cache_root"])
         train_manifest = load_manifest(_capture_root(root, "train"))
         eval_manifest = load_manifest(_capture_root(root, "eval"))
         validate_sae_storage_assignments(sae, (train_manifest, eval_manifest))
@@ -717,7 +785,6 @@ def _load_sae_storage_bundle(
     benchmark = benchmark_value
 
     compatibility: Mapping[str, Any] | None = None
-    layout: dict[str, Any] | None = None
     compatibility_error: str | None = None
     try:
         compatibility = sae.get("capture_compatibility")
@@ -741,7 +808,6 @@ def _load_sae_storage_bundle(
             benchmark_record=benchmark,
             consumer_environment=current_environment,
         )
-        layout = _sae_storage_layout(activation, sae)
     except Exception as error:
         compatibility_error = f"{type(error).__name__}: {error}"
     _collective_raise_if_any(
@@ -2331,6 +2397,16 @@ def _command_qualify_sae_storage(args: argparse.Namespace) -> int:
     root = _artifact_root(config, args.artifact_root).resolve()
     _require_production_artifact_root(root)
     require_v4_32_runtime()
+    cache_root: Path | None = None
+    runtime_error: str | None = None
+    try:
+        cache_root = _require_lingering_sae_cache_runtime(args.cache_root)
+    except Exception as error:
+        runtime_error = f"{type(error).__name__}: {error}"
+    _collective_raise_if_any(
+        runtime_error, purpose="SAE resident-cache runtime"
+    )
+    assert cache_root is not None
     current_environment = _coordinated_environment()
     path = _sae_storage_attestation_path(
         root, str(current_environment.get("sha256", ""))
@@ -2446,7 +2522,6 @@ def _command_qualify_sae_storage(args: argparse.Namespace) -> int:
         compatibility_error, purpose="SAE storage compatibility validation"
     )
     assert compatibility is not None
-    cache_root = Path(args.cache_root).expanduser().resolve()
     qualification = qualify_sae_streaming_cache(
         cache_root,
         (train_manifest, eval_manifest),
