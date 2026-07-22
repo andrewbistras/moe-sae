@@ -19,7 +19,7 @@ from moe_sae.cli import (
     build_parser,
     main,
 )
-from moe_sae.config import Gemma4Config, MODEL_REVISION
+from moe_sae.config import Gemma4Config, MODEL_REVISION, load_config
 from moe_sae.data import (
     ALLENAI_C4_REPO_ID,
     ALLENAI_C4_REVISION,
@@ -460,6 +460,20 @@ def test_smoke_process_ranges_are_exact_disjoint_full_batch():
     assert ranges == [(0, 4_096), (4_096, 8_192), (8_192, 12_288), (12_288, 16_384)]
     with pytest.raises(RuntimeError, match="exactly four"):
         cli_module._smoke_process_token_range(16_384, 0, 2)
+
+
+def test_smoke_distributed_config_uses_real_production_batch_contract():
+    config = load_config(Path("configs/gemma4_26b_a4b.yaml"))
+    training_config = cli_module._training_config(
+        config, "F", 1, a_capacity=None
+    )
+
+    distributed = cli_module._smoke_distributed_config(training_config)
+
+    assert training_config.microbatches_per_update == (
+        config.effective_batch_tokens // config.microbatch_tokens
+    )
+    assert distributed.microbatches_per_update == 4
 
 
 def test_sae_phase_requires_inherited_fd_for_exact_live_attempt(

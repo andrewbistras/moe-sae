@@ -5851,6 +5851,16 @@ def _smoke_process_token_range(
     return start, start + local_tokens
 
 
+def _smoke_distributed_config(training_config: Any) -> Any:
+    """Build the smoke mesh contract from the canonical training contract."""
+
+    from moe_sae.distributed import DistributedConfig
+
+    return DistributedConfig(
+        microbatches_per_update=training_config.microbatches_per_update
+    )
+
+
 def _collective_smoke_attempt_id(requested: str | None) -> str:
     process_index, _ = _process_context()
     source = (
@@ -5911,11 +5921,7 @@ def _cleanup_passed_smoke_cache(cache_path: Path, cache_root: Path) -> None:
 def _command_sae_smoke(args: argparse.Namespace) -> int:
     """Run one fresh-process member of the mandatory collective F/A/B suite."""
 
-    from moe_sae.distributed import (
-        DistributedConfig,
-        create_mesh,
-        precompute_distributed_a_capacity,
-    )
+    from moe_sae.distributed import create_mesh, precompute_distributed_a_capacity
     from moe_sae.sae_smoke_collective import SAESmokeCollectiveRunner
     from moe_sae.sae_smoke_jax import jax_collective_hooks
     from moe_sae.sae_smoke_tpu import SAESmokeTPUAdapter
@@ -5973,13 +5979,11 @@ def _command_sae_smoke(args: argparse.Namespace) -> int:
     except Exception as error:
         prefetch_error = f"{type(error).__name__}: {error}"
     _collective_raise_if_any(prefetch_error, purpose="SAE smoke batch prefetch")
-    distributed = DistributedConfig(
-        microbatches_per_update=config.microbatches_per_update
-    )
     a_capacity: int | None = None
     training_config = _training_config(
         config, args.condition, 1, a_capacity=None
     )
+    distributed = _smoke_distributed_config(training_config)
     if args.condition == "A":
         a_capacity = precompute_distributed_a_capacity(
             dataset,
