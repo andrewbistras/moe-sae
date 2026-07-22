@@ -61,3 +61,8 @@ dev = [
 [tool.pytest.ini_options]
 addopts = "-ra"
 testpaths = ["tests"]
+
+[tool.ruff.lint.per-file-ignores]
+# data.py remains byte-identical to the sealed capture producer so the
+# fail-closed compatibility proof can retain its exact whole-file hash.
+"src/moe_sae/data.py" = ["F401"]
