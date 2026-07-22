@@ -231,7 +231,6 @@ def validate_canary_gate(
         "source_conversion_attestation_sha256": "conversion_attestation_sha256",
         "source_dataset_fingerprint": "dataset_fingerprint",
         "source_environment_sha256": "environment_sha256",
-        "storage_attestation_sha256": "storage_attestation_sha256",
     }
     if waiver.get("source_canary_passed") is not False or any(
         waiver.get(waiver_name) != source.get(source_name)
@@ -261,6 +260,41 @@ def validate_canary_gate(
             raise CanaryGateError(f"immutable canary evidence changed: {path}")
     if not mutable_host_paths.issubset(normalized_bound):
         raise CanaryGateError("canary waiver did not bind all four source host ledgers")
+    storage_path = (root / "preflight" / "storage.json").resolve()
+    storage_file_sha256 = normalized_bound.get(str(storage_path))
+    if (
+        not isinstance(storage_file_sha256, str)
+        or not _SHA256_RE.fullmatch(storage_file_sha256)
+        or _sha256_file(storage_path) != storage_file_sha256
+    ):
+        raise CanaryGateError(
+            "canary waiver does not bind the exact storage attestation file"
+        )
+    try:
+        storage_payload = json.loads(storage_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise CanaryGateError("bound storage attestation is invalid") from error
+    if not isinstance(storage_payload, Mapping):
+        raise CanaryGateError("bound storage attestation is not an object")
+    storage_attestation_sha256 = storage_payload.get("attestation_sha256")
+    unsigned_storage = {
+        name: value
+        for name, value in storage_payload.items()
+        if name != "attestation_sha256"
+    }
+    if (
+        not isinstance(storage_attestation_sha256, str)
+        or not _SHA256_RE.fullmatch(storage_attestation_sha256)
+        or hashlib.sha256(_canonical(unsigned_storage)).hexdigest()
+        != storage_attestation_sha256
+        or waiver.get("storage_attestation_sha256")
+        != storage_attestation_sha256
+        or train_metadata.get("storage_attestation_sha256")
+        != storage_attestation_sha256
+    ):
+        raise CanaryGateError(
+            "waiver, sealed capture, and bound storage attestation differ"
+        )
     selected_path = (root / "benchmark" / "selected.json").resolve()
     if (
         normalized_bound.get(str(selected_path))

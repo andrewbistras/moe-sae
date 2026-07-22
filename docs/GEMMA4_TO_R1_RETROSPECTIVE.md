@@ -355,6 +355,18 @@ therefore became a prerequisite to requalification. The passed throughput and
 hash proof had been valid; the target runtime invalidated its resident bytes
 after the process boundary.
 
+After that repair, the first `sae-begin` attempt exposed a different boundary
+bug before an operation was created. The durable canary `CampaignSummary` v2
+never had a `storage_attestation_sha256` field, but the consumer validator
+compared the waiver's storage identity to that nonexistent source field. The
+actual chain was intact: the waiver, sealed train-manifest metadata, selected
+benchmark, and self-hashed `preflight/storage.json` all named `f82efc…9c5c`,
+and the waiver bound the exact storage file hash `6ff7f4…e38c`. The repair did
+not edit the old waiver or relax its scope. It validates the five identities
+that really belong to `CampaignSummary`, then separately requires the exact
+bound storage file, verifies its canonical self-hash, and requires equality
+across the waiver and sealed manifest.
+
 The Stage-8 hardening implementation preserves the immutable activation
 attestation, adds a separate SAE-storage attestation for bounded `/dev/shm` and
 Orbax paths, and adds a producer/consumer compatibility proof. That
@@ -490,7 +502,13 @@ relative A/B/F quality had yet been inspected.
     target-runtime lifecycle debt, not a GCS-throughput or cache-integrity
     failure.
 
-12. **The experiment evidence was split across durability domains.** A 1 TiB
+12. **The canary validator assumed a field outside the source schema.** Unit
+    tests had exercised waiver mechanics without constructing the real
+    `CampaignSummary` type. The first operation seal caught the impossible
+    storage-field comparison. The immutable evidence was mutually consistent;
+    the typed compatibility edge was not.
+
+13. **The experiment evidence was split across durability domains.** A 1 TiB
     minimum Basic HDD Filestore volume carried a small amount of authoritative
     control data while GCS carried the bulk objects. Filestore remained zonal,
     separately billed (quoted during operation at about $0.27/hour), and
@@ -701,6 +719,12 @@ that “it worked once” does not silently turn them into policy.
     states, fewer manual commands, and fewer identity concepts exposed to the
     operator directly reduce the chance of comparing the wrong bytes or
     silently changing a denominator.
+
+11. **Compatibility tests must instantiate the real producer schema.** A
+    dictionary-shaped fixture can accidentally promise fields the producer
+    never emitted. Build waiver, recovery, and migration tests from the actual
+    versioned record type, and separately validate identities that belong to
+    adjacent artifacts.
 
 ## Target architecture for DeepSeek-R1 on multi-region v6e-64
 
@@ -1171,10 +1195,11 @@ are still waste.
 | cached production input path | observed | roughly 20.3k tokens/s; input wait below 2% |
 | NFS publication protocol | **failed repeatedly** | waiver/start-release visibility incidents and negative-dentry split after successful 50M seal |
 | immutable capture recovery | observed | no train recapture; exact wrapper/waiver bindings retained |
-| `/dev/shm` lifecycle across SSH exit | **failed and isolated; remediation required** | 73.66 GB passed at 4.946 GB/s then vanished after about 20s; worker-0 `Linger=yes` sentinel survived while workers 1--3 `Linger=no` sentinels vanished |
+| `/dev/shm` lifecycle across SSH exit | **failed, repaired, and verified live** | original 73.66 GB/controller cache vanished; final all-worker `Linger=yes` disconnect probes and a 294.64 GB requalification survived SSH teardown |
+| canary/recovery evidence chain | **intact; consumer validator repaired** | first `sae-begin` failed closed on a field absent from real `CampaignSummary`; exact waiver/storage/manifest chain independently recomputed and tested |
 | complete experiment evidence independent of Filestore | **not yet established** | immutable GCS payloads exist; control/evidence export and reconstruction remain required |
-| SAE storage and producer/consumer compatibility | in progress | separate attestation and selected-code compatibility proof exist only in worktree |
-| checkpoint-reconciled metrics journal | in progress | identity-bound, monotonic, `fsync`ed implementation and tests exist in worktree; interrupted TPU validation pending |
+| SAE storage and producer/consumer compatibility | implementation committed; final identity requalification pending | separate attestation passed twice and selected-code compatibility remained exact; the canary-validator commit requires one final consumer identity |
+| checkpoint-reconciled metrics journal | committed and smoke-qualified | identity-bound, monotonic, `fsync`ed implementation passed full-shape save/restore; interrupted full-run validation remains pending |
 | nine final SAE runs and exploratory G/C | **not yet established** | must not be inferred from capture success |
 | original-contract headline eligibility | **permanently false** | hard MFU and canary gates were waived, not passed |
 
