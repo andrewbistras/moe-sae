@@ -107,6 +107,8 @@ _COORDINATOR_JSON_VISIBILITY_POLL_SECONDS = 0.05
 _COLLECTIVE_ERROR_BYTES = 4096
 _COORDINATOR_BROADCAST_MAX_BYTES = 64 * 1024**2
 _LOGINCTL_LINGER_TIMEOUT_SECONDS = 5.0
+_PREFETCH_TELEMETRY_SCHEMA = "gemma4-process-prefetch-telemetry-v1"
+_PREFETCH_COUNTER_BYTES = 8
 
 
 def _sha256_argument(value: str) -> str:
@@ -978,10 +980,112 @@ def _sealed_dataset(
     )
 
 
+def _normalize_prefetch_observation(value: Mapping[str, Any]) -> dict[str, int]:
+    """Validate one process-local prefetch observation before a collective."""
+
+    if not isinstance(value, Mapping) or set(value) != {"objects", "bytes"}:
+        raise RuntimeError(
+            "capture prefetch observation must contain exactly objects and bytes"
+        )
+    normalized: dict[str, int] = {}
+    maximum = (1 << (8 * _PREFETCH_COUNTER_BYTES)) - 1
+    for name in ("objects", "bytes"):
+        raw = value[name]
+        if isinstance(raw, bool) or not isinstance(raw, (int, np.integer)):
+            raise RuntimeError(f"capture prefetch {name} must be an integer")
+        counter = int(raw)
+        if not 0 <= counter <= maximum:
+            raise RuntimeError(
+                f"capture prefetch {name} must fit an unsigned "
+                f"{8 * _PREFETCH_COUNTER_BYTES}-bit counter"
+            )
+        normalized[name] = counter
+    return normalized
+
+
+def _canonical_prefetch_summary(
+    observations: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Build one ordered, identical record from every process's cache work.
+
+    ``objects`` and ``bytes`` are aggregate materialization work, not unique
+    capture inventory.  A physical shard intersecting two process token ranges
+    is intentionally counted once for each process that validated its local
+    copy.  The ordered per-process rows retain that distinction.
+    """
+
+    if not observations:
+        raise RuntimeError("capture prefetch telemetry has no process observations")
+    normalized = [
+        _normalize_prefetch_observation(observation)
+        for observation in observations
+    ]
+    per_process = [
+        {
+            "process_index": process_index,
+            "objects": observation["objects"],
+            "bytes": observation["bytes"],
+        }
+        for process_index, observation in enumerate(normalized)
+    ]
+    return {
+        "schema_version": _PREFETCH_TELEMETRY_SCHEMA,
+        "process_count": len(per_process),
+        "objects": sum(item["objects"] for item in per_process),
+        "bytes": sum(item["bytes"] for item in per_process),
+        "per_process": per_process,
+    }
+
+
+def _collective_prefetch_summary(local: Mapping[str, Any]) -> dict[str, Any]:
+    """All-gather process-local cache counters into canonical process order."""
+
+    observation = _normalize_prefetch_observation(local)
+    _, process_count = _process_context()
+    if process_count == 1:
+        return _canonical_prefetch_summary((observation,))
+
+    from jax.experimental import multihost_utils
+
+    encoded = np.frombuffer(
+        observation["objects"].to_bytes(_PREFETCH_COUNTER_BYTES, "big")
+        + observation["bytes"].to_bytes(_PREFETCH_COUNTER_BYTES, "big"),
+        dtype=np.uint8,
+    ).copy()
+    row_bytes = 2 * _PREFETCH_COUNTER_BYTES
+    gathered = np.asarray(
+        multihost_utils.process_allgather(encoded, tiled=False), dtype=np.uint8
+    ).reshape(process_count, -1)
+    if gathered.shape != (process_count, row_bytes):
+        raise RuntimeError("capture prefetch collective returned an invalid shape")
+    observations = []
+    for row in gathered:
+        observations.append(
+            {
+                "objects": int.from_bytes(
+                    row[:_PREFETCH_COUNTER_BYTES].tobytes(), "big"
+                ),
+                "bytes": int.from_bytes(
+                    row[_PREFETCH_COUNTER_BYTES:].tobytes(), "big"
+                ),
+            }
+        )
+    return _canonical_prefetch_summary(observations)
+
+
+def _empty_prefetch_summary() -> dict[str, Any]:
+    """Represent zero prefetch work without lying about process cardinality."""
+
+    _, process_count = _process_context()
+    return _canonical_prefetch_summary(
+        tuple({"objects": 0, "bytes": 0} for _ in range(process_count))
+    )
+
+
 def _prefetch_process_partition(
     dataset: ArtifactDataset, total_tokens: int, *, label: str
-) -> tuple[dict[str, int], float]:
-    """Warm this controller's immutable capture partition outside SAE timing."""
+) -> tuple[dict[str, Any], float]:
+    """Warm and canonically attest every process's immutable partition."""
 
     process_index, process_count = _process_context()
     start = (total_tokens * process_index) // process_count
@@ -991,7 +1095,9 @@ def _prefetch_process_partition(
     result: dict[str, int] | None = None
     local_error: str | None = None
     try:
-        result = dataset.prefetch_token_range(start, end)
+        result = _normalize_prefetch_observation(
+            dataset.prefetch_token_range(start, end)
+        )
     except Exception as error:
         local_error = f"{type(error).__name__}: {error}"
     local_elapsed = time.perf_counter() - started
@@ -999,9 +1105,10 @@ def _prefetch_process_partition(
         local_error, purpose=f"{label} qualified-cache prefetch"
     )
     assert result is not None
+    summary = _collective_prefetch_summary(result)
     elapsed = _global_max_seconds(local_elapsed)
     _global_barrier(f"gemma4-{label}-prefetch-complete")
-    return result, elapsed
+    return summary, elapsed
 
 
 def _run_root(root: Path, condition: str, seed: int) -> Path:
@@ -1925,8 +2032,10 @@ def _coordinator_read_json(path: Path, *, purpose: str) -> Any:
     return value
 
 
-def _coordinator_created_at_utc() -> str:
-    """Generate one attestation timestamp on process zero and broadcast it."""
+def _coordinator_created_at_utc(
+    *, purpose: str = "attestation timestamp"
+) -> str:
+    """Generate one UTC timestamp on process zero and broadcast it."""
 
     process_index, _ = _process_context()
     source = (
@@ -1934,10 +2043,40 @@ def _coordinator_created_at_utc() -> str:
         if process_index == 0
         else None
     )
-    shared = _broadcast_coordinator_bytes(source, purpose="attestation timestamp")
+    shared = _broadcast_coordinator_bytes(source, purpose=purpose)
     if shared is None:
-        raise RuntimeError("coordinator did not provide an attestation timestamp")
+        raise RuntimeError(f"coordinator did not provide {purpose}")
     return shared.decode("ascii")
+
+
+def _immutable_report_created_at(path: Path) -> str:
+    """Reuse an immutable report timestamp after a crash, or create it once."""
+
+    existing = _coordinator_read_json_if_exists(
+        path, purpose="existing immutable efficiency report"
+    )
+    if existing is None:
+        return _coordinator_created_at_utc(purpose="efficiency report timestamp")
+    if not isinstance(existing, Mapping) or not isinstance(
+        existing.get("created_at"), str
+    ):
+        raise RuntimeError("existing immutable efficiency report lacks created_at")
+    created_at = str(existing["created_at"])
+    try:
+        parsed = datetime.fromisoformat(created_at)
+    except ValueError as error:
+        raise RuntimeError(
+            "existing immutable efficiency report has invalid created_at"
+        ) from error
+    if (
+        parsed.tzinfo is None
+        or parsed.utcoffset() is None
+        or parsed.utcoffset() != timezone.utc.utcoffset(parsed)
+    ):
+        raise RuntimeError(
+            "existing immutable efficiency report created_at is not UTC"
+        )
+    return created_at
 
 
 def _aggregate_benchmark_observation(
@@ -3814,7 +3953,7 @@ def _command_train(args: argparse.Namespace) -> int:
             storage_bundle=storage_bundle,
             canary_gate=canary_gate,
         )
-    capture_prefetch = {"objects": 0, "bytes": 0}
+    capture_prefetch = _empty_prefetch_summary()
     capture_prefetch_wall_seconds = 0.0
     if storage_layout is not None:
         capture_prefetch, capture_prefetch_wall_seconds = _prefetch_process_partition(
@@ -4272,7 +4411,7 @@ def _command_eval_one(
             storage_bundle=storage_bundle,
             canary_gate=canary_gate,
         )
-    evaluation_prefetch = {"objects": 0, "bytes": 0}
+    evaluation_prefetch = _empty_prefetch_summary()
     evaluation_prefetch_seconds = 0.0
     if storage_layout is not None:
         evaluation_prefetch, evaluation_prefetch_seconds = (
@@ -5196,6 +5335,8 @@ def _command_report(args: argparse.Namespace) -> int:
     evaluation_seconds = sum(
         float(record.get("evaluation_seconds_excluded", 0.0)) for record in evaluations
     )
+    destination = operation_paths.report_path
+    report_created_at = _immutable_report_created_at(destination)
     report = build_efficiency_report(
         evaluations,
         harvester=harvester,
@@ -5203,6 +5344,11 @@ def _command_report(args: argparse.Namespace) -> int:
         checkpoint_seconds=checkpoint_seconds,
         evaluation_seconds=evaluation_seconds,
         nominal_candidate_exposure_percent=100.0 * config.candidate_exposure,
+    )
+    report["created_at"] = report_created_at
+    report["created_at_basis"] = (
+        "one coordinator-broadcast UTC timestamp retained across immutable "
+        "report retries"
     )
     waived_labels: list[str] = []
     if harvester.get("performance_gate_status") == "waived-unmet":
@@ -5236,7 +5382,9 @@ def _command_report(args: argparse.Namespace) -> int:
         ),
         "basis": (
             "generation-pinned GCS capture shards are cached before optimizer "
-            "timing and reused across A/B/F"
+            "timing and reused across A/B/F; objects and bytes are aggregate "
+            "per-process materialization work, so a boundary shard used by "
+            "multiple processes is counted once per process"
         ),
     }
     report["storage_planes"] = {
@@ -5290,7 +5438,6 @@ def _command_report(args: argparse.Namespace) -> int:
             for (condition, seed), run_record in zip(pairs, run_records, strict=True)
         },
     }
-    destination = operation_paths.report_path
     if args.output is not None:
         requested = Path(args.output).expanduser().resolve()
         if requested != destination:

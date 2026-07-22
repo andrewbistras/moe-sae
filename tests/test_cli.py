@@ -182,6 +182,118 @@ def test_noncoordinator_validates_publication_without_writing(
     assert barriers == ["publication-visible"]
 
 
+def test_canonical_prefetch_summary_preserves_divergent_process_partitions() -> None:
+    observations = [
+        {"objects": 96, "bytes": 70_827_253_224},
+        {"objects": 97, "bytes": 71_566_104_881},
+        {"objects": 96, "bytes": 70_827_255_119},
+        {"objects": 95, "bytes": 69_984_778_007},
+    ]
+
+    summary = cli_module._canonical_prefetch_summary(observations)
+
+    assert summary == {
+        "schema_version": "gemma4-process-prefetch-telemetry-v1",
+        "process_count": 4,
+        "objects": 384,
+        "bytes": 283_205_391_231,
+        "per_process": [
+            {"process_index": index, **observation}
+            for index, observation in enumerate(observations)
+        ],
+    }
+    assert len({json.dumps(value, sort_keys=True) for value in observations}) == 4
+    assert json.dumps(summary, sort_keys=True) == json.dumps(
+        cli_module._canonical_prefetch_summary(observations), sort_keys=True
+    )
+
+
+@pytest.mark.parametrize("label", ["train-capture", "eval-capture"])
+def test_prefetch_partition_allgathers_divergent_process_telemetry(
+    label: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from jax.experimental import multihost_utils
+
+    observations = [
+        {"objects": 2, "bytes": 101},
+        {"objects": 3, "bytes": 211},
+        {"objects": 2, "bytes": 307},
+        {"objects": 1, "bytes": 401},
+    ]
+    packed = np.stack(
+        [
+            np.frombuffer(
+                observation["objects"].to_bytes(8, "big")
+                + observation["bytes"].to_bytes(8, "big"),
+                dtype=np.uint8,
+            )
+            for observation in observations
+        ]
+    )
+    current_process = [0]
+    barriers: list[str] = []
+
+    class Dataset:
+        def prefetch_token_range(self, start: int, end: int) -> dict[str, int]:
+            assert (start, end) == (
+                25 * current_process[0],
+                25 * (current_process[0] + 1),
+            )
+            return dict(observations[current_process[0]])
+
+    def process_allgather(value: np.ndarray, *, tiled: bool) -> np.ndarray:
+        assert tiled is False
+        np.testing.assert_array_equal(value, packed[current_process[0]])
+        return packed
+
+    def require_success(error: str | None, *, purpose: str) -> None:
+        assert error is None, purpose
+
+    monkeypatch.setattr(multihost_utils, "process_allgather", process_allgather)
+    monkeypatch.setattr(cli_module, "_collective_raise_if_any", require_success)
+    monkeypatch.setattr(cli_module, "_global_max_seconds", lambda _value: 9.5)
+    monkeypatch.setattr(cli_module, "_global_barrier", barriers.append)
+
+    summaries = []
+    for process_index in range(4):
+        current_process[0] = process_index
+        monkeypatch.setattr(
+            cli_module, "_process_context", lambda index=process_index: (index, 4)
+        )
+        summary, elapsed = cli_module._prefetch_process_partition(
+            Dataset(), 100, label=label
+        )
+        summaries.append(summary)
+        assert elapsed == 9.5
+
+    expected = cli_module._canonical_prefetch_summary(observations)
+    assert summaries == [expected] * 4
+    assert barriers == [
+        event
+        for _ in range(4)
+        for event in (
+            f"gemma4-{label}-prefetch-start",
+            f"gemma4-{label}-prefetch-complete",
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "observation",
+    [
+        {"objects": True, "bytes": 1},
+        {"objects": -1, "bytes": 1},
+        {"objects": 1, "bytes": -1},
+        {"objects": 1, "bytes": 2, "host": "worker-0"},
+    ],
+)
+def test_prefetch_telemetry_rejects_noncanonical_local_counters(
+    observation: dict[str, object],
+) -> None:
+    with pytest.raises(RuntimeError, match="capture prefetch"):
+        cli_module._canonical_prefetch_summary((observation,))
+
+
 def test_coordinator_publication_failure_is_decided_before_barrier(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -280,6 +392,83 @@ def test_attestation_timestamp_is_coordinator_broadcast(
         == "2026-07-22T03:04:05+00:00"
     )
     assert observed == [None]
+
+
+def test_immutable_report_timestamp_is_created_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = tmp_path / "report.json"
+    calls: list[str] = []
+    monkeypatch.setattr(
+        cli_module,
+        "_coordinator_read_json_if_exists",
+        lambda candidate, *, purpose: (
+            calls.append(f"read:{candidate.name}:{purpose}") or None
+        ),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_coordinator_created_at_utc",
+        lambda *, purpose: (
+            calls.append(f"create:{purpose}") or "2026-07-22T03:04:05+00:00"
+        ),
+    )
+
+    assert (
+        cli_module._immutable_report_created_at(path)
+        == "2026-07-22T03:04:05+00:00"
+    )
+    assert calls == [
+        "read:report.json:existing immutable efficiency report",
+        "create:efficiency report timestamp",
+    ]
+
+
+def test_immutable_report_timestamp_reuses_exact_published_value(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = tmp_path / "report.json"
+    monkeypatch.setattr(
+        cli_module,
+        "_coordinator_read_json_if_exists",
+        lambda _path, *, purpose: {
+            "created_at": "2026-07-22T03:04:05.123456+00:00"
+        },
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_coordinator_created_at_utc",
+        lambda **_kwargs: pytest.fail("retry must not mint a new timestamp"),
+    )
+
+    assert (
+        cli_module._immutable_report_created_at(path)
+        == "2026-07-22T03:04:05.123456+00:00"
+    )
+
+
+@pytest.mark.parametrize(
+    "existing",
+    [
+        {},
+        {"created_at": 123},
+        {"created_at": "not-a-timestamp"},
+        {"created_at": "2026-07-22T03:04:05"},
+        {"created_at": "2026-07-22T03:04:05+01:00"},
+    ],
+)
+def test_immutable_report_timestamp_rejects_invalid_existing_report(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    existing: dict[str, object],
+) -> None:
+    monkeypatch.setattr(
+        cli_module,
+        "_coordinator_read_json_if_exists",
+        lambda _path, *, purpose: existing,
+    )
+    with pytest.raises(RuntimeError, match="immutable efficiency report"):
+        cli_module._immutable_report_created_at(tmp_path / "report.json")
 
 
 def test_sae_storage_attestation_path_is_consumer_environment_versioned(

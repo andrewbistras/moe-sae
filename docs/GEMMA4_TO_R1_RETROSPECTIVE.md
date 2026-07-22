@@ -474,6 +474,47 @@ suite, and operation identity; they are not retroactively part of
 zero SAE optimizer updates and is retained as an amelioration ledger, not a
 partial scientific result.
 
+Commit `ffd7dec` deployed that repair into a new clean consumer identity. The
+new operation `61db8deb0eaf6c5dbf182d867723cc995f2e6cf2986da320071c03b31cef446f`
+passed prerequisite validation and the F/A/B full-shape smokes, then completed
+all numerical work for the seed-1 A health gate: 306 updates and 5,013,504
+scientific tokens, exact L0 64, valid TopK, 99.6956% live features, health-loss
+ratio 0.527406, about 668.1 optimizer seconds, and a finalized Orbax checkpoint.
+It nevertheless failed before the phase-result envelope was accepted.
+
+The failure was a shared-payload locality error. Each process prefetched and
+validated its own deterministic capture partition, so its `{objects, bytes}`
+counters were legitimately different. The training command placed that local
+dictionary directly in the supposedly replicated `run.json`. Process zero
+published its view; the other processes rejected it after the bounded
+visibility check because their expected bytes were different. The exact
+cross-process comparison worked as designed and prevented a locally true
+record from masquerading as a global one. The checkpoint is evidence that the
+numerics and health gate were healthy, but the absence of an accepted phase
+envelope means the operation remains failed.
+
+The durable repair gathers the two unsigned counters from every process in
+process-index order and publishes both the ordered observations and their
+aggregate. It is shared by training and evaluation. Top-level byte/object
+totals mean aggregate materialization work, not unique shard inventory, so a
+boundary shard used by two process partitions is counted twice. The report's
+other fresh-process hazard is also removed: its timestamp is now generated
+once by the coordinator and reused verbatim on an immutable retry instead of
+being generated independently on each process. Recovery must use a newly
+qualified environment, new F/A/B smokes, and a new operation; the old
+operation's checkpoint must not be transplanted because its identity binds the
+failed operation SHA.
+
+The incident also exposed a scaling cost that correctness telemetry had made
+easy to overlook. Each Gemma worker materialized roughly 73 GB of capture
+objects before training, and A's route-capacity preparation caused another
+full byte-validation read, with process I/O near 142 GB per host before the
+optimizer run. That is tolerable for this fixed 50M-token study but will not
+scale cleanly to R1 across ephemeral v6e-64 spot slices. The R1 data plane needs
+shard-aware regional placement, one verified local materialization reused by
+capacity planning and training, and explicit accounting of duplicate boundary
+reads and cold-cache attempt waste.
+
 The farm also lacks a numerical-progress watchdog. Its outer heartbeat can
 remain healthy while a child is stuck in XLA compilation, an optimizer step,
 or another long-running numerical call. Current monitoring must therefore
@@ -481,11 +522,12 @@ inspect the metrics journal and scientific-token/step progress as well as the
 lease heartbeat. R1 requires a cloud-resident phase-specific progress monitor,
 bounded compile/step deadlines, and an incident record before automated retry.
 
-The final SAE metric is still pending. When all nine runs, evaluation, and
-reporting complete, this document may record the exploratory G/C result, but
-the two performance waivers must remain attached and headline eligibility must
-remain false. No production SAE comparison existed at this snapshot, so no
-relative A/B/F quality had yet been inspected.
+The final SAE metric is still pending. The seed-1 A gate supplied only
+operational/health evidence; it is not a completed training run or a relative
+A/B/F quality comparison. When all nine runs, evaluation, and reporting
+complete, this document may record the exploratory G/C result, but the two
+performance waivers must remain attached and headline eligibility must remain
+false.
 
 ## What worked
 
@@ -1359,7 +1401,9 @@ are still waste.
 | checkpoint-reconciled metrics journal | committed and smoke-qualified | identity-bound, monotonic, `fsync`ed implementation passed full-shape save/restore; interrupted full-run validation remains pending |
 | first sealed SAE farm launch | **failed closed before training** | attempt 1 retains the base-Python import failure; the hard-link recovery passed prerequisites and `smoke-F`, but repeated completion/boundary sessions exposed NFS cache and NLM-poll storms; operation `e74bc0…b5769` ran zero SAE updates |
 | NFS farm-control qualification | **probe passed; original farm protocol failed** | `noac,lookupcache=none` passed 64 cross-host replacements plus remote-lock exclusion (`5708c…937a2`), while `/proc` then showed 30--60s NLM/lookup stalls caused by the farm's own high-rate polling |
-| durable farm control/launcher repair | **current clean-deployment candidate; not part of c8 operation** | venv symlink is preserved; NFS mount is correctness-first; polling/heartbeat/freshness bounds are derived and low-rate; heartbeat writes are serialized; released terminal records are quiescent; new qualification/smokes/operation are mandatory |
+| durable farm control/launcher repair | **committed, deployed, and exercised** | `ffd7dec` preserves the venv symlink, makes the NFS mount correctness-first, bounds low-rate polling/heartbeats, serializes heartbeat writes, and treats released terminal records as quiescent; the new operation passed prerequisites and F/A/B smokes |
+| seed-1 A health-gate attempt under `ffd7dec` | **numerically healthy; phase failed at shared publication** | operation `61db8d…446f` completed 306 updates/5,013,504 tokens and finalized its checkpoint, then rejected process-local prefetch counters embedded in shared `run.json`; no phase-result envelope was accepted |
+| canonical shared training/evaluation telemetry | **local audited repair; redeployment pending** | ordered per-process prefetch observations and aggregate work replace local counters; immutable report timestamp is coordinator-generated and retry-stable; divergent-partition tests cover train and eval paths |
 | numerical-progress watchdog | **not implemented** | farm lease/parent heartbeats can remain healthy without optimizer-step or scientific-token progress |
 | nine final SAE runs and exploratory G/C | **not yet established** | must not be inferred from capture success |
 | original-contract headline eligibility | **permanently false** | hard MFU and canary gates were waived, not passed |

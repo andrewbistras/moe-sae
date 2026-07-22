@@ -1871,13 +1871,34 @@ gcloud compute tpus tpu-vm ssh "$TPU_NAME" \
 ```
 
 The CLI refuses an unsafe clear while a phase runs or any lane lease is held.
-After diagnosis, resume with the same `OPERATION_SHA256` and the same detached
-all-host launch. Passed phases are skipped only after their immutable evidence
-revalidates. If a child is hard-hung inside XLA or a collective, preserve
-status, all logs, and the TPU description; recovery acts on the entire slice,
-never one worker. Because the qualified cache is volatile, a TPU reboot or
-replacement also ends this exact consumer deployment rather than authorizing
-an implicit cache refill.
+After diagnosis, reuse the same `OPERATION_SHA256` only when the committed
+consumer environment is unchanged and the failure is a transient,
+restart-safe interruption. Passed phases are skipped only after their
+immutable evidence revalidates. A source fix changes the consumer environment
+identity: retain the old operation as failed evidence, deploy the audited fix,
+requalify the resident cache for that environment, repeat the required F/A/B
+smokes, and create a new operation with `sae-begin`. Do not edit or delete the
+old state, `run.json`, checkpoint pointers, or phase records. Do not transplant
+an old-operation checkpoint into the replacement operation: checkpoint and
+run identities deliberately bind the old operation SHA, so even a numerically
+healthy checkpoint is diagnostic evidence rather than an authorized resume
+seed.
+
+Training and evaluation run records are shared multi-process publications.
+Every field in them must therefore be either replicated by construction or
+made canonical by a collective. Capture-prefetch telemetry is an ordered
+all-gather of each process's `objects` and `bytes`, with top-level totals that
+represent aggregate per-process materialization work. A capture shard crossing
+two process token partitions is intentionally counted twice; these counters
+are not unique capture inventory. A payload disagreement is a failed phase,
+not permission to discard the differing field or accept only process zero's
+view.
+
+If a child is hard-hung inside XLA or a collective, preserve status, all logs,
+and the TPU description; recovery acts on the entire slice, never one worker.
+Because the qualified cache is volatile, a TPU reboot or replacement also
+ends this exact consumer deployment rather than authorizing an implicit cache
+refill.
 
 ## Stage 10 — accept, export evidence, and clean up
 
