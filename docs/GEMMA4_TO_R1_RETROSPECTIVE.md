@@ -800,9 +800,9 @@ that “it worked once” does not silently turn them into policy.
   released source is FP8-quantized, so source precision, conversion semantics,
   and the intended runtime weight format must be frozen explicitly.
 
-- A DeepSeek aggregate activation record with BF16 `[N,7168]`, eight uint8
-  IDs, eight BF16 weights, int64 sequence ID, and uint16 position is 14,370
-  bytes/token. Fifty million tokens are about 718.5 GB decimal (669 GiB).
+- A DeepSeek aggregate activation record with BF16 `[N,7168]`, eight uint16
+  IDs, eight BF16 weights, int64 sequence ID, and uint16 position is 14,378
+  bytes/token. Fifty million tokens are 718.9 GB decimal (about 670 GiB).
   This still favors aggregate capture strongly, but regional replication and
   cache sizing must be explicit.
 
@@ -826,9 +826,15 @@ that “it worked once” does not silently turn them into policy.
   runtime states; qualify v6e-128/v6e-256, host-offload, or another supported
   layout if the full oracle does not fit.
 
-- TPU Spot VMs can be preempted at any time, cannot be restarted, and do not
-  support the optional 120-second preemption notice. Recovery must assume zero
-  warning. See [Manage TPU Spot VMs](https://docs.cloud.google.com/tpu/docs/spot).
+- TPU Spot capacity can be preempted at any time. The legacy Cloud TPU API does
+  not support the optional 120-second notice. Generic Compute Engine Spot
+  instance templates expose that notice as a Preview field, but this study
+  treats its use with a multi-host TPU MIG as unqualified until a live creation
+  canary proves the exact template is accepted. Notice is never guaranteed, and
+  a partial multi-host slice is not repairable, so correctness assumes zero
+  warning and recovery replaces the whole slice. See
+  [Manage TPU Spot VMs](https://docs.cloud.google.com/tpu/docs/spot) and
+  [Compute Engine Spot VMs](https://docs.cloud.google.com/compute/docs/instances/spot).
 
 - Cross-region execution cannot be one low-latency JAX collective. A zonal
   slice is the failure and synchronization domain; regional slices can only
@@ -1083,10 +1089,15 @@ Use three identities:
 1. **Scientific identity:** model/checkpoint tensor digest, tokenizer, corpus
    manifest, target layer/site, activation schema, condition geometry,
    optimizer, token order, and seed.
-2. **Implementation identity:** repository commit, MaxText commit, image
-   digest, JAX/libtpu/XLA versions, converter, and adapter implementation.
-3. **Deployment identity:** cloud project, zone, consumption model, slice and
-   topology, VM/process/device coordinates, service account, and attempt.
+2. **Implementation identity:** repository commit, MaxText commit, exact
+   observed image-manifest SHA-256, JAX/libtpu/XLA versions, converter, and
+   adapter implementation. A GCE image is not a container digest.
+3. **Deployment identity:** only the implementation digest, deployment-
+   envelope digest, complete device-inventory digest, and attempt ID. The
+   envelope owns project, placement, Spot/MIG policy, and service account;
+   host attestations and the inventory own boot-source image IDs and raw
+   process/device coordinates. Those physical facts are never duplicated in
+   the compact identity.
 
 A compatibility attestation links a producer implementation to a consumer
 implementation only after schema validation and numerical parity. A storage or
@@ -1235,7 +1246,8 @@ tokens and not the default broadly privileged Compute account.
 ### Identity and security
 
 - Exact source model revision, tensor inventory, tokenizer, MaxText commit,
-  image digest, and repository commit are present and self-consistent.
+  image-manifest digest, numeric GCE image identity, and repository commit are
+  present and self-consistent; no boot-disk content digest is fabricated.
 - No human credential exists on workers. Every service account has a reviewed
   minimal role set and can access only its stage's prefixes/actions.
 - Scientific, implementation, and deployment identities are distinct and
@@ -1268,11 +1280,21 @@ tokens and not the default broadly privileged Compute account.
   retries or halts; an outer heartbeat alone is never accepted as progress.
 - Peak per-chip HBM retains at least a measured safety margin (default 15%) and
   no host approaches tmpfs/DRAM exhaustion.
-- A roofline-derived useful-prefix MFU floor is frozen before production. A
-  provisional planning ambition is at least 30% on v6e and at least 80% of a
-  calibrated roofline, but neither number is current evidence or a valid gate
-  until real prefix measurements establish the attainable model. Any lower
-  launch is an explicit operational exception, never a silent gate change.
+- Useful-prefix MFU is at least 51% on real v6e-64 for three independent
+  synchronized real-data windows of at least 500 steps and 60 seconds each.
+  The numerator is frozen from the exact prefix tensor/execution inventory and
+  counts only scientific non-padding work; the denominator is the documented
+  BF16 peak of all 64 physical chips times device wall. There is no
+  performance-waiver path.
+- An actually executed dense-encoder/dense-decoder calibration on the R1
+  activation shape independently satisfies the same 51% floor under the
+  `12*N*d*M` Gemma Scope convention. Production F uses selected-column sparse
+  decoding, so it has a separate actual-work numerator: it passes 51% only if
+  that real program achieves it, otherwise it must reach at least 80% of a
+  pre-registered condition-specific roofline. A counterfactual dense decoder
+  or pruned encoder-input gradient is never called F MFU. A/B use the same
+  calibrated-roofline rule; their lower arithmetic intensity makes raw peak
+  MFU a misleading optimization gate, but raw MFU is still reported.
 - Real-data scientific tokens/s is at least 90% of the density-matched
   synthetic path; input wait is below 5%; durable output is at least 90% of
   device output; writer queues remain bounded.
