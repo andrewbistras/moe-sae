@@ -1,0 +1,103 @@
+schema = "moe-sae.r1.runtime-bundle.v1"
+qualification_state = "UNBUILT"
+production_admission_enabled = false
+python_version = "3.12.11"
+uv_version = "0.11.14"
+uv_artifact_url = "https://github.com/astral-sh/uv/releases/download/0.11.14/uv-x86_64-unknown-linux-gnu.tar.gz"
+uv_artifact_sha256 = "f3b623eb0e6141a7053d571d59a0bdc341e0f238ea8f5f0b4815ddbec9a2a296"
+uv_binary_sha256 = "b5cbc3a3f35debad0b4770811efd190bcf460b654114d6a3f71e0ce298468e5d"
+uv_artifact_member = "uv-x86_64-unknown-linux-gnu/uv"
+packer_version = "1.15.4"
+googlecompute_plugin_version = "1.2.7"
+maxtext_commit = "c03f8bd307d18049fa814fc8c104bd9ec8c292aa"
+jax_version = "0.10.2"
+jaxlib_version = "0.10.2"
+libtpu_version = "0.0.43"
+target_os_release_id = "ubuntu"
+target_os_release_version_id = "22.04"
+target_architecture = "x86_64"
+base_image_source_family = "projects/ubuntu-os-accelerator-images/global/images/family/ubuntu-accel-2204-amd64-tpu-v5e-v5p-v6e"
+runtime_user = "moe_sae"
+runtime_uid = 20001
+runtime_gid = 20001
+service_unit = "moe-sae-r1.service"
+entrypoint_module = "moe_sae.r1.runtime_entrypoint"
+entrypoint_metadata_key = "moe-sae-r1-launch-ref"
+unmet_gates = [
+    "controller-base-image-family-resolution-receipt",
+    "v6e-base-image-prerequisite-service-attestation",
+    "published-numeric-gce-image-identity",
+    "observed-image-manifest-and-sbom",
+    "controller-compute-placement-receipt",
+    "atomic-16-host-jax-vfio-admission",
+    "exact-jax-libtpu-xla-loader-proxy-environment",
+    "ssh-disconnect-liveness",
+    "checkpoint-restore-and-parity",
+    "v6e-kernel-and-mfu-qualification",
+]
+
+[[files]]
+name = "python-version"
+path = "deploy/r1/runtime/.python-version"
+mode = "0644"
+sha256 = "43fd694bd564dd2215f51a6b23f6a3712834850225e629d7781c81c71076092d"
+
+[[files]]
+name = "runtime-pyproject"
+path = "deploy/r1/runtime/pyproject.toml"
+mode = "0644"
+sha256 = "5594d63cd479dab2102149158df3c35a1357c5f2a28085b1e42777ffe3f8aeb4"
+
+[[files]]
+name = "runtime-lock"
+path = "deploy/r1/runtime/uv.lock"
+mode = "0644"
+sha256 = "da612aa55b1022baf6d971f1018bf53ff3e5f15ec0546f7d485904850fce5e64"
+
+[[files]]
+name = "context-spec"
+path = "deploy/r1/context-files.json"
+mode = "0644"
+sha256 = "8f9605ba385941dbc9514f2ec8a93575f7797089f21a557dfa2f17c0a23719cb"
+
+[[files]]
+name = "packer-template"
+path = "deploy/r1/image/r1-v6e.pkr.hcl"
+mode = "0644"
+sha256 = "ea1c51e84ecdd7c281e58119134f5bc20197587b41bb475b8528c6393151c6a9"
+
+[[files]]
+name = "provisioner"
+path = "deploy/r1/image/provision.sh"
+mode = "0755"
+sha256 = "0b54d4e55a9bffadb4edf71187ed20f0542022016c4be5344c3b93585a373a26"
+
+[[files]]
+name = "image-measurer"
+path = "deploy/r1/image/measure_image.py"
+mode = "0755"
+sha256 = "6972a305b53bce036a6db00e6de76687175a15c64ea30f5989bfb02f99fe5329"
+
+[[files]]
+name = "service-unit"
+path = "deploy/r1/systemd/moe-sae-r1.service"
+mode = "0644"
+sha256 = "d468b96db51fdae6ca483f8927e12bab2c56d014a3fdc15b2339ec3f588dd688"
+
+[[files]]
+name = "entrypoint"
+path = "src/moe_sae/r1/runtime_entrypoint.py"
+mode = "0644"
+sha256 = "0ca75e5799839371718c394ace0189614a4485997bcf9a3bebdd0fc05bdb54f7"
+
+[[files]]
+name = "context-builder"
+path = "deploy/r1/build_context.py"
+mode = "0755"
+sha256 = "ac41942f43bd1a8a32ac107b7cf6189722f737ca3da3a3c8330024f1c030814a"
+
+[[files]]
+name = "bundle-validator"
+path = "src/moe_sae/r1/runtime_bundle.py"
+mode = "0644"
+sha256 = "788e1adb58b9a12589009b3c3c70a355a28ae9186653d6bf55d62fd776acafc5"

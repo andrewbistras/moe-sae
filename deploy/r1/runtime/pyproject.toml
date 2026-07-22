@@ -1,0 +1,34 @@
+[project]
+name = "moe-sae-r1-worker"
+version = "0.1.0"
+description = "Sealed DeepSeek-R1 v6e worker runtime"
+requires-python = "==3.12.11"
+dependencies = [
+    "array-record==0.8.3",
+    "google-cloud-storage==3.13.0",
+    "google-crc32c==1.8.0",
+    "grain==0.2.18",
+    "jax==0.10.2",
+    "jaxlib==0.10.2",
+    "libtpu==0.0.43 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "maxtext[tpu]==0.2.3",
+    "ml-dtypes==0.5.4",
+    "numpy==2.5.1",
+    "orbax-checkpoint==0.12.1",
+    "safetensors==0.8.0",
+    "tensorstore==0.1.84",
+]
+
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/moe_sae"]
+
+[tool.uv]
+package = true
+default-groups = []
+
+[tool.uv.sources]
+maxtext = { git = "https://github.com/AI-Hypercomputer/maxtext.git", rev = "c03f8bd307d18049fa814fc8c104bd9ec8c292aa" }

@@ -28,8 +28,8 @@ SERVICE_ACCOUNT = "r1-worker@neural-dragnet.iam.gserviceaccount.com"
 BASE_IMAGE_ID = 1_012_345_678_901_234_567
 IMAGE_ID = 2_012_345_678_901_234_567
 BASE_IMAGE_LINK = (
-    "https://www.googleapis.com/compute/v1/projects/ubuntu-os-cloud/"
-    "global/images/ubuntu-2404-noble-amd64-v20260701"
+    "https://www.googleapis.com/compute/v1/projects/ubuntu-os-accelerator-images/"
+    "global/images/ubuntu-accel-2204-amd64-tpu-v5e-v5p-v6e-v20260719"
 )
 IMAGE_NAME = "r1-v6e-20260722"
 IMAGE_LINK = (
@@ -66,7 +66,7 @@ def _manifest(recipe: ImageRecipeV1 | None = None) -> ImageManifestV1:
     return ImageManifestV1(
         recipe_sha256=recipe.digest,
         os_release_id="ubuntu",
-        os_release_version_id="24.04",
+        os_release_version_id="22.04",
         kernel_release="6.8.0-1030-gcp",
         architecture="x86_64",
         repository_commit=recipe.repository_commit,

@@ -1,0 +1,49 @@
+[Unit]
+Description=Immutable DeepSeek-R1 v6e worker
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=moe_sae
+Group=moe_sae
+WorkingDirectory=/var/lib/moe-sae-r1
+RuntimeDirectory=moe-sae-r1
+RuntimeDirectoryMode=0700
+ExecStart=/opt/moe-sae-r1/runtime/bin/python -I -m moe_sae.r1.runtime_entrypoint --metadata-key=moe-sae-r1-launch-ref
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=110
+KillMode=mixed
+UMask=0077
+StandardInput=null
+StandardOutput=journal
+StandardError=journal
+Environment=HOME=/var/lib/moe-sae-r1
+Environment=PYTHONNOUSERSITE=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+Environment=TMPDIR=/var/tmp/moe-sae-r1
+Environment=XDG_CACHE_HOME=/var/cache/moe-sae-r1
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/moe-sae-r1 /var/cache/moe-sae-r1 /var/tmp/moe-sae-r1 /run/moe-sae-r1 /dev/shm
+CapabilityBoundingSet=
+AmbientCapabilities=
+LockPersonality=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

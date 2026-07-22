@@ -40,10 +40,12 @@ working set under synchronous source/sink contracts. The one-validated-shard
 local-scratch limit and sink staging limit remain adapter obligations and have
 not been measured because those adapters do not exist. The shared project
 environment also still resolves MaxText to the Gemma commit; it must not be
-used for R1. A separate R1 runtime/lock pinned to the MaxText revision below is
-required before a real source, Orbax sink, restore, or parity run. The pinned
-plan constructor measures both `pyproject.toml` and `uv.lock` and explicitly
-rejects this current shared lock rather than accepting the prose revision.
+used for R1. The isolated project at `deploy/r1/runtime/` now pins the MaxText
+revision below plus exact Python/JAX/JAXLIB/libtpu versions. The pinned plan
+constructor measures both of its files and accepts that lock while continuing
+to reject the shared root lock. This closes the static lock-identity gap only:
+the image is unbuilt, the worker admission path is deliberately fail-closed,
+and a real source, Orbax sink, restore, or parity run still cannot seal.
 
 ## Immutable source identity
 

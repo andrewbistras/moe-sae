@@ -1,0 +1,25 @@
+{
+  "schema": "moe-sae.r1.runtime-context.v1",
+  "files": [
+    {"source": "deploy/r1/runtime/.python-version", "archive": ".python-version", "mode": "0644"},
+    {"source": "deploy/r1/runtime/pyproject.toml", "archive": "pyproject.toml", "mode": "0644"},
+    {"source": "deploy/r1/runtime/uv.lock", "archive": "uv.lock", "mode": "0644"},
+    {"source": "deploy/r1/image/r1-v6e.pkr.hcl", "archive": "image/r1-v6e.pkr.hcl", "mode": "0644"},
+    {"source": "deploy/r1/image/provision.sh", "archive": "image/provision.sh", "mode": "0755"},
+    {"source": "deploy/r1/image/measure_image.py", "archive": "image/measure_image.py", "mode": "0755"},
+    {"source": "deploy/r1/systemd/moe-sae-r1.service", "archive": "systemd/moe-sae-r1.service", "mode": "0644"},
+    {"source": "src/moe_sae/__init__.py", "archive": "src/moe_sae/__init__.py", "mode": "0644"},
+    {"source": "src/moe_sae/r1/__init__.py", "archive": "src/moe_sae/r1/__init__.py", "mode": "0644"},
+    {"source": "src/moe_sae/r1/protocol.py", "archive": "src/moe_sae/r1/protocol.py", "mode": "0644"},
+    {"source": "src/moe_sae/r1/control_store.py", "archive": "src/moe_sae/r1/control_store.py", "mode": "0644"},
+    {"source": "src/moe_sae/r1/gcs_control_store.py", "archive": "src/moe_sae/r1/gcs_control_store.py", "mode": "0644"},
+    {"source": "src/moe_sae/r1/controller.py", "archive": "src/moe_sae/r1/controller.py", "mode": "0644"},
+    {"source": "src/moe_sae/r1/image_protocol.py", "archive": "src/moe_sae/r1/image_protocol.py", "mode": "0644"},
+    {"source": "src/moe_sae/r1/preemption.py", "archive": "src/moe_sae/r1/preemption.py", "mode": "0644"},
+    {"source": "src/moe_sae/r1/flops.py", "archive": "src/moe_sae/r1/flops.py", "mode": "0644"},
+    {"source": "src/moe_sae/r1/mfu.py", "archive": "src/moe_sae/r1/mfu.py", "mode": "0644"},
+    {"source": "src/moe_sae/r1/mfu_v2.py", "archive": "src/moe_sae/r1/mfu_v2.py", "mode": "0644"},
+    {"source": "src/moe_sae/r1/mfu_authority.py", "archive": "src/moe_sae/r1/mfu_authority.py", "mode": "0644"},
+    {"source": "src/moe_sae/r1/runtime_entrypoint.py", "archive": "src/moe_sae/r1/runtime_entrypoint.py", "mode": "0644"}
+  ]
+}

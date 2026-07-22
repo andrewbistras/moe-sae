@@ -557,17 +557,21 @@ reboot, human credentials, or SSH-owned lifetime.
 
 ### Phase 2: checkpoint and model oracle
 
-**Implementation status, 2026-07-23:** the exact inventory/mapping authority
-and a bounded reference conversion planner/executor exist. The executor uses
+**Implementation status, 2026-07-23:** the exact inventory/mapping authority,
+an isolated R1 runtime lock, a deterministic allowlisted image context, and a
+bounded reference conversion planner/executor exist. The executor uses
 deterministic immutable chunk IDs, authenticating-source and create-only-sink
 interfaces, FP32 blockwise FP8 multiplication followed by one BF16 cast,
 statically checked transform-array limits, a one-shard source/sink protocol,
 and exact crash/resume receipts. Its evidence is synthetic only. The shared
-project lock still points MaxText at the Gemma commit and is not an R1 runtime.
-Production sealing remains disabled: no isolated R1 lock/image, downloaded
-pinned payload, real safetensor adapter, TensorStore/Orbax sink and restore,
-independent R1 conversion oracle, full-model logit parity, or prefix/full parity
-has passed.
+project lock still points MaxText at the Gemma commit and remains intentionally
+separate; `deploy/r1/runtime/` is the only accepted static R1 lock. Its Packer
+context and systemd entrypoint validate offline but are explicitly `UNBUILT`
+and `production_qualified=false`. Production sealing remains disabled: no
+published/qualified R1 image, trusted Compute placement receipt, atomic 16-host
+runtime admission, downloaded pinned payload, real safetensor adapter,
+TensorStore/Orbax sink and restore, independent R1 conversion oracle,
+full-model logit parity, or prefix/full parity has passed.
 
 1. Use the exact Hugging Face and MaxText source identities and file hashes in
    the checkpoint conversion contract; neither repository's moving `main` is
