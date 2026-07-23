@@ -374,6 +374,43 @@ split/ring-of-experts schedule is therefore the leading starting point:
 double-buffer token chunks and prove attention/dispatch/expert/combine overlap
 in Xprof instead of assuming raw expert GEMMs dominate.
 
+The pinned MaxText audit found that its batch-split implementation is a useful
+kernel source, not an executable harvesting path. The checked-in YAML inherits
+`batch_split_factor=1`, while the scan indexes a second microbatch and leaves
+microbatches beyond the second unfinished; the current schedule is coherent
+only at exactly two. It also omits packed-sequence segment IDs from attention,
+casts the FP32 router parameters to the global BF16 dtype, remaps global expert
+IDs to shard-local IDs, computes the shared expert at the target, and carries
+custom-VJP, backward-residual, and host-offload machinery. Upstream tests only
+parse the configuration; they do not execute this path. None of these facts is
+accepted implicitly because the model is listed as supported.
+
+The ordinary MoE path is the independent performance candidate, but it has two
+separate drop controls. Positive `capacity_factor` masks assignments, and
+positive `ragged_buffer_factor` truncates the sparse routing buffer. Setting
+only `capacity_factor=-1` is therefore not a dropless proof. A practical
+positive ragged bound needs an explicit required-row counter and a compiled
+hard failure; a nonpositive bound allocates the mathematical worst case, which
+can reach 32 times balanced occupancy for top-8 over 256 experts.
+
+Two model trees keep correctness and speed separable. The oracle is an
+ordinary unscanned prefix through 30 complete blocks plus target attention and
+the target routed-only MoE. The performance tree scans the three dense blocks,
+scans the 27 completed MoE blocks, then executes one separate routed-only
+target; it removes custom VJP/backward state, preserves FP32 routing and global
+IDs, and adds exact packed-segment masking. HLO and restored-parameter
+inventories must prove that target shared weights, suffix layers, final norm,
+logits, backward computation, and host residual transfers are absent.
+
+Static BF16 prefix state alone is approximately 26.24, 17.72, 13.45, and
+11.32 GiB per chip for EP64/FSDP1, EP32/FSDP2, EP16/FSDP4, and EP8/FSDP8,
+respectively. These numbers exclude gathered layer weights, executables,
+attention, routing expansion, and capture buffers. Qualification therefore
+starts with EP16/FSDP4, then EP32/FSDP2 and EP8/FSDP8; EP64/FSDP1 is an HBM and
+communication boundary, not the presumed winner. Both the repaired
+forward-only batch split and the instrumented ordinary ring/ragged path must
+be benchmarked before one becomes production.
+
 At 65,536 valid tokens, one-copy BF16 dispatch plus combine across the 28
 routed invocations moves about 6.577 GB/chip. Even the optimistic 800 GB/s
 lower bound is 8.22 ms, roughly 10.05% of the entire 81.78 ms 51%-MFU step
@@ -548,6 +585,14 @@ campaign from its accepted event head.
 
 ### Phase 1: immutable image and data identities
 
+**Implementation status, 2026-07-23:** additive placement V2 records now
+require a certified dated Ubuntu 22.04 base-image resolution, Spot `DELETE`, a
+full 16-VM v6e-64 MIG, a fresh generation-pinned launch reference/template/MIG
+per attempt, and controller-side API evidence. They permit cross-region
+successors while holding image/runtime/shape policy fixed. The cloud response
+adapter and a live create/preempt/recreate qualification have not run; V1 is
+preserved unchanged and is not production authority.
+
 1. Bake and qualify the v6e image.
 2. Restage the same bounded C4 source sample with the pinned R1 tokenizer.
 3. Make sequence/range IDs topology-neutral and produce regional replicas.
@@ -568,10 +613,13 @@ project lock still points MaxText at the Gemma commit and remains intentionally
 separate; `deploy/r1/runtime/` is the only accepted static R1 lock. Its Packer
 context and systemd entrypoint validate offline but are explicitly `UNBUILT`
 and `production_qualified=false`. Production sealing remains disabled: no
-published/qualified R1 image, trusted Compute placement receipt, atomic 16-host
-runtime admission, downloaded pinned payload, real safetensor adapter,
-TensorStore/Orbax sink and restore, independent R1 conversion oracle,
-full-model logit parity, or prefix/full parity has passed.
+published/qualified R1 image, live Compute placement receipt, atomic 16-VM
+runtime admission, controller-authenticated weight prestaging,
+TensorStore/Orbax sink and restore, independent real-payload R1 conversion
+oracle, full-model logit parity, or prefix/full parity has passed. A bounded
+local safetensor adapter now verifies already-prestaged blobs and executes the
+conversion core end to end, but deliberately cannot attest how those blobs
+arrived or seal a checkpoint.
 
 1. Use the exact Hugging Face and MaxText source identities and file hashes in
    the checkpoint conversion contract; neither repository's moving `main` is
