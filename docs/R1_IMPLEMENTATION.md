@@ -471,6 +471,30 @@ Required kernel properties:
 - bounded asynchronous device-to-host buffers and direct regional GCS upload;
 - prefix-only weights so post-target layers do not consume HBM or load time.
 
+The first data-plane contract is now frozen, but no live writer is claimed.
+Each addressable two-sequence shard is one topology-neutral logical fragment:
+2,048 valid-token positions at full size and 29,446,144 durable bytes. A full
+B128 step therefore emits 64 objects, four per TPU VM, totaling
+1,884,553,216 bytes. Fragment identity uses the immutable input range, step,
+and global batch slice returned by the array sharding; host suffix, process
+index, local device order, zone, and upload stream are excluded. Partial final
+fragments compact only their contiguous valid-token prefix, while padding-only
+shards publish nothing. This gives 24,415 objects and 718.900 GB for an exact
+50M-token range, or 977 objects and 28.756 GB for 2M tokens.
+
+The first writer candidate has two host slots, permits at most one complete
+step of queue depth, and uses four independent upload streams per VM. At the
+planning 801,000 tokens/s it must move 11,516,778,000 bytes/s aggregate and
+719,798,625 bytes/s per VM. The synchronized path may never wait for a writer
+slot: exhaustion is a qualification failure, not permission to block, drop a
+fragment, or dilute the MFU clock. One successful create acknowledgement is
+only provisional. Generation-pinned full-payload readback and manifest
+publication occur outside the numerical window, so the checkpoint-oriented
+GCS primitive's immediate full readback is deliberately not inserted into
+this path. The contract remains `production_sealable=false` and
+`production_admission_enabled=false` until an executable asynchronous writer,
+validator, chaos tests, and real throughput measurements exist.
+
 Qualification proceeds from an uninstrumented synthetic kernel microbenchmark
 to full synthetic prefix, instrumented synthetic prefix, real in-memory input,
 and finally real persisted capture. A stage that misses its threshold is
