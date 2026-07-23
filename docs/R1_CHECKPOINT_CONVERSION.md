@@ -1,16 +1,17 @@
 # DeepSeek-R1-0528 checkpoint conversion contract
 
-**Status:** source-backed design audit, bounded reference execution core, and
-verified local safetensor reader, 2026-07-23. No weight payload was downloaded
-during this work. Safetensor headers, the Hugging Face index and configuration,
-and the pinned MaxText source were inspected.
+**Status:** source-backed design audit, bounded reference execution core,
+verified local safetensor reader, and diagnostic local immutable output store,
+2026-07-23. No weight payload was downloaded during this work. Safetensor
+headers, the Hugging Face index and configuration, and the pinned MaxText
+source were inspected.
 
 This document defines the only checkpoint conversion that may authorize the
 one-indexed block-31 activation prefix. It is intentionally fail closed. A
 converter completing without an exception is not evidence that the resulting
 checkpoint is scientifically equivalent to the released model.
 
-The active implementation now has two deliberately separate layers:
+The active implementation now has three deliberately separate layers:
 
 - [`checkpoint_inventory.py`](../src/moe_sae/r1/checkpoint_inventory.py) is the
   sole authority for the exact source inventory, routed-prefix selection,
@@ -29,6 +30,15 @@ The active implementation now has two deliberately separate layers:
   bounded FP8/BF16/FP32 region reads, and fails on observed mutation. Its
   end-to-end test executes the real conversion core and verifies resume plus
   independent BF16 and FP8 numerical oracles.
+- [`prefix_checkpoint.py`](../src/moe_sae/r1/prefix_checkpoint.py) is a
+  diagnostic local implementation of the output protocol. It publishes
+  content-derived chunk files and exact bindings without replacement, recovers
+  every tested instruction-boundary publication state, and seals one stable
+  plan-bound storage manifest only after every exact object validates. Source
+  observations accumulate under plan-derived paths and seal separately, so a
+  reused-first retry cannot make the storage manifest order-dependent. Its
+  bounded reader reconstructs exact flat tensor regions and exposes complete
+  source-observation evidence as an explicit stronger gate.
 
 The chunk identity binds the exact conversion-module hash, the measured NumPy
 and `ml_dtypes` native-extension and distribution-record hashes, and an
@@ -38,25 +48,29 @@ JAX dependency.
 
 This is not an Orbax converter and produces no production seal. The local
 source adapter proves bytes only after a trusted controller has prestaged
-them; it does not authenticate the download or object-store generation. There
-is no controller/GCS prestager, TensorStore/Orbax sink, fresh-process restore,
-independent real-R1 FP8 hash oracle, full-model logit oracle, or prefix/full
-parity result yet. The only public sealing function fails unconditionally
-until those gates exist.
+them; it does not authenticate the download or object-store generation. The
+local output store uses POSIX inode and fsync semantics and explicitly marks
+its path-derived identity as local-only. It is a diagnostic proof of the sink
+contract, not a GCS, TensorStore, Orbax, or multi-host implementation. There is
+no controller/GCS prestager, production checkpoint sink, fresh-process MaxText
+restore, independent real-R1 FP8 hash oracle, full-model logit oracle, or
+prefix/full parity result yet. The only production sealing function fails
+unconditionally until those gates exist.
 
 The memory limits are statically checked bounds on the core's numerical array
-working set under synchronous source/sink contracts. The local reader enforces
-one verified shard and bounded hash/read buffers, but its full-scale throughput
-and scratch behavior have not been measured. The durable sink staging limit
-remains an unimplemented adapter obligation. The shared project
-environment also still resolves MaxText to the Gemma commit; it must not be
-used for R1. The isolated project at `deploy/r1/runtime/` now pins the MaxText
-revision below plus exact Python/JAX/JAXLIB/libtpu versions. The pinned plan
-constructor measures both of its files and accepts that lock while continuing
-to reject the shared root lock. This closes the static lock-identity gap only:
-the image is unbuilt, the worker admission path is deliberately fail-closed,
-and authenticated prestaging, an Orbax sink, restore, or parity run still
-cannot seal.
+working set under synchronous source/sink contracts. The local source and
+output adapters additionally enforce their declared stream-buffer limits;
+those limits do not purport to bound total Python RSS. Full-scale throughput
+and scratch behavior have not been measured. A bounded production GCS/Orbax
+adapter remains an unimplemented obligation. The shared project environment
+also still resolves MaxText to the Gemma commit; it must not be used for R1.
+The isolated project at `deploy/r1/runtime/` now pins the MaxText revision below
+plus exact Python/JAX/JAXLIB/libtpu versions. The pinned plan constructor
+measures both of its files and accepts that lock while continuing to reject the
+shared root lock. This closes the static lock-identity gap only: the image is
+unbuilt, the worker admission path is deliberately fail-closed, and
+authenticated prestaging, a production checkpoint sink, restore, or parity run
+still cannot seal.
 
 ## Immutable source identity
 

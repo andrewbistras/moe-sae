@@ -639,7 +639,12 @@ TensorStore/Orbax sink and restore, independent real-payload R1 conversion
 oracle, full-model logit parity, or prefix/full parity has passed. A bounded
 local safetensor adapter now verifies already-prestaged blobs and executes the
 conversion core end to end, but deliberately cannot attest how those blobs
-arrived or seal a checkpoint.
+arrived or seal a checkpoint. A diagnostic local immutable output adapter now
+also proves exact chunk publication/recovery, plan-bound storage finalization,
+retry-order-independent source-observation evidence, and bounded flat-region
+reconstruction. Its path-derived store identity and POSIX durability model are
+explicitly local-only; it is not the production GCS/TensorStore/Orbax sink and
+cannot make the production seal eligible.
 
 1. Use the exact Hugging Face and MaxText source identities and file hashes in
    the checkpoint conversion contract; neither repository's moving `main` is
