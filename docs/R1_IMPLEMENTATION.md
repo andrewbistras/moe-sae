@@ -545,9 +545,13 @@ It rejects gaps, duplicates, crossed receipts, mixed stores, mixed regions,
 mixed validators, repeated physical identities, and any byte total other than
 the exact work range. Its deterministic manifest candidate records complete
 coverage and full readback as true, while manifest publication and production
-sealing remain false. Publication of that manifest candidate, live JAX buffer
-integration, real GCS chaos testing, and v6e throughput qualification are not
-yet implemented or satisfied.
+sealing remain false. The manifest-last publisher now writes those canonical
+bytes to a separate unique attempt-scoped GCS prefix through the ordinary
+create-or-verify path, including generation-pinned full readback of the
+manifest itself. Its receipt can truthfully make the fragment entries visible,
+but still records production sealing as false. Live JAX buffer integration,
+real GCS chaos testing, and v6e throughput qualification are not yet
+implemented or satisfied.
 
 Qualification proceeds from an uninstrumented synthetic kernel microbenchmark
 to full synthetic prefix, instrumented synthetic prefix, real in-memory input,

@@ -15,8 +15,13 @@ from moe_sae.r1.capture_manifest import (
     SealedCaptureManifestV1,
     seal_capture_manifest,
 )
+from moe_sae.r1.gcs_capture_manifest_publisher import (
+    GCSCaptureManifestPublicationError,
+    GCSCaptureManifestPublisherV1,
+    PublishedCaptureManifestReceiptV1,
+)
 from moe_sae.r1.gcs_provisional_capture_sink import GCSProvisionalCaptureSinkV1
-from tests.r1.test_gcs_immutable_byte_store import _store
+from tests.r1.test_gcs_immutable_byte_store import _FakeClient, _store
 
 
 @pytest.fixture(scope="module")
@@ -130,4 +135,75 @@ def test_sealed_manifest_cannot_be_constructed_directly(
         SealedCaptureManifestV1(
             work_plan=work,
             entries=manifest.entries,
+        )
+
+
+def test_manifest_publisher_is_last_and_performs_full_manifest_readback(
+    two_fragment_cohort,
+) -> None:
+    work, planned, _data_store, _client = two_fragment_cohort
+    manifest = seal_capture_manifest(work, planned)
+    attempt_id = "manifest-publication-attempt-0001"
+    store, client = _store(
+        prefix=f"capture-manifests/attempts/{attempt_id}",
+    )
+    publisher = GCSCaptureManifestPublisherV1(
+        store,
+        attempt_id=attempt_id,
+    )
+    client.calls.clear()
+
+    receipt = publisher.publish(manifest)
+
+    receipt.require_matches(manifest)
+    assert receipt.manifest_sha256 == manifest.digest
+    assert receipt.exact_range_verified is True
+    assert receipt.fragment_full_payload_readback_verified is True
+    assert receipt.manifest_full_payload_readback_verified is True
+    assert receipt.fragments_manifest_visible is True
+    assert receipt.production_sealable is False
+    assert publisher.production_identity_qualified is False
+    assert client.downloaded_bytes == len(manifest.canonical_bytes())
+    assert [item[0] for item in client.calls].count("upload") == 1
+    assert [item[0] for item in client.calls].count("download") == 1
+
+
+def test_manifest_publisher_rejects_wrong_prefix_region_and_direct_receipt(
+    two_fragment_cohort,
+) -> None:
+    work, planned, _data_store, _client = two_fragment_cohort
+    manifest = seal_capture_manifest(work, planned)
+    with pytest.raises(
+        GCSCaptureManifestPublicationError,
+        match="unique attempt",
+    ):
+        store, _client = _store(prefix="capture-manifests/not-an-attempt")
+        GCSCaptureManifestPublisherV1(store, attempt_id="attempt-0002")
+
+    store, client = _store(
+        _FakeClient(location="US-EAST1"),
+        prefix="capture-manifests/attempts/attempt-0003",
+        region="us-east1",
+    )
+    publisher = GCSCaptureManifestPublisherV1(
+        store,
+        attempt_id="attempt-0003",
+    )
+    with pytest.raises(
+        GCSCaptureManifestPublicationError,
+        match="another region",
+    ):
+        publisher.publish(manifest)
+    assert client.objects == {}
+
+    with pytest.raises(
+        GCSCaptureManifestPublicationError,
+        match="only through",
+    ):
+        PublishedCaptureManifestReceiptV1(
+            manifest=manifest,
+            manifest_sha256=manifest.digest,
+            manifest_size_bytes=len(manifest.canonical_bytes()),
+            physical_receipt=planned[0][1].physical_receipt,
+            publisher_id=publisher.publisher_id,
         )
