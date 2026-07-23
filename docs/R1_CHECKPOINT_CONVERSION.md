@@ -230,6 +230,13 @@ leaves. The distinction is part of the V2 manifest contract: it records
 43,679 source entries, 21,930 source logical tensors, 510 destination tensors,
 and 22,108 chunks separately.
 
+The forward-only performance-tree contract consumes those same 510 canonical
+destinations without restating the HF-to-MaxText suffix map. It proposes 44
+restore leaves: one embedding, 12 scanned-dense, 17 scanned-completed-MoE, and
+14 unscanned target-routed-only leaves. This is a checked geometry contract,
+not a restore implementation or evidence that any released checkpoint was
+observed; its production admission and sealing flags remain false.
+
 The final object-store footprint will be slightly larger because of Orbax or
 TensorStore metadata and chunking. On a 64-chip slice the mixed tensor payload
 averages 10.151 GB per chip under perfect partitioning. That arithmetic is not

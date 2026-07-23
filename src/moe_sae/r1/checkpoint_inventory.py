@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from functools import lru_cache
 import hashlib
 import json
 import math
@@ -1516,15 +1517,7 @@ class CheckpointInventorySelectionV1:
         )
         if len(destinations) != len(set(destinations)):
             raise CheckpointInventoryError("mapping descriptors collide at destination")
-        canonical_mappings = tuple(
-            sorted(
-                (
-                    _mapping_descriptor(spec, self.full.geometry)
-                    for spec in expected_prefix_logical_specs(self.full.geometry)
-                ),
-                key=lambda item: item.source_key,
-            )
-        )
+        canonical_mappings = expected_prefix_mapping_descriptors(self.full.geometry)
         if self.mappings != canonical_mappings:
             raise CheckpointInventoryError(
                 "mapping descriptors differ from the canonical HF-to-MaxText map"
@@ -2276,6 +2269,29 @@ def _mapping_descriptor(
     )
 
 
+@lru_cache(maxsize=8)
+def expected_prefix_mapping_descriptors(
+    geometry: DeepSeekR1CheckpointGeometryV1 = PINNED_GEOMETRY,
+) -> tuple[MaxTextMappingDescriptorV1, ...]:
+    """Return the canonical HF-to-MaxText mappings for one routed prefix.
+
+    The immutable descriptors are the public bridge from the source inventory
+    authority to consumers that need a different physical parameter tree.
+    Consumers must derive from these descriptors rather than restating the
+    DeepSeek family/suffix tables.
+    """
+
+    return tuple(
+        sorted(
+            (
+                _mapping_descriptor(spec, geometry)
+                for spec in expected_prefix_logical_specs(geometry)
+            ),
+            key=lambda item: item.source_key,
+        )
+    )
+
+
 def _select_routed_prefix(full: TensorInventoryV1) -> CheckpointInventorySelectionV1:
     if full.scope not in {"full-released-snapshot", "full-synthetic-snapshot"}:
         raise CheckpointInventoryError("prefix selection requires a full inventory")
@@ -2322,12 +2338,7 @@ def _select_routed_prefix(full: TensorInventoryV1) -> CheckpointInventorySelecti
             full.authenticated_full_lfs_manifest_sha256
         ),
     )
-    mappings = tuple(
-        sorted(
-            (_mapping_descriptor(spec, geometry) for spec in logical_specs),
-            key=lambda item: item.source_key,
-        )
-    )
+    mappings = expected_prefix_mapping_descriptors(geometry)
     return CheckpointInventorySelectionV1(full, selected, mappings)
 
 
@@ -2509,6 +2520,7 @@ __all__ = [
     "expected_full_logical_specs",
     "expected_full_source_specs",
     "expected_prefix_logical_specs",
+    "expected_prefix_mapping_descriptors",
     "parse_full_hf_inventory",
     "parse_synthetic_hf_inventory",
     "select_block31_prefix",

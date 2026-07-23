@@ -224,6 +224,12 @@ about 801,000 valid tokens/s, or roughly 82 ms for a
 65,536-token global batch. A 14,378-byte capture row at that rate is about 11.5
 GB/s of aggregate device output. The writer must be designed for that number;
 persisting directly in the synchronized prefix step would erase the MFU result.
+The ordinary path may benchmark that 64-sequence batch, but it is not a valid
+two-way batch-split input: data×FSDP×expert already shards the sequence batch
+over all 64 chips, leaving only one sequence per chip. The first executable
+batch-split candidate is therefore exactly 128 sequences (131,072 positions),
+two sequences per chip, and one sequence per split microbatch. At the same
+planning throughput its step budget is about 164 ms.
 
 ### SAE numerators: dense calibration and sparse F
 
@@ -384,6 +390,19 @@ IDs to shard-local IDs, computes the shared expert at the target, and carries
 custom-VJP, backward-residual, and host-offload machinery. Upstream tests only
 parse the configuration; they do not execute this path. None of these facts is
 accepted implicitly because the model is listed as supported.
+
+The repository now freezes the first repair boundary in a non-executable,
+non-sealable contract. It derives all 510 unscanned checkpoint destinations
+from the canonical inventory and groups them into 44 performance leaves: one
+embedding, 12 leaves across three scanned dense blocks, 17 leaves across 27
+scanned completed MoE blocks, and 14 unscanned target-routed-only leaves. The
+candidate order is EP16/FSDP4, EP32/FSDP2, then EP8/FSDP8. Its device ABI has
+exactly three outputs—BF16 routed activation, global int32 expert IDs, and FP32
+scaled router weights. Host-created int64 sequence IDs and uint16 positions are
+durable metadata, not model outputs. After durable casts the complete row is
+14,378 bytes: 1,884,553,216 bytes per B128 step, 117,784,576 bytes per host,
+and 29,446,144 bytes per chip. The plan remains inventory-unbound and cannot
+authorize restore, admission, or production.
 
 The ordinary MoE path is the independent performance candidate, but it has two
 separate drop controls. Positive `capacity_factor` masks assignments, and
