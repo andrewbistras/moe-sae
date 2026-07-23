@@ -131,29 +131,34 @@ def _validate_metadata(
     position_flat = position.reshape(-1)[:valid_tokens]
     if np.any(sequence_flat < 0):
         raise CaptureFragmentCodecError("retained sequence IDs must be nonnegative")
-    expected_positions = np.tile(
-        np.arange(PINNED_SEQUENCE_LENGTH, dtype=np.uint16),
-        2,
-    )[:valid_tokens]
-    if not np.array_equal(position_flat, expected_positions):
-        raise CaptureFragmentCodecError(
-            "retained positions are not the exact zero-based sequence positions"
+    for row_start in range(0, valid_tokens, PINNED_SEQUENCE_LENGTH):
+        row_stop = min(row_start + PINNED_SEQUENCE_LENGTH, valid_tokens)
+        row_sequence = sequence_flat[row_start:row_stop]
+        row_position = position_flat[row_start:row_stop].astype(
+            np.int64,
+            copy=False,
         )
-    if valid_tokens > PINNED_SEQUENCE_LENGTH:
-        first = sequence_flat[:PINNED_SEQUENCE_LENGTH]
-        second = sequence_flat[PINNED_SEQUENCE_LENGTH:]
-        if (
-            np.any(first != first[0])
-            or np.any(second != second[0])
-            or first[0] == second[0]
-        ):
+        if row_position[0] != 0:
             raise CaptureFragmentCodecError(
-                "sequence IDs must be constant and distinct across retained sequences"
+                "each retained packed row must begin at sequence position zero"
             )
-    elif np.any(sequence_flat != sequence_flat[0]):
-        raise CaptureFragmentCodecError(
-            "sequence ID must be constant within the retained sequence"
-        )
+        if len(row_sequence) > 1:
+            same_segment = row_sequence[1:] == row_sequence[:-1]
+            expected = np.where(same_segment, row_position[:-1] + 1, 0)
+            if not np.array_equal(row_position[1:], expected):
+                raise CaptureFragmentCodecError(
+                    "retained packed positions must increment within a segment "
+                    "and reset to zero at each sequence-ID transition"
+                )
+        seen = {int(row_sequence[0])}
+        transitions = np.flatnonzero(row_sequence[1:] != row_sequence[:-1]) + 1
+        for transition in transitions:
+            next_sequence = int(row_sequence[transition])
+            if next_sequence in seen:
+                raise CaptureFragmentCodecError(
+                    "a packed sequence ID cannot reappear discontinuously in one row"
+                )
+            seen.add(next_sequence)
     return (
         _little_endian_contiguous(sequence_flat, _I64),
         _little_endian_contiguous(position_flat, _U16),

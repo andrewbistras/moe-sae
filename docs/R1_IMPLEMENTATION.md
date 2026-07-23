@@ -496,7 +496,10 @@ that remains a device-side run invariant. The codec performs no cloud action
 and every packed result still records persistence, readback, and sealing as
 false. Constructing an addressable host shard transfers all five buffers into
 read-only writer ownership; they remain owned until the asynchronous ticket is
-terminal.
+terminal. Metadata validation follows the packed-input contract rather than
+assuming one document per 1,024-token row: positions start at zero, increment
+within a segment, reset at a sequence-ID transition, and a sequence ID cannot
+reappear discontinuously within one packed row.
 
 The first writer candidate has two host slots, permits at most one complete
 step of queue depth, and uses four independent upload streams per VM. At the

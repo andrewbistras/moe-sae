@@ -156,6 +156,96 @@ def test_partial_fragment_compacts_only_the_retained_prefix(
     )
 
 
+def test_codec_accepts_real_packed_segment_transitions(
+    addressable_shard: AddressableCaptureShardV1,
+) -> None:
+    sequence_id = addressable_shard.sequence_id.copy()
+    position = addressable_shard.position.copy()
+    sequence_id[0, :200] = 201
+    sequence_id[0, 200:405] = 202
+    position[0, :200] = np.arange(200, dtype=np.uint16)
+    position[0, 200:405] = np.arange(205, dtype=np.uint16)
+    packed_shard = replace(
+        addressable_shard,
+        sequence_id=sequence_id,
+        position=position,
+    )
+    work = build_capture_work_plan(
+        work_id="codec-packed-segments",
+        input_range_sha256="d" * 64,
+        start_token_ordinal=0,
+        token_count=405,
+    )
+    plan = next(work.iter_fragments())
+
+    packed = pack_capture_fragment(plan, packed_shard)
+    decoded = decode_capture_fragment(
+        plan,
+        packed.payload,
+        expected_sha256=packed.sha256,
+    )
+
+    np.testing.assert_array_equal(
+        decoded.fields["sequence_id"],
+        np.concatenate(
+            (
+                np.full(200, 201, dtype=np.int64),
+                np.full(205, 202, dtype=np.int64),
+            )
+        ),
+    )
+    np.testing.assert_array_equal(
+        decoded.fields["position"],
+        np.concatenate(
+            (
+                np.arange(200, dtype=np.uint16),
+                np.arange(205, dtype=np.uint16),
+            )
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("missing-reset", "same-id-reset", "discontinuous-id"),
+)
+def test_codec_rejects_malformed_packed_segment_metadata(
+    addressable_shard: AddressableCaptureShardV1,
+    mutation: str,
+) -> None:
+    sequence_id = addressable_shard.sequence_id.copy()
+    position = addressable_shard.position.copy()
+    sequence_id[0, :200] = 301
+    sequence_id[0, 200:300] = 302
+    sequence_id[0, 300:405] = 303
+    position[0, :200] = np.arange(200, dtype=np.uint16)
+    position[0, 200:300] = np.arange(100, dtype=np.uint16)
+    position[0, 300:405] = np.arange(105, dtype=np.uint16)
+    if mutation == "missing-reset":
+        position[0, 200] = 200
+    elif mutation == "same-id-reset":
+        sequence_id[0, 200:300] = 301
+    else:
+        sequence_id[0, 300:405] = 301
+    malformed = replace(
+        addressable_shard,
+        sequence_id=sequence_id,
+        position=position,
+    )
+    plan = next(
+        build_capture_work_plan(
+            work_id=f"codec-packed-invalid-{mutation}",
+            input_range_sha256="e" * 64,
+            start_token_ordinal=0,
+            token_count=405,
+        ).iter_fragments()
+    )
+
+    expected = "reappear" if mutation == "discontinuous-id" else "positions"
+    with pytest.raises(CaptureFragmentCodecError, match=expected):
+        pack_capture_fragment(plan, malformed)
+
+
 def test_invalid_router_or_metadata_never_produces_payload(
     addressable_shard: AddressableCaptureShardV1,
 ) -> None:
