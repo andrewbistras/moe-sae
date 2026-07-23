@@ -1972,6 +1972,7 @@ class LazyRegionalPrefixCheckpointReaderV1:
     envelope: RegionalPrefixCheckpointEnvelopeV1
     manifest: LogicalPrefixCheckpointManifestV2
     maximum_read_bytes: int
+    _opening_envelope_receipt: GCSPhysicalObjectReceiptV1
     _store_id_snapshot: str
     _region_snapshot: str
     _destinations: Mapping[str, LogicalStoredDestinationV2]
@@ -1983,6 +1984,7 @@ class LazyRegionalPrefixCheckpointReaderV1:
         envelope: RegionalPrefixCheckpointEnvelopeV1,
         manifest: LogicalPrefixCheckpointManifestV2,
         *,
+        envelope_receipt: GCSPhysicalObjectReceiptV1 | None = None,
         maximum_read_bytes: int,
         _capability: object | None = None,
     ) -> None:
@@ -1993,6 +1995,7 @@ class LazyRegionalPrefixCheckpointReaderV1:
         if (
             type(envelope) is not RegionalPrefixCheckpointEnvelopeV1
             or type(manifest) is not LogicalPrefixCheckpointManifestV2
+            or type(envelope_receipt) is not GCSPhysicalObjectReceiptV1
             or type(maximum_read_bytes) is not int
             or not 1 <= maximum_read_bytes <= MAX_PAYLOAD_READ_BYTES
         ):
@@ -2004,7 +2007,17 @@ class LazyRegionalPrefixCheckpointReaderV1:
         ):
             raise PrefixCheckpointV2Error("regional reader store identity is invalid")
         envelope.validate_for_manifest(manifest)
-        if manifest.digest != envelope.logical_manifest_sha256:
+        envelope_raw = envelope.canonical_bytes()
+        if (
+            manifest.digest != envelope.logical_manifest_sha256
+            or envelope_receipt.sha256 != envelope.digest
+            or envelope_receipt.size_bytes != len(envelope_raw)
+            or envelope_receipt.store_id != envelope.store_id
+            or envelope_receipt.region != envelope.region
+            or envelope_receipt.content_type != "application/json"
+            or envelope_receipt.object_id
+            != content_addressed_record_object_id(envelope_receipt.sha256)
+        ):
             raise PrefixCheckpointV2Error("regional reader logical identity changed")
         destinations = {item.destination_key: item for item in manifest.destinations}
         binding_receipts = {
@@ -2019,6 +2032,7 @@ class LazyRegionalPrefixCheckpointReaderV1:
         object.__setattr__(self, "envelope", envelope)
         object.__setattr__(self, "manifest", manifest)
         object.__setattr__(self, "maximum_read_bytes", maximum_read_bytes)
+        object.__setattr__(self, "_opening_envelope_receipt", envelope_receipt)
         object.__setattr__(self, "_store_id_snapshot", envelope.store_id)
         object.__setattr__(self, "_region_snapshot", envelope.region)
         object.__setattr__(self, "_destinations", MappingProxyType(destinations))
@@ -2134,6 +2148,7 @@ class LazyRegionalPrefixCheckpointReaderV1:
             store,
             envelope,
             manifest,
+            envelope_receipt=envelope_receipt,
             maximum_read_bytes=maximum_read_bytes,
             _capability=_READER_OPEN_CAPABILITY,
         )

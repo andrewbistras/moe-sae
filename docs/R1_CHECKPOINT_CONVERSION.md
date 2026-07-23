@@ -3,8 +3,9 @@
 **Status:** source-backed design audit, bounded reference execution core,
 verified local safetensor reader, diagnostic local immutable output store,
 generation-pinned GCS byte store and conversion publisher, and a
-topology-neutral logical/regional checkpoint protocol, 2026-07-23. No weight
-payload was downloaded during this work. Safetensor
+topology-neutral logical/regional checkpoint protocol with a bounded direct
+restore authority, 2026-07-23. No weight payload was downloaded during this
+work. Safetensor
 headers, the Hugging Face index and configuration, and the pinned MaxText
 source were inspected.
 
@@ -72,6 +73,18 @@ The active implementation has deliberately separate layers:
   envelope are each capped at 32 MiB and remain explicitly
   `production_sealable=false`. The bounded GCS sink/publisher is wired to this
   protocol; controller CAS and qualification are not.
+- [`prefix_restore_authority.py`](../src/moe_sae/r1/prefix_restore_authority.py)
+  joins an exact regional-envelope receipt, an independently expected logical
+  manifest and inventory identity, and the canonical 510-destination-to-44-leaf
+  performance-tree plan. Opening performs exactly two bounded control reads
+  and no payload reads. Each leaf exposes only its canonical destination
+  sources through generation-pinned flat-region reads, with an 8 MiB default
+  and 64 MiB hard request limit, and never assembles a whole destination.
+  The retained opening receipt, derived leaf specifications, source maps, read
+  bounds, and complete binding identity are cross-checked before the authority
+  is returned. This is a framework-neutral adapter seam, not a JAX/Orbax
+  restore: released-source observation, completed restore, qualification,
+  sealing, and production admission remain hard false.
 
 The production GCS writer role for this primitive must contain only bucket
 metadata read plus object create/get permissions. It must not include object
@@ -233,9 +246,12 @@ and 22,108 chunks separately.
 The forward-only performance-tree contract consumes those same 510 canonical
 destinations without restating the HF-to-MaxText suffix map. It proposes 44
 restore leaves: one embedding, 12 scanned-dense, 17 scanned-completed-MoE, and
-14 unscanned target-routed-only leaves. This is a checked geometry contract,
-not a restore implementation or evidence that any released checkpoint was
-observed; its production admission and sealing flags remain false.
+14 unscanned target-routed-only leaves. The direct restore authority now binds
+that geometry to one exact V2 control plane and exposes bounded lazy source
+regions for a future framework adapter. No framework array has been created
+and no complete payload has been read, so this is not evidence that any
+released checkpoint was observed or restored; its production admission and
+sealing flags remain false.
 
 The final object-store footprint will be slightly larger because of Orbax or
 TensorStore metadata and chunking. On a 64-chip slice the mixed tensor payload

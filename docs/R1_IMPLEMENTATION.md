@@ -414,6 +414,18 @@ backward/host-offload work. This is still a patch plan rather than a kernel:
 patch, packed-attention, restore, parity, v6e qualification, sealing, and
 production-admission claims are all hard false.
 
+The checkpoint side now has a matching framework-neutral restore authority.
+Given one exact generation-pinned V2 envelope receipt and an independently
+expected logical-manifest plus inventory identity, it opens exactly the
+envelope and manifest, rederives the canonical 510-to-44 plan, and returns
+leaf-scoped lazy views. Those views read only exact flat regions, default to an
+8 MiB bound, hard-cap requests at 64 MiB, and do not assemble whole
+destinations. The opening receipt, every binding field, every derived leaf
+specification, each source map, and all reader bounds are cross-checked. This
+closes the topology-neutral control-plane-to-adapter seam only: no released
+payload has been observed, no JAX/Orbax array has been restored, and
+qualification, sealing, and production admission remain hard false.
+
 The ordinary MoE path is the independent performance candidate, but it has two
 separate drop controls. Positive `capacity_factor` masks assignments, and
 positive `ragged_buffer_factor` truncates the sparse routing buffer. Setting
@@ -702,9 +714,14 @@ the logical manifest and regional envelope last. Its 72 MiB explicit staging
 budget covers the 64 MiB immutable snapshot plus one 8 MiB application stream
 slice; opaque client RSS is deliberately unclaimed and remains a live
 qualification measurement. It exposes no listing, latest-pointer, delete, or
-controller-CAS operation. There is still no controller CAS integration,
-JAX/Orbax restore path, real-bucket chaos evidence, full-scale throughput
-evidence, or measured Python RSS bound.
+controller-CAS operation. A framework-neutral direct restore authority now
+binds that exact two-read control plane and independently expected inventory
+identity to the canonical 510-to-44 performance tree. It exposes only
+generation-pinned, leaf-scoped, bounded flat reads to a future framework
+adapter; all source-observation, completed-restore, qualification, sealing, and
+admission claims remain false. There is still no controller CAS integration,
+JAX/Orbax array-construction path, real-bucket chaos evidence, full-scale
+throughput evidence, or measured Python RSS bound.
 
 1. Use the exact Hugging Face and MaxText source identities and file hashes in
    the checkpoint conversion contract; neither repository's moving `main` is

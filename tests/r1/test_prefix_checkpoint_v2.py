@@ -696,6 +696,7 @@ def test_lazy_open_is_exactly_two_control_reads_then_touched_bindings_and_payloa
         regional.envelope_receipt,
         expected_logical_manifest_sha256=artifacts.manifest.digest,
     )
+    assert reader._opening_envelope_receipt == regional.envelope_receipt
     assert len(store.calls) == 2
     assert [call[0] for call in store.calls] == [
         regional.envelope_receipt,
