@@ -1,0 +1,1174 @@
+# MaxText c03f8bd DeepSeek-R1 B128 routed-prefix adapter.
+diff --git a/src/maxtext/layers/nnx_decoders.py b/src/maxtext/layers/nnx_decoders.py
+index 0661bb8e76d6512903c88a837cbbc8e41bfe79af..42b8a4464d5682e21053f82329486f7a378ccb02 100644
+--- a/src/maxtext/layers/nnx_decoders.py
++++ b/src/maxtext/layers/nnx_decoders.py
+@@ -48,6 +48,7 @@ from maxtext.models import (
+     deepseek4,
+     deepseek_batchsplit,
+     deepseek_batchsplit_fp8,
++    deepseek_prefix,
+     gemma,
+     gemma2,
+     gemma3,
+@@ -1387,6 +1388,70 @@ class NNXDecoder(nnx.Module):
+         "DeepSeekMoeBlock_0": state_dict.get("moe_block", state_dict.get("DeepSeekMoeBlock_0")),
+     }
+-
++
++  def r1_forward_routed_prefix(
++      self,
++      shared_embedding: Any,
++      decoder_input_tokens,
++      decoder_positions,
++      decoder_segment_ids,
++      target_params,
++  ):
++    """Run the fixed R1 block-31 routed prefix and return its capture ABI."""
++
++    cfg = self.config
++    if not self.is_deepseek:
++      raise ValueError("R1 routed-prefix capture requires a DeepSeek decoder")
++    if not cfg.scan_layers or not cfg.use_batch_split_schedule:
++      raise ValueError("R1 routed-prefix capture requires scanned batch split")
++    if cfg.using_pipeline_parallelism:
++      raise ValueError("R1 routed-prefix capture does not use pipeline parallelism")
++    if cfg.num_decoder_layers != 30 or cfg.first_num_dense_layers != 3:
++      raise ValueError(
++          "R1 routed-prefix decoder must contain three dense and 27 complete "
++          "MoE layers; the target is supplied separately"
++      )
++    if cfg.use_qwix_quantization or cfg.quantization:
++      raise ValueError("the first R1 routed-prefix runtime is BF16-only")
++    if decoder_segment_ids is None:
++      raise ValueError("R1 routed-prefix capture requires packed segment IDs")
++    if cfg.dropout_rate != 0.0:
++      raise ValueError("R1 routed-prefix capture requires dropout_rate=0")
++    deepseek_prefix._validate_config(cfg, self.mesh)
++    deepseek_prefix.validate_entrypoint_inputs(
++        decoder_input_tokens,
++        decoder_positions,
++        decoder_segment_ids,
++    )
++
++    deterministic = True
++    model_mode = MODEL_MODE_TRAIN
++    hidden = self._apply_embedding(
++        shared_embedding,
++        decoder_input_tokens,
++        decoder_positions,
++        deterministic,
++        model_mode,
++    )
++    hidden, _, _ = self._apply_layers_sequentially(
++        self.dense_layers,
++        hidden,
++        decoder_segment_ids,
++        decoder_positions,
++        deterministic,
++        model_mode,
++        length=cfg.first_num_dense_layers,
++    )
++    completed_moe_params = self._build_linen_params(self.moe_layers)
++    return deepseek_prefix.forward_routed_prefix(
++        hidden,
++        completed_moe_params,
++        target_params,
++        decoder_positions,
++        decoder_segment_ids,
++        mesh=self.mesh,
++        cfg=cfg,
++    )
++
+   def _find_next_boundary(self, current_idx, end_idx, engram_indices):
+     """Finds the next index boundary, either the next Engram layer index or the overall end index."""
+     next_engrams = [l for l in engram_indices if l > current_idx]
+diff --git a/src/maxtext/models/deepseek_prefix.py b/src/maxtext/models/deepseek_prefix.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f6daa2b184721b55443e47eae82cb94909d4b460
+--- /dev/null
++++ b/src/maxtext/models/deepseek_prefix.py
+@@ -0,0 +1,1083 @@
++# Copyright 2026 Google LLC
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#    https://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Forward-only DeepSeek prefix used by routed-activation harvesting.
++
++This module deliberately does not reuse the training custom-VJP scan in
++``deepseek_batchsplit``.  It executes exactly the completed scanned MoE
++prefix, then one routed-only target layer, while retaining MaxText's explicit
++batch/FSDP/expert sharding and batch-split grouped-MoE machinery.
++
++The caller executes token embedding and the three dense layers before entering
++``forward_routed_prefix``.  Completed MoE parameters have scan length 27.  The
++target parameters are unscanned and omit the shared expert by construction.
++"""
++
++from __future__ import annotations
++
++import functools
++
++import jax
++import jax.numpy as jnp
++
++from maxtext.kernels import attention
++from maxtext.models import deepseek_batchsplit as batchsplit
++
++
++_COMPLETED_MOE_LAYERS = 27
++_BATCH_SPLIT_FACTOR = 2
++_GLOBAL_BATCH_SIZE = 128
++_SEQUENCE_LENGTH = 1024
++_HIDDEN_DIM = 7168
++_TARGET_LAYER_ZERO_INDEXED = 30
++_ALLOWED_LAYOUTS = frozenset(((1, 4, 16), (1, 2, 32), (1, 8, 8)))
++
++_COMPLETED_STORAGE_SPECS = (
++    ("pre_attention_norm", (7168, 27), "bfloat16"),
++    ("attention.wq_a", (7168, 27, 1536), "bfloat16"),
++    ("attention.wq_b", (1536, 27, 128, 192), "bfloat16"),
++    ("attention.q_norm", (1536, 27), "bfloat16"),
++    ("attention.wkv_a", (7168, 27, 576), "bfloat16"),
++    ("attention.wkv_b", (512, 27, 128, 256), "bfloat16"),
++    ("attention.kv_norm", (512, 27), "bfloat16"),
++    ("attention.out", (128, 27, 128, 7168), "bfloat16"),
++    ("post_attention_norm", (7168, 27), "bfloat16"),
++    ("router.kernel", (7168, 27, 256), "bfloat16"),
++    ("router.correction_bias", (256, 27), "float32"),
++    ("routed.wi_0", (256, 27, 7168, 2048), "bfloat16"),
++    ("routed.wi_1", (256, 27, 7168, 2048), "bfloat16"),
++    ("routed.wo", (256, 27, 2048, 7168), "bfloat16"),
++    ("shared.wi_0", (7168, 27, 2048), "bfloat16"),
++    ("shared.wi_1", (7168, 27, 2048), "bfloat16"),
++    ("shared.wo", (2048, 27, 7168), "bfloat16"),
++)
++_TARGET_STORAGE_SPECS = (
++    ("pre_attention_norm", (7168,), "bfloat16"),
++    ("attention.wq_a", (7168, 1536), "bfloat16"),
++    ("attention.wq_b", (1536, 128, 192), "bfloat16"),
++    ("attention.q_norm", (1536,), "bfloat16"),
++    ("attention.wkv_a", (7168, 576), "bfloat16"),
++    ("attention.wkv_b", (512, 128, 256), "bfloat16"),
++    ("attention.kv_norm", (512,), "bfloat16"),
++    ("attention.out", (128, 128, 7168), "bfloat16"),
++    ("post_attention_norm", (7168,), "bfloat16"),
++    ("router.kernel", (7168, 256), "bfloat16"),
++    ("router.correction_bias", (256,), "float32"),
++    ("routed.wi_0", (256, 7168, 2048), "bfloat16"),
++    ("routed.wi_1", (256, 7168, 2048), "bfloat16"),
++    ("routed.wo", (256, 2048, 7168), "bfloat16"),
++)
++
++
++def _dtype_name(value):
++  try:
++    return jnp.dtype(value).name
++  except TypeError as error:
++    raise ValueError(f"unsupported dtype {value!r}") from error
++
++
++def _require_tensor(value, name, shape, dtype):
++  if tuple(value.shape) != tuple(shape):
++    raise ValueError(
++        f"{name} shape {tuple(value.shape)} differs from required {tuple(shape)}"
++    )
++  actual_dtype = _dtype_name(value.dtype)
++  if actual_dtype != dtype:
++    raise ValueError(
++        f"{name} dtype {actual_dtype} differs from required {dtype}"
++    )
++
++
++def _validate_weight_layout(weights, specs, scope):
++  leaves = jax.tree.leaves(weights)
++  if len(leaves) != len(specs):
++    raise ValueError(
++        f"{scope} has {len(leaves)} leaves; required {len(specs)}"
++    )
++  for leaf, (name, shape, dtype) in zip(leaves, specs, strict=True):
++    _require_tensor(leaf, f"{scope}.{name}", shape, dtype)
++
++
++def _cast_validated_weights(weights, specs, dtype, scope):
++  _validate_weight_layout(weights, specs, scope)
++  leaves, tree = jax.tree.flatten(weights)
++  cast = []
++  for leaf, (name, _, _) in zip(leaves, specs, strict=True):
++    compute_dtype = (
++        jnp.float32 if name in ("router.kernel", "router.correction_bias") else dtype
++    )
++    cast.append(jnp.asarray(leaf, compute_dtype))
++  return jax.tree.unflatten(tree, cast)
++
++
++def _validate_config(cfg, mesh=None):
++  required = {
++      "batch_split_factor": _BATCH_SPLIT_FACTOR,
++      "max_target_length": _SEQUENCE_LENGTH,
++      "emb_dim": _HIDDEN_DIM,
++      "num_decoder_layers": _TARGET_LAYER_ZERO_INDEXED,
++      "first_num_dense_layers": 3,
++      "param_scan_axis": 1,
++      "num_experts": 256,
++      "num_experts_per_tok": 8,
++      "n_routing_groups": 8,
++      "topk_routing_group": 4,
++      "shared_experts": 1,
++      "q_lora_rank": 1536,
++      "kv_lora_rank": 512,
++      "qk_nope_head_dim": 128,
++      "qk_rope_head_dim": 64,
++      "v_head_dim": 128,
++      "num_query_heads": 128,
++      "moe_mlp_dim": 2048,
++      "mhc_expansion_rate": 1,
++  }
++  for name, expected in required.items():
++    actual = getattr(cfg, name, None)
++    if actual != expected:
++      raise ValueError(
++          f"R1 prefix requires {name}={expected!r}; received {actual!r}"
++      )
++  if _dtype_name(getattr(cfg, "dtype", None)) != "bfloat16":
++    raise ValueError("R1 prefix requires BF16 activation compute")
++  if _dtype_name(getattr(cfg, "weight_dtype", None)) != "bfloat16":
++    raise ValueError("R1 prefix requires BF16 parameter storage")
++  if float(getattr(cfg, "dropout_rate", -1.0)) != 0.0:
++    raise ValueError("R1 prefix requires dropout_rate=0")
++  if float(getattr(cfg, "routed_scaling_factor", -1.0)) != 2.5:
++    raise ValueError("R1 prefix requires routed_scaling_factor=2.5")
++  if getattr(cfg, "routed_score_func", None) != "sigmoid":
++    raise ValueError("R1 prefix requires sigmoid router scores")
++  if getattr(cfg, "routed_bias", None) is not True:
++    raise ValueError("R1 prefix requires the FP32 router correction bias")
++  if getattr(cfg, "engram_layers", ()):
++    raise ValueError("R1 prefix does not support Engram layers")
++  if not getattr(cfg, "scan_layers", False):
++    raise ValueError("R1 prefix requires scanned layers")
++  if not getattr(cfg, "use_batch_split_schedule", False):
++    raise ValueError("R1 prefix requires the batch-split schedule")
++  if getattr(cfg, "use_qwix_quantization", False) or getattr(
++      cfg, "quantization", None
++  ):
++    raise ValueError("R1 prefix is BF16-only")
++  if mesh is not None:
++    shape = mesh.shape
++    layout = tuple(int(shape.get(axis, 0)) for axis in ("data", "fsdp", "expert"))
++    if layout not in _ALLOWED_LAYOUTS:
++      raise ValueError(
++          "R1 prefix mesh must be EP16/FSDP4, EP32/FSDP2, or EP8/FSDP8 "
++          f"with data=1; received data/fsdp/expert={layout}"
++      )
++    if int(shape.get("context", 1)) != 1:
++      raise ValueError("R1 prefix requires context parallelism one")
++
++
++def validate_entrypoint_inputs(tokens, positions, segment_ids):
++  """Validate the static packed B128 input ABI before model execution."""
++
++  required_shape = (_GLOBAL_BATCH_SIZE, _SEQUENCE_LENGTH)
++  _require_tensor(tokens, "decoder_input_tokens", required_shape, "int32")
++  _require_tensor(positions, "decoder_positions", required_shape, "int32")
++  _require_tensor(segment_ids, "decoder_segment_ids", required_shape, "int32")
++
++
++def fetch_completed_weights(params, dtype):
++  """Fetch completed-layer weights without truncating router precision."""
++
++  def raw(value):
++    return getattr(value, "value", value)[...]
++
++  weights = (
++      (
++          raw(params["pre_self_attention_layer_norm"]["scale"]),
++          (
++              raw(params["self_attention"]["wq_a"]["kernel"]),
++              raw(params["self_attention"]["wq_b"]["kernel"]),
++              raw(params["self_attention"]["q_norm"]["scale"]),
++              raw(params["self_attention"]["wkv_a"]["kernel"]),
++              raw(params["self_attention"]["wkv_b"]["kernel"]),
++              raw(params["self_attention"]["kv_norm"]["scale"]),
++              raw(params["self_attention"]["out"]["kernel"]),
++          ),
++      ),
++      (
++          raw(params["post_self_attention_layer_norm"]["scale"]),
++          (
++              raw(params["DeepSeekMoeBlock_0"]["MoeBlock_0"]["gate"]["kernel"]),
++              raw(params["DeepSeekMoeBlock_0"]["MoeBlock_0"]["gate"]["bias"]),
++          ),
++          (
++              raw(params["DeepSeekMoeBlock_0"]["MoeBlock_0"]["wi_0"]),
++              raw(params["DeepSeekMoeBlock_0"]["MoeBlock_0"]["wi_1"]),
++              raw(params["DeepSeekMoeBlock_0"]["MoeBlock_0"]["wo"]),
++          ),
++          (
++              raw(
++                  params["DeepSeekMoeBlock_0"]["shared_experts"]["wi_0"][
++                      "kernel"
++                  ]
++              ),
++              raw(
++                  params["DeepSeekMoeBlock_0"]["shared_experts"]["wi_1"][
++                      "kernel"
++                  ]
++              ),
++              raw(params["DeepSeekMoeBlock_0"]["shared_experts"]["wo"]["kernel"]),
++          ),
++      ),
++  )
++  return _cast_validated_weights(
++      weights,
++      _COMPLETED_STORAGE_SPECS,
++      dtype,
++      "completed_moe_params",
++  )
++
++
++def fetch_target_weights(params, dtype):
++  """Fetch the unscanned target without requiring shared-expert parameters."""
++
++  target_block = params["DeepSeekMoeBlock_0"]
++  if "shared_experts" in target_block:
++    raise ValueError("target_params must omit the target shared expert")
++
++  def raw(value):
++    return getattr(value, "value", value)[...]
++
++  weights = (
++      (
++          raw(params["pre_self_attention_layer_norm"]["scale"]),
++          (
++              raw(params["self_attention"]["wq_a"]["kernel"]),
++              raw(params["self_attention"]["wq_b"]["kernel"]),
++              raw(params["self_attention"]["q_norm"]["scale"]),
++              raw(params["self_attention"]["wkv_a"]["kernel"]),
++              raw(params["self_attention"]["wkv_b"]["kernel"]),
++              raw(params["self_attention"]["kv_norm"]["scale"]),
++              raw(params["self_attention"]["out"]["kernel"]),
++          ),
++      ),
++      (
++          raw(params["post_self_attention_layer_norm"]["scale"]),
++          (
++              raw(params["DeepSeekMoeBlock_0"]["MoeBlock_0"]["gate"]["kernel"]),
++              raw(params["DeepSeekMoeBlock_0"]["MoeBlock_0"]["gate"]["bias"]),
++          ),
++          (
++              raw(params["DeepSeekMoeBlock_0"]["MoeBlock_0"]["wi_0"]),
++              raw(params["DeepSeekMoeBlock_0"]["MoeBlock_0"]["wi_1"]),
++              raw(params["DeepSeekMoeBlock_0"]["MoeBlock_0"]["wo"]),
++          ),
++      ),
++  )
++  return _cast_validated_weights(
++      weights,
++      _TARGET_STORAGE_SPECS,
++      dtype,
++      "target_params",
++  )
++
++
++def _gather_target_weights(weights, mesh):
++  """All-gather the target subset with the same semantics as MaxText."""
++
++  def gather(weights):
++    (
++        pre_attn_norm,
++        (wq_a, wq_b, q_norm, wkv_a, wkv_b, kv_norm, out),
++    ), (
++        post_attn_norm,
++        (gate, bias),
++        (routed_wi_0, routed_wi_1, routed_wo),
++    ) = weights
++
++    wq_a = jax.lax.pcast(wq_a, axis_name="data", to="reduced")
++    wq_b = jax.lax.pcast(wq_b, axis_name="data", to="reduced")
++    wkv_a = jax.lax.pcast(wkv_a, axis_name="data", to="reduced")
++    wkv_b = jax.lax.pcast(wkv_b, axis_name="data", to="reduced")
++    out = jax.lax.pcast(out, axis_name="data", to="reduced")
++    gate = jax.lax.pcast(gate, axis_name="data", to="reduced")
++    routed_wi_0 = jax.lax.pcast(routed_wi_0, axis_name="data", to="reduced")
++    routed_wi_1 = jax.lax.pcast(routed_wi_1, axis_name="data", to="reduced")
++    routed_wo = jax.lax.pcast(routed_wo, axis_name="data", to="reduced")
++
++    wq_a = jax.lax.pcast(wq_a, axis_name="expert", to="reduced")
++    wq_b = jax.lax.pcast(wq_b, axis_name="expert", to="reduced")
++    wkv_a = jax.lax.pcast(wkv_a, axis_name="expert", to="reduced")
++    wkv_b = jax.lax.pcast(wkv_b, axis_name="expert", to="reduced")
++    out = jax.lax.pcast(out, axis_name="expert", to="reduced")
++    gate = jax.lax.pcast(gate, axis_name="expert", to="reduced")
++
++    wq_a = jax.lax.all_gather(wq_a, axis_name="fsdp", tiled=True, to="reduced")
++    wq_b = jax.lax.all_gather(wq_b, axis_name="fsdp", tiled=True, to="reduced")
++    wkv_a = jax.lax.all_gather(wkv_a, axis_name="fsdp", tiled=True, to="reduced")
++    wkv_b = jax.lax.all_gather(wkv_b, axis_name="fsdp", tiled=True, to="reduced")
++    out = jax.lax.all_gather(
++        out, axis_name="fsdp", tiled=True, axis=2, to="reduced"
++    )
++    gate = jax.lax.all_gather(gate, axis_name="fsdp", tiled=True, to="reduced")
++    routed_wi_0 = jax.lax.all_gather(
++        routed_wi_0, axis_name="fsdp", tiled=True, axis=1, to="reduced"
++    )
++    routed_wi_1 = jax.lax.all_gather(
++        routed_wi_1, axis_name="fsdp", tiled=True, axis=1, to="reduced"
++    )
++    routed_wo = jax.lax.all_gather(
++        routed_wo, axis_name="fsdp", tiled=True, axis=2, to="reduced"
++    )
++    return (
++        (
++            pre_attn_norm,
++            (wq_a, wq_b, q_norm, wkv_a, wkv_b, kv_norm, out),
++        ),
++        (
++            post_attn_norm,
++            (gate, bias),
++            (routed_wi_0, routed_wi_1, routed_wo),
++        ),
++    )
++
++  return jax.lax.optimization_barrier(
++      jax.shard_map(
++          gather,
++          mesh=mesh,
++          in_specs=(
++              (
++                  (
++                      jax.sharding.PartitionSpec(None),
++                      (
++                          jax.sharding.PartitionSpec("fsdp", None),
++                          jax.sharding.PartitionSpec("fsdp", None, None),
++                          jax.sharding.PartitionSpec(None),
++                          jax.sharding.PartitionSpec("fsdp", None),
++                          jax.sharding.PartitionSpec("fsdp", None, None),
++                          jax.sharding.PartitionSpec(None),
++                          jax.sharding.PartitionSpec(None, None, "fsdp"),
++                      ),
++                  ),
++                  (
++                      jax.sharding.PartitionSpec(None),
++                      (
++                          jax.sharding.PartitionSpec("fsdp", None),
++                          jax.sharding.PartitionSpec(None),
++                      ),
++                      (
++                          jax.sharding.PartitionSpec("expert", "fsdp", None),
++                          jax.sharding.PartitionSpec("expert", "fsdp", None),
++                          jax.sharding.PartitionSpec("expert", None, "fsdp"),
++                      ),
++                  ),
++              ),
++          ),
++          out_specs=(
++              (
++                  jax.sharding.PartitionSpec(None),
++                  (
++                      jax.sharding.PartitionSpec(
++                          None, None, reduced={"data", "fsdp", "expert"}
++                      ),
++                      jax.sharding.PartitionSpec(
++                          None, None, None, reduced={"data", "fsdp", "expert"}
++                      ),
++                      jax.sharding.PartitionSpec(None),
++                      jax.sharding.PartitionSpec(
++                          None, None, reduced={"data", "fsdp", "expert"}
++                      ),
++                      jax.sharding.PartitionSpec(
++                          None, None, None, reduced={"data", "fsdp", "expert"}
++                      ),
++                      jax.sharding.PartitionSpec(None),
++                      jax.sharding.PartitionSpec(
++                          None, None, None, reduced={"data", "fsdp", "expert"}
++                      ),
++                  ),
++              ),
++              (
++                  jax.sharding.PartitionSpec(None),
++                  (
++                      jax.sharding.PartitionSpec(
++                          None, None, reduced={"data", "fsdp", "expert"}
++                      ),
++                      jax.sharding.PartitionSpec(None),
++                  ),
++                  (
++                      jax.sharding.PartitionSpec(
++                          "expert", None, None, reduced={"data", "fsdp"}
++                      ),
++                      jax.sharding.PartitionSpec(
++                          "expert", None, None, reduced={"data", "fsdp"}
++                      ),
++                      jax.sharding.PartitionSpec(
++                          "expert", None, None, reduced={"data", "fsdp"}
++                      ),
++                  ),
++              ),
++          ),
++          check_vma=True,
++      )(weights)
++  )
++
++
++def _packed_flash_attention(
++    query,
++    key,
++    value,
++    segment_ids,
++    *,
++    mesh,
++    splash_kernel,
++    activation_pspec,
++):
++  """Splash causal attention with runtime packed-segment isolation."""
++
++  query = jnp.transpose(query, axes=(0, 2, 1, 3))
++  key = jnp.transpose(key, axes=(0, 2, 1, 3))
++  value = jnp.transpose(value, axes=(0, 2, 1, 3))
++
++  q_pspec = jax.sharding.PartitionSpec(*activation_pspec + (None,))
++  kv_pspec = jax.sharding.PartitionSpec(*activation_pspec + (None,))
++  lse_pspec = activation_pspec
++  segment_pspec = jax.sharding.PartitionSpec(activation_pspec[0], None)
++
++  @functools.partial(
++      jax.shard_map,
++      mesh=mesh,
++      in_specs=(q_pspec, kv_pspec, kv_pspec, segment_pspec),
++      out_specs=(q_pspec, lse_pspec),
++      check_vma=False,
++  )
++  def run(query, key, value, segment_ids):
++    packed_ids = attention.splash_attention_kernel.SegmentIds(
++        q=segment_ids,
++        kv=segment_ids,
++    )
++    return jax.vmap(
++        splash_kernel.manual_fwd,
++        in_axes=(0, 0, 0, 0, None),
++        out_axes=(0, 0),
++    )(query, key, value, packed_ids, None)
++
++  output, logsumexp = run(query, key, value, segment_ids)
++  return jnp.transpose(output, axes=(0, 2, 1, 3)), logsumexp
++
++
++def _mla(
++    inputs,
++    yarn_freqs,
++    segment_ids,
++    weights,
++    *,
++    cfg,
++    splash_kernel,
++    yarn_mask,
++    mesh,
++    activation_pspec,
++):
++  """Forward-only MLA with packed-segment Splash attention."""
++
++  (
++      wq_a,
++      wq_b,
++      q_norm,
++      wkv_a,
++      wkv_b,
++      kv_norm,
++      out,
++  ) = weights
++  query = batchsplit.query_projection(
++      inputs,
++      yarn_freqs,
++      wq_a,
++      wq_b,
++      q_norm,
++      epsilon=cfg.normalization_layer_epsilon,
++      qk_rope_head_dim=cfg.qk_rope_head_dim,
++      max_position_embeddings=cfg.max_position_embeddings,
++      original_max_position_embeddings=cfg.original_max_position_embeddings,
++      rope_factor=cfg.rope_factor,
++      pairwise_swap_and_negate_mask=yarn_mask,
++      dtype=cfg.dtype,
++      qk_nope_head_dim=cfg.qk_nope_head_dim,
++      mscale=cfg.mscale,
++      config=cfg,
++      mesh=mesh,
++      activation_pspec=activation_pspec,
++  )
++  key, value = batchsplit.kv_projection(
++      inputs,
++      yarn_freqs,
++      wkv_a,
++      wkv_b,
++      kv_norm,
++      kv_lora_rank=cfg.kv_lora_rank,
++      kv_norm_epsilon=cfg.normalization_layer_epsilon,
++      pairwise_swap_and_negate_mask=yarn_mask,
++      dtype=cfg.dtype,
++      qk_nope_head_dim=cfg.qk_nope_head_dim,
++      num_query_heads=cfg.num_query_heads,
++      config=cfg,
++      mesh=mesh,
++      activation_pspec=activation_pspec,
++  )
++  attention_out, _ = _packed_flash_attention(
++      query,
++      key,
++      value,
++      segment_ids,
++      mesh=mesh,
++      splash_kernel=splash_kernel,
++      activation_pspec=activation_pspec,
++  )
++  return batchsplit.dot(attention_out, out, axes=2)
++
++
++def _attention_residual(
++    inputs,
++    weights,
++    yarn_freqs,
++    segment_ids,
++    *,
++    cfg,
++    splash_kernel,
++    yarn_mask,
++    mesh,
++    activation_pspec,
++):
++  """Run the two split microbatches without retaining training residuals."""
++
++  pre_attn_scale, attention_weights = weights
++  outputs = []
++  for index, (x, freqs, segments) in enumerate(
++      zip(inputs, yarn_freqs, segment_ids, strict=True)
++  ):
++    normalized = batchsplit.rms_norm(
++        x,
++        pre_attn_scale,
++        epsilon=cfg.normalization_layer_epsilon,
++        dtype=cfg.dtype,
++        out_sharding=jax.sharding.NamedSharding(mesh, activation_pspec),
++    )
++    attention_out = _mla(
++        normalized,
++        freqs,
++        segments,
++        attention_weights,
++        cfg=cfg,
++        splash_kernel=splash_kernel,
++        yarn_mask=yarn_mask,
++        mesh=mesh,
++        activation_pspec=activation_pspec,
++    )
++    output = jax.lax.optimization_barrier(attention_out + x)
++    outputs.append(output)
++    if index:
++      outputs[index - 1], outputs[index] = jax.lax.optimization_barrier(
++          (outputs[index - 1], outputs[index])
++      )
++  return outputs
++
++
++def _select_and_route(
++    inputs,
++    post_attn_scale,
++    gate_kernel,
++    gate_bias,
++    *,
++    cfg,
++    mesh,
++    activation_pspec,
++):
++  """Normalize, select globally in FP32, then route for expert compute."""
++
++  normalized = batchsplit.rms_norm(
++      inputs,
++      post_attn_scale,
++      epsilon=cfg.normalization_layer_epsilon,
++      dtype=cfg.dtype,
++  )
++  flat = jnp.reshape(normalized, (-1, normalized.shape[-1]))
++  pre_bias_scores = jax.nn.sigmoid(
++      batchsplit.dot(
++          flat.astype(jnp.float32),
++          gate_kernel.astype(jnp.float32),
++      )
++  )
++  biased_scores = pre_bias_scores + gate_bias.astype(jnp.float32)
++  global_ids, scaled_weights = batchsplit.expert_indices_and_weights(
++      biased_scores,
++      pre_bias_scores,
++      num_experts_per_tok=cfg.num_experts_per_tok,
++      routed_scaling_factor=cfg.routed_scaling_factor,
++      n_routing_groups=cfg.n_routing_groups,
++      topk_routing_group=cfg.topk_routing_group,
++      top_k_in_group=2,
++  )
++  group_sizes = jnp.bincount(jnp.ravel(global_ids), length=cfg.num_experts)
++  routed, dispatch_ids, dispatch_weights, group_sizes = batchsplit.route(
++      flat,
++      global_ids,
++      scaled_weights,
++      group_sizes,
++      expert_axis_name="expert",
++      num_experts=cfg.num_experts,
++      num_expert_shards=mesh.shape.get("expert", 1),
++      use_gather_mosaic_kernel=cfg.use_gather_mosaic_kernel,
++  )
++  return (
++      normalized,
++      routed,
++      dispatch_ids,
++      dispatch_weights,
++      group_sizes,
++      global_ids,
++      scaled_weights,
++  )
++
++
++def _target_moe(
++    inputs,
++    weights,
++    *,
++    cfg,
++    mesh,
++    activation_pspec,
++):
++  """Return the target routed aggregate and pre-remap router metadata."""
++
++  def run(microbatches, weights):
++    post_attn_scale, (gate_kernel, gate_bias), routed_weights = weights
++    routed_states = []
++    for index, moe_inputs in enumerate(microbatches):
++      (
++          _,
++          routed,
++          dispatch_ids,
++          dispatch_weights,
++          group_sizes,
++          global_ids,
++          scaled_weights,
++      ) = _select_and_route(
++          moe_inputs,
++          post_attn_scale,
++          gate_kernel,
++          gate_bias,
++          cfg=cfg,
++          mesh=mesh,
++          activation_pspec=activation_pspec,
++      )
++      routed_states.append(
++          (
++              routed,
++              dispatch_ids,
++              dispatch_weights,
++              group_sizes,
++              global_ids,
++              scaled_weights,
++          )
++      )
++      if index:
++        routed_states[index - 1], routed_states[index] = (
++            jax.lax.optimization_barrier(
++                (routed_states[index - 1], routed_states[index])
++            )
++        )
++
++    gating_states = []
++    for index, (
++        routed,
++        dispatch_ids,
++        dispatch_weights,
++        group_sizes,
++        global_ids,
++        scaled_weights,
++    ) in enumerate(routed_states):
++      routed_wi_0, routed_wi_1, routed_wo = routed_weights
++      layer_wi_0, layer_wi_1 = batchsplit.compute_gating(
++          routed,
++          routed_wi_0,
++          routed_wi_1,
++          group_sizes,
++          dtype=cfg.dtype,
++          config=cfg,
++      )
++      gating_states.append(
++          (
++              layer_wi_0,
++              layer_wi_1,
++              routed_wo,
++              dispatch_ids,
++              dispatch_weights,
++              group_sizes,
++              global_ids,
++              scaled_weights,
++          )
++      )
++      if index:
++        gating_states[index - 1], gating_states[index] = (
++            jax.lax.optimization_barrier(
++                (gating_states[index - 1], gating_states[index])
++            )
++        )
++
++    linear_states = []
++    for index, (
++        layer_wi_0,
++        layer_wi_1,
++        routed_wo,
++        dispatch_ids,
++        dispatch_weights,
++        group_sizes,
++        global_ids,
++        scaled_weights,
++    ) in enumerate(gating_states):
++      routed = batchsplit.compute_linear(
++          layer_wi_0,
++          layer_wi_1,
++          routed_wo,
++          group_sizes,
++          dispatch_weights,
++          dtype=cfg.dtype,
++          config=cfg,
++      )
++      linear_states.append(
++          (routed, dispatch_ids, global_ids, scaled_weights)
++      )
++      if index:
++        linear_states[index - 1], linear_states[index] = (
++            jax.lax.optimization_barrier(
++                (linear_states[index - 1], linear_states[index])
++            )
++        )
++
++    routed_outputs = []
++    global_ids_outputs = []
++    scaled_weights_outputs = []
++    for index, (
++        routed,
++        dispatch_ids,
++        global_ids,
++        scaled_weights,
++    ) in enumerate(linear_states):
++      routed = batchsplit.unroute(
++          routed,
++          dispatch_ids,
++          expert_axis_name="expert",
++          use_gather_mosaic_kernel=cfg.use_gather_mosaic_kernel,
++      )
++      routed_outputs.append(
++          jnp.reshape(
++              routed,
++              (-1, cfg.max_target_length, routed.shape[-1]),
++          ).astype(cfg.dtype)
++      )
++      global_ids_outputs.append(
++          jnp.reshape(
++              global_ids,
++              (-1, cfg.max_target_length, cfg.num_experts_per_tok),
++          ).astype(jnp.int32)
++      )
++      scaled_weights_outputs.append(
++          jnp.reshape(
++              scaled_weights,
++              (-1, cfg.max_target_length, cfg.num_experts_per_tok),
++          ).astype(jnp.float32)
++      )
++      if index:
++        routed_outputs[index - 1], routed_outputs[index] = (
++            jax.lax.optimization_barrier(
++                (routed_outputs[index - 1], routed_outputs[index])
++            )
++        )
++    return routed_outputs, global_ids_outputs, scaled_weights_outputs
++
++  output_metadata_pspec = jax.sharding.PartitionSpec(
++      activation_pspec[0], None, None
++  )
++  return jax.shard_map(
++      run,
++      mesh=mesh,
++      in_specs=(
++          [activation_pspec] * _BATCH_SPLIT_FACTOR,
++          (
++              jax.sharding.PartitionSpec(None),
++              (
++                  jax.sharding.PartitionSpec(
++                      None, None, reduced={"data", "fsdp", "expert"}
++                  ),
++                  jax.sharding.PartitionSpec(None),
++              ),
++              (
++                  jax.sharding.PartitionSpec(
++                      "expert", None, None, reduced={"data", "fsdp"}
++                  ),
++                  jax.sharding.PartitionSpec(
++                      "expert", None, None, reduced={"data", "fsdp"}
++                  ),
++                  jax.sharding.PartitionSpec(
++                      "expert", None, None, reduced={"data", "fsdp"}
++                  ),
++              ),
++          ),
++      ),
++      out_specs=(
++          [activation_pspec] * _BATCH_SPLIT_FACTOR,
++          [output_metadata_pspec] * _BATCH_SPLIT_FACTOR,
++          [output_metadata_pspec] * _BATCH_SPLIT_FACTOR,
++      ),
++      check_vma=True,
++  )([x.astype(cfg.dtype) for x in inputs], weights)
++
++
++def _split_global(value, mesh, input_pspec, output_pspec):
++  return jax.shard_map(
++      functools.partial(
++          batchsplit.split,
++          split_factor=_BATCH_SPLIT_FACTOR,
++      ),
++      mesh=mesh,
++      in_specs=input_pspec,
++      out_specs=[output_pspec] * _BATCH_SPLIT_FACTOR,
++  )(value)
++
++
++def _merge_global(values, mesh, pspec):
++  return jax.shard_map(
++      functools.partial(
++          batchsplit.merge,
++          split_factor=_BATCH_SPLIT_FACTOR,
++      ),
++      mesh=mesh,
++      in_specs=([pspec] * _BATCH_SPLIT_FACTOR,),
++      out_specs=pspec,
++  )(values)
++
++
++def forward_routed_prefix(
++    dense_prefix_output,
++    completed_moe_params,
++    target_params,
++    positions,
++    segment_ids,
++    *,
++    mesh,
++    cfg,
++):
++  """Execute 27 complete MoE layers and the routed-only target layer."""
++
++  _validate_config(cfg, mesh)
++  _require_tensor(
++      dense_prefix_output,
++      "dense_prefix_output",
++      (_GLOBAL_BATCH_SIZE, _SEQUENCE_LENGTH, _HIDDEN_DIM),
++      "bfloat16",
++  )
++  _require_tensor(
++      positions,
++      "decoder_positions",
++      (_GLOBAL_BATCH_SIZE, _SEQUENCE_LENGTH),
++      "int32",
++  )
++  _require_tensor(
++      segment_ids,
++      "decoder_segment_ids",
++      (_GLOBAL_BATCH_SIZE, _SEQUENCE_LENGTH),
++      "int32",
++  )
++
++  completed_weights = fetch_completed_weights(completed_moe_params, cfg.dtype)
++  target_weights = fetch_target_weights(target_params, cfg.dtype)
++  activation_pspec = jax.sharding.PartitionSpec(
++      ("data", "fsdp", "expert"),
++      None,
++      None,
++  )
++  metadata_pspec = jax.sharding.PartitionSpec(
++      ("data", "fsdp", "expert"),
++      None,
++  )
++  dense_prefix_output = jax.reshard(
++      dense_prefix_output,
++      jax.sharding.NamedSharding(mesh, activation_pspec),
++  )
++  positions = jax.reshard(
++      positions,
++      jax.sharding.NamedSharding(mesh, metadata_pspec),
++  )
++  segment_ids = jax.reshard(
++      segment_ids,
++      jax.sharding.NamedSharding(mesh, metadata_pspec),
++  )
++  yarn_freqs = batchsplit.initialize_yarn_freqs(
++      positions=positions,
++      embedding_dims=cfg.qk_rope_head_dim,
++      rope_theta=cfg.rope_max_timescale,
++      max_position_embeddings=cfg.max_position_embeddings,
++      original_max_position_embeddings=cfg.original_max_position_embeddings,
++      beta_fast=cfg.beta_fast,
++      beta_slow=cfg.beta_slow,
++      rope_factor=cfg.rope_factor,
++      mesh=mesh,
++      activation_pspec=activation_pspec,
++  )
++  yarn_mask = batchsplit.initialize_yarn_mask(cfg.qk_rope_head_dim)
++  splash_kernel = batchsplit.init_splash_kernel(cfg)
++
++  microbatches = _split_global(
++      dense_prefix_output,
++      mesh,
++      activation_pspec,
++      activation_pspec,
++  )
++  split_freqs = batchsplit.split(
++      yarn_freqs,
++      split_factor=_BATCH_SPLIT_FACTOR,
++  )
++  split_segments = _split_global(
++      segment_ids,
++      mesh,
++      metadata_pspec,
++      metadata_pspec,
++  )
++
++  def complete_layer(microbatches, weights):
++    norm_mla_weights, moe_weights = weights
++    microbatches = _attention_residual(
++        microbatches,
++        norm_mla_weights,
++        split_freqs,
++        split_segments,
++        cfg=cfg,
++        splash_kernel=splash_kernel,
++        yarn_mask=yarn_mask,
++        mesh=mesh,
++        activation_pspec=activation_pspec,
++    )
++    # Native MaxText MoE deliberately unrouts split 0 and leaves split 1 as a
++    # fixed-shape pending tuple.  The next layer finishes that tuple before its
++    # attention, preserving the batch-split cross-layer overlap.
++    microbatches, _ = batchsplit.moe(
++        microbatches,
++        moe_weights,
++        mesh=mesh,
++        num_experts=cfg.num_experts,
++        num_experts_per_tok=cfg.num_experts_per_tok,
++        routed_scaling_factor=cfg.routed_scaling_factor,
++        n_routing_groups=cfg.n_routing_groups,
++        topk_routing_group=cfg.topk_routing_group,
++        top_k_in_group=2,
++        expert_axis_name="expert",
++        num_expert_shards=mesh.shape.get("expert", 1),
++        capacity_factor=2,
++        use_gather_mosaic_kernel=cfg.use_gather_mosaic_kernel,
++        config=cfg,
++        normalization_layer_epsilon=cfg.normalization_layer_epsilon,
++        dtype=cfg.dtype,
++        activation_pspec=activation_pspec,
++    )
++    return microbatches
++
++  def finish_pending_second_microbatch(microbatches):
++    moe_inputs, routed, shared, dispatch_ids = microbatches[1]
++    microbatches[1], _ = batchsplit.unroute_ubatch_shard_mapped(
++        moe_inputs,
++        routed,
++        shared,
++        dispatch_ids,
++        expert_axis_name="expert",
++        use_gather_mosaic_kernel=cfg.use_gather_mosaic_kernel,
++        target_length=cfg.max_target_length,
++        mesh=mesh,
++        activation_pspec=activation_pspec,
++    )
++    return microbatches
++
++  with batchsplit.scheduling_group(group_id=60):
++    first_weights = batchsplit.gather_weights(
++        batchsplit.extract_layer_weights(
++            completed_weights,
++            0,
++            cfg.param_scan_axis,
++        ),
++        mesh,
++    )
++  with batchsplit.scheduling_group(group_id=61):
++    second_weights = batchsplit.gather_weights(
++        batchsplit.extract_layer_weights(
++            completed_weights,
++            1,
++            cfg.param_scan_axis,
++        ),
++        mesh,
++    )
++  microbatches = complete_layer(microbatches, first_weights)
++
++  def prefetch_complete_layer(carry, layer_index):
++    microbatches, current_weights = carry
++    with batchsplit.scheduling_group(group_id=62):
++      next_weights = batchsplit.gather_weights(
++          batchsplit.extract_layer_weights(
++              completed_weights,
++              layer_index + 1,
++              cfg.param_scan_axis,
++          ),
++          mesh,
++      )
++    microbatches = finish_pending_second_microbatch(microbatches)
++    microbatches = complete_layer(microbatches, current_weights)
++    return (microbatches, next_weights), None
++
++  (microbatches, final_weights), _ = jax.lax.scan(
++      prefetch_complete_layer,
++      (microbatches, second_weights),
++      jnp.arange(1, _COMPLETED_MOE_LAYERS - 1),
++  )
++  # Target AG is independent of the final completed layer.  Issuing it first
++  # gives XLA a legal overlap window while retaining explicit scheduling groups.
++  with batchsplit.scheduling_group(group_id=63):
++    target_weights = _gather_target_weights(target_weights, mesh)
++  microbatches = finish_pending_second_microbatch(microbatches)
++  microbatches = complete_layer(microbatches, final_weights)
++  microbatches = finish_pending_second_microbatch(microbatches)
++  target_norm_mla_weights, target_moe_weights = target_weights
++  microbatches = _attention_residual(
++      microbatches,
++      target_norm_mla_weights,
++      split_freqs,
++      split_segments,
++      cfg=cfg,
++      splash_kernel=splash_kernel,
++      yarn_mask=yarn_mask,
++      mesh=mesh,
++      activation_pspec=activation_pspec,
++  )
++  routed, global_ids, scaled_weights = _target_moe(
++      microbatches,
++      target_moe_weights,
++      cfg=cfg,
++      mesh=mesh,
++      activation_pspec=activation_pspec,
++  )
++  return (
++      _merge_global(routed, mesh, activation_pspec),
++      _merge_global(
++          global_ids,
++          mesh,
++          jax.sharding.PartitionSpec(activation_pspec[0], None, None),
++      ),
++      _merge_global(
++          scaled_weights,
++          mesh,
++          jax.sharding.PartitionSpec(activation_pspec[0], None, None),
++      ),
++  )
