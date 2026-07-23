@@ -1,9 +1,9 @@
 # DeepSeek-R1-0528 checkpoint conversion contract
 
-**Status:** source-backed design audit plus bounded reference execution core,
-2026-07-23. No weight payload was downloaded during this work. Safetensor
-headers, the Hugging Face index and configuration, and the pinned MaxText
-source were inspected.
+**Status:** source-backed design audit, bounded reference execution core, and
+verified local safetensor reader, 2026-07-23. No weight payload was downloaded
+during this work. Safetensor headers, the Hugging Face index and configuration,
+and the pinned MaxText source were inspected.
 
 This document defines the only checkpoint conversion that may authorize the
 one-indexed block-31 activation prefix. It is intentionally fail closed. A
@@ -22,6 +22,13 @@ The active implementation now has two deliberately separate layers:
   tests cover layout parity, boundary blocks, FP32 multiply-before-BF16
   rounding, bitwise BF16/FP32 passthrough, cross-shard scales, crash/resume,
   conflicting receipts, and pre-I/O memory rejection.
+- [`safetensor_source.py`](../src/moe_sae/r1/safetensor_source.py) maps a
+  controller-prestaged directory to the source protocol. It pins regular-file
+  identities, hashes each complete blob before payload access, revalidates the
+  strict header against the full authenticated shard inventory, performs
+  bounded FP8/BF16/FP32 region reads, and fails on observed mutation. Its
+  end-to-end test executes the real conversion core and verifies resume plus
+  independent BF16 and FP8 numerical oracles.
 
 The chunk identity binds the exact conversion-module hash, the measured NumPy
 and `ml_dtypes` native-extension and distribution-record hashes, and an
@@ -29,23 +36,27 @@ explicit externally attested source-adapter implementation hash.
 `ml_dtypes==0.5.4` is a direct dependency rather than an accidental transitive
 JAX dependency.
 
-This is not an Orbax converter and produces no production seal. There is no
-real safetensor source adapter, TensorStore/Orbax sink, fresh-process restore,
+This is not an Orbax converter and produces no production seal. The local
+source adapter proves bytes only after a trusted controller has prestaged
+them; it does not authenticate the download or object-store generation. There
+is no controller/GCS prestager, TensorStore/Orbax sink, fresh-process restore,
 independent real-R1 FP8 hash oracle, full-model logit oracle, or prefix/full
 parity result yet. The only public sealing function fails unconditionally
 until those gates exist.
 
 The memory limits are statically checked bounds on the core's numerical array
-working set under synchronous source/sink contracts. The one-validated-shard
-local-scratch limit and sink staging limit remain adapter obligations and have
-not been measured because those adapters do not exist. The shared project
+working set under synchronous source/sink contracts. The local reader enforces
+one verified shard and bounded hash/read buffers, but its full-scale throughput
+and scratch behavior have not been measured. The durable sink staging limit
+remains an unimplemented adapter obligation. The shared project
 environment also still resolves MaxText to the Gemma commit; it must not be
 used for R1. The isolated project at `deploy/r1/runtime/` now pins the MaxText
 revision below plus exact Python/JAX/JAXLIB/libtpu versions. The pinned plan
 constructor measures both of its files and accepts that lock while continuing
 to reject the shared root lock. This closes the static lock-identity gap only:
 the image is unbuilt, the worker admission path is deliberately fail-closed,
-and a real source, Orbax sink, restore, or parity run still cannot seal.
+and authenticated prestaging, an Orbax sink, restore, or parity run still
+cannot seal.
 
 ## Immutable source identity
 
