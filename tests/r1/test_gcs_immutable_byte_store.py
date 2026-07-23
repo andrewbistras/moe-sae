@@ -9,8 +9,19 @@ import threading
 from typing import Any, Callable
 
 import google_crc32c
+import ml_dtypes
+import numpy as np
 import pytest
 
+from moe_sae.r1.capture_data_plane_contract import build_capture_work_plan
+from moe_sae.r1.capture_fragment_codec import (
+    AddressableCaptureShardV1,
+    pack_capture_fragment,
+)
+from moe_sae.r1.gcs_provisional_capture_sink import (
+    GCSProvisionalCaptureSinkError,
+    GCSProvisionalCaptureSinkV1,
+)
 from moe_sae.r1.gcs_immutable_byte_store import (
     MAX_APPLICATION_STREAM_SLICE_BYTES,
     MAX_IMMUTABLE_SNAPSHOT_BYTES,
@@ -364,6 +375,182 @@ def _create(
         expected_sha256=hashlib.sha256(payload).hexdigest(),
         expected_size_bytes=len(payload),
     )
+
+
+def test_provisional_create_ack_performs_no_head_adoption_or_payload_readback() -> None:
+    store, client = _store(io_chunk_bytes=2 * _MIB)
+    payload = b"p" * (9 * _MIB)
+    sha256 = hashlib.sha256(payload).hexdigest()
+    client.calls.clear()
+
+    receipt = store.create_content_provisional_ack(
+        payload,
+        expected_sha256=sha256,
+        expected_size_bytes=len(payload),
+    )
+
+    assert receipt.sha256 == sha256
+    assert receipt.size_bytes == len(payload)
+    assert receipt.crc32c == _crc32c(payload)
+    assert receipt.object_id == content_addressed_object_id(sha256)
+    assert [item[0] for item in client.calls] == ["upload"]
+    assert client.downloaded_bytes == 0
+    assert client.upload_read_sizes == [2 * _MIB] * 4 + [_MIB]
+
+
+def test_provisional_conflict_and_ambiguous_commit_fail_without_adoption() -> None:
+    store, client = _store()
+    first = b"first provisional object"
+    first_sha256 = hashlib.sha256(first).hexdigest()
+    store.create_content_provisional_ack(
+        first,
+        expected_sha256=first_sha256,
+        expected_size_bytes=len(first),
+    )
+    client.calls.clear()
+    with pytest.raises(GCSImmutableByteStoreError, match="provisional"):
+        store.create_content_provisional_ack(
+            first,
+            expected_sha256=first_sha256,
+            expected_size_bytes=len(first),
+        )
+    assert [item[0] for item in client.calls] == ["upload"]
+    assert client.downloaded_bytes == 0
+
+    second = b"ambiguous committed provisional object"
+    second_sha256 = hashlib.sha256(second).hexdigest()
+    client.calls.clear()
+    client.fail_upload_after_status = 503
+    with pytest.raises(GCSImmutableByteStoreError, match="provisional"):
+        store.create_content_provisional_ack(
+            second,
+            expected_sha256=second_sha256,
+            expected_size_bytes=len(second),
+        )
+    assert [item[0] for item in client.calls] == ["upload"]
+    assert client.downloaded_bytes == 0
+    assert (
+        "r1-checkpoints",
+        f"converted/r1/{content_addressed_object_id(second_sha256)}",
+    ) in client.objects
+
+
+def test_provisional_create_rejects_ambiguous_inputs_before_object_io() -> None:
+    store, client = _store()
+    payload = b"strict provisional input"
+    sha256 = hashlib.sha256(payload).hexdigest()
+    client.calls.clear()
+
+    with pytest.raises(
+        (ProtocolError, GCSImmutableByteStoreError),
+        match="expected_sha256",
+    ):
+        store.create_content_provisional_ack(
+            payload,
+            expected_sha256=_DriftStr(sha256),
+            expected_size_bytes=len(payload),
+        )
+    with pytest.raises(GCSImmutableByteStoreError, match="exact immutable bytes"):
+        store.create_content_provisional_ack(  # type: ignore[arg-type]
+            bytearray(payload),
+            expected_sha256=sha256,
+            expected_size_bytes=len(payload),
+        )
+    assert client.calls == []
+    assert client.objects == {}
+
+
+def _tiny_packed_capture_fragment():
+    activation = np.zeros(
+        (2, 1_024, 7_168),
+        dtype=np.dtype(ml_dtypes.bfloat16),
+    )
+    ids = np.broadcast_to(
+        np.arange(8, dtype=np.int32),
+        (2, 1_024, 8),
+    ).copy()
+    weights = np.full(
+        (2, 1_024, 8),
+        np.float32(2.5 / 8),
+        dtype=np.float32,
+    )
+    sequence_id = np.broadcast_to(
+        np.asarray([1, 2], dtype=np.int64)[:, None],
+        (2, 1_024),
+    ).copy()
+    position = np.broadcast_to(
+        np.arange(1_024, dtype=np.uint16),
+        (2, 1_024),
+    ).copy()
+    shard = AddressableCaptureShardV1(
+        activation,
+        ids,
+        weights,
+        sequence_id,
+        position,
+    )
+    work = build_capture_work_plan(
+        work_id="gcs-provisional-sink-test",
+        input_range_sha256="5" * 64,
+        start_token_ordinal=0,
+        token_count=1,
+    )
+    return pack_capture_fragment(next(work.iter_fragments()), shard)
+
+
+def test_attempt_scoped_provisional_sink_wraps_only_hard_false_receipts() -> None:
+    attempt_id = "attempt-0001"
+    store, client = _store(prefix=f"captures/attempts/{attempt_id}")
+    packed = _tiny_packed_capture_fragment()
+    sink = GCSProvisionalCaptureSinkV1(store, attempt_id=attempt_id)
+    client.calls.clear()
+
+    receipt = sink.create_provisional(packed)
+
+    receipt.require_matches(packed)
+    assert receipt.object_create_acknowledged is True
+    assert receipt.full_payload_readback_verified is False
+    assert receipt.manifest_visible is False
+    assert receipt.production_sealable is False
+    assert sink.production_identity_qualified is False
+    assert sink.distributed_store_identity_qualified is False
+    assert sink.sink_id.startswith("gcs-provisional-capture-sink-v1:")
+    assert [item[0] for item in client.calls] == ["upload"]
+    assert client.downloaded_bytes == 0
+
+
+def test_provisional_sink_rejects_prefix_drift_and_conflict_without_readback() -> None:
+    packed = _tiny_packed_capture_fragment()
+    store, client = _store(prefix="captures/not-an-attempt")
+    with pytest.raises(GCSProvisionalCaptureSinkError, match="unique attempt"):
+        GCSProvisionalCaptureSinkV1(store, attempt_id="attempt-0002")
+    assert client.objects == {}
+
+    attempt_id = "attempt-0003"
+    store, client = _store(prefix=f"captures/attempts/{attempt_id}")
+    sink = GCSProvisionalCaptureSinkV1(store, attempt_id=attempt_id)
+    sink.create_provisional(packed)
+    client.calls.clear()
+    with pytest.raises(GCSProvisionalCaptureSinkError, match="without adoption"):
+        sink.create_provisional(packed)
+    assert [item[0] for item in client.calls] == ["upload"]
+    assert client.downloaded_bytes == 0
+
+
+def test_provisional_sink_identity_is_frozen_and_rejects_string_subclasses() -> None:
+    attempt_id = "attempt-0004"
+    store, client = _store(prefix=f"captures/attempts/{attempt_id}")
+    with pytest.raises(GCSProvisionalCaptureSinkError, match="exact safe"):
+        GCSProvisionalCaptureSinkV1(
+            store,
+            attempt_id=_DriftStr(attempt_id),
+        )
+    sink = GCSProvisionalCaptureSinkV1(store, attempt_id=attempt_id)
+    with pytest.raises(AttributeError, match="immutable"):
+        sink._attempt_id = "other"  # type: ignore[misc]
+    with pytest.raises(AttributeError, match="immutable"):
+        del sink._store  # type: ignore[misc]
+    assert client.objects == {}
 
 
 def test_receipt_is_strict_canonical_with_decimal_generation_fields() -> None:

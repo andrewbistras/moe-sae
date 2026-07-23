@@ -29,6 +29,15 @@ narrow ``bucket(...).blob(...)`` client surface and a retry-policy sentinel,
 so the base CPU test environment does not need the optional cloud package.
 Injected clients are explicitly test-only: they receive a different store
 identity and cannot claim a distributed production identity.
+
+The additive ``create_content_provisional_ack`` method is intentionally weaker
+than the ordinary API.  It is reserved for the asynchronous capture data path:
+after a successful create-only upload it validates the exact response metadata
+and server CRC32C but performs no HEAD, adoption, or payload readback.  Any
+upload exception, including an ambiguous post-commit exception or a create
+conflict, is fatal to that caller.  The returned physical receipt must be
+wrapped in a hard-false provisional capture receipt and independently read
+back before manifest visibility.
 """
 
 from __future__ import annotations
@@ -1135,6 +1144,107 @@ class GCSImmutableByteStore:
             expected_sha256=expected_sha256,
             expected_size_bytes=expected_size_bytes,
         )
+
+    def create_content_provisional_ack(
+        self,
+        payload: bytes,
+        *,
+        expected_sha256: str,
+        expected_size_bytes: int,
+    ) -> GCSPhysicalObjectReceiptV1:
+        """Create one content object without HEAD, adoption, or byte readback.
+
+        This method returns only a provisional server acknowledgement.  An
+        exception after the server committed bytes remains an error and may
+        leave an unreachable immutable object.  Callers must not retry or
+        publish a manifest from this return value alone.
+        """
+
+        if type(payload) is not bytes:
+            raise GCSImmutableByteStoreError(
+                "provisional payload must be exact immutable bytes"
+            )
+        if type(expected_sha256) is not str:
+            raise GCSImmutableByteStoreError(
+                "expected_sha256 must be an exact immutable string"
+            )
+        expected_sha256 = require_string(
+            expected_sha256,
+            "expected_sha256",
+            pattern=SHA256_PATTERN,
+        )
+        object_id = content_addressed_object_id(expected_sha256)
+        if (
+            type(expected_size_bytes) is not int
+            or not 1 <= expected_size_bytes <= self.maximum_object_bytes
+            or len(payload) != expected_size_bytes
+        ):
+            raise GCSImmutableByteStoreError(
+                "provisional payload size differs from the positive store bound"
+            )
+        measured_sha256 = hashlib.sha256()
+        view = memoryview(payload)
+        try:
+            cursor = 0
+            while cursor < len(view):
+                stop = min(cursor + self.stream_buffer_bytes, len(view))
+                piece = view[cursor:stop]
+                try:
+                    measured_sha256.update(piece)
+                finally:
+                    piece.release()
+                cursor = stop
+            if measured_sha256.hexdigest() != expected_sha256:
+                raise GCSImmutableByteStoreError(
+                    "provisional payload SHA-256 differs from expectation"
+                )
+            checksum = google_crc32c.Checksum()
+            checksum.update(payload)
+            expected_crc32c = _crc32c_base64(checksum)
+            blob = self._blob(object_id)
+            blob.metadata = _metadata(
+                store_id=self.store_id,
+                object_id=object_id,
+                sha256=expected_sha256,
+                size_bytes=expected_size_bytes,
+            )
+            reader = _MemoryViewReader(
+                view,
+                maximum_read_bytes=self.stream_buffer_bytes,
+                exact_bytes=payload,
+            )
+            client_checksum = (
+                "crc32c" if expected_size_bytes <= _MAX_MULTIPART_SIZE_BYTES else None
+            )
+            try:
+                blob.upload_from_file(
+                    reader,
+                    rewind=False,
+                    size=expected_size_bytes,
+                    content_type=_CONTENT_TYPE_BINARY,
+                    if_generation_match=0,
+                    checksum=client_checksum,
+                    retry=self._retry_policy,
+                    timeout=self._timeout_seconds,
+                    crc32c_checksum_value=expected_crc32c,
+                )
+            except Exception as error:
+                raise GCSImmutableByteStoreError(
+                    f"provisional create-only upload failed: {object_id}"
+                ) from error
+            receipt = self._receipt_from_blob(object_id, blob)
+            if (
+                receipt.sha256 != expected_sha256
+                or receipt.size_bytes != expected_size_bytes
+                or receipt.crc32c != expected_crc32c
+                or receipt.object_id != object_id
+            ):
+                raise CorruptGCSImmutableObject(
+                    "provisional upload response differs from exact local bytes"
+                )
+            return receipt
+        finally:
+            view.release()
 
     def create_memoryview_or_verify(
         self,

@@ -471,7 +471,8 @@ Required kernel properties:
 - bounded asynchronous device-to-host buffers and direct regional GCS upload;
 - prefix-only weights so post-target layers do not consume HBM or load time.
 
-The first data-plane contract is now frozen, but no live writer is claimed.
+The first data-plane contract is now frozen, but no live JAX integration or
+production-qualified writer is claimed.
 Each addressable two-sequence shard is one topology-neutral logical fragment:
 2,048 valid-token positions at full size and 29,446,144 durable bytes. A full
 B128 step therefore emits 64 objects, four per TPU VM, totaling
@@ -519,9 +520,21 @@ third fails immediately. One coordinator fans each active step to four codec
 and create workers. Any pack, create, or exact receipt mismatch latches a fatal
 state, fails already queued work without publishing a result, and rejects
 future submissions. Successful tickets contain only create acknowledgements
-whose full-readback, manifest-visible, and sealing flags remain false. The
-actual fast GCS create adapter and independent generation-pinned validator are
-still unimplemented.
+whose full-readback, manifest-visible, and sealing flags remain false.
+
+The first fast GCS adapter now implements that provisional boundary. It
+requires a unique attempt-scoped prefix and exact immutable bytes, calculates
+the local SHA-256 and CRC32C, and makes one create-only upload. A successful
+server response is checked against the exact local object identity, byte
+count, and CRC32C. It performs no HEAD, adoption, or byte readback; a conflict
+or ambiguous post-commit exception is fatal and may leave an unreachable
+object under that attempt prefix. This is deliberate: the synchronized
+numerical path never turns uncertainty into an unbounded retry/readback stall,
+and provisional objects cannot become manifest-visible evidence. The adapter
+and writer still remain `production_identity_qualified=false`. The independent
+generation-pinned full-payload validator, exact-range manifest sealer, live JAX
+buffer integration, real GCS chaos test, and v6e throughput qualification are
+not yet implemented or satisfied.
 
 Qualification proceeds from an uninstrumented synthetic kernel microbenchmark
 to full synthetic prefix, instrumented synthetic prefix, real in-memory input,
