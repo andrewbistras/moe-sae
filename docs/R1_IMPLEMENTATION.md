@@ -532,9 +532,14 @@ object under that attempt prefix. This is deliberate: the synchronized
 numerical path never turns uncertainty into an unbounded retry/readback stall,
 and provisional objects cannot become manifest-visible evidence. The adapter
 and writer still remain `production_identity_qualified=false`. The independent
-generation-pinned full-payload validator, exact-range manifest sealer, live JAX
-buffer integration, real GCS chaos test, and v6e throughput qualification are
-not yet implemented or satisfied.
+generation-pinned validator now binds each provisional receipt to its exact
+fragment plan, performs a pinned HEAD, streams and hashes every payload byte,
+and rechecks the immutable generation afterward. Its successful receipt
+records full-payload readback as true but keeps manifest visibility and
+production sealing false. It neither retains the activation payload nor runs
+inside the numerical window. The exact-range manifest sealer, live JAX buffer
+integration, real GCS chaos test, and v6e throughput qualification are not yet
+implemented or satisfied.
 
 Qualification proceeds from an uninstrumented synthetic kernel microbenchmark
 to full synthetic prefix, instrumented synthetic prefix, real in-memory input,
