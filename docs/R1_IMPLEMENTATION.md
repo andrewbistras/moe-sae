@@ -404,15 +404,20 @@ durable metadata, not model outputs. After durable casts the complete row is
 and 29,446,144 bytes per chip. The plan remains inventory-unbound and cannot
 authorize restore, admission, or production.
 
-A separate source-bound adapter contract now pins the exact c03 identities of
+A separate source-bound adapter contract pins the exact c03 identities of
 the decoder, DeepSeek model, pure-JAX batch-split implementation, and model
 configuration. It records seven required source repairs: thread packed segment
 metadata, build a block-diagonal causal mask, stop the scan after 27 complete
 MoE blocks plus one partial target, omit the target shared expert and residual,
 keep router math in FP32, capture global IDs before remap, and remove custom-VJP
-backward/host-offload work. This is still a patch plan rather than a kernel:
-patch, packed-attention, restore, parity, v6e qualification, sealing, and
-production-admission claims are all hard false.
+backward/host-offload work. The two ordered source patches now implement this
+B128×1024 candidate against the pinned MaxText commit. They reuse native
+batch-split MoE execution, overlap the next completed-layer gather with the
+pending second microbatch, gather the target while the final completed layer
+finishes, execute packed target attention, and stop after the routed aggregate
+and native router metadata. Patch application is commit-, hash-, and
+post-image-bound. Real v6e qualification, parity, sealing, and production
+admission remain hard false.
 
 The checkpoint side now has a matching framework-neutral restore authority.
 Given one exact generation-pinned V2 envelope receipt and an independently
@@ -421,10 +426,29 @@ envelope and manifest, rederives the canonical 510-to-44 plan, and returns
 leaf-scoped lazy views. Those views read only exact flat regions, default to an
 8 MiB bound, hard-cap requests at 64 MiB, and do not assemble whole
 destinations. The opening receipt, every binding field, every derived leaf
-specification, each source map, and all reader bounds are cross-checked. This
-closes the topology-neutral control-plane-to-adapter seam only: no released
-payload has been observed, no JAX/Orbax array has been restored, and
-qualification, sealing, and production admission remain hard false.
+specification, each source map, and all reader bounds are cross-checked.
+
+This control plane is now joined to a runtime-only JAX adapter. It constructs
+the exact 44 global arrays with `jax.make_array_from_callback`, reads only the
+requested global shard slices, binds 30 arrays into the pruned NNX graph, passes
+14 arrays to the unscanned target, and compiles with the merged model as a
+dynamic `nnx.jit` argument. An exact-receipt VM-local read-through cache ensures
+that many shard callbacks do not redownload the same at-most-64-MiB GCS object.
+Randomized rectangular-slice tests, an eight-device scan-axis test, and
+64-device emulation pass. No released payload has been observed and no real
+v6e restore or compile has completed, so qualification, sealing, and production
+admission remain hard false.
+
+The first real-hardware benchmark no longer depends on the 649.674 GB
+checkpoint conversion. A synthetic allocator creates the same 44-leaf logical
+tree directly on the 64 devices: giant expert matrices are dynamic zero-valued
+arguments, while embeddings and router kernels are randomized to keep expert
+loads balanced. The full MaxText graph therefore still executes, but no bulk
+checkpoint transfer is needed to find the winning mesh. The benchmark excludes
+allocation, compilation, and five warmups; measures at least 500 synchronized
+steps; reduces the slowest host duration after the timed window; and requires a
+step at or below 163.551 ms for 51% of the official 64-chip BF16 peak under the
+frozen useful-prefix numerator.
 
 The ordinary MoE path is the independent performance candidate, but it has two
 separate drop controls. Positive `capacity_factor` masks assignments, and
@@ -816,12 +840,15 @@ slice; opaque client RSS is deliberately unclaimed and remains a live
 qualification measurement. It exposes no listing, latest-pointer, delete, or
 controller-CAS operation. A framework-neutral direct restore authority now
 binds that exact two-read control plane and independently expected inventory
-identity to the canonical 510-to-44 performance tree. It exposes only
-generation-pinned, leaf-scoped, bounded flat reads to a future framework
-adapter; all source-observation, completed-restore, qualification, sealing, and
-admission claims remain false. There is still no controller CAS integration,
-JAX/Orbax array-construction path, real-bucket chaos evidence, full-scale
-throughput evidence, or measured Python RSS bound.
+identity to the canonical 510-to-44 performance tree. Its JAX adapter constructs
+sharded arrays from generation-pinned bounded callbacks, verifies the exact
+30-model/14-target split, and reaches the TPU-only Splash lowering boundary
+after tracing the full patched prefix on 64 emulated devices. Region-affine CAS
+scheduling now advances attempt fences monotonically and admits a slice only
+when every sealed bulk input already has one replica in that region. There is
+still no released R1 payload, real-bucket chaos evidence, real v6e compile,
+full-scale throughput evidence, measured Python RSS bound, or production
+admission.
 
 1. Use the exact Hugging Face and MaxText source identities and file hashes in
    the checkpoint conversion contract; neither repository's moving `main` is
