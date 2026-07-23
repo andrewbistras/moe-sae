@@ -652,10 +652,17 @@ without listing. It uses exact immutable `bytes`; selects server-prevalidated
 CRC32C without the pinned client's resumable corruption-delete path; rejects a
 default CMEK; and grants production identity only to its internally constructed
 exact-3.13.0 client. Its one-time bucket attestation assumes trusted operators
-do not update bucket configuration while the store is live. It is not yet a
-`ConversionOutputSink`, does not publish the topology-neutral logical manifest
-or regional envelope, and has no JAX/Orbax restore path, real-bucket chaos
-evidence, full-scale throughput evidence, or measured Python RSS bound.
+do not update bucket configuration while the store is live. An additive V2
+checkpoint protocol now commits the exact 43,679 source entries, 21,930 source
+logical tensors, 510 packed MaxText destinations, 22,108 content-addressed
+chunks, 324,837,104,640 parameters, and 649,674,223,616 payload bytes without
+regional topology in the logical identity. Generation-pinned per-chunk
+bindings and a publish-last regional envelope carry physical placement; lazy
+open uses exactly two bounded control reads, then reads only touched bindings
+and payloads. Both records remain `production_sealable=false`. The GCS byte
+store is not yet a `ConversionOutputSink` or publisher, and there is still no
+controller CAS integration, JAX/Orbax restore path, real-bucket chaos evidence,
+full-scale throughput evidence, or measured Python RSS bound.
 
 1. Use the exact Hugging Face and MaxText source identities and file hashes in
    the checkpoint conversion contract; neither repository's moving `main` is

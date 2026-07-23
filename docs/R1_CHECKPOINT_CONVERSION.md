@@ -1,9 +1,10 @@
 # DeepSeek-R1-0528 checkpoint conversion contract
 
 **Status:** source-backed design audit, bounded reference execution core,
-verified local safetensor reader, diagnostic local immutable output store, and
-an unwired GCS immutable byte-store primitive, 2026-07-23. No weight payload
-was downloaded during this work. Safetensor
+verified local safetensor reader, diagnostic local immutable output store,
+generation-pinned GCS byte-store primitive, and an unwired topology-neutral
+logical/regional checkpoint protocol, 2026-07-23. No weight payload was
+downloaded during this work. Safetensor
 headers, the Hugging Face index and configuration, and the pinned MaxText
 source were inspected.
 
@@ -49,9 +50,18 @@ The active implementation has deliberately separate layers:
   `records/sha256` namespaces are reserved and must agree exactly with the
   receipt SHA-256 and canonical suffix. This standalone
   primitive accepts exact immutable `bytes`, not caller-mutable buffers. It
-  has no listing API. It is not a `ConversionOutputSink` and is not yet wired
-  into the prefix sink, manifest, reader, or controller publication path;
-  therefore it cannot seal a checkpoint.
+  has no listing API. It is not yet a `ConversionOutputSink`; therefore it
+  cannot seal a checkpoint.
+- [`prefix_checkpoint_v2.py`](../src/moe_sae/r1/prefix_checkpoint_v2.py)
+  separates one topology-neutral logical checkpoint identity from its
+  generation-pinned regional replicas. It binds the 21,930 selected source
+  tensors to 510 packed MaxText destination arrays and 22,108 immutable
+  payload leaves, publishes per-leaf source/physical bindings, and opens a
+  regional replica with exactly two bounded metadata reads before lazily
+  fetching only touched binding and payload objects. Its manifest and regional
+  envelope are each capped at 32 MiB and remain explicitly
+  `production_sealable=false`. The GCS sink/publisher and controller CAS path
+  are not wired yet.
 
 The production GCS writer role for this primitive must contain only bucket
 metadata read plus object create/get permissions. It must not include object
@@ -94,9 +104,9 @@ output adapters additionally enforce their declared stream-buffer limits.
 The GCS primitive takes an already-resident immutable `bytes` payload and
 bounds subsequent explicit application stream slices at 8 MiB, but the pinned
 HTTP client's total RSS and internal copies have not been measured.
-Full-scale throughput and scratch behavior remain unqualified. A GCS prefix
-sink/manifest/reader integration and the later JAX/Orbax mapper remain
-unimplemented obligations. The shared project environment
+Full-scale throughput and scratch behavior remain unqualified. A GCS
+conversion sink/publisher, controller integration, and the later JAX/Orbax
+mapper remain unimplemented obligations. The shared project environment
 also still resolves MaxText to the Gemma commit; it must not be used for R1.
 The isolated project at `deploy/r1/runtime/` now pins the MaxText revision below
 plus exact Python/JAX/JAXLIB/libtpu versions. The pinned plan constructor
@@ -196,6 +206,14 @@ storage arithmetic is:
 | complete source shard blobs 1--78 | 325,944,454,407 | 325.944 GB |
 | converted tensor payload, all logical tensors BF16 | 649,674,209,280 | 649.674 GB |
 | converted payload with 28 router biases retained FP32 | 649,674,223,616 | 649.674 GB |
+
+The 21,930 rows above count Hugging Face logical source tensors, not restored
+MaxText arrays. Expert slices with a common destination key pack into 510
+unique MaxText destination tensors. Under the pinned 64 MiB output-chunk
+limit, those 510 arrays contain exactly 22,108 ordered immutable payload
+leaves. The distinction is part of the V2 manifest contract: it records
+43,679 source entries, 21,930 source logical tensors, 510 destination tensors,
+and 22,108 chunks separately.
 
 The final object-store footprint will be slightly larger because of Orbax or
 TensorStore metadata and chunking. On a 64-chip slice the mixed tensor payload
@@ -353,23 +371,42 @@ shard; the core rejects any declared source blob or numerical chunk above its
 plan limits before reading it. Durable output is written under a unique attempt
 prefix. No mutable `latest` pointer is published during conversion.
 
-### 3. Seal output last
+### 3. Publish logical content and regional placement separately
 
-The sealed prefix manifest contains:
+The V2 logical manifest contains only topology-neutral facts: exact source,
+MaxText, inventory, plan, conversion-engine, numeric-codec, source-adapter, and
+runtime-lock identities; every destination key, shape, dtype, ordered chunk
+interval, and content hash; and the exact 43,679 / 21,930 / 510 / 22,108
+cardinalities above. Its SHA-256 is computed over its canonical bytes; no
+self-hash is serialized into those bytes.
 
-- source and MaxText revisions and all source file/shard receipts;
-- full and selected inventory digests;
-- dequantization and tensor-map implementation digests;
-- every destination logical key, shape, dtype, element count, chunk layout,
-  logical hash, and physical object receipt;
-- exact totals matching 21,930 logical tensors, 324,837,104,640 parameters,
-  and 649,674,223,616 bytes of tensor payload;
-- explicit proof that the target shared expert, suffix, final norm, LM head,
-  and MTP block are absent;
-- a canonical self-hash and immutable publication generation.
+Regional placement is separate. Each chunk binding joins one logical output
+receipt and its plan-derived source lineage to one generation-pinned GCS
+payload receipt. A regional envelope then joins the exact logical-manifest
+receipt to the ordered set of exact binding-record receipts for one store and
+region. Bucket, URI, generation, metageneration, CRC32C, host, and region never
+enter the logical manifest, so a byte-identical cross-region copy retains the
+same logical checkpoint ID while receiving a different regional-envelope ID.
 
-The manifest is not sealed if any count, hash, dtype, restore, or parity check
-is incomplete.
+The only accepted crash order is:
+
+1. create or verify each content-addressed payload;
+2. create or verify its plan/chunk-derived binding record;
+3. create or verify the content-addressed logical manifest;
+4. create or verify the content-addressed regional envelope last;
+5. publish the exact envelope receipt through the controller's fenced CAS.
+
+An interrupted earlier stage may leave unreachable immutable bytes, never an
+apparently complete checkpoint. Opening requires both an exact envelope
+receipt and an independently expected logical-manifest SHA-256. It performs no
+listing and accepts no mutable `latest` path.
+
+V2 proves storage structure only. Both records hard-code
+`production_sealable=false`; a later qualification record must join complete
+source-observation evidence, fresh-process restore, Orbax/TensorStore
+interoperability, an independent numerical oracle, full-model and routed-prefix
+parity, and real throughput/RSS measurements without rewriting the logical
+checkpoint identity.
 
 ## Router and capture semantics
 
