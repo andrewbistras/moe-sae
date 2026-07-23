@@ -168,9 +168,9 @@ not sufficient for numerical execution. The following gates remain:
    prerequisite. Static knowledge of the image family does not prove this.
 3. A generation/hash-pinned launch reference and controller challenge must be
    implemented without allowing metadata to become shell or argv.
-4. Exactly 16 physical hosts must initialize one 64-device JAX topology, agree
-   collectively on the launch/environment/image fingerprint, and produce a
-   complete `DeviceInventoryV1` before scientific input opens.
+4. Exactly 16 TPU VMs/JAX processes must initialize one 64-device JAX
+   topology, agree collectively on the launch/environment/image fingerprint,
+   and produce a complete `DeviceInventoryV1` before scientific input opens.
 5. A final SSH-disconnect/logind-duration test must prove systemd owns the
    process and `/dev/shm` sentinel.
 6. Checkpoint restore/parity, v6e kernel qualification, and the preregistered
@@ -183,11 +183,14 @@ requirements; static bundle validation does not close that gap.
 
 No build should be labeled qualified until all six pass.
 
-## Deployment protocol blocker
+## Deployment protocol boundary
 
-The current `DeploymentEnvelopeV1` requires Spot termination action `STOP`.
-Google's current TPU Spot/MIG guide instead shows `DELETE` and says a stopped
-TPU Spot VM or MIG must be deleted and recreated to restart. Resolve this with
-a documented live API test and then version the deployment envelope; do not
-silently reinterpret the existing V1 record. See the
+`DeploymentEnvelopeV1` remains immutable and retains its obsolete Spot
+termination action `STOP`. The additive `placement_v2` protocol instead
+requires `DELETE`, a fresh whole 16-VM MIG and launch reference for every
+replacement attempt, and controller-side Compute API evidence. It permits a
+successor attempt to move regions without changing the image, runtime, or
+scientific identity. The V2 records are still a protocol oracle: the cloud API
+adapter and a documented live create/preempt/recreate test remain required
+before production admission. See the
 [official TPU Spot VM guide](https://docs.cloud.google.com/tpu/docs/spot-compute).
