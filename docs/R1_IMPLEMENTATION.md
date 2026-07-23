@@ -556,6 +556,21 @@ but still records production sealing as false. Live JAX buffer integration,
 real GCS chaos testing, and v6e throughput qualification are not yet
 implemented or satisfied.
 
+The first JAX handoff candidate now connects the frozen three-output B128 ABI
+to that writer without using device enumeration as science identity. On the
+model thread it checks the global shapes/dtypes and four addressable
+two-sequence slices, snapshots only their local host metadata, and invokes
+`copy_to_host_async`; it never waits for D2H, packing, or storage. The
+end-to-end permit is acquired before those checks, so an occupied third slot
+fails before metadata copying or D2H scheduling. A coordinator materializes
+the prefetched local arrays, canonicalizes them by global batch interval, and
+transfers writer ownership. The same two permits cover both transfer and
+persistence, so a third complete step cannot create a hidden device/host
+queue. Any accepted D2H or writer failure permanently latches the bridge. This
+is still a CPU/fake-array-tested candidate with
+`production_identity_qualified=false`; actual `jax.Array` buffers, HBM
+pressure, overlap, and timing must be qualified on v6e-64.
+
 Qualification proceeds from an uninstrumented synthetic kernel microbenchmark
 to full synthetic prefix, instrumented synthetic prefix, real in-memory input,
 and finally real persisted capture. A stage that misses its threshold is
