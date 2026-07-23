@@ -337,6 +337,11 @@ def test_nonfinite_numbers_and_duplicate_fields_are_rejected() -> None:
         canonical_json_bytes({"schema": "test.v1", "value": math.nan})
 
 
+def test_overlong_json_integer_is_a_protocol_error() -> None:
+    with pytest.raises(ProtocolError, match="invalid JSON"):
+        parse_json('{"schema":"test.v1","value":' + "9" * 5_000 + "}")
+
+
 def test_schema_mismatch_is_rejected() -> None:
     payload = _content().as_dict()
     payload["schema"] = "moe-sae.r1.content-ref.v2"

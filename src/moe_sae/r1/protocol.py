@@ -73,7 +73,11 @@ def parse_json(value: str | bytes) -> Any:
         )
     except ProtocolError:
         raise
-    except (TypeError, json.JSONDecodeError) as error:
+    # ``json.loads`` may raise a plain ``ValueError`` before returning a
+    # syntax error, notably when Python's bounded integer parser rejects an
+    # overlong decimal token.  Keep every malformed wire value behind the
+    # protocol's one fail-closed exception boundary.
+    except (TypeError, ValueError) as error:
         raise ProtocolError("invalid JSON") from error
     _validate_json_tree(parsed)
     return parsed
