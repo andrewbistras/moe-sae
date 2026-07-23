@@ -479,8 +479,21 @@ B128 step therefore emits 64 objects, four per TPU VM, totaling
 and global batch slice returned by the array sharding; host suffix, process
 index, local device order, zone, and upload stream are excluded. Partial final
 fragments compact only their contiguous valid-token prefix, while padding-only
-shards publish nothing. This gives 24,415 objects and 718.900 GB for an exact
-50M-token range, or 977 objects and 28.756 GB for 2M tokens.
+shards publish nothing. Expert-ID/weight pairs are stored in ascending global
+expert-ID order so backend TopK slot ordering cannot change logical content.
+This gives 24,415 objects and 718.900 GB for an exact 50M-token range, or 977
+objects and 28.756 GB for 2M tokens.
+
+The corresponding host codec now executes that format against exact NumPy
+addressable-shard buffers. It validates the small router and metadata fields
+using the independent R1 router oracle, performs the uint16/BF16 durable casts,
+packs the five little-endian C-order columns without a header, and emits local
+SHA-256/CRC32C plus the canonical content object ID. Its decoder independently
+checks size and SHA-256 and exposes read-only zero-copy column views. The
+activation matrix is not rescanned for finiteness on the host-critical path;
+that remains a device-side run invariant. The codec performs no cloud action
+and every packed result still records persistence, readback, and sealing as
+false.
 
 The first writer candidate has two host slots, permits at most one complete
 step of queue depth, and uses four independent upload streams per VM. At the

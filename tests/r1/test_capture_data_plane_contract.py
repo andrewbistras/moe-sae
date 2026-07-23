@@ -52,6 +52,7 @@ def test_contract_freezes_exact_byte_and_throughput_arithmetic() -> None:
     assert contract.writer_slot_count == 2
     assert contract.maximum_queued_complete_steps == 1
     assert contract.upload_streams_per_host == 4
+    assert contract.router_pair_order == "ascending-global-expert-id"
     assert contract.synchronized_path_may_wait_for_writer is False
     assert contract.create_ack_is_durable_qualification is False
     assert contract.production_sealable is False

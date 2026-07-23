@@ -60,6 +60,7 @@ PINNED_MINIMUM_PERSISTED_DENOMINATOR = 10
 _CREATE_POLICY = "unique-attempt-create-only-conflict-is-failure"
 _READBACK_POLICY = "generation-pinned-full-readback-outside-numerical-window"
 _PAYLOAD_LAYOUT = "columnar-c-order-little-endian-v1"
+_ROUTER_PAIR_ORDER = "ascending-global-expert-id"
 _DTYPE_BYTES = {
     "bfloat16": 2,
     "uint16": 2,
@@ -178,6 +179,7 @@ class CaptureDataPlaneContractV1(CanonicalRecord):
 
     batchsplit_contract_sha256: str = PINNED_PREFIX_BATCHSPLIT_CONTRACT_SHA256
     payload_layout: str = _PAYLOAD_LAYOUT
+    router_pair_order: str = _ROUTER_PAIR_ORDER
     payload_fields: tuple[CapturePayloadFieldV1, ...] = PINNED_CAPTURE_PAYLOAD_FIELDS
     fragment_token_capacity: int = PINNED_FRAGMENT_TOKEN_CAPACITY
     fragments_per_step: int = PINNED_FRAGMENTS_PER_STEP
@@ -215,6 +217,11 @@ class CaptureDataPlaneContractV1(CanonicalRecord):
             or self.payload_layout != _PAYLOAD_LAYOUT
         ):
             raise CaptureDataPlaneContractError("payload layout changed")
+        if (
+            type(self.router_pair_order) is not str
+            or self.router_pair_order != _ROUTER_PAIR_ORDER
+        ):
+            raise CaptureDataPlaneContractError("router pair order changed")
         if (
             type(self.payload_fields) is not tuple
             or self.payload_fields != PINNED_CAPTURE_PAYLOAD_FIELDS
@@ -359,6 +366,7 @@ class CaptureDataPlaneContractV1(CanonicalRecord):
             "schema": self.SCHEMA,
             "batchsplit_contract_sha256": self.batchsplit_contract_sha256,
             "payload_layout": self.payload_layout,
+            "router_pair_order": self.router_pair_order,
             "payload_fields": [item.as_dict() for item in self.payload_fields],
             "row_bytes": self.row_bytes,
             "fragment_token_capacity": self.fragment_token_capacity,
@@ -400,7 +408,7 @@ class CaptureDataPlaneContractV1(CanonicalRecord):
 
 PINNED_CAPTURE_DATA_PLANE_CONTRACT = CaptureDataPlaneContractV1()
 PINNED_CAPTURE_DATA_PLANE_CONTRACT_SHA256 = (
-    "ac61594cd3dd23a27f579fc66020368e75bec6557b3860185b7a8109885a7240"
+    "7a93074cc0172152d35cb30ebd1ebaeccbfffd8bbd4eb1eb6772a625085e7a7e"
 )
 if (
     PINNED_CAPTURE_DATA_PLANE_CONTRACT.digest
