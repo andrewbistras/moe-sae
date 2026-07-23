@@ -229,6 +229,10 @@ atomic-replace failure with temporary-file cleanup.
 - The flag exists only on direct `RoutedMoE` construction. It is not threaded
   through `RoutedAndSharedMoE`, a decoder block, or a prefix executable, so the
   normal model call path cannot request the five-tuple yet.
+- The separate `prefix_forward_adapter_contract` pins the batch-split source
+  identities and the exact B128 forward-only repair obligations. It does not
+  make this ordinary-MoE patch reusable by the batch-split kernel, and it
+  deliberately carries no patch-artifact or execution claim.
 - Tap-off preserves the three-value API and original output shard specs. The
   patched DeepSeek tap-off program is not promised to have byte-identical whole
   HLO to the unpatched source because correction bias intentionally changes from

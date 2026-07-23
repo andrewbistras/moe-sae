@@ -404,6 +404,16 @@ durable metadata, not model outputs. After durable casts the complete row is
 and 29,446,144 bytes per chip. The plan remains inventory-unbound and cannot
 authorize restore, admission, or production.
 
+A separate source-bound adapter contract now pins the exact c03 identities of
+the decoder, DeepSeek model, pure-JAX batch-split implementation, and model
+configuration. It records seven required source repairs: thread packed segment
+metadata, build a block-diagonal causal mask, stop the scan after 27 complete
+MoE blocks plus one partial target, omit the target shared expert and residual,
+keep router math in FP32, capture global IDs before remap, and remove custom-VJP
+backward/host-offload work. This is still a patch plan rather than a kernel:
+patch, packed-attention, restore, parity, v6e qualification, sealing, and
+production-admission claims are all hard false.
+
 The ordinary MoE path is the independent performance candidate, but it has two
 separate drop controls. Positive `capacity_factor` masks assignments, and
 positive `ragged_buffer_factor` truncates the sparse routing buffer. Setting
