@@ -92,7 +92,7 @@ def _exact_array(value: object, name: str) -> np.ndarray:
 
 @dataclass(frozen=True, slots=True)
 class AddressableCaptureShardV1:
-    """One host-resident two-sequence shard with exclusive writer ownership."""
+    """One host-resident shard; construction transfers read-only ownership."""
 
     routed_activation: np.ndarray
     global_expert_ids: np.ndarray
@@ -102,7 +102,12 @@ class AddressableCaptureShardV1:
 
     def __post_init__(self) -> None:
         for name in _ADDRESSABLE_SHAPES:
-            _exact_array(getattr(self, name), name)
+            value = _exact_array(getattr(self, name), name)
+            value.setflags(write=False)
+            if value.flags.writeable:
+                raise CaptureFragmentCodecError(
+                    f"{name} could not enter read-only writer ownership"
+                )
 
 
 def _little_endian_contiguous(value: np.ndarray, dtype: np.dtype) -> np.ndarray:

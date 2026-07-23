@@ -57,6 +57,23 @@ def addressable_shard() -> AddressableCaptureShardV1:
     )
 
 
+def test_addressable_shard_construction_transfers_read_only_ownership(
+    addressable_shard: AddressableCaptureShardV1,
+) -> None:
+    assert all(
+        not getattr(addressable_shard, name).flags.writeable
+        for name in (
+            "routed_activation",
+            "global_expert_ids",
+            "scaled_router_weights",
+            "sequence_id",
+            "position",
+        )
+    )
+    with pytest.raises(ValueError):
+        addressable_shard.global_expert_ids[0, 0, 0] = 99
+
+
 @pytest.fixture(scope="module")
 def packed_full(
     addressable_shard: AddressableCaptureShardV1,

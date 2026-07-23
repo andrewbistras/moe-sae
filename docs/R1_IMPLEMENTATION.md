@@ -493,7 +493,9 @@ checks size and SHA-256 and exposes read-only zero-copy column views. The
 activation matrix is not rescanned for finiteness on the host-critical path;
 that remains a device-side run invariant. The codec performs no cloud action
 and every packed result still records persistence, readback, and sealing as
-false.
+false. Constructing an addressable host shard transfers all five buffers into
+read-only writer ownership; they remain owned until the asynchronous ticket is
+terminal.
 
 The first writer candidate has two host slots, permits at most one complete
 step of queue depth, and uses four independent upload streams per VM. At the
@@ -505,8 +507,21 @@ only provisional. Generation-pinned full-payload readback and manifest
 publication occur outside the numerical window, so the checkpoint-oriented
 GCS primitive's immediate full readback is deliberately not inserted into
 this path. The contract remains `production_sealable=false` and
-`production_admission_enabled=false` until an executable asynchronous writer,
-validator, chaos tests, and real throughput measurements exist.
+`production_admission_enabled=false` until the asynchronous writer is joined
+to live JAX buffers and a real provisional sink, then passes validator, chaos,
+and throughput qualification.
+
+The framework-neutral asynchronous host writer now enforces the two-slot/four-
+stream part of that contract against a pluggable provisional sink. Submission
+uses a nonblocking two-permit semaphore, so the first two complete host steps
+are accepted even if the coordinator thread has not yet been scheduled; a
+third fails immediately. One coordinator fans each active step to four codec
+and create workers. Any pack, create, or exact receipt mismatch latches a fatal
+state, fails already queued work without publishing a result, and rejects
+future submissions. Successful tickets contain only create acknowledgements
+whose full-readback, manifest-visible, and sealing flags remain false. The
+actual fast GCS create adapter and independent generation-pinned validator are
+still unimplemented.
 
 Qualification proceeds from an uninstrumented synthetic kernel microbenchmark
 to full synthetic prefix, instrumented synthetic prefix, real in-memory input,
