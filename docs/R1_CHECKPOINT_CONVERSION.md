@@ -45,8 +45,9 @@ The active implementation has deliberately separate layers:
   caller-derived exact objects with `if_generation_match=0`, strict custom
   metadata, decimal-string generation receipts, server CRC32C, and local
   whole-object SHA-256/CRC32C verification through generation- and
-  metageneration-pinned bounded streams. The `objects/sha256` namespace is
-  reserved and must agree exactly with the receipt SHA-256. This standalone
+  metageneration-pinned bounded streams. The binary `objects/sha256` and JSON
+  `records/sha256` namespaces are reserved and must agree exactly with the
+  receipt SHA-256 and canonical suffix. This standalone
   primitive accepts exact immutable `bytes`, not caller-mutable buffers. It
   has no listing API. It is not a `ConversionOutputSink` and is not yet wired
   into the prefix sink, manifest, reader, or controller publication path;

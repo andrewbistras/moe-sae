@@ -19,6 +19,7 @@ from moe_sae.r1.gcs_immutable_byte_store import (
     GCSImmutableObjectConflict,
     GCSPhysicalObjectReceiptV1,
     content_addressed_object_id,
+    content_addressed_record_object_id,
 )
 from moe_sae.r1.protocol import ProtocolError
 
@@ -604,7 +605,7 @@ def test_divergent_exact_path_fails_closed_without_overwrite() -> None:
     assert client.current("r1-checkpoints", f"converted/r1/{object_id}").value == first
 
 
-def test_reserved_content_address_namespace_rejects_foreign_or_malformed_paths() -> (
+def test_reserved_content_address_namespaces_reject_foreign_or_malformed_paths() -> (
     None
 ):
     store, client = _store()
@@ -628,9 +629,47 @@ def test_reserved_content_address_namespace_rejects_foreign_or_malformed_paths()
             expected_sha256=foreign_sha256,
             expected_size_bytes=len(foreign),
         )
+    with pytest.raises(GCSImmutableByteStoreError, match="reserved"):
+        store.create_or_verify(
+            content_addressed_record_object_id(intended_sha256),
+            foreign,
+            expected_sha256=foreign_sha256,
+            expected_size_bytes=len(foreign),
+        )
+    with pytest.raises(GCSImmutableByteStoreError, match="reserved"):
+        store.create_or_verify(
+            "records/sha256/foreign-binding.json",
+            foreign,
+            expected_sha256=foreign_sha256,
+            expected_size_bytes=len(foreign),
+        )
 
     assert not [call for call in client.calls if call[0] == "upload"]
     assert not client.objects
+
+
+def test_content_addressed_json_record_is_idempotent_and_reserved() -> None:
+    store, _client = _store()
+    payload = b'{"schema":"example.v1"}'
+    digest = hashlib.sha256(payload).hexdigest()
+    object_id = content_addressed_record_object_id(digest)
+
+    first = store.create_or_verify(
+        object_id,
+        payload,
+        expected_sha256=digest,
+        expected_size_bytes=len(payload),
+    )
+    second = store.create_or_verify(
+        object_id,
+        payload,
+        expected_sha256=digest,
+        expected_size_bytes=len(payload),
+    )
+
+    assert first == second
+    assert first.content_type == "application/json"
+    assert first.object_id == object_id
 
 
 def test_existing_exact_bytes_with_foreign_metadata_are_a_conflict() -> None:

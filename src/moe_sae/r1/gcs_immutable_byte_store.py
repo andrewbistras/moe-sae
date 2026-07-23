@@ -280,23 +280,33 @@ def content_addressed_object_id(sha256: str) -> str:
     return _validate_object_id(f"objects/sha256/{digest[:2]}/{digest}.bin")
 
 
+def content_addressed_record_object_id(sha256: str) -> str:
+    """Return the canonical relative JSON-record path for one SHA-256 digest."""
+
+    digest = require_string(sha256, "sha256", pattern=SHA256_PATTERN)
+    return _validate_object_id(f"records/sha256/{digest[:2]}/{digest}.json")
+
+
 def _validate_reserved_content_address(
     object_id: str,
     sha256: str,
     *,
     protocol: bool = False,
 ) -> None:
-    """Protect the canonical SHA-256 namespace from foreign bindings."""
+    """Protect canonical binary and JSON SHA-256 namespaces from squatting."""
 
-    if object_id != "objects/sha256" and not object_id.startswith("objects/sha256/"):
+    if object_id == "objects/sha256" or object_id.startswith("objects/sha256/"):
+        expected = f"objects/sha256/{sha256[:2]}/{sha256}.bin"
+    elif object_id == "records/sha256" or object_id.startswith("records/sha256/"):
+        expected = f"records/sha256/{sha256[:2]}/{sha256}.json"
+    else:
         return
-    expected = f"objects/sha256/{sha256[:2]}/{sha256}.bin"
     if object_id != expected:
         error_type: type[ValueError] = (
             ProtocolError if protocol else GCSImmutableByteStoreError
         )
         raise error_type(
-            "objects/sha256 is reserved for canonical content-addressed payloads"
+            "SHA-256 namespaces are reserved for canonical content-addressed objects"
         )
 
 
