@@ -919,9 +919,10 @@ As of this snapshot:
 - MaxText lists DeepSeek V3 0324 and DeepSeek R1-0528 671B as supported JAX
   models. Pin a new exact MaxText commit; “current main” is not a production
   identity. See the [MaxText model list](https://github.com/AI-Hypercomputer/maxtext).
-- `v6e-64` is an 8×8 topology with 64 chips, eight physical hosts, and 16
-  four-chip VMs. Each chip provides 32 GB HBM and 918 BF16 TFLOP/s peak, so the
-  slice peak is 58.752 PFLOP/s by multiplication.
+- `v6e-64` is an 8×8 topology with 64 chips exposed through 16 four-chip TPU
+  VMs. Physical-host placement is provider-owned and is not a protocol input.
+  Each chip provides 32 GB HBM and 918 BF16 TFLOP/s peak, so the slice peak is
+  58.752 PFLOP/s by multiplication.
 - Currently advertised general v6e zones are `us-central1-b`, `us-east1-d`,
   `us-east5-a`, `us-east5-b`, `us-south1-ai1b`, `europe-west4-a`,
   `asia-northeast1-b`, and `southamerica-west1-a`. Availability is not a
