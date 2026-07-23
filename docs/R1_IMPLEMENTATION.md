@@ -644,7 +644,18 @@ also proves exact chunk publication/recovery, plan-bound storage finalization,
 retry-order-independent source-observation evidence, and bounded flat-region
 reconstruction. Its path-derived store identity and POSIX durability model are
 explicitly local-only; it is not the production GCS/TensorStore/Orbax sink and
-cannot make the production seal eligible.
+cannot make the production seal eligible. A separate additive GCS immutable
+byte-store primitive now implements regional-bucket attestation, create-only
+generation convergence, exact allowlisted metadata, CRC32C/SHA-256 receipts,
+reserved content-address validation, and generation-pinned bounded verification
+without listing. It uses exact immutable `bytes`; selects server-prevalidated
+CRC32C without the pinned client's resumable corruption-delete path; rejects a
+default CMEK; and grants production identity only to its internally constructed
+exact-3.13.0 client. Its one-time bucket attestation assumes trusted operators
+do not update bucket configuration while the store is live. It is not yet a
+`ConversionOutputSink`, does not publish the topology-neutral logical manifest
+or regional envelope, and has no JAX/Orbax restore path, real-bucket chaos
+evidence, full-scale throughput evidence, or measured Python RSS bound.
 
 1. Use the exact Hugging Face and MaxText source identities and file hashes in
    the checkpoint conversion contract; neither repository's moving `main` is

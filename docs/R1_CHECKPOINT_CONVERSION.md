@@ -1,8 +1,9 @@
 # DeepSeek-R1-0528 checkpoint conversion contract
 
 **Status:** source-backed design audit, bounded reference execution core,
-verified local safetensor reader, and diagnostic local immutable output store,
-2026-07-23. No weight payload was downloaded during this work. Safetensor
+verified local safetensor reader, diagnostic local immutable output store, and
+an unwired GCS immutable byte-store primitive, 2026-07-23. No weight payload
+was downloaded during this work. Safetensor
 headers, the Hugging Face index and configuration, and the pinned MaxText
 source were inspected.
 
@@ -11,7 +12,7 @@ one-indexed block-31 activation prefix. It is intentionally fail closed. A
 converter completing without an exception is not evidence that the resulting
 checkpoint is scientifically equivalent to the released model.
 
-The active implementation now has three deliberately separate layers:
+The active implementation has deliberately separate layers:
 
 - [`checkpoint_inventory.py`](../src/moe_sae/r1/checkpoint_inventory.py) is the
   sole authority for the exact source inventory, routed-prefix selection,
@@ -39,6 +40,35 @@ The active implementation now has three deliberately separate layers:
   reused-first retry cannot make the storage manifest order-dependent. Its
   bounded reader reconstructs exact flat tensor regions and exposes complete
   source-observation evidence as an explicit stronger gate.
+- [`gcs_immutable_byte_store.py`](../src/moe_sae/r1/gcs_immutable_byte_store.py)
+  is the first production storage primitive. It creates content-addressed or
+  caller-derived exact objects with `if_generation_match=0`, strict custom
+  metadata, decimal-string generation receipts, server CRC32C, and local
+  whole-object SHA-256/CRC32C verification through generation- and
+  metageneration-pinned bounded streams. The `objects/sha256` namespace is
+  reserved and must agree exactly with the receipt SHA-256. This standalone
+  primitive accepts exact immutable `bytes`, not caller-mutable buffers. It
+  has no listing API. It is not a `ConversionOutputSink` and is not yet wired
+  into the prefix sink, manifest, reader, or controller publication path;
+  therefore it cannot seal a checkpoint.
+
+The production GCS writer role for this primitive must contain only bucket
+metadata read plus object create/get permissions. It must not include object
+list, update, or delete. For objects above the pinned client's 8 MiB multipart
+limit, the primitive supplies the precomputed CRC32C for server finalization
+validation but sets the client checksum mode to `None`; this avoids the pinned
+client's unqualified `DataCorruption` delete path. Multipart objects retain
+client CRC32C validation. Denying delete remains defense in depth. Any
+incompatible object already occupying an exact path is an operator incident,
+never an overwrite request.
+
+The constructor rejects a bucket with a default CMEK because GCS does not
+expose the required server CRC32C receipt for CMEK objects. It attests region
+and default encryption once and assumes trusted operators do not update bucket
+configuration during the store's lifetime; the writer identity itself has no
+bucket-update authority. Client injection is test-only, produces a separate
+unqualified store identity, and can never claim distributed production
+qualification. Only an internally constructed exact 3.13.0 client does so.
 
 The chunk identity binds the exact conversion-module hash, the measured NumPy
 and `ml_dtypes` native-extension and distribution-record hashes, and an
@@ -59,10 +89,13 @@ unconditionally until those gates exist.
 
 The memory limits are statically checked bounds on the core's numerical array
 working set under synchronous source/sink contracts. The local source and
-output adapters additionally enforce their declared stream-buffer limits;
-those limits do not purport to bound total Python RSS. Full-scale throughput
-and scratch behavior have not been measured. A bounded production GCS/Orbax
-adapter remains an unimplemented obligation. The shared project environment
+output adapters additionally enforce their declared stream-buffer limits.
+The GCS primitive takes an already-resident immutable `bytes` payload and
+bounds subsequent explicit application stream slices at 8 MiB, but the pinned
+HTTP client's total RSS and internal copies have not been measured.
+Full-scale throughput and scratch behavior remain unqualified. A GCS prefix
+sink/manifest/reader integration and the later JAX/Orbax mapper remain
+unimplemented obligations. The shared project environment
 also still resolves MaxText to the Gemma commit; it must not be used for R1.
 The isolated project at `deploy/r1/runtime/` now pins the MaxText revision below
 plus exact Python/JAX/JAXLIB/libtpu versions. The pinned plan constructor
