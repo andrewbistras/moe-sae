@@ -2,9 +2,9 @@
 
 **Status:** source-backed design audit, bounded reference execution core,
 verified local safetensor reader, diagnostic local immutable output store,
-generation-pinned GCS byte-store primitive, and an unwired topology-neutral
-logical/regional checkpoint protocol, 2026-07-23. No weight payload was
-downloaded during this work. Safetensor
+generation-pinned GCS byte store and conversion publisher, and a
+topology-neutral logical/regional checkpoint protocol, 2026-07-23. No weight
+payload was downloaded during this work. Safetensor
 headers, the Hugging Face index and configuration, and the pinned MaxText
 source were inspected.
 
@@ -48,10 +48,20 @@ The active implementation has deliberately separate layers:
   whole-object SHA-256/CRC32C verification through generation- and
   metageneration-pinned bounded streams. The binary `objects/sha256` and JSON
   `records/sha256` namespaces are reserved and must agree exactly with the
-  receipt SHA-256 and canonical suffix. This standalone
-  primitive accepts exact immutable `bytes`, not caller-mutable buffers. It
-  has no listing API. It is not yet a `ConversionOutputSink`; therefore it
-  cannot seal a checkpoint.
+  receipt SHA-256 and canonical suffix. It accepts exact immutable `bytes` or
+  a synchronous bounded `memoryview`; every mutable view is first copied into
+  at most 64 MiB of immutable bytes and SHA-256 checked before a canonical
+  object path is opened. Upload and verification use application-owned slices
+  of at most 8 MiB. It has no listing or delete API and cannot itself seal a
+  checkpoint. These strengthened semantics use storage/store identity v2, so
+  an object carrying the earlier v1 store identity is incompatible.
+- [`gcs_prefix_checkpoint_sink.py`](../src/moe_sae/r1/gcs_prefix_checkpoint_sink.py)
+  adapts that primitive to the conversion executor. It reattests the admitted
+  store identity and bounds around every operation, resumes only through an
+  exact plan/chunk binding path, verifies the bound payload generation, then
+  publishes payload, binding, logical manifest, and regional envelope in that
+  order. It neither writes a mutable latest pointer nor performs controller
+  CAS, and its returned publication remains `production_sealable=false`.
 - [`prefix_checkpoint_v2.py`](../src/moe_sae/r1/prefix_checkpoint_v2.py)
   separates one topology-neutral logical checkpoint identity from its
   generation-pinned regional replicas. It binds the 21,930 selected source
@@ -60,8 +70,8 @@ The active implementation has deliberately separate layers:
   regional replica with exactly two bounded metadata reads before lazily
   fetching only touched binding and payload objects. Its manifest and regional
   envelope are each capped at 32 MiB and remain explicitly
-  `production_sealable=false`. The GCS sink/publisher and controller CAS path
-  are not wired yet.
+  `production_sealable=false`. The bounded GCS sink/publisher is wired to this
+  protocol; controller CAS and qualification are not.
 
 The production GCS writer role for this primitive must contain only bucket
 metadata read plus object create/get permissions. It must not include object
@@ -93,28 +103,33 @@ them; it does not authenticate the download or object-store generation. The
 local output store uses POSIX inode and fsync semantics and explicitly marks
 its path-derived identity as local-only. It is a diagnostic proof of the sink
 contract, not a GCS, TensorStore, Orbax, or multi-host implementation. There is
-no controller/GCS prestager, production checkpoint sink, fresh-process MaxText
-restore, independent real-R1 FP8 hash oracle, full-model logit oracle, or
-prefix/full parity result yet. The only production sealing function fails
+no controller/GCS prestager, fresh-process MaxText restore, independent real-R1
+FP8 hash oracle, full-model logit oracle, or prefix/full parity result yet. The
+GCS sink has only deterministic/fault-injected local evidence, not a real-bucket
+throughput and chaos qualification. The only production sealing function fails
 unconditionally until those gates exist.
 
 The memory limits are statically checked bounds on the core's numerical array
 working set under synchronous source/sink contracts. The local source and
 output adapters additionally enforce their declared stream-buffer limits.
-The GCS primitive takes an already-resident immutable `bytes` payload and
-bounds subsequent explicit application stream slices at 8 MiB, but the pinned
-HTTP client's total RSS and internal copies have not been measured.
-Full-scale throughput and scratch behavior remain unqualified. A GCS
-conversion sink/publisher, controller integration, and the later JAX/Orbax
-mapper remain unimplemented obligations. The shared project environment
-also still resolves MaxText to the Gemma commit; it must not be used for R1.
+The GCS sink takes an already-resident conversion `memoryview`. Its default
+explicit staging budget is 72 MiB: one complete 64 MiB immutable snapshot plus
+one 8 MiB application upload/verification slice. The conversion planner charges
+that complete bound on every chunk. The pinned topology remains 22,108 chunks;
+its maximum explicit resident estimate is 306,716,544 bytes under these
+defaults. This is not a claim about allocator overhead or opaque copies inside
+the pinned HTTP client; total RSS remains a measured qualification gate.
+Full-scale throughput and scratch behavior remain unqualified. Controller
+integration and the later JAX/Orbax mapper remain
+unimplemented obligations. The shared project environment also still resolves
+MaxText to the Gemma commit; it must not be used for R1.
 The isolated project at `deploy/r1/runtime/` now pins the MaxText revision below
 plus exact Python/JAX/JAXLIB/libtpu versions. The pinned plan constructor
 measures both of its files and accepts that lock while continuing to reject the
 shared root lock. This closes the static lock-identity gap only: the image is
 unbuilt, the worker admission path is deliberately fail-closed, and
-authenticated prestaging, a production checkpoint sink, restore, or parity run
-still cannot seal.
+authenticated prestaging, a real-bucket-qualified checkpoint publication,
+restore, or parity run still cannot seal.
 
 ## Immutable source identity
 

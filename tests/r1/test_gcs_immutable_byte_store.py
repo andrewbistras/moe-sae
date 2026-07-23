@@ -12,8 +12,11 @@ import google_crc32c
 import pytest
 
 from moe_sae.r1.gcs_immutable_byte_store import (
+    MAX_APPLICATION_STREAM_SLICE_BYTES,
+    MAX_IMMUTABLE_SNAPSHOT_BYTES,
     CorruptGCSImmutableObject,
     GCS_CLIENT_VERSION,
+    GCS_IMMUTABLE_STORAGE_CONTRACT,
     GCSImmutableByteStore,
     GCSImmutableByteStoreError,
     GCSImmutableObjectConflict,
@@ -43,6 +46,18 @@ class _HTTPError(RuntimeError):
     def __init__(self, code: int, message: str) -> None:
         self.code = code
         super().__init__(message)
+
+
+class _DriftStr(str):
+    """A string whose formatted representation can drift after validation."""
+
+    def __new__(cls, value: str) -> "_DriftStr":
+        instance = super().__new__(cls, value)
+        instance.render = value
+        return instance
+
+    def __format__(self, format_spec: str) -> str:
+        return format(self.render, format_spec)
 
 
 def _crc32c(value: bytes) -> str:
@@ -77,6 +92,7 @@ class _FakeClient:
         self.calls: list[tuple[str, str, dict[str, Any]]] = []
         self.lock = threading.RLock()
         self.next_generation = 100
+        self.before_blob: Callable[["_FakeBucket"], None] | None = None
         self.before_upload: Callable[[], None] | None = None
         self.before_download: Callable[[str, str], None] | None = None
         self.after_download: Callable[[str, str], None] | None = None
@@ -141,6 +157,10 @@ class _FakeBucket:
         chunk_size: int,
         generation: int | None = None,
     ) -> "_FakeBlob":
+        hook = self.client.before_blob
+        if hook is not None:
+            self.client.before_blob = None
+            hook(self)
         return _FakeBlob(
             self.client,
             self.name,
@@ -315,6 +335,7 @@ def _store(
     prefix: str = "converted/r1",
     region: str = "us-central1",
     io_chunk_bytes: int = 256 * 1024,
+    maximum_object_bytes: int = MAX_IMMUTABLE_SNAPSHOT_BYTES,
 ) -> tuple[GCSImmutableByteStore, _FakeClient]:
     fake = _FakeClient() if client is None else client
     return (
@@ -324,6 +345,7 @@ def _store(
             region,
             fake,
             io_chunk_bytes=io_chunk_bytes,
+            maximum_object_bytes=maximum_object_bytes,
             timeout_seconds=17,
             retry_deadline_seconds=29,
             resolution_attempts=4,
@@ -356,6 +378,11 @@ def test_receipt_is_strict_canonical_with_decimal_generation_fields() -> None:
     assert receipt.uri == f"gs://r1-checkpoints/converted/r1/{receipt.object_id}"
     assert receipt.region == "us-central1"
     assert receipt.crc32c == _crc32c(payload)
+    assert (
+        receipt.storage_contract
+        == GCS_IMMUTABLE_STORAGE_CONTRACT
+        == "gcs-json-create-only-generation-crc32c-sha256-v2"
+    )
     assert not hasattr(client, "list_blobs")
 
     forged = receipt.as_dict()
@@ -373,6 +400,10 @@ def test_receipt_is_strict_canonical_with_decimal_generation_fields() -> None:
     forged = receipt.as_dict()
     forged["unknown"] = "forbidden"
     with pytest.raises(ProtocolError, match="unknown"):
+        GCSPhysicalObjectReceiptV1.from_dict(forged)
+    forged = receipt.as_dict()
+    forged["storage_contract"] = "gcs-json-create-only-generation-crc32c-sha256-v1"
+    with pytest.raises(ProtocolError, match="unsupported"):
         GCSPhysicalObjectReceiptV1.from_dict(forged)
     forged = receipt.as_dict()
     forged["generation"] = "9" * 5000
@@ -399,8 +430,10 @@ def test_store_identity_bucket_location_and_constructor_bounds_are_exact() -> No
     assert store.store_id == same.store_id
     assert store.store_id != different.store_id
     assert store.distributed_identity_qualified is False
-    assert store.store_id.startswith("gcs-test-prefix-byte-store-v1:")
-    assert store.stream_buffer_bytes == 8 * _MIB
+    assert store.store_id.startswith("gcs-test-prefix-byte-store-v2:")
+    assert store.immutable_snapshot_bytes == MAX_IMMUTABLE_SNAPSHOT_BYTES
+    assert store.maximum_object_bytes == MAX_IMMUTABLE_SNAPSHOT_BYTES
+    assert store.stream_buffer_bytes == MAX_APPLICATION_STREAM_SLICE_BYTES
     assert _RETRY_POLICY.timeout == 29.0
     bucket_reload = client.calls[0]
     assert bucket_reload == (
@@ -417,6 +450,73 @@ def test_store_identity_bucket_location_and_constructor_bounds_are_exact() -> No
                 default_kms_key_name="projects/p/locations/us/keyRings/r/cryptoKeys/k"
             )
         )
+
+
+@pytest.mark.parametrize(
+    ("field", "argument_name", "value"),
+    [
+        ("bucket", "bucket", "r1-checkpoints"),
+        ("prefix", "prefix", "converted/r1"),
+        ("region", "expected_region", "us-central1"),
+    ],
+)
+def test_store_rejects_render_mutable_string_subclasses_before_object_io(
+    field: str,
+    argument_name: str,
+    value: str,
+) -> None:
+    client = _FakeClient()
+    arguments: dict[str, str] = {
+        "bucket": "r1-checkpoints",
+        "prefix": "converted/r1",
+        "expected_region": "us-central1",
+    }
+    arguments[argument_name] = _DriftStr(value)
+
+    with pytest.raises(ValueError, match=field):
+        GCSImmutableByteStore(
+            **arguments,
+            client=client,
+            retry_policy=_RETRY_POLICY,
+        )
+
+    assert client.calls == []
+    assert client.objects == {}
+
+
+def test_operation_local_blob_address_drift_fails_before_object_io() -> None:
+    store, client = _store()
+    client.calls.clear()
+    client.before_blob = lambda bucket: setattr(bucket, "name", "other-bucket")
+
+    with pytest.raises(GCSImmutableByteStoreError, match="blob address drifted"):
+        _create(store, b"must stay on the frozen bucket")
+
+    assert client.calls == []
+    assert client.objects == {}
+
+
+@pytest.mark.parametrize("field", ["object_id", "expected_sha256"])
+def test_create_rejects_render_mutable_string_subclasses_before_object_io(
+    field: str,
+) -> None:
+    store, client = _store()
+    payload = b"must not poison a canonical SHA path"
+    sha256 = hashlib.sha256(payload).hexdigest()
+    arguments: dict[str, object] = {
+        "object_id": content_addressed_object_id(sha256),
+        "payload": payload,
+        "expected_sha256": sha256,
+        "expected_size_bytes": len(payload),
+    }
+    arguments[field] = _DriftStr(str(arguments[field]))
+    client.calls.clear()
+
+    with pytest.raises((ProtocolError, GCSImmutableByteStoreError), match=field):
+        store.create_or_verify(**arguments)  # type: ignore[arg-type]
+
+    assert client.calls == []
+    assert client.objects == {}
     with pytest.raises(ValueError, match="region"):
         _store(_FakeClient(location="NAM4"), region="nam4")
     with pytest.raises(ValueError, match="256-KiB"):
@@ -428,6 +528,8 @@ def test_store_identity_bucket_location_and_constructor_bounds_are_exact() -> No
             io_chunk_bytes=123,
             retry_policy=_RETRY_POLICY,
         )
+    with pytest.raises(ValueError, match="64 MiB"):
+        _store(maximum_object_bytes=MAX_IMMUTABLE_SNAPSHOT_BYTES + 1)
     with pytest.raises(ValueError, match="retry_policy"):
         GCSImmutableByteStore(
             "r1-checkpoints",
@@ -436,6 +538,66 @@ def test_store_identity_bucket_location_and_constructor_bounds_are_exact() -> No
             _FakeClient(),
             retry_policy=None,
         )
+
+
+@pytest.mark.parametrize(
+    ("attribute", "replacement"),
+    [
+        ("bucket_name", "other-bucket"),
+        ("prefix", "converted/other"),
+        ("region", "us-east1"),
+        ("client", _FakeClient()),
+        ("_bucket", object()),
+        ("_bucket_name_snapshot", "other-bucket"),
+        ("_prefix_snapshot", "converted/other"),
+        ("_region_snapshot", "us-east1"),
+    ],
+)
+def test_real_adapter_address_identity_snapshots_are_read_only(
+    attribute: str,
+    replacement: object,
+) -> None:
+    store, _client = _store()
+
+    with pytest.raises(AttributeError):
+        setattr(store, attribute, replacement)
+
+    payload = b"still uses the frozen bucket and prefix"
+    receipt = _create(store, payload)
+    assert receipt.uri == (f"gs://r1-checkpoints/converted/r1/{receipt.object_id}")
+
+
+def test_store_snapshot_cannot_be_deleted_then_reassigned() -> None:
+    store, client = _store()
+    client.calls.clear()
+
+    with pytest.raises(AttributeError, match="immutable store snapshot"):
+        del store._prefix_snapshot  # noqa: SLF001 - exact freeze invariant
+    with pytest.raises(AttributeError, match="immutable store snapshot"):
+        store._prefix_snapshot = "converted/redirected"  # noqa: SLF001
+
+    assert store.prefix == "converted/r1"
+    assert client.calls == []
+    assert client.objects == {}
+
+
+@pytest.mark.parametrize("drift", ["bucket-name", "bucket-client"])
+def test_real_adapter_retained_bucket_handle_drift_fails_before_object_io(
+    drift: str,
+) -> None:
+    store, client = _store()
+    bucket = store._bucket_snapshot  # noqa: SLF001 - exact adapter invariant
+    if drift == "bucket-name":
+        bucket.name = "other-bucket"
+    else:
+        bucket.client = _FakeClient()
+    client.calls.clear()
+
+    with pytest.raises(GCSImmutableByteStoreError, match="handle drifted"):
+        _create(store, b"must not cross the frozen address boundary")
+
+    assert client.calls == []
+    assert client.objects == {}
 
 
 def test_exact_313_client_contract_and_internal_client_production_identity(
@@ -467,7 +629,7 @@ def test_exact_313_client_contract_and_internal_client_production_identity(
     injected, _client = _store(_FakeClient())
 
     assert production.distributed_identity_qualified is True
-    assert production.store_id.startswith("gcs-prefix-byte-store-v1:")
+    assert production.store_id.startswith("gcs-prefix-byte-store-v2:")
     assert production.store_id != injected.store_id
 
 
@@ -529,6 +691,71 @@ def test_pinned_313_multipart_upload_computes_crc_from_exact_immutable_bytes() -
     assert upload[2]["checksum"] == "crc32c"
     assert upload[2]["crc32c_checksum_value"] == _crc32c(payload)
     assert store.verify(receipt) == receipt
+
+
+def test_memoryview_multipart_snapshot_cannot_poison_canonical_path() -> None:
+    store, client = _store()
+    mutable = bytearray(b"a" * (2 * _MIB))
+    expected = bytes(mutable)
+    digest = hashlib.sha256(expected).hexdigest()
+
+    def mutate_source() -> None:
+        mutable[:] = b"b" * len(mutable)
+
+    client.before_upload = mutate_source
+    view = memoryview(mutable)
+    try:
+        receipt = store.create_memoryview_or_verify(
+            content_addressed_object_id(digest),
+            view,
+            expected_sha256=digest,
+            expected_size_bytes=len(view),
+        )
+    finally:
+        view.release()
+
+    stored = client.current(
+        "r1-checkpoints",
+        f"converted/r1/{content_addressed_object_id(digest)}",
+    )
+    assert stored.value == expected
+    assert stored.value != bytes(mutable)
+    assert receipt.sha256 == digest
+    assert receipt.crc32c == _crc32c(expected)
+
+
+def test_memoryview_resumable_same_crc_mutation_cannot_poison_canonical_path() -> None:
+    store, client = _store(io_chunk_bytes=256 * 1024)
+    prefix = b"a" * (8 * _MIB)
+    # These fixed equal-length suffixes are a deterministic CRC32C collision.
+    expected = prefix + bytes.fromhex("6c7fd5e46cf48184")
+    colliding = prefix + bytes.fromhex("5f479afde2b0d701")
+    assert _crc32c(expected) == _crc32c(colliding)
+    assert hashlib.sha256(expected).digest() != hashlib.sha256(colliding).digest()
+    mutable = bytearray(expected)
+    digest = hashlib.sha256(expected).hexdigest()
+    object_id = content_addressed_object_id(digest)
+
+    def mutate_source() -> None:
+        mutable[:] = colliding
+
+    client.before_upload = mutate_source
+    view = memoryview(mutable)
+    try:
+        receipt = store.create_memoryview_or_verify(
+            object_id,
+            view,
+            expected_sha256=digest,
+            expected_size_bytes=len(view),
+        )
+    finally:
+        view.release()
+
+    stored = client.current("r1-checkpoints", f"converted/r1/{object_id}")
+    assert stored.value == expected
+    assert stored.value != bytes(mutable)
+    assert receipt.sha256 == digest
+    assert receipt.crc32c == _crc32c(expected)
 
 
 def test_read_exact_downloads_and_hashes_whole_generation_but_captures_range() -> None:

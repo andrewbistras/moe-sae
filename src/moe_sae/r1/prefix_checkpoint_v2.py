@@ -1370,6 +1370,44 @@ class RegionalPrefixChunkBindingV1(CanonicalRecord):
             )
 
 
+def build_regional_prefix_chunk_binding_v1(
+    plan: StreamingConversionPlanV1,
+    chunk: ConversionChunkIdentityV1,
+    output_receipt: OutputChunkReceiptV1,
+    physical_receipt: GCSPhysicalObjectReceiptV1,
+) -> RegionalPrefixChunkBindingV1:
+    """Build one binding with exact plan-derived source lineage."""
+
+    if (
+        type(plan) is not StreamingConversionPlanV1
+        or type(chunk) is not ConversionChunkIdentityV1
+        or type(output_receipt) is not OutputChunkReceiptV1
+        or type(physical_receipt) is not GCSPhysicalObjectReceiptV1
+    ):
+        raise PrefixCheckpointV2Error(
+            "regional binding construction requires exact protocol types"
+        )
+    try:
+        output_receipt.validate_for(
+            plan,
+            chunk,
+            sink_id=PRODUCTION_PREFIX_SINK_ID,
+        )
+        binding = RegionalPrefixChunkBindingV1(
+            plan_id=plan.plan_id,
+            chunk_id=chunk.chunk_id,
+            output_receipt=output_receipt,
+            physical_receipt=physical_receipt,
+            source_lineage=_lineage_for_chunk(plan, chunk),
+        )
+        binding.validate_for(plan, chunk)
+    except (CheckpointConversionError, ProtocolError) as error:
+        raise PrefixCheckpointV2Error(
+            "regional binding cannot be derived from the exact plan"
+        ) from error
+    return binding
+
+
 @dataclass(frozen=True, slots=True)
 class RegionalChunkReplicaV1(CanonicalRecord):
     """Exact regional receipt for one durably published binding record."""
@@ -2232,6 +2270,7 @@ __all__ = [
     "SOURCE_LINEAGE_CONTRACT",
     "TARGET_SEMANTICS",
     "build_logical_prefix_checkpoint_manifest_v2",
+    "build_regional_prefix_chunk_binding_v1",
     "build_regional_prefix_checkpoint_envelope_v1",
     "content_addressed_record_object_id",
     "regional_chunk_binding_object_id",

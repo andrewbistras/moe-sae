@@ -648,21 +648,34 @@ cannot make the production seal eligible. A separate additive GCS immutable
 byte-store primitive now implements regional-bucket attestation, create-only
 generation convergence, exact allowlisted metadata, CRC32C/SHA-256 receipts,
 reserved content-address validation, and generation-pinned bounded verification
-without listing. It uses exact immutable `bytes`; selects server-prevalidated
-CRC32C without the pinned client's resumable corruption-delete path; rejects a
-default CMEK; and grants production identity only to its internally constructed
-exact-3.13.0 client. Its one-time bucket attestation assumes trusted operators
-do not update bucket configuration while the store is live. An additive V2
-checkpoint protocol now commits the exact 43,679 source entries, 21,930 source
+without listing. It accepts immutable `bytes` and synchronous bounded
+`memoryview` payloads; every mutable view becomes an at-most-64-MiB immutable
+snapshot whose SHA-256 is checked before canonical create. It uses at most one
+additional 8 MiB application stream slice, selects server-prevalidated CRC32C
+without the pinned client's resumable corruption-delete path, rejects a default
+CMEK, and grants production identity only to its internally constructed
+exact-3.13.0 client. The strengthened storage/store identity is v2, so unsafe
+v1 objects cannot be adopted. Address components must be exact built-in strings,
+frozen address state cannot be reassigned or deleted, and each object operation
+uses a fresh local handle derived from that state. Its one-time bucket attestation
+assumes trusted operators do not update bucket configuration while the store is
+live. An additive V2 checkpoint protocol now commits the exact 43,679 source
+entries, 21,930 source
 logical tensors, 510 packed MaxText destinations, 22,108 content-addressed
 chunks, 324,837,104,640 parameters, and 649,674,223,616 payload bytes without
 regional topology in the logical identity. Generation-pinned per-chunk
 bindings and a publish-last regional envelope carry physical placement; lazy
 open uses exactly two bounded control reads, then reads only touched bindings
-and payloads. Both records remain `production_sealable=false`. The GCS byte
-store is not yet a `ConversionOutputSink` or publisher, and there is still no
-controller CAS integration, JAX/Orbax restore path, real-bucket chaos evidence,
-full-scale throughput evidence, or measured Python RSS bound.
+and payloads. Both records remain `production_sealable=false`. A bounded GCS
+conversion sink now publishes each content-addressed payload before its exact
+plan/chunk binding, reloads and verifies every bound generation, then publishes
+the logical manifest and regional envelope last. Its 72 MiB explicit staging
+budget covers the 64 MiB immutable snapshot plus one 8 MiB application stream
+slice; opaque client RSS is deliberately unclaimed and remains a live
+qualification measurement. It exposes no listing, latest-pointer, delete, or
+controller-CAS operation. There is still no controller CAS integration,
+JAX/Orbax restore path, real-bucket chaos evidence, full-scale throughput
+evidence, or measured Python RSS bound.
 
 1. Use the exact Hugging Face and MaxText source identities and file hashes in
    the checkpoint conversion contract; neither repository's moving `main` is

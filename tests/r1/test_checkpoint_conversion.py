@@ -767,6 +767,36 @@ def test_chunk_contract_change_changes_plan_and_chunk_identities(
     }
 
 
+def test_peak_estimate_charges_the_complete_declared_sink_staging_bound(
+    tiny_geometry: DeepSeekR1CheckpointGeometryV1,
+    limits: ConversionMemoryLimitsV1,
+) -> None:
+    selection = _wire_inventory(tiny_geometry)
+    first = _plan(selection, limits)
+    second = _plan(
+        selection,
+        replace(limits, sink_staging_buffer_bytes=limits.sink_staging_buffer_bytes + 1),
+    )
+
+    def identity(chunk):
+        return (
+            chunk.mapping.source_key,
+            chunk.source_start,
+            chunk.source_stop,
+            chunk.destination_flat_start,
+            chunk.destination_flat_stop,
+        )
+
+    first_by_identity = {identity(chunk): chunk for chunk in first.chunks}
+    second_by_identity = {identity(chunk): chunk for chunk in second.chunks}
+    assert set(first_by_identity) == set(second_by_identity)
+    assert all(
+        second_by_identity[key].estimated_peak_resident_bytes
+        == first_by_identity[key].estimated_peak_resident_bytes + 1
+        for key in first_by_identity
+    )
+
+
 def test_nonfinite_scale_fails_without_creating_that_chunk(
     tiny_geometry: DeepSeekR1CheckpointGeometryV1,
     limits: ConversionMemoryLimitsV1,

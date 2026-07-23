@@ -9,9 +9,12 @@ will use plan-derived identities for small bindings and regional envelopes.
 The adapter deliberately exposes no listing operation.  Every mutation uses
 ``if_generation_match=0`` and every accepted object is re-read from its exact
 generation and metageneration, then checked with local SHA-256 and CRC32C.
-The explicit stream chunk is bounded at 8 MiB.  That is a bound on individual
-Python stream reads and writes, not a measured bound on total process RSS or
-copies inside the pinned HTTP client.
+Every caller-supplied memoryview is copied into exact immutable bytes and
+cryptographically checked before a canonical object path is opened for
+upload.  The application-owned immutable snapshot is bounded at 64 MiB and
+individual application stream slices are bounded at 8 MiB.  These are
+separate allocation bounds, not a measured total-process RSS bound and not a
+bound on multipart bodies or other copies inside the pinned HTTP client.
 
 The pinned 3.13.0 client computes multipart CRC32C itself.  For resumable
 objects this adapter supplies the precomputed CRC32C for server finalization
@@ -54,7 +57,7 @@ from .protocol import (
 
 
 GCS_CLIENT_VERSION = "3.13.0"
-GCS_IMMUTABLE_STORAGE_CONTRACT = "gcs-json-create-only-generation-crc32c-sha256-v1"
+GCS_IMMUTABLE_STORAGE_CONTRACT = "gcs-json-create-only-generation-crc32c-sha256-v2"
 
 _CONTENT_TYPE_BINARY = "application/octet-stream"
 _CONTENT_TYPE_JSON = "application/json"
@@ -64,6 +67,9 @@ _METADATA_STORE_ID_KEY = "moe-sae-r1-immutable-store-id"
 _METADATA_OBJECT_ID_SHA256_KEY = "moe-sae-r1-immutable-object-id-sha256"
 _METADATA_SHA256_KEY = "moe-sae-r1-immutable-sha256"
 _METADATA_SIZE_KEY = "moe-sae-r1-immutable-size-bytes"
+# The metadata field layout remains v1.  The v2 storage contract is carried in
+# the derived store ID, which is itself mandatory metadata, so objects written
+# by the unsafe v1 adapter cannot be adopted by this adapter.
 _METADATA_SCHEMA = "v1"
 
 _COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
@@ -79,9 +85,11 @@ _MAX_GCS_NAME_BYTES = 1024
 _MAX_GCS_LONG = (1 << 63) - 1
 _MAX_GCS_UNSIGNED_LONG = (1 << 64) - 1
 _MIN_STREAM_CHUNK_BYTES = 256 * 1024
-_MAX_STREAM_CHUNK_BYTES = 8 * 1024**2
+MAX_APPLICATION_STREAM_SLICE_BYTES = 8 * 1024**2
+_MAX_STREAM_CHUNK_BYTES = MAX_APPLICATION_STREAM_SLICE_BYTES
 _MAX_MULTIPART_SIZE_BYTES = 8 * 1024**2
-_DEFAULT_MAXIMUM_OBJECT_BYTES = 64 * 1024**2
+MAX_IMMUTABLE_SNAPSHOT_BYTES = 64 * 1024**2
+_DEFAULT_MAXIMUM_OBJECT_BYTES = MAX_IMMUTABLE_SNAPSHOT_BYTES
 _RETRYABLE_OR_AMBIGUOUS_STATUSES = {408, 412, 429, 500, 502, 503, 504}
 _AUTO_RETRY = object()
 
@@ -121,7 +129,7 @@ def _status_code(error: BaseException) -> int | None:
 
 
 def _validate_object_id(value: str) -> str:
-    if not isinstance(value, str) or not value:
+    if type(value) is not str or not value:
         raise GCSImmutableByteStoreError("object_id must be a non-empty string")
     if len(value.encode("utf-8")) > _MAX_OBJECT_ID_BYTES:
         raise GCSImmutableByteStoreError("object_id exceeds its byte bound")
@@ -158,21 +166,21 @@ def _validate_prefix(value: str) -> str:
 
 
 def _validate_bucket(value: str) -> str:
-    if not isinstance(value, str) or _BUCKET.fullmatch(value) is None:
+    if type(value) is not str or _BUCKET.fullmatch(value) is None:
         raise ValueError("bucket must be a normalized GCS bucket name")
     return value
 
 
 def _validate_region(value: str, *, protocol: bool = False) -> str:
     error_type: type[ValueError] = ProtocolError if protocol else ValueError
-    if not isinstance(value, str) or _REGION.fullmatch(value) is None:
+    if type(value) is not str or _REGION.fullmatch(value) is None:
         raise error_type("region must be a normalized lowercase GCS location")
     return value
 
 
 def _decimal_generation(value: Any, name: str) -> str:
     if (
-        not isinstance(value, str)
+        type(value) is not str
         or _DECIMAL_GENERATION.fullmatch(value) is None
         or len(value) > 19
         or int(value) > _MAX_GCS_LONG
@@ -196,7 +204,7 @@ def _remote_decimal_generation(value: Any, name: str, uri: str) -> str:
         if not 1 <= value <= _MAX_GCS_LONG:
             raise CorruptGCSImmutableObject(f"{name} is invalid for {uri}")
         return str(value)
-    if not isinstance(value, str):
+    if type(value) is not str:
         raise CorruptGCSImmutableObject(f"{name} is invalid for {uri}")
     if (
         _DECIMAL_GENERATION.fullmatch(value) is None
@@ -210,7 +218,7 @@ def _remote_decimal_generation(value: Any, name: str, uri: str) -> str:
 def _remote_positive_integer(value: Any, name: str, uri: str) -> int:
     if type(value) is int:
         result = value
-    elif isinstance(value, str):
+    elif type(value) is str:
         if (
             _DECIMAL_GENERATION.fullmatch(value) is None
             or len(value) > 20
@@ -229,7 +237,7 @@ def _validate_crc32c(value: Any, *, protocol: bool = False) -> str:
     error_type: type[ValueError] = (
         ProtocolError if protocol else CorruptGCSImmutableObject
     )
-    if not isinstance(value, str) or _CRC32C.fullmatch(value) is None:
+    if type(value) is not str or _CRC32C.fullmatch(value) is None:
         raise error_type("crc32c must be canonical base64 for four bytes")
     try:
         decoded = base64.b64decode(value, validate=True)
@@ -241,7 +249,7 @@ def _validate_crc32c(value: Any, *, protocol: bool = False) -> str:
 
 
 def _parse_gs_uri(uri: str) -> tuple[str, str]:
-    if not isinstance(uri, str) or not uri.startswith("gs://"):
+    if type(uri) is not str or not uri.startswith("gs://"):
         raise ProtocolError("uri must be a gs:// object URI")
     bucket, separator, name = uri[5:].partition("/")
     if (
@@ -276,6 +284,8 @@ def _protocol_content_type(object_id: str) -> str:
 def content_addressed_object_id(sha256: str) -> str:
     """Return the canonical relative payload path for one SHA-256 digest."""
 
+    if type(sha256) is not str:
+        raise ProtocolError("sha256 must be an exact immutable string")
     digest = require_string(sha256, "sha256", pattern=SHA256_PATTERN)
     return _validate_object_id(f"objects/sha256/{digest[:2]}/{digest}.bin")
 
@@ -283,6 +293,8 @@ def content_addressed_object_id(sha256: str) -> str:
 def content_addressed_record_object_id(sha256: str) -> str:
     """Return the canonical relative JSON-record path for one SHA-256 digest."""
 
+    if type(sha256) is not str:
+        raise ProtocolError("sha256 must be an exact immutable string")
     digest = require_string(sha256, "sha256", pattern=SHA256_PATTERN)
     return _validate_object_id(f"records/sha256/{digest[:2]}/{digest}.json")
 
@@ -347,6 +359,20 @@ class GCSPhysicalObjectReceiptV1(CanonicalRecord):
     storage_contract: str = GCS_IMMUTABLE_STORAGE_CONTRACT
 
     def __post_init__(self) -> None:
+        for name in (
+            "store_id",
+            "object_id",
+            "uri",
+            "region",
+            "generation",
+            "metageneration",
+            "crc32c",
+            "sha256",
+            "content_type",
+            "storage_contract",
+        ):
+            if type(getattr(self, name)) is not str:
+                raise ProtocolError(f"{name} must be an exact immutable string")
         require_string(self.store_id, "store_id", pattern=IDENTIFIER_PATTERN)
         object_id = _protocol_object_id(self.object_id)
         sha256 = require_string(self.sha256, "sha256", pattern=SHA256_PATTERN)
@@ -425,9 +451,25 @@ class GCSPhysicalObjectReceiptV1(CanonicalRecord):
 class _MemoryViewReader:
     """Seekable byte reader that never returns more than one stream chunk."""
 
-    def __init__(self, view: memoryview, *, maximum_read_bytes: int) -> None:
+    def __init__(
+        self,
+        view: memoryview,
+        *,
+        maximum_read_bytes: int,
+        exact_bytes: bytes,
+    ) -> None:
+        if (
+            type(exact_bytes) is not bytes
+            or not view.readonly
+            or view.obj is not exact_bytes
+            or len(exact_bytes) != len(view)
+        ):
+            raise GCSImmutableByteStoreError(
+                "upload reader requires an exact immutable bytes view"
+            )
         self._view = view
         self._maximum_read_bytes = maximum_read_bytes
+        self._exact_bytes = exact_bytes
         self._position = 0
 
     def tell(self) -> int:
@@ -460,6 +502,11 @@ class _MemoryViewReader:
             )
         start = self._position
         self._position += request
+        if start == 0 and request == len(self._exact_bytes):
+            # Pinned 3.13.0 reads a multipart object in one call.  Reusing the
+            # exact immutable object avoids a second 8-MiB Python allocation
+            # while the bounded memoryview snapshot is live.
+            return self._exact_bytes
         return self._view[start : start + request].tobytes()
 
     def readable(self) -> bool:
@@ -507,10 +554,15 @@ class _HashingCaptureWriter:
                     "GCS download exceeded immutable object size"
                 )
             self._sha256.update(view)
-            # google-crc32c's C extension requires immutable bytes rather than
-            # accepting every buffer-protocol value.  This copy is capped by
-            # maximum_write_bytes and never materialises the full object.
-            self._crc32c.update(view.tobytes())
+            if type(value) is bytes:
+                # The pinned client writes exact bytes.  Reuse that immutable
+                # stream slice instead of making an application-side copy.
+                self._crc32c.update(value)
+            else:
+                # google-crc32c's C extension does not accept every
+                # buffer-protocol value.  This fallback copy is independently
+                # capped by maximum_write_bytes.
+                self._crc32c.update(view.tobytes())
             if self._captured is not None and self._capture_offset is not None:
                 left = max(self._position, self._capture_offset)
                 right = min(
@@ -543,6 +595,32 @@ class _HashingCaptureWriter:
 class GCSImmutableByteStore:
     """No-listing create-only byte store on one region-pinned GCS prefix."""
 
+    __slots__ = (
+        "_bucket_name_snapshot",
+        "_bucket_snapshot",
+        "_client_snapshot",
+        "_io_chunk_bytes",
+        "_maximum_object_bytes",
+        "_prefix_snapshot",
+        "_production_identity_qualified",
+        "_region_snapshot",
+        "_resolution_attempts",
+        "_retry_policy",
+        "_store_id",
+        "_stream_buffer_bytes",
+        "_timeout_seconds",
+    )
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in self.__slots__ and hasattr(self, name):
+            raise AttributeError(f"{name} is an immutable store snapshot")
+        object.__setattr__(self, name, value)
+
+    def __delattr__(self, name: str) -> None:
+        if name in self.__slots__:
+            raise AttributeError(f"{name} is an immutable store snapshot")
+        object.__delattr__(self, name)
+
     def __init__(
         self,
         bucket: str,
@@ -561,7 +639,7 @@ class GCSImmutableByteStore:
         bucket_name = _validate_bucket(bucket)
         normalized_prefix = _validate_prefix(prefix)
         normalized_region = _validate_region(expected_region)
-        if project is not None and (not isinstance(project, str) or not project):
+        if project is not None and (type(project) is not str or not project):
             raise ValueError("project must be a non-empty string when supplied")
         if (
             type(io_chunk_bytes) is not int
@@ -571,8 +649,14 @@ class GCSImmutableByteStore:
             raise ValueError(
                 "io_chunk_bytes must be a 256-KiB multiple in [256 KiB, 8 MiB]"
             )
-        if type(maximum_object_bytes) is not int or maximum_object_bytes <= 0:
-            raise ValueError("maximum_object_bytes must be a positive integer")
+        if (
+            type(maximum_object_bytes) is not int
+            or not 1 <= maximum_object_bytes <= MAX_IMMUTABLE_SNAPSHOT_BYTES
+        ):
+            raise ValueError(
+                "maximum_object_bytes must be in [1, 64 MiB] so mutable inputs "
+                "have a deterministic immutable-snapshot bound"
+            )
         if isinstance(timeout_seconds, bool) or not isinstance(
             timeout_seconds, (int, float)
         ):
@@ -619,10 +703,10 @@ class GCSImmutableByteStore:
         if retry_policy is None:
             raise ValueError("retry_policy.with_timeout returned no policy")
 
-        self.client = client
-        self.bucket_name = bucket_name
-        self.prefix = normalized_prefix
-        self.region = normalized_region
+        self._client_snapshot = client
+        self._bucket_name_snapshot = bucket_name
+        self._prefix_snapshot = normalized_prefix
+        self._region_snapshot = normalized_region
         self._io_chunk_bytes = io_chunk_bytes
         # The pinned Blob API always materialises a complete multipart
         # payload at or below 8 MiB even when its resumable chunk is smaller.
@@ -632,9 +716,9 @@ class GCSImmutableByteStore:
         self._timeout_seconds = timeout
         self._retry_policy = retry_policy
         self._resolution_attempts = resolution_attempts
-        self._bucket = client.bucket(bucket_name)
+        self._bucket_snapshot = client.bucket(bucket_name)
         try:
-            self._bucket.reload(
+            self._bucket_snapshot.reload(
                 projection="noAcl",
                 timeout=self._timeout_seconds,
                 retry=self._retry_policy,
@@ -643,15 +727,15 @@ class GCSImmutableByteStore:
             raise GCSImmutableByteStoreError(
                 f"cannot attest GCS bucket location: {bucket_name}"
             ) from error
-        observed_location = getattr(self._bucket, "location", None)
+        observed_location = getattr(self._bucket_snapshot, "location", None)
         if (
-            not isinstance(observed_location, str)
+            type(observed_location) is not str
             or observed_location.lower() != normalized_region
         ):
             raise GCSImmutableByteStoreError(
                 "GCS bucket location does not match expected_region"
             )
-        if getattr(self._bucket, "default_kms_key_name", None) is not None:
+        if getattr(self._bucket_snapshot, "default_kms_key_name", None) is not None:
             raise GCSImmutableByteStoreError(
                 "GCS immutable storage does not support a default CMEK because "
                 "the required server CRC32C receipt is unavailable"
@@ -676,9 +760,9 @@ class GCSImmutableByteStore:
             "identity_scope": identity_scope,
         }
         store_id_prefix = (
-            "gcs-prefix-byte-store-v1:"
+            "gcs-prefix-byte-store-v2:"
             if internally_constructed_client
-            else "gcs-test-prefix-byte-store-v1:"
+            else "gcs-test-prefix-byte-store-v2:"
         )
         self._store_id = (
             store_id_prefix + hashlib.sha256(canonical_json_bytes(identity)).hexdigest()
@@ -689,8 +773,32 @@ class GCSImmutableByteStore:
         return self._store_id
 
     @property
+    def client(self) -> Any:
+        """The construction-time client handle; the property is read-only."""
+
+        return self._client_snapshot
+
+    @property
+    def bucket_name(self) -> str:
+        return self._bucket_name_snapshot
+
+    @property
+    def prefix(self) -> str:
+        return self._prefix_snapshot
+
+    @property
+    def region(self) -> str:
+        return self._region_snapshot
+
+    @property
+    def immutable_snapshot_bytes(self) -> int:
+        """Maximum exact-bytes snapshot made from caller-mutable storage."""
+
+        return self._maximum_object_bytes
+
+    @property
     def stream_buffer_bytes(self) -> int:
-        """Maximum explicit stream slice, not a total Python RSS bound."""
+        """Maximum application stream slice, separate from snapshot bytes."""
 
         return self._stream_buffer_bytes
 
@@ -702,32 +810,84 @@ class GCSImmutableByteStore:
     def distributed_identity_qualified(self) -> bool:
         return self._production_identity_qualified
 
+    def _require_address_state(self) -> None:
+        self._require_bucket_address(self._bucket_snapshot)
+
+    def _require_bucket_address(self, bucket: Any) -> None:
+        bucket_client = getattr(bucket, "client", getattr(bucket, "_client", None))
+        bucket_name = getattr(bucket, "name", None)
+        if (
+            type(bucket_name) is not str
+            or bucket_name != self._bucket_name_snapshot
+            or bucket_client is not self._client_snapshot
+        ):
+            raise GCSImmutableByteStoreError(
+                "GCS bucket/client handle drifted from the immutable store identity"
+            )
+
+    def _require_blob_address(self, blob: Any, object_name: str) -> None:
+        blob_name = getattr(blob, "name", None)
+        blob_bucket = getattr(blob, "bucket", None)
+        if type(blob_bucket) is str:
+            blob_bucket_name = blob_bucket
+            blob_bucket_client = self._client_snapshot
+        else:
+            blob_bucket_name = getattr(blob_bucket, "name", None)
+            blob_bucket_client = getattr(
+                blob_bucket, "client", getattr(blob_bucket, "_client", None)
+            )
+        if (
+            type(blob_name) is not str
+            or blob_name != object_name
+            or type(blob_bucket_name) is not str
+            or blob_bucket_name != self._bucket_name_snapshot
+            or blob_bucket_client is not self._client_snapshot
+        ):
+            raise GCSImmutableByteStoreError(
+                "GCS blob address drifted from the immutable store identity"
+            )
+
     def object_uri(self, object_id: str) -> str:
+        self._require_address_state()
         object_id = _validate_object_id(object_id)
-        return f"gs://{self.bucket_name}/{self._object_name(object_id)}"
+        return f"gs://{self._bucket_name_snapshot}/{self._object_name(object_id)}"
 
     def _object_name(self, object_id: str) -> str:
+        self._require_address_state()
         object_id = _validate_object_id(object_id)
-        name = f"{self.prefix}/{object_id}"
+        name = f"{self._prefix_snapshot}/{object_id}"
         if len(name.encode("utf-8")) > _MAX_GCS_NAME_BYTES:
             raise GCSImmutableByteStoreError("GCS object name exceeds its byte bound")
         return name
 
     def _blob(self, object_id: str, *, generation: int | None = None) -> Any:
-        return self._bucket.blob(
-            self._object_name(object_id),
+        self._require_address_state()
+        object_name = self._object_name(object_id)
+        # Construct a private operation-local handle from the frozen address.
+        # The attested construction-time bucket remains a configuration
+        # snapshot only; accidental mutation of that retained object can
+        # therefore never redirect an object request after the state check.
+        bucket = self._client_snapshot.bucket(self._bucket_name_snapshot)
+        self._require_bucket_address(bucket)
+        blob = bucket.blob(
+            object_name,
             chunk_size=self._io_chunk_bytes,
             generation=generation,
         )
+        self._require_blob_address(blob, object_name)
+        return blob
 
     def _receipt_from_blob(
         self, object_id: str, blob: Any
     ) -> GCSPhysicalObjectReceiptV1:
         uri = self.object_uri(object_id)
-        if getattr(blob, "name", self._object_name(object_id)) != self._object_name(
-            object_id
-        ):
-            raise CorruptGCSImmutableObject(f"blob name is invalid for {uri}")
+        object_name = self._object_name(object_id)
+        try:
+            self._require_blob_address(blob, object_name)
+        except GCSImmutableByteStoreError as error:
+            raise CorruptGCSImmutableObject(
+                f"blob address is invalid for {uri}"
+            ) from error
         generation = _remote_decimal_generation(blob.generation, "generation", uri)
         metageneration = _remote_decimal_generation(
             blob.metageneration, "metageneration", uri
@@ -739,7 +899,7 @@ class GCSImmutableByteStore:
             )
         crc32c = _validate_crc32c(blob.crc32c)
         content_type = getattr(blob, "content_type", None)
-        if content_type != _content_type(object_id):
+        if type(content_type) is not str or content_type != _content_type(object_id):
             raise CorruptGCSImmutableObject(
                 f"immutable object has unexpected content type: {uri}"
             )
@@ -768,7 +928,7 @@ class GCSImmutableByteStore:
             or metadata_dict.get(_METADATA_OBJECT_ID_SHA256_KEY)
             != hashlib.sha256(object_id.encode("utf-8")).hexdigest()
             or metadata_dict.get(_METADATA_SIZE_KEY) != str(size_bytes)
-            or not isinstance(sha256, str)
+            or type(sha256) is not str
             or SHA256_PATTERN.fullmatch(sha256) is None
         ):
             raise CorruptGCSImmutableObject(
@@ -784,7 +944,7 @@ class GCSImmutableByteStore:
             store_id=self.store_id,
             object_id=object_id,
             uri=uri,
-            region=self.region,
+            region=self._region_snapshot,
             generation=generation,
             metageneration=metageneration,
             size_bytes=size_bytes,
@@ -843,7 +1003,7 @@ class GCSImmutableByteStore:
     def _validate_receipt(self, receipt: GCSPhysicalObjectReceiptV1) -> None:
         if type(receipt) is not GCSPhysicalObjectReceiptV1:
             raise GCSImmutableByteStoreError("physical receipt has the wrong type")
-        if receipt.store_id != self.store_id or receipt.region != self.region:
+        if receipt.store_id != self.store_id or receipt.region != self._region_snapshot:
             raise GCSImmutableByteStoreError(
                 "physical receipt belongs to another GCS store"
             )
@@ -976,6 +1136,55 @@ class GCSImmutableByteStore:
             expected_size_bytes=expected_size_bytes,
         )
 
+    def create_memoryview_or_verify(
+        self,
+        object_id: str,
+        payload: memoryview,
+        *,
+        expected_sha256: str,
+        expected_size_bytes: int,
+    ) -> GCSPhysicalObjectReceiptV1:
+        """Snapshot mutable storage before opening a canonical upload path.
+
+        The exact immutable snapshot is bounded by
+        :attr:`immutable_snapshot_bytes`.  SHA-256 is checked from that
+        snapshot before upload, so concurrent caller mutation can only produce
+        either the expected immutable bytes or a pre-upload failure.  The
+        method is synchronous and never retains ``payload`` after return.
+        """
+
+        if type(payload) is not memoryview:
+            raise GCSImmutableByteStoreError(
+                "mutable immutable-upload payload must be an exact memoryview"
+            )
+        try:
+            view = payload.cast("B")
+        except (TypeError, ValueError) as error:
+            raise GCSImmutableByteStoreError(
+                "immutable upload memoryview must be contiguous byte storage"
+            ) from error
+        try:
+            if (
+                type(expected_size_bytes) is not int
+                or not 1 <= expected_size_bytes <= self.immutable_snapshot_bytes
+            ):
+                raise GCSImmutableByteStoreError(
+                    "expected_size_bytes exceeds the immutable snapshot bound"
+                )
+            if len(view) != expected_size_bytes:
+                raise GCSImmutableByteStoreError(
+                    "immutable payload size differs from expectation"
+                )
+            snapshot = view.tobytes()
+            return self.create_or_verify(
+                object_id,
+                snapshot,
+                expected_sha256=expected_sha256,
+                expected_size_bytes=expected_size_bytes,
+            )
+        finally:
+            view.release()
+
     def create_or_verify(
         self,
         object_id: str,
@@ -984,7 +1193,36 @@ class GCSImmutableByteStore:
         expected_sha256: str,
         expected_size_bytes: int,
     ) -> GCSPhysicalObjectReceiptV1:
+        if type(payload) is not bytes:
+            raise GCSImmutableByteStoreError(
+                "immutable payload must be exact bytes, not mutable buffer storage"
+            )
+        view = memoryview(payload)
+        try:
+            return self._create_view_or_verify(
+                object_id,
+                view,
+                expected_sha256=expected_sha256,
+                expected_size_bytes=expected_size_bytes,
+                exact_bytes=payload,
+            )
+        finally:
+            view.release()
+
+    def _create_view_or_verify(
+        self,
+        object_id: str,
+        view: memoryview,
+        *,
+        expected_sha256: str,
+        expected_size_bytes: int,
+        exact_bytes: bytes,
+    ) -> GCSPhysicalObjectReceiptV1:
         object_id = _validate_object_id(object_id)
+        if type(expected_sha256) is not str:
+            raise GCSImmutableByteStoreError(
+                "expected_sha256 must be an exact immutable string"
+            )
         expected_sha256 = require_string(
             expected_sha256, "expected_sha256", pattern=SHA256_PATTERN
         )
@@ -997,95 +1235,93 @@ class GCSImmutableByteStore:
             raise GCSImmutableByteStoreError(
                 "expected_size_bytes exceeds the positive store bound"
             )
-        if type(payload) is not bytes:
+        if len(view) != expected_size_bytes:
             raise GCSImmutableByteStoreError(
-                "immutable payload must be exact bytes, not mutable buffer storage"
+                "immutable payload size differs from expectation"
             )
-        view = memoryview(payload)
-        try:
-            if len(view) != expected_size_bytes:
-                raise GCSImmutableByteStoreError(
-                    "immutable payload size differs from expectation"
-                )
-            sha256 = hashlib.sha256()
-            crc32c = google_crc32c.Checksum()
-            cursor = 0
-            while cursor < len(view):
-                stop = min(cursor + self.stream_buffer_bytes, len(view))
-                piece = view[cursor:stop]
-                try:
-                    sha256.update(piece)
-                    # The pinned google-crc32c C extension requires bytes.
-                    # The temporary copy is bounded by stream_buffer_bytes.
-                    crc32c.update(piece.tobytes())
-                finally:
-                    piece.release()
-                cursor = stop
-            if sha256.hexdigest() != expected_sha256:
-                raise GCSImmutableByteStoreError(
-                    "immutable payload SHA-256 differs from expectation"
-                )
-            expected_crc32c = _crc32c_base64(crc32c)
-            blob = self._blob(object_id)
-            blob.metadata = _metadata(
-                store_id=self.store_id,
-                object_id=object_id,
-                sha256=expected_sha256,
-                size_bytes=expected_size_bytes,
+        if (
+            type(exact_bytes) is not bytes
+            or not view.readonly
+            or view.obj is not exact_bytes
+            or len(exact_bytes) != len(view)
+        ):
+            raise GCSImmutableByteStoreError(
+                "canonical upload requires an exact immutable bytes view"
             )
-            reader = _MemoryViewReader(
-                view,
-                maximum_read_bytes=self.stream_buffer_bytes,
-            )
+        sha256 = hashlib.sha256()
+        cursor = 0
+        while cursor < len(view):
+            stop = min(cursor + self.stream_buffer_bytes, len(view))
+            piece = view[cursor:stop]
             try:
-                # In 3.13.0 crc32c_checksum_value is ignored by multipart
-                # uploads, whose client checksum is safe because payload is
-                # exact bytes.  Resumable uploads send the precomputed value
-                # for server validation with no client checksum, avoiding the
-                # client's generation-unqualified DataCorruption deletion.
-                checksum = (
-                    "crc32c"
-                    if expected_size_bytes <= _MAX_MULTIPART_SIZE_BYTES
-                    else None
-                )
-                blob.upload_from_file(
-                    reader,
-                    rewind=False,
-                    size=expected_size_bytes,
-                    content_type=content_type,
-                    if_generation_match=0,
-                    checksum=checksum,
-                    retry=self._retry_policy,
-                    timeout=self._timeout_seconds,
-                    crc32c_checksum_value=expected_crc32c,
-                )
-            except Exception as error:
-                status = _status_code(error)
-                if status is None or status in _RETRYABLE_OR_AMBIGUOUS_STATUSES:
-                    try:
-                        return self._resolve_expected(
-                            object_id,
-                            expected_sha256=expected_sha256,
-                            expected_size_bytes=expected_size_bytes,
-                            expected_crc32c=expected_crc32c,
-                        )
-                    except GCSImmutableObjectConflict:
-                        raise
-                    except GCSImmutableByteStoreError as resolution_error:
-                        raise GCSImmutableByteStoreError(
-                            f"cannot create immutable GCS object: {object_id}"
-                        ) from resolution_error
-                raise GCSImmutableByteStoreError(
-                    f"cannot create immutable GCS object: {object_id}"
-                ) from error
-            return self._resolve_expected(
-                object_id,
-                expected_sha256=expected_sha256,
-                expected_size_bytes=expected_size_bytes,
-                expected_crc32c=expected_crc32c,
+                sha256.update(piece)
+            finally:
+                piece.release()
+            cursor = stop
+        if sha256.hexdigest() != expected_sha256:
+            raise GCSImmutableByteStoreError(
+                "immutable payload SHA-256 differs from expectation"
             )
-        finally:
-            view.release()
+        crc32c = google_crc32c.Checksum()
+        crc32c.update(exact_bytes)
+        expected_crc32c = _crc32c_base64(crc32c)
+        blob = self._blob(object_id)
+        blob.metadata = _metadata(
+            store_id=self.store_id,
+            object_id=object_id,
+            sha256=expected_sha256,
+            size_bytes=expected_size_bytes,
+        )
+        reader = _MemoryViewReader(
+            view,
+            maximum_read_bytes=self.stream_buffer_bytes,
+            exact_bytes=exact_bytes,
+        )
+        try:
+            # In 3.13.0 crc32c_checksum_value is ignored by multipart
+            # uploads, whose client checksum is safe because payload is
+            # exact bytes.  Resumable uploads send the precomputed value
+            # for server validation with no client checksum, avoiding the
+            # client's generation-unqualified DataCorruption deletion.
+            checksum = (
+                "crc32c" if expected_size_bytes <= _MAX_MULTIPART_SIZE_BYTES else None
+            )
+            blob.upload_from_file(
+                reader,
+                rewind=False,
+                size=expected_size_bytes,
+                content_type=content_type,
+                if_generation_match=0,
+                checksum=checksum,
+                retry=self._retry_policy,
+                timeout=self._timeout_seconds,
+                crc32c_checksum_value=expected_crc32c,
+            )
+        except Exception as error:
+            status = _status_code(error)
+            if status is None or status in _RETRYABLE_OR_AMBIGUOUS_STATUSES:
+                try:
+                    return self._resolve_expected(
+                        object_id,
+                        expected_sha256=expected_sha256,
+                        expected_size_bytes=expected_size_bytes,
+                        expected_crc32c=expected_crc32c,
+                    )
+                except GCSImmutableObjectConflict:
+                    raise
+                except GCSImmutableByteStoreError as resolution_error:
+                    raise GCSImmutableByteStoreError(
+                        f"cannot create immutable GCS object: {object_id}"
+                    ) from resolution_error
+            raise GCSImmutableByteStoreError(
+                f"cannot create immutable GCS object: {object_id}"
+            ) from error
+        return self._resolve_expected(
+            object_id,
+            expected_sha256=expected_sha256,
+            expected_size_bytes=expected_size_bytes,
+            expected_crc32c=expected_crc32c,
+        )
 
     def probe_bounded(
         self, object_id: str, *, maximum_bytes: int

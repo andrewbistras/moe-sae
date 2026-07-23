@@ -305,15 +305,20 @@ class ConversionMemoryLimitsV1:
     """Hard bounds applied before source I/O.
 
     ``max_source_blob_bytes`` bounds the source adapter's one-shard local
-    scratch.  The remaining fields bound resident arrays owned by the core.
-    A sink implementation must stream from the supplied memoryview with at
-    most ``sink_staging_buffer_bytes`` additional resident bytes.
+    scratch.  The remaining fields bound resident arrays owned explicitly by
+    the core and sink.  A sink implementation may retain at most
+    ``sink_staging_buffer_bytes`` additional application-owned bytes while the
+    supplied memoryview is live.  This is not a claim about allocator overhead
+    or opaque third-party client RSS; those require a measured qualification.
     """
 
     max_source_blob_bytes: int = 6 * 1024**3
     max_resident_bytes: int = 512 * 1024**2
     max_output_chunk_bytes: int = 64 * 1024**2
-    sink_staging_buffer_bytes: int = 8 * 1024**2
+    # The production GCS sink snapshots a complete maximum-sized conversion
+    # chunk into immutable bytes before it can occupy a canonical SHA path and
+    # may concurrently own one bounded 8-MiB upload/verification slice.
+    sink_staging_buffer_bytes: int = 72 * 1024**2
 
     def __post_init__(self) -> None:
         _require_int(
@@ -1046,17 +1051,13 @@ def _estimate_peak_resident_bytes(
     if mapping.transform == "identity-v1":
         trailing = _numel(source_shape[1:])
         source_bytes = stream_width * trailing * source_itemsize
-        return source_bytes + min(source_bytes, sink_staging_bytes)
+        return source_bytes + sink_staging_bytes
 
     rows = source_shape[0]
     source_bytes = rows * stream_width * source_itemsize
     destination_bytes = rows * stream_width * destination_itemsize
     if mapping.transform == "transpose-reshape-v1":
-        return (
-            source_bytes
-            + destination_bytes
-            + min(destination_bytes, sink_staging_bytes)
-        )
+        return source_bytes + destination_bytes + sink_staging_bytes
     if mapping.transform != (
         "blockwise-fp8-f32-dequantize-then-transpose-reshape-bf16-v1"
     ):
@@ -1072,7 +1073,7 @@ def _estimate_peak_resident_bytes(
         + scale_bytes
         + fp32_work_bytes
         + destination_bytes
-        + min(destination_bytes, sink_staging_bytes)
+        + sink_staging_bytes
     )
 
 
