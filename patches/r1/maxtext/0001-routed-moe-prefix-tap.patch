@@ -1,0 +1,313 @@
+diff --git a/src/maxtext/layers/moe.py b/src/maxtext/layers/moe.py
+index 7737734b09c8be5dc332f9b29748ff93b7c96cff..c84c56b28bdd31b2e16001d5028db47de2b274ae 100644
+--- a/src/maxtext/layers/moe.py
++++ b/src/maxtext/layers/moe.py
+@@ -309,4 +309,10 @@ class GateLogit(nnx.Module):
+       bias_shape = kernel_shape[-len(self.out_features_shape) :]
++      # DeepSeek's expert-selection correction bias is released in FP32 and is
++      # added to FP32 sigmoid scores.  Keeping it in weight_dtype would round
++      # the checkpoint value to BF16 before the cast in __call__.
++      bias_dtype = (
++          jnp.float32 if self.model_name.startswith(("deepseek3", "deepseek4")) else self.weight_dtype
++      )
+       self.bias = nnx.Param(
+-          default_bias_init(rngs.params(), bias_shape, self.weight_dtype),
++          default_bias_init(rngs.params(), bias_shape, bias_dtype),
+           out_sharding=bias_axes,
+@@ -392,2 +398,3 @@ class RoutedMoE(nnx.Module):
+       is_hash_routing: bool = False,
++      capture_router_metadata: bool = False,
+   ):
+@@ -408,2 +415,6 @@ class RoutedMoE(nnx.Module):
+       is_hash_routing: Whether this layer uses deterministic hash routing instead of top-K routing.
++      capture_router_metadata: Whether to return the native global top-k IDs and
++        scaled weights alongside the routed aggregate. This is a static,
++        target-only prefix-harvesting option; the default preserves the
++        existing three-value API.
+     """
+@@ -421,2 +432,32 @@ class RoutedMoE(nnx.Module):
+     self.is_hash_routing = is_hash_routing
++    if type(capture_router_metadata) is not bool:
++      raise TypeError("capture_router_metadata must be a bool")
++    self.capture_router_metadata = capture_router_metadata
++
++    if self.capture_router_metadata:
++      unsupported = []
++      # The released DeepSeek correction bias can change selections below BF16
++      # resolution, and positive ragged capacity may truncate named routes.
++      if not self.config.float32_gate_logits:
++        unsupported.append("float32_gate_logits=False")
++      if not self.config.sparse_matmul:
++        unsupported.append("sparse_matmul=False")
++      if self.config.attention == "vllm_rpa":
++        unsupported.append("attention=vllm_rpa")
++      if self.is_hash_routing:
++        unsupported.append("hash routing")
++      if self.config.use_random_routing:
++        unsupported.append("random routing")
++      if self.config.num_moe_emb_chunks > 0:
++        unsupported.append("num_moe_emb_chunks>0")
++      if self.config.use_batch_split_schedule:
++        unsupported.append("use_batch_split_schedule=True")
++      if self.config.ragged_buffer_factor > 0.0:
++        unsupported.append("ragged_buffer_factor>0")
++      if self.quant is not None:
++        unsupported.append("quantization")
++      if unsupported:
++        raise ValueError(
++            "router metadata capture does not support " + ", ".join(unsupported)
++        )
+
+@@ -964,3 +1005,3 @@ class RoutedMoE(nnx.Module):
+
+-    return (
++    result = (
+         sorted_inputs,
+@@ -974,2 +1015,8 @@ class RoutedMoE(nnx.Module):
+     )
++    if self.capture_router_metadata:
++      # Preserve the original global IDs.  The existing selected-expert output
++      # above is deliberately transformed for GMM dispatch and may be rolled or
++      # remapped to shard-local IDs.
++      return result + (selected_experts,)
++    return result
+
+@@ -1653,2 +1700,3 @@ class RoutedMoE(nnx.Module):
+       # expert shards, and then routes within each shard.
++      local_batch_size = x.shape[0]
+
+@@ -1661,12 +1709,3 @@ class RoutedMoE(nnx.Module):
+       num_experts_per_shard = self.config.num_experts // num_ep
+-      (
+-          x,
+-          sorted_selected_experts,
+-          weights,
+-          group_sizes,
+-          selected_experts,
+-          lb_loss,
+-          bias_updates,
+-          local_group_sizes,
+-      ) = self.permute(
++      permuted = self.permute(
+           x,
+@@ -1679,3 +1718,26 @@ class RoutedMoE(nnx.Module):
+       )
+-      return (
++      if self.capture_router_metadata:
++        (
++            x,
++            sorted_selected_experts,
++            weights,
++            group_sizes,
++            selected_experts,
++            lb_loss,
++            bias_updates,
++            local_group_sizes,
++            global_top_k_indices,
++        ) = permuted
++      else:
++        (
++            x,
++            sorted_selected_experts,
++            weights,
++            group_sizes,
++            selected_experts,
++            lb_loss,
++            bias_updates,
++            local_group_sizes,
++        ) = permuted
++      result = (
+           x,
+@@ -1697,2 +1759,15 @@ class RoutedMoE(nnx.Module):
+       )
++      if self.capture_router_metadata:
++        # Ring routing computes top-k after gathering the EP batch.  Return
++        # only this shard's original logical-batch slice; routing.weights must
++        # remain gathered for the native unpermute below.
++        start = expert_shard_id * local_batch_size
++        local_top_k_indices = jax.lax.dynamic_slice_in_dim(
++            global_top_k_indices, start, local_batch_size, axis=0
++        )
++        local_top_k_weights = jax.lax.dynamic_slice_in_dim(
++            weights, start, local_batch_size, axis=0
++        )
++        return result + (local_top_k_indices, local_top_k_weights)
++      return result
+
+@@ -1702,12 +1777,3 @@ class RoutedMoE(nnx.Module):
+       reshaped_group_sizes = None
+-      (
+-          x,
+-          sorted_selected_experts,
+-          weights,
+-          group_sizes,
+-          selected_experts,
+-          lb_loss,
+-          bias_updates,
+-          local_group_sizes,
+-      ) = self.permute(
++      permuted = self.permute(
+           x,
+@@ -1719,2 +1785,25 @@ class RoutedMoE(nnx.Module):
+       )
++      if self.capture_router_metadata:
++        (
++            x,
++            sorted_selected_experts,
++            weights,
++            group_sizes,
++            selected_experts,
++            lb_loss,
++            bias_updates,
++            local_group_sizes,
++            global_top_k_indices,
++        ) = permuted
++      else:
++        (
++            x,
++            sorted_selected_experts,
++            weights,
++            group_sizes,
++            selected_experts,
++            lb_loss,
++            bias_updates,
++            local_group_sizes,
++        ) = permuted
+
+@@ -1778,3 +1867,3 @@ class RoutedMoE(nnx.Module):
+
+-      return (
++      result = (
+           x,
+@@ -1796,2 +1885,5 @@ class RoutedMoE(nnx.Module):
+       )
++      if self.capture_router_metadata:
++        return result + (global_top_k_indices, weights)
++      return result
+
+@@ -2128,3 +2220,7 @@ class RoutedMoE(nnx.Module):
+       else:
+-        x, routing, route_metadata = route(x, logits, pre_bias_logits, rngs, input_ids=sharded_input_ids)
++        routed = route(x, logits, pre_bias_logits, rngs, input_ids=sharded_input_ids)
++        if self.capture_router_metadata:
++          x, routing, route_metadata, top_k_indices, top_k_weights = routed
++        else:
++          x, routing, route_metadata = routed
+
+@@ -2182,3 +2278,6 @@ class RoutedMoE(nnx.Module):
+         )
+-        return output, routing.lb_loss, routing.bias_updates
++        result = (output, routing.lb_loss, routing.bias_updates)
++        if self.capture_router_metadata:
++          return result + (top_k_indices, top_k_weights)
++        return result
+
+@@ -2214,3 +2313,23 @@ class RoutedMoE(nnx.Module):
+
+-      return output, routing.lb_loss, routing.bias_updates
++      result = (output, routing.lb_loss, routing.bias_updates)
++      if self.capture_router_metadata:
++        return result + (top_k_indices, top_k_weights)
++      return result
++
++    sparse_matmul_out_specs = (
++        self._logical_to_mesh_axes(
++            (
++                batch_logical_axis,
++                "activation_norm_length",
++                "activation_embed",
++            )
++        ),
++        P(),  # Handle None or replicate the output
++        P(),  # Handle None or replicate the output
++    )
++    if self.capture_router_metadata:
++      router_metadata_pspec = self._logical_to_mesh_axes(
++          (batch_logical_axis, "activation_norm_length", None)
++      )
++      sparse_matmul_out_specs += (router_metadata_pspec, router_metadata_pspec)
+
+@@ -2232,13 +2351,3 @@ class RoutedMoE(nnx.Module):
+         ),
+-        out_specs=(
+-            self._logical_to_mesh_axes(
+-                (
+-                    batch_logical_axis,
+-                    "activation_norm_length",
+-                    "activation_embed",
+-                )
+-            ),
+-            P(),  # Handle None or replicate the output
+-            P(),  # Handle None or replicate the output
+-        ),
++        out_specs=sparse_matmul_out_specs,
+         check_vma=self.config.check_vma,
+@@ -2288,2 +2397,3 @@ class RoutedMoE(nnx.Module):
+       outs, lb_losses, bias_updates_list = [], [], []
++      top_k_indices_list, top_k_weights_list = [], []
+       _prev = None
+@@ -2298,3 +2408,3 @@ class RoutedMoE(nnx.Module):
+           x_c, _prev = jax.lax.optimization_barrier((x_c, _prev))
+-        out_c, lb_c, bu_c = _moe_body(
++        chunk_result = _moe_body(
+             x_c,
+@@ -2311,2 +2421,8 @@ class RoutedMoE(nnx.Module):
+         )
++        if self.capture_router_metadata:
++          out_c, lb_c, bu_c, top_k_indices_c, top_k_weights_c = chunk_result
++          top_k_indices_list.append(top_k_indices_c)
++          top_k_weights_list.append(top_k_weights_c)
++        else:
++          out_c, lb_c, bu_c = chunk_result
+         if self.config.moe_chunk_barrier:
+@@ -2319,3 +2435,9 @@ class RoutedMoE(nnx.Module):
+       bias_updates = None if bias_updates_list[0] is None else sum(bias_updates_list) / n_chunks
+-      return output, lb_loss, bias_updates
++      result = (output, lb_loss, bias_updates)
++      if self.capture_router_metadata:
++        return result + (
++            jnp.concatenate(top_k_indices_list, axis=1),
++            jnp.concatenate(top_k_weights_list, axis=1),
++        )
++      return result
+
+@@ -3043,3 +3165,6 @@ class RoutedMoE(nnx.Module):
+       out_sharding: NamedSharding | None = None,
+-  ) -> tuple[jax.Array, Optional[jax.Array], Optional[jax.Array]]:
++  ) -> (
++      tuple[jax.Array, Optional[jax.Array], Optional[jax.Array]]
++      | tuple[jax.Array, Optional[jax.Array], Optional[jax.Array], jax.Array, jax.Array]
++  ):
+     """Executes the routed MoE block.
+@@ -3055,3 +3180,5 @@ class RoutedMoE(nnx.Module):
+       A tuple containing the MoE output, the load balance loss (if applicable),
+-      and any routed bias updates.
++      and any routed bias updates. When capture_router_metadata is enabled, the
++      same native invocation additionally returns global top-k expert IDs and
++      scaled FP32 router weights.
+     """
+@@ -3120,3 +3247,3 @@ class RoutedMoE(nnx.Module):
+         )
+-      output, lb_loss, bias_updates = self.sparse_matmul(
++      sparse_result = self.sparse_matmul(
+           inputs,
+@@ -3132,2 +3259,6 @@ class RoutedMoE(nnx.Module):
+       )
++      if self.capture_router_metadata:
++        output, lb_loss, bias_updates, top_k_indices, top_k_weights = sparse_result
++      else:
++        output, lb_loss, bias_updates = sparse_result
+     else:
+@@ -3145,5 +3276,11 @@ class RoutedMoE(nnx.Module):
+       )
+-    return output, lb_loss, bias_updates
++    result = (output, lb_loss, bias_updates)
++    if self.capture_router_metadata:
++      return result + (
++          top_k_indices.astype(jnp.int32),
++          top_k_weights.astype(jnp.float32),
++      )
++    return result
+
+
+ class RoutedAndSharedMoE(nnx.Module):
