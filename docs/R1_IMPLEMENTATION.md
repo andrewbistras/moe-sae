@@ -498,9 +498,10 @@ consumed as an explicit input. Overflow is a hard failure.
 
 ## Global Spot system
 
-No collective crosses a zone. One v6e-64 is one atomic executor: 64 chips,
-eight physical hosts, and 16 four-chip VMs. All 16 VMs join or the attempt
-does no accepted scientific work.
+No collective crosses a zone. One v6e-64 is one atomic executor: 64 chips
+exposed through exactly 16 four-chip TPU VMs. Physical-host placement is
+provider-owned and is neither counted nor trusted by the protocol. All 16 TPU
+VMs join or the attempt does no accepted scientific work.
 
 ```text
 small non-Spot controller
@@ -543,6 +544,16 @@ checkpoint has a logical SHA-256 plus one or more physical regional replicas.
 Replica URI, generation, CRC32C, size, and region are deployment facts. A
 regional loss changes placement, not scientific identity.
 
+Spot correctness assumes zero guaranteed preemption notice. An exact metadata
+`TRUE`, ambiguous metadata, lease expiry, or member loss may close the local
+new-step gate, but it never authorizes an emergency checkpoint. Recovery uses
+only the last fully sealed checkpoint already published through the
+controller's generation-pinned CAS pointer; partial, in-flight, and sealed but
+unpublished writes remain diagnostic. A successor starts only after the old
+lease expires, the fence advances, and a fresh whole-MIG attempt is admitted.
+The additive V2 protocol tests this transition while preserving the historical
+75-second V1 implementation unchanged and non-authoritative.
+
 ## Image, lifecycle, and alerts
 
 Workers boot a qualified TPU-compatible custom OS image with pinned Python,
@@ -572,6 +583,15 @@ optimizer, MFU formula, acceptance threshold, or report contract.
 ## Implementation sequence
 
 ### Phase 0: evidence and protocol
+
+**Implementation status, 2026-07-23:** additive preemption V2 records and a
+thread-safe local step latch now bind the exact lease, deployment identity, and
+placement V2 envelope; freeze the first zero-notice whole-slice incident; and
+derive recovery only from a prepublished CAS checkpoint pointer under a fresh
+fence/MIG. Lease renewal is allowed only while the gate is open. The metadata
+poller, slice-wide fanout, durable incident sink, checkpoint-pointer adapter,
+and live preempt/recreate chaos test remain unimplemented, so this is not yet
+production authority.
 
 1. Finish Gemma and export the complete Filestore control/evidence bundle to
    immutable GCS.
