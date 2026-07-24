@@ -1,0 +1,77 @@
+{
+  "attempts": [
+    {
+      "benchmark_started": false,
+      "controller_log_sha256": "465a6b0cebeab410455a79f76ea0a7623005cc69ab8bd2c8c7ff54c6bde27c7e",
+      "controller_sha256": "86ede1c2ff3538eabc01bcf7a044b28c7764858561696f145356776dc80f98d8",
+      "create_time": "2026-07-24T07:04:43.273866579Z",
+      "evidence_manifest_sha256": "452d3527a7e698dc19f2a1c5667fe62a7e15e080b3e0864610e9ad94379dcd08",
+      "first_observed_provisioning": "2026-07-24T07:05:53Z",
+      "first_observed_suspending": "2026-07-24T07:09:36Z",
+      "layout": "EP16/FSDP4",
+      "name": "r1-v6e64-spot-euw4a-a6",
+      "queued_resource_snapshot_sha256": "101cef2a0d5cc249ca54d2a8c130ccfee2501b5f168ba0008d1379e20538127f",
+      "reached_ready": false,
+      "release_confirmed": "2026-07-24T07:10:01Z",
+      "release_marker_epoch": 1784876981,
+      "runtime_downloads": 0,
+      "service_state_initiator": "SERVICE",
+      "zone": "europe-west4-a"
+    },
+    {
+      "benchmark_started": false,
+      "controller_log_sha256": "98c89abb6267359f8a30858b3f6844612c173570654df3c1793b38380e20eeae",
+      "controller_sha256": "86ede1c2ff3538eabc01bcf7a044b28c7764858561696f145356776dc80f98d8",
+      "create_time": "2026-07-24T07:11:47.513605398Z",
+      "evidence_manifest_sha256": "8e58f85aed2bec8c2053bc82f25ba1140b7e133e28f6d5a9d9f469e31a5abe4f",
+      "first_observed_provisioning": "2026-07-24T07:13:31Z",
+      "first_observed_suspending": "2026-07-24T07:16:09Z",
+      "layout": "EP16/FSDP4",
+      "name": "r1-v6e64-spot-euw4a-a7",
+      "queued_resource_snapshot_sha256": "45cb9d77137c92ff741ca26e74cda373b93b65f6e7ecdbc0f72b6caa648d5bbd",
+      "reached_ready": false,
+      "release_confirmed": "2026-07-24T07:16:30Z",
+      "release_marker_epoch": 1784877374,
+      "runtime_downloads": 0,
+      "service_state_initiator": "SERVICE",
+      "zone": "europe-west4-a"
+    },
+    {
+      "benchmark_started": false,
+      "controller_log_sha256": "2ca13cba637359d459e448c3379f4fe5d5e78c3e311964211873230727aa0c31",
+      "controller_sha256": "86ede1c2ff3538eabc01bcf7a044b28c7764858561696f145356776dc80f98d8",
+      "create_time": "2026-07-24T07:17:40.227444202Z",
+      "evidence_manifest_sha256": "a7bd83167095da017d2c2841c7e808d032f9261f5ae222988caabdc1a5f787a4",
+      "first_observed_provisioning": "2026-07-24T07:20:14Z",
+      "first_observed_suspending": "2026-07-24T07:23:22Z",
+      "layout": "EP16/FSDP4",
+      "name": "r1-v6e64-spot-euw4a-a8",
+      "queued_resource_snapshot_sha256": "e6885717fa2b10fa64110b3f084134b1641b5df1cd3d7f7e4f868f0cb51a2171",
+      "reached_ready": false,
+      "release_confirmed": "2026-07-24T07:23:47Z",
+      "release_marker_epoch": 1784877806,
+      "runtime_downloads": 0,
+      "service_state_initiator": "SERVICE",
+      "zone": "europe-west4-a"
+    }
+  ],
+  "conclusion": {
+    "adapter_or_benchmark_failure_observed": false,
+    "cumulative_attempt_count": 8,
+    "cumulative_provider_suspension_count": 8,
+    "cumulative_ready_slice_count": 0,
+    "ep16_attempt_count": 3,
+    "ep16_provider_suspension_count": 3
+  },
+  "controller_commit": "f91d207d7e8514d73869fee56d01e76a42af223b",
+  "predecessor_evidence": {
+    "path": "legacy-v6e-spot-formation-20260724.json",
+    "sha256": "39fe85be965433047763d7bbb2ec26c6146e76ae10db4969c2dfa3812e7d6886"
+  },
+  "project": "neural-dragnet",
+  "runtime": {
+    "commit": "68a9547b6e46e56b3afdbd74ad43d3daa7809a24",
+    "sha256": "872720d5a668c05350ad86a0cf92b1ff5767146dd08861b969a95cf9f871da31"
+  },
+  "schema": "moe-sae.r1.legacy-v6e-spot-formation-continuation-evidence.v1"
+}
