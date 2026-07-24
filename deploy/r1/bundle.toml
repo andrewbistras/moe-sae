@@ -70,7 +70,7 @@ sha256 = "81ede4f04f76290b4e3a53c8b7f541953d193d26e540df814edf8b39f929a9ea"
 name = "provisioner"
 path = "deploy/r1/image/provision.sh"
 mode = "0755"
-sha256 = "eefc0f49e8eaa20d24e034e6ba317665ed283e271af7e3e75ea2c5c0d2d05926"
+sha256 = "5a1eb0560e9da091fe6b1db30343f9def912462e5c49a6932367cbc3dec8d8ad"
 
 [[files]]
 name = "image-measurer"

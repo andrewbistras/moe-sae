@@ -320,7 +320,8 @@ tar \
 [[ "$(sha256_file "$uv_tmp/$UV_ARCHIVE_MEMBER")" == "$UV_BINARY_SHA256" ]] || \
   die "pinned uv executable hash mismatch"
 install -o root -g root -m 0755 "$uv_tmp/$UV_ARCHIVE_MEMBER" /usr/local/bin/uv
-[[ "$(/usr/local/bin/uv --version)" == "uv $UV_VERSION" ]] || \
+[[ "$(/usr/local/bin/uv --version)" == \
+  "uv $UV_VERSION (x86_64-unknown-linux-gnu)" ]] || \
   die "uv version mismatch"
 
 export UV_PYTHON_INSTALL_DIR="$PREFIX/python"
