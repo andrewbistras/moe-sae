@@ -731,13 +731,21 @@ def _context_worker_package_payload_sha256(
 def _default_runner(
     argv: Sequence[str], environment: Mapping[str, str] | None
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
+    result = subprocess.run(
         list(argv),
-        check=True,
+        check=False,
         text=True,
         capture_output=True,
         env=None if environment is None else dict(environment),
     )
+    if result.returncode != 0:
+        stdout = result.stdout[-4096:]
+        stderr = result.stderr[-4096:]
+        raise RepackError(
+            f"command failed with exit code {result.returncode}: "
+            f"{' '.join(argv[:3])}; stdout={stdout!r}; stderr={stderr!r}"
+        )
+    return result
 
 
 def _build_environment(work_root: Path) -> dict[str, str]:
@@ -1092,6 +1100,16 @@ def install_worker_wheel(
         ),
         _build_environment(work_root),
     )
+
+
+def _retained_worker_wheel_path(
+    retained_root: Path,
+    wheel: WheelIdentity,
+) -> Path:
+    # uv parses distribution/version/tags from the basename.  Keep the digest
+    # in a parent directory so the content address cannot invalidate the wheel
+    # filename grammar.
+    return retained_root / "wheels" / wheel.sha256 / wheel.name
 
 
 def _installed_worker_package_payload_sha256(
@@ -1674,9 +1692,9 @@ def repack(
         raise RepackError(
             "worker wheel does not exactly cover the target worker source"
         )
-    retained_wheel_dir = retained_root / "wheels"
+    retained_wheel = _retained_worker_wheel_path(retained_root, wheel)
+    retained_wheel_dir = retained_wheel.parent
     retained_wheel_dir.mkdir(mode=0o755, parents=True)
-    retained_wheel = retained_wheel_dir / f"{wheel.sha256}-{wheel.name}"
     with (
         wheel.path.open("rb") as source_wheel,
         retained_wheel.open("xb") as output_wheel,

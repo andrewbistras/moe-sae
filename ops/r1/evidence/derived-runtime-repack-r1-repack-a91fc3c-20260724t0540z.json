@@ -1,0 +1,101 @@
+{
+  "attempts": [
+    {
+      "context": {
+        "archive_sha256": "006bd10be198021fc0e0e4bcbb796c181ba7fb03136937685200aba4ea8b0bda",
+        "file_count": 39,
+        "manifest_sha256": "c6668e4b4d6256a5c0bb1cb8060830edf085b359a9e5718df8fdac12067cf20f"
+      },
+      "failure": {
+        "boundary": "pre-mutation",
+        "phase": "base-image-recipe-wire-validation",
+        "stderr": "[r1-runtime-repack] ERROR: base image recipe is not canonical JSON"
+      },
+      "ordinal": 1,
+      "output_archive_created": false,
+      "repacker_sha256": "4a510d59d4a0118a180ef5bd6881bc339031de54c08b2a3a385f75375ec59d76",
+      "repository_commit": "a91fc3c0a44fbf0f2d3395220e1ad5d89befb91a",
+      "result_created": false,
+      "started_at": "2026-07-24T05:40:49Z",
+      "systemd": {
+        "exec_main_status": 1,
+        "failed_at": "2026-07-24T05:40:50Z",
+        "result": "exit-code",
+        "unit": "moe-sae-r1-repack-a91fc3c.service"
+      }
+    },
+    {
+      "context": {
+        "archive_sha256": "1c9915d7fe0fe336de1580da220619828189894218496a3f254645ab3d96ebd2",
+        "file_count": 39,
+        "manifest_sha256": "de273aa1849391c561d379b0fd59d60fe56e35df2545575f7f55e81a402befb4"
+      },
+      "failure": {
+        "boundary": "post-overlay-marker-at-worker-install-argument-validation",
+        "diagnostic_reproduction": {
+          "exit_status": 2,
+          "stderr": "Using Python 3.12.11 environment at: /var/tmp/uv-wheel-name-probe\nerror: The wheel filename \"d7b2807f5eb668b298d0e2d90c025b65ea0568a1fb2431578d9cc7a039bc900b-moe_sae_r1_worker-0.1.0-py3-none-any.whl\" has an invalid version: expected version to start with a number, but no leading ASCII digits were found\n"
+        },
+        "incomplete_marker": {
+          "path": "/opt/moe-sae-r1/derived/OVERLAY-INCOMPLETE.json",
+          "present": true,
+          "size_bytes": 337
+        },
+        "phase": "worker-wheel-install"
+      },
+      "ordinal": 2,
+      "output_archive_created": false,
+      "repacker_sha256": "e033966570100192a4284f6ac42f4bed5f151f593097fba4b260a243511b63ce",
+      "repository_commit": "eceea2e6d025781aed4731ff5b29de5f6e556356",
+      "result_created": false,
+      "started_at": "2026-07-24T05:47:12Z",
+      "systemd": {
+        "exec_main_status": 1,
+        "failed_at": "2026-07-24T05:48:53Z",
+        "result": "exit-code",
+        "runtime_limit_effective": false,
+        "unit": "moe-sae-r1-repack-eceea2e.service"
+      }
+    }
+  ],
+  "base": {
+    "base_runtime_archive_sha256": "6129738baad8d2bb4060c6e19b8a9227341afe9c795304f70fdf3206155f45c9",
+    "image_observation_sha256": "0582a9a5d5c1ff11c44cbe713a82124680fa9f67a311927ed883b1105cc3a143",
+    "image_recipe_sha256": "3e3e82e0c43b5312711a9ff51617c0e6c9aeeb2b3339761fd258cc7867c9d164",
+    "repository_commit": "0b01bc2b76e375271249eb6f7e0499d5b016a1da"
+  },
+  "cleanup": {
+    "boot_disk_deleted": true,
+    "instance_deleted": true,
+    "observed_at": "2026-07-24T05:51:23.939Z"
+  },
+  "project": "neural-dragnet",
+  "publication": {
+    "gcs_object_write_attempted": false,
+    "gcs_objects_published": [],
+    "output_archive_created": false,
+    "result_created": false
+  },
+  "resource": {
+    "boot_disk": {
+      "auto_delete": true,
+      "id": "3750682547631113352",
+      "name": "r1-repack-a91fc3c-20260724t0540z",
+      "size_gb": 100,
+      "type": "pd-balanced"
+    },
+    "boot_image": {
+      "id": "9023833988234439751",
+      "resource": "projects/neural-dragnet/global/images/moe-sae-r1-v6e-native-0b01bc2-20260724"
+    },
+    "instance": {
+      "created_at": "2026-07-23T22:38:47.884-07:00",
+      "external_ip": false,
+      "id": "3535217631962285192",
+      "machine_type": "e2-standard-2",
+      "name": "r1-repack-a91fc3c-20260724t0540z"
+    }
+  },
+  "schema": "moe-sae.r1.derived-runtime-repack-failure-evidence.v1",
+  "zone": "europe-west4-a"
+}

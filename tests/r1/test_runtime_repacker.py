@@ -591,6 +591,49 @@ def test_install_command_can_only_reinstall_local_worker_without_deps(
     assert command[-1] == "/opt/moe-sae-r1/derived/wheels/exact.whl"
 
 
+def test_retained_wheel_is_content_addressed_without_renaming_the_wheel(
+    tmp_path: Path,
+) -> None:
+    wheel_path = tmp_path / "moe_sae_r1_worker-0.1.0-py3-none-any.whl"
+    _wheel(wheel_path)
+    wheel = repacker.validate_worker_wheel(wheel_path)
+
+    retained = repacker._retained_worker_wheel_path(
+        Path("/opt/moe-sae-r1/derived"),
+        wheel,
+    )
+
+    assert retained == (
+        Path("/opt/moe-sae-r1/derived/wheels")
+        / wheel.sha256
+        / "moe_sae_r1_worker-0.1.0-py3-none-any.whl"
+    )
+    assert retained.name == wheel.name
+    assert retained.parent.name == wheel.sha256
+
+
+def test_default_runner_reports_bounded_subprocess_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        del args, kwargs
+        return subprocess.CompletedProcess(
+            ("uv", "pip", "install"),
+            2,
+            "x" * 5000,
+            "invalid wheel filename",
+        )
+
+    monkeypatch.setattr(repacker.subprocess, "run", fail)
+    with pytest.raises(
+        repacker.RepackError,
+        match="exit code 2.*invalid wheel filename",
+    ) as failure:
+        repacker._default_runner(("uv", "pip", "install"), None)
+    assert "x" * 4096 in str(failure.value)
+    assert "x" * 4097 not in str(failure.value)
+
+
 def test_installed_worker_tree_rejects_unrecorded_stale_file(
     tmp_path: Path,
 ) -> None:
