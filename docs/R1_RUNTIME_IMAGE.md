@@ -67,7 +67,7 @@ attest_r1_runtime_lock(".")                  # rejects Gemma pin
 
 ## Deterministic context
 
-`context-files.json` is an exact 35-file allowlist. It includes the isolated
+`context-files.json` is an exact 39-file allowlist. It includes the isolated
 runtime project, all three MaxText patches, the patch/restore/benchmark closure, the
 R1 protocol/control/MFU modules needed by the worker, the fixed entrypoint,
 service, and image measurement inputs. It excludes the root project and lock,

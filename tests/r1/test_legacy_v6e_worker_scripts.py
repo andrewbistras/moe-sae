@@ -220,15 +220,26 @@ def test_controller_derives_every_retry_identity_from_one_sequence() -> None:
     )
     assert 'readonly TPU_NAME="${QUEUED_RESOURCE}-node"' in source
     assert (
-        'readonly ATTEMPT="${REGION_CODE}-legacy-a${ATTEMPT_SEQUENCE}-ep8-fsdp8"'
+        'readonly ATTEMPT="${REGION_CODE}-legacy-a${ATTEMPT_SEQUENCE}-${LAYOUT_CODE}"'
         in source
     )
-    assert "fsdp8-${REGION_CODE}-a${ATTEMPT_SEQUENCE}" in source
+    assert (
+        "qualification-legacy-native-${LAYOUT_CODE}-${REGION_CODE}"
+        "-a${ATTEMPT_SEQUENCE}"
+    ) in source
     assert 'readonly DEPLOYMENT_PROFILE="${DEPLOYMENT_PROFILE:-euw4a}"' in source
+    assert 'readonly LAYOUT_PROFILE="${LAYOUT_PROFILE:-ep8fsdp8}"' in source
+    assert "ep8fsdp8)" in source
+    assert 'readonly LAYOUT_CODE="ep8-fsdp8"' in source
+    assert 'readonly MESH="EP8/FSDP8"' in source
+    assert "ep16fsdp4)" in source
+    assert 'readonly LAYOUT_CODE="ep16-fsdp4"' in source
+    assert 'readonly MESH="EP16/FSDP4"' in source
     assert 'readonly ZONE="us-east1-d"' in source
     assert 'readonly REGION_CODE="use1d"' in source
     assert "Environment=ATTEMPT_SEQUENCE=${ATTEMPT_SEQUENCE}" in source
     assert "Environment=DEPLOYMENT_PROFILE=${DEPLOYMENT_PROFILE}" in source
+    assert "Environment=LAYOUT_PROFILE=${LAYOUT_PROFILE}" in source
     assert "require_positive_integer \"$ATTEMPT_SEQUENCE\"" in source
 
 
@@ -244,8 +255,8 @@ def test_legacy_controller_fans_out_fixed_systemd_benchmark() -> None:
     assert "--property=LimitNOFILE=100000" in source
     assert "prefix_benchmark_runner" in source
     assert "--mesh ${MESH}" in source
-    assert 'readonly MESH="EP8/FSDP8"' in source
-    assert "legacy bridge is identity-bound to EP8/FSDP8" in source
+    assert "--layout-profile \"$LAYOUT_PROFILE\"" in source
+    assert "legacy bridge layout identity is inconsistent" in source
     assert "all 16 TPU SSH identities are ready" in source
     assert "exact runtime bootstrap" in source
     assert 'WORKER_BOOTSTRAP_TIMEOUT_SECONDS + 180' in source
@@ -257,9 +268,12 @@ def test_legacy_controller_fans_out_fixed_systemd_benchmark() -> None:
 def test_controller_binds_exact_bootstrap_and_never_uploads_evidence() -> None:
     source = _source(CONTROLLER)
     bootstrap_source = _source(BOOTSTRAP).encode()
+    validator_source = _source(VALIDATOR).encode()
 
     expected = hashlib.sha256(bootstrap_source).hexdigest()
     assert f'readonly EXPECTED_BOOTSTRAP_SHA256="{expected}"' in source
+    expected_validator = hashlib.sha256(validator_source).hexdigest()
+    assert f'readonly EXPECTED_VALIDATOR_SHA256="{expected_validator}"' in source
     assert "sha256sum --check --status" in source
     assert "gcloud storage cp" not in source
     assert "gcloud storage rsync" not in source
@@ -271,7 +285,11 @@ def _fraction(value: Fraction) -> dict[str, int]:
     return {"numerator": value.numerator, "denominator": value.denominator}
 
 
-def _qualification(*, duration_ns: int) -> dict[str, object]:
+def _qualification(
+    *,
+    duration_ns: int,
+    layout_profile: str = "ep8fsdp8",
+) -> dict[str, object]:
     steps = 500
     tokens = 128 * 1_024
     flops = 4_900_569_495_896_064
@@ -280,10 +298,16 @@ def _qualification(*, duration_ns: int) -> dict[str, object]:
     total_duration = duration_ns * steps
     aggregate = Fraction(flops * steps * 1_000_000_000, peak * total_duration)
     rate = Fraction(tokens * steps * 1_000_000_000, total_duration)
+    layouts = {
+        "ep8fsdp8": ("EP8/FSDP8", 8, 8, False),
+        "ep16fsdp4": ("EP16/FSDP4", 4, 16, True),
+    }
+    mesh, fsdp_count, expert_count, allow_split = layouts[layout_profile]
     devices = []
-    for fsdp in range(8):
-        for expert in range(8):
-            device_id = fsdp * 8 + expert
+    memory_devices = []
+    for fsdp in range(fsdp_count):
+        for expert in range(expert_count):
+            device_id = fsdp * expert_count + expert
             devices.append(
                 {
                     "logical_index": [0, fsdp, expert, 0],
@@ -292,16 +316,29 @@ def _qualification(*, duration_ns: int) -> dict[str, object]:
                     "physical_coordinates": [fsdp, expert, 0],
                 }
             )
+            memory_devices.append(
+                {
+                    "device_id": device_id,
+                    "process_index": device_id // 4,
+                    "memory_stats_status": "available",
+                    "peak_bytes_in_use_key_present": True,
+                    "peak_bytes_in_use": 20_000_000_000,
+                    "bytes_limit_key_present": True,
+                    "bytes_limit": 32_000_000_000,
+                    "bytes_in_use_key_present": True,
+                    "bytes_in_use": 19_000_000_000,
+                }
+            )
     return {
-        "schema": "moe-sae.r1.synthetic-prefix-qualification.v1",
-        "mesh": "EP8/FSDP8",
+        "schema": "moe-sae.r1.synthetic-prefix-qualification.v2",
+        "mesh": mesh,
         "seed": 0,
         "process_count": 16,
         "device_count": 64,
         "physical_mesh": {
             "axis_names": ["data", "fsdp", "expert", "context"],
-            "logical_shape": [1, 8, 8, 1],
-            "allow_split_physical_axes": False,
+            "logical_shape": [1, fsdp_count, expert_count, 1],
+            "allow_split_physical_axes": allow_split,
             "devices": devices,
         },
         "prepare_seconds": 123.5,
@@ -336,6 +373,24 @@ def _qualification(*, duration_ns: int) -> dict[str, object]:
             "p95_step_ns": duration_ns,
             "passes_51_percent": aggregate >= Fraction(51, 100),
         },
+        "device_memory": {
+            "schema": "moe-sae.r1.v6e-device-memory-stats.v1",
+            "source": "jax.Device.memory_stats",
+            "sample_phase": (
+                "after-final-synchronized-measurement-step-before-duration-and-"
+                "evidence-gathers"
+            ),
+            "documented_v6e_hbm_bytes": 32_000_000_000,
+            "maximum_hbm_usage": {"numerator": 17, "denominator": 20},
+            "bounded_gather": {
+                "process_count": 16,
+                "records_per_process": 4,
+                "uint32_words_per_record": 12,
+                "total_bytes": 3_072,
+            },
+            "devices": memory_devices,
+            "passes_15_percent_headroom": True,
+        },
     }
 
 
@@ -343,14 +398,38 @@ def _validator_namespace() -> dict[str, object]:
     return runpy.run_path(str(VALIDATOR), run_name="legacy_result_validator")
 
 
-def test_result_validator_accepts_only_derived_ep8_result(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("layout_profile", "mesh"),
+    [
+        ("ep8fsdp8", "EP8/FSDP8"),
+        ("ep16fsdp4", "EP16/FSDP4"),
+    ],
+)
+def test_result_validator_accepts_both_closed_layout_profiles(
+    tmp_path: Path,
+    layout_profile: str,
+    mesh: str,
+) -> None:
     path = tmp_path / "result.json"
-    path.write_text(json.dumps(_qualification(duration_ns=150_000_000)))
+    path.write_text(
+        json.dumps(
+            _qualification(
+                duration_ns=150_000_000,
+                layout_profile=layout_profile,
+            )
+        )
+    )
     namespace = _validator_namespace()
-    summary = namespace["validate_result"](path)  # type: ignore[operator]
-    assert summary["mesh"] == "EP8/FSDP8"
+    summary = namespace["validate_result"](  # type: ignore[operator]
+        path,
+        layout_profile,
+    )
+    assert summary["mesh"] == mesh
+    assert summary["layout_profile"] == layout_profile
+    assert summary["useful_flops_per_step"] == 4_900_569_495_896_064
     assert summary["passes_51_percent"] is True
     assert summary["aggregate_mfu"] > 0.51
+    assert summary["passes_15_percent_hbm_headroom"] is True
 
 
 def test_result_validator_rejects_low_mfu_and_derived_tampering(
@@ -361,7 +440,7 @@ def test_result_validator_rejects_low_mfu_and_derived_tampering(
     low = tmp_path / "low.json"
     low.write_text(json.dumps(_qualification(duration_ns=200_000_000)))
     with pytest.raises(error, match="below 51%"):  # type: ignore[arg-type]
-        namespace["validate_result"](low)  # type: ignore[operator]
+        namespace["validate_result"](low, "ep8fsdp8")  # type: ignore[operator]
 
     tampered_payload = _qualification(duration_ns=150_000_000)
     tampered_payload["benchmark"]["aggregate_mfu"] = {  # type: ignore[index]
@@ -371,7 +450,10 @@ def test_result_validator_rejects_low_mfu_and_derived_tampering(
     tampered = tmp_path / "tampered.json"
     tampered.write_text(json.dumps(tampered_payload))
     with pytest.raises(error, match="aggregate MFU is not derived"):  # type: ignore[arg-type]
-        namespace["validate_result"](tampered)  # type: ignore[operator]
+        namespace["validate_result"](  # type: ignore[operator]
+            tampered,
+            "ep8fsdp8",
+        )
 
 
 def test_result_validator_rejects_topology_and_output_drift(
@@ -384,14 +466,107 @@ def test_result_validator_rejects_topology_and_output_drift(
     path = tmp_path / "wrong-process.json"
     path.write_text(json.dumps(payload))
     with pytest.raises(error, match="exactly four devices"):  # type: ignore[arg-type]
-        namespace["validate_result"](path)  # type: ignore[operator]
+        namespace["validate_result"](path, "ep8fsdp8")  # type: ignore[operator]
 
     payload = _qualification(duration_ns=150_000_000)
     payload["output_validation"]["ids_unique"] = False  # type: ignore[index]
     path = tmp_path / "bad-output.json"
     path.write_text(json.dumps(payload))
     with pytest.raises(error, match="ids_unique"):  # type: ignore[arg-type]
-        namespace["validate_result"](path)  # type: ignore[operator]
+        namespace["validate_result"](path, "ep8fsdp8")  # type: ignore[operator]
+
+
+def test_result_validator_rejects_missing_and_duplicate_hbm_devices(
+    tmp_path: Path,
+) -> None:
+    namespace = _validator_namespace()
+    error = namespace["ResultValidationError"]
+
+    missing = _qualification(duration_ns=150_000_000)
+    missing["device_memory"]["devices"].pop()  # type: ignore[index,union-attr]
+    path = tmp_path / "missing-hbm-device.json"
+    path.write_text(json.dumps(missing))
+    with pytest.raises(error, match="exactly 64"):  # type: ignore[arg-type]
+        namespace["validate_result"](path, "ep8fsdp8")  # type: ignore[operator]
+
+    duplicate = _qualification(duration_ns=150_000_000)
+    duplicate["device_memory"]["devices"][63]["device_id"] = 0  # type: ignore[index]
+    path = tmp_path / "duplicate-hbm-device.json"
+    path.write_text(json.dumps(duplicate))
+    with pytest.raises(error, match="device-memory device ID"):  # type: ignore[arg-type]
+        namespace["validate_result"](path, "ep8fsdp8")  # type: ignore[operator]
+
+
+@pytest.mark.parametrize("peak_bytes", [0, 27_200_000_001])
+def test_result_validator_rejects_zero_or_over_boundary_peak_hbm(
+    tmp_path: Path,
+    peak_bytes: int,
+) -> None:
+    namespace = _validator_namespace()
+    error = namespace["ResultValidationError"]
+    payload = _qualification(duration_ns=150_000_000)
+    device_memory = payload["device_memory"]  # type: ignore[assignment]
+    device_memory["devices"][0]["peak_bytes_in_use"] = peak_bytes  # type: ignore[index]
+    device_memory["devices"][0]["bytes_in_use"] = max(0, peak_bytes - 1)  # type: ignore[index]
+    device_memory["passes_15_percent_headroom"] = False  # type: ignore[index]
+    path = tmp_path / f"bad-peak-{peak_bytes}.json"
+    path.write_text(json.dumps(payload))
+    with pytest.raises(error, match="does not prove 15% HBM"):  # type: ignore[arg-type]
+        namespace["validate_result"](path, "ep8fsdp8")  # type: ignore[operator]
+
+
+def test_result_validator_rejects_unavailable_peak_hbm(tmp_path: Path) -> None:
+    namespace = _validator_namespace()
+    error = namespace["ResultValidationError"]
+    payload = _qualification(duration_ns=150_000_000)
+    first = payload["device_memory"]["devices"][0]  # type: ignore[index]
+    first["peak_bytes_in_use_key_present"] = False
+    first["peak_bytes_in_use"] = None
+    first["bytes_in_use_key_present"] = False
+    first["bytes_in_use"] = None
+    payload["device_memory"]["passes_15_percent_headroom"] = False  # type: ignore[index]
+    path = tmp_path / "missing-peak.json"
+    path.write_text(json.dumps(payload))
+    with pytest.raises(error, match="does not prove 15% HBM"):  # type: ignore[arg-type]
+        namespace["validate_result"](path, "ep8fsdp8")  # type: ignore[operator]
+
+
+def test_result_validator_accepts_exact_85_percent_hbm_boundary(
+    tmp_path: Path,
+) -> None:
+    namespace = _validator_namespace()
+    payload = _qualification(duration_ns=150_000_000)
+    first = payload["device_memory"]["devices"][0]  # type: ignore[index]
+    first["peak_bytes_in_use"] = 27_200_000_000
+    first["bytes_in_use"] = 27_199_999_999
+    path = tmp_path / "exact-boundary.json"
+    path.write_text(json.dumps(payload))
+    summary = namespace["validate_result"](  # type: ignore[operator]
+        path,
+        "ep8fsdp8",
+    )
+    assert summary["minimum_hbm_headroom"] == pytest.approx(0.15)
+
+
+def test_result_validator_rejects_layout_identity_and_flop_drift(
+    tmp_path: Path,
+) -> None:
+    namespace = _validator_namespace()
+    error = namespace["ResultValidationError"]
+    payload = _qualification(
+        duration_ns=150_000_000,
+        layout_profile="ep16fsdp4",
+    )
+    path = tmp_path / "ep16.json"
+    path.write_text(json.dumps(payload))
+    with pytest.raises(error, match="identity-bound EP8"):  # type: ignore[arg-type]
+        namespace["validate_result"](path, "ep8fsdp8")  # type: ignore[operator]
+
+    payload["benchmark"]["useful_flops_per_step"] += 1  # type: ignore[index,operator]
+    path = tmp_path / "ep16-flop-drift.json"
+    path.write_text(json.dumps(payload))
+    with pytest.raises(error, match="useful-FLOP count"):  # type: ignore[arg-type]
+        namespace["validate_result"](path, "ep16fsdp4")  # type: ignore[operator]
 
 
 def test_result_validator_rejects_float_identities_and_impossible_mfu(
@@ -405,10 +580,10 @@ def test_result_validator_rejects_float_identities_and_impossible_mfu(
     path = tmp_path / "float-process-count.json"
     path.write_text(json.dumps(payload))
     with pytest.raises(error, match="result process count"):  # type: ignore[arg-type]
-        namespace["validate_result"](path)  # type: ignore[operator]
+        namespace["validate_result"](path, "ep8fsdp8")  # type: ignore[operator]
 
     impossible = _qualification(duration_ns=50_000_000)
     path = tmp_path / "impossible-mfu.json"
     path.write_text(json.dumps(impossible))
     with pytest.raises(error, match="exceeds 100%"):  # type: ignore[arg-type]
-        namespace["validate_result"](path)  # type: ignore[operator]
+        namespace["validate_result"](path, "ep8fsdp8")  # type: ignore[operator]

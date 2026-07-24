@@ -7,7 +7,7 @@ from typing import Any, Mapping
 import pytest
 
 from moe_sae.r1.control_store import MemoryJSONCASStore
-from moe_sae.r1.controller import CampaignController
+from moe_sae.r1.controller import CampaignController, CampaignNotInitialized
 from moe_sae.r1.gcs_immutable_byte_store import (
     GCSPhysicalObjectReceiptV1,
     content_addressed_record_object_id,
@@ -32,6 +32,7 @@ from moe_sae.r1.protocol import (
     ContentRefV1,
     CostLedgerV1,
     HarvestRangeV1,
+    ProtocolError,
     RegionalReplicaV1,
 )
 from moe_sae.r1.runtime_supervisor import (
@@ -46,6 +47,7 @@ from moe_sae.r1.runtime_supervisor import (
     RuntimeLaunchTokenV1,
     RuntimeStepContextV1,
     RuntimeSupervisorV1,
+    SliceMemberLost,
     publish_runtime_launch_admission,
     publish_runtime_launch_token,
 )
@@ -451,13 +453,34 @@ class FakeWholeSlice:
     def __init__(self) -> None:
         self.admissions: list[RuntimeLaunchAdmissionV1] = []
         self.terminations: list[tuple[str, str | None]] = []
+        self.stop_request: Any = None
+        self.distributed_permits: list[int] = []
+        self.fail_distributed_step = False
+        self.inventory_sha256 = INVENTORY
+
+    def bind_stop_request(self, request_stop: Any) -> None:
+        self.stop_request = request_stop
 
     def initialize_device_inventory_sha256(
         self,
         admission: RuntimeLaunchAdmissionV1,
     ) -> str:
         self.admissions.append(admission)
-        return INVENTORY
+        return self.inventory_sha256
+
+    def run_authorized_step(
+        self,
+        *,
+        permit: int,
+        authority: AttemptAuthorityV2,
+        accelerator_step: Any,
+    ) -> Any:
+        assert authority.fence >= 1
+        self.distributed_permits.append(permit)
+        if self.fail_distributed_step:
+            self.stop_request("SLICE_MEMBER_LOST")
+            raise SliceMemberLost("injected follower loss")
+        return accelerator_step()
 
     def terminate(
         self,
@@ -487,7 +510,6 @@ class FakeWorkload:
             tuple[object, FullySealedCheckpointV2 | None, bytes | None]
         ] = []
         self.run_calls: list[int] = []
-        self.authorized_permits: list[int] = []
 
     @property
     def total_units(self) -> int:
@@ -512,7 +534,7 @@ class FakeWorkload:
         self.run_calls.append(unit_index)
         if unit_index in self.advance_clock_on_unit:
             self.clock.value = self.advance_clock_on_unit[unit_index]
-        self.authorized_permits.append(context.authorize_step())
+        context.run_accelerator_step(lambda: None)
         authority = context.authority
         manifest = {
             "schema": "moe-sae.r1.test-training-checkpoint-manifest.v1",
@@ -601,6 +623,7 @@ def _supervisor(
     *,
     attempt: int,
     workload: FakeWorkload,
+    regional_input_resolver: Any | None = None,
 ) -> tuple[RuntimeSupervisorV1, MetadataTransport, FakeWholeSlice]:
     _launch_ref, transport = _publish_launch(store, token, attempt=attempt)
     metadata = GCEMetadataClientV1(transport=transport)
@@ -618,7 +641,11 @@ def _supervisor(
         resolver=resolver,
         control_store=store,
         pinned_reader=reader,
-        regional_input_resolver=FakeRegionalInputResolver(),
+        regional_input_resolver=(
+            FakeRegionalInputResolver()
+            if regional_input_resolver is None
+            else regional_input_resolver
+        ),
         slice_runtime=slice_runtime,
         workload=workload,
         content_verifier=lambda content: content == OUTPUT,
@@ -757,6 +784,98 @@ def test_resolver_requires_existing_token_derived_admission() -> None:
         resolver.resolve()
 
 
+def test_control_setup_failure_after_slice_initialization_terminates_slice() -> None:
+    store = MemoryJSONCASStore()
+    clock = Clock()
+    workload = FakeWorkload(store, clock, total_units=1)
+    supervisor, _transport, slice_runtime = _supervisor(
+        store,
+        clock,
+        _token(attempt=1, fence=1),
+        attempt=1,
+        workload=workload,
+    )
+
+    with pytest.raises(CampaignNotInitialized):
+        supervisor.run()
+
+    assert len(slice_runtime.admissions) == 1
+    assert slice_runtime.terminations == [("FAILED", None)]
+
+
+def test_invalid_inventory_return_after_slice_initialization_cleans_up() -> None:
+    store = MemoryJSONCASStore()
+    clock = Clock()
+    _initialize_campaign(store, clock)
+    workload = FakeWorkload(store, clock, total_units=1)
+    supervisor, _transport, slice_runtime = _supervisor(
+        store,
+        clock,
+        _token(attempt=1, fence=1),
+        attempt=1,
+        workload=workload,
+    )
+    slice_runtime.inventory_sha256 = "not-a-sha256"
+
+    with pytest.raises(ProtocolError, match="device_inventory_sha256"):
+        supervisor.run()
+
+    assert len(slice_runtime.admissions) == 1
+    assert slice_runtime.terminations == [("FAILED", None)]
+
+
+def test_lease_admission_failure_after_slice_initialization_cleans_up() -> None:
+    store = MemoryJSONCASStore()
+    clock = Clock()
+    _initialize_campaign(store, clock)
+    workload = FakeWorkload(store, clock, total_units=1)
+    supervisor, _transport, slice_runtime = _supervisor(
+        store,
+        clock,
+        _token(attempt=1, fence=2),
+        attempt=1,
+        workload=workload,
+    )
+
+    with pytest.raises(LaunchAdmissionError, match="exact next fence"):
+        supervisor.run()
+
+    assert slice_runtime.distributed_permits == []
+    assert slice_runtime.terminations == [("FAILED", None)]
+
+
+def test_regional_input_failure_after_lease_acquisition_cleans_up() -> None:
+    store = MemoryJSONCASStore()
+    clock = Clock()
+    _initialize_campaign(store, clock)
+    workload = FakeWorkload(store, clock, total_units=1)
+
+    class FailingRegionalInput:
+        production_qualified = True
+
+        def open(self, *_args: Any, **_kwargs: Any) -> object:
+            raise RuntimeError("regional input unavailable")
+
+    supervisor, _transport, slice_runtime = _supervisor(
+        store,
+        clock,
+        _token(attempt=1, fence=1),
+        attempt=1,
+        workload=workload,
+        regional_input_resolver=FailingRegionalInput(),
+    )
+
+    with pytest.raises(RuntimeError, match="regional input unavailable"):
+        supervisor.run()
+
+    assert slice_runtime.distributed_permits == []
+    assert slice_runtime.terminations == [("FAILED", None)]
+
+
+def test_workload_has_no_public_leader_only_permit_bypass() -> None:
+    assert not hasattr(RuntimeStepContextV1, "authorize_step")
+
+
 def test_lease_renews_before_expiry_at_an_accelerator_boundary() -> None:
     store = MemoryJSONCASStore()
     clock = Clock()
@@ -779,9 +898,65 @@ def test_lease_renews_before_expiry_at_an_accelerator_boundary() -> None:
 
     assert result.outcome == "SUCCEEDED"
     assert result.authority.lease.expires_at_unix_ms == 11_650
-    assert workload.authorized_permits
+    assert slice_runtime.distributed_permits == [1]
     assert any(url.endswith("/preempted") for url in transport.calls)
     assert slice_runtime.terminations == [("SUCCEEDED", None)]
+
+
+def test_context_executes_step_through_whole_slice_before_checkpoint() -> None:
+    store = MemoryJSONCASStore()
+    clock = Clock()
+    _initialize_campaign(store, clock)
+    workload = FakeWorkload(
+        store,
+        clock,
+        total_units=1,
+    )
+    supervisor, _transport, slice_runtime = _supervisor(
+        store,
+        clock,
+        _token(attempt=1, fence=1),
+        attempt=1,
+        workload=workload,
+    )
+
+    result = supervisor.run()
+
+    assert result.outcome == "SUCCEEDED"
+    assert slice_runtime.distributed_permits == [1]
+    assert result.final_checkpoint is not None
+    assert result.final_checkpoint.checkpoint.completed_steps == 1
+
+
+def test_whole_slice_member_loss_closes_gate_before_checkpoint() -> None:
+    store = MemoryJSONCASStore()
+    clock = Clock()
+    _initialize_campaign(store, clock)
+    workload = FakeWorkload(
+        store,
+        clock,
+        total_units=1,
+    )
+    supervisor, _transport, slice_runtime = _supervisor(
+        store,
+        clock,
+        _token(attempt=1, fence=1),
+        attempt=1,
+        workload=workload,
+    )
+    slice_runtime.fail_distributed_step = True
+
+    result = supervisor.run()
+
+    assert result.outcome == "PREEMPTED"
+    assert result.completed_units == 0
+    assert result.final_checkpoint is None
+    assert result.incident is not None
+    assert result.incident.trigger_kind == "SLICE_MEMBER_LOST"
+    assert result.incident.authorized_steps_before_latch == 1
+    assert slice_runtime.terminations == [
+        ("PREEMPTED", result.incident.digest)
+    ]
 
 
 def test_local_sigterm_preemption_resumes_only_from_published_pointer() -> None:
@@ -952,7 +1127,7 @@ def test_sigterm_racing_local_permit_cannot_reach_accelerator_step(
     assert result.incident.trigger_kind == "VM_TERMINATED"
     assert result.incident.authorized_steps_before_latch == 1
     assert workload.run_calls == [0]
-    assert workload.authorized_permits == []
+    assert slice_runtime.distributed_permits == []
     assert slice_runtime.terminations == [
         ("PREEMPTED", result.incident.digest)
     ]

@@ -319,8 +319,9 @@ def test_real_context_contains_the_patched_prefix_benchmark_closure() -> None:
         "src/moe_sae/r1/placement_v2.py",
         "src/moe_sae/r1/preemption_v2.py",
         "src/moe_sae/r1/runtime_supervisor.py",
+        "src/moe_sae/r1/legacy_slice_runtime.py",
     }
-    assert len(spec["files"]) == 38
+    assert len(spec["files"]) == 39
     assert required <= sources
 
     provisioner = (REPOSITORY / "deploy/r1/image/provision.sh").read_text(

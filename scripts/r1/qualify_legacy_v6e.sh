@@ -31,6 +31,21 @@ case "$DEPLOYMENT_PROFILE" in
     exit 64
     ;;
 esac
+readonly LAYOUT_PROFILE="${LAYOUT_PROFILE:-ep8fsdp8}"
+case "$LAYOUT_PROFILE" in
+  ep8fsdp8)
+    readonly LAYOUT_CODE="ep8-fsdp8"
+    readonly MESH="EP8/FSDP8"
+    ;;
+  ep16fsdp4)
+    readonly LAYOUT_CODE="ep16-fsdp4"
+    readonly MESH="EP16/FSDP4"
+    ;;
+  *)
+    printf 'unsupported LAYOUT_PROFILE=%s\n' "$LAYOUT_PROFILE" >&2
+    exit 64
+    ;;
+esac
 readonly ATTEMPT_SEQUENCE="${ATTEMPT_SEQUENCE:-3}"
 readonly QUEUED_RESOURCE="r1-v6e64-spot-${REGION_CODE}-a${ATTEMPT_SEQUENCE}"
 readonly TPU_NAME="${QUEUED_RESOURCE}-node"
@@ -38,12 +53,11 @@ readonly EXPECTED_ACCELERATOR="v6e-64"
 readonly EXPECTED_RUNTIME_VERSION="v6e-ubuntu-2404"
 readonly EXPECTED_SERVICE_ACCOUNT="655343590563-compute@developer.gserviceaccount.com"
 readonly EXPECTED_NETWORK="projects/neural-dragnet/global/networks/default"
-readonly EXPECTED_LAUNCH_REF="qualification-legacy-native-ep8-fsdp8-${REGION_CODE}-a${ATTEMPT_SEQUENCE}"
+readonly EXPECTED_LAUNCH_REF="qualification-legacy-native-${LAYOUT_CODE}-${REGION_CODE}-a${ATTEMPT_SEQUENCE}"
 readonly EXPECTED_RUNTIME_COMMIT="0b01bc2b76e375271249eb6f7e0499d5b016a1da"
 readonly EXPECTED_BOOTSTRAP_SHA256="482d5c2e00740e6638986b439bedf9cbe693e7f942ce3afedf73441c40b5ed5e"
-readonly EXPECTED_VALIDATOR_SHA256="0f30113726e878cfaf544c86e98d8b81edd80d4a08dea7c05462d63e187b5c07"
-readonly ATTEMPT="${REGION_CODE}-legacy-a${ATTEMPT_SEQUENCE}-ep8-fsdp8"
-readonly MESH="EP8/FSDP8"
+readonly EXPECTED_VALIDATOR_SHA256="49cb78d112caa18a99d8e937a81cdfeb6653449a3967b68d449a02d9c1122350"
+readonly ATTEMPT="${REGION_CODE}-legacy-a${ATTEMPT_SEQUENCE}-${LAYOUT_CODE}"
 readonly FORMATION_TIMEOUT_SECONDS="${FORMATION_TIMEOUT_SECONDS:-28800}"
 readonly WORKER_BOOTSTRAP_TIMEOUT_SECONDS="${WORKER_BOOTSTRAP_TIMEOUT_SECONDS:-2400}"
 readonly BENCHMARK_TIMEOUT_SECONDS="${BENCHMARK_TIMEOUT_SECONDS:-3600}"
@@ -603,6 +617,7 @@ install_persistent_reaper() {
       'Type=exec' \
       "Environment=PROJECT=${PROJECT}" \
       "Environment=DEPLOYMENT_PROFILE=${DEPLOYMENT_PROFILE}" \
+      "Environment=LAYOUT_PROFILE=${LAYOUT_PROFILE}" \
       "Environment=ATTEMPT_SEQUENCE=${ATTEMPT_SEQUENCE}" \
       "Environment=STATE_ROOT=${STATE_ROOT}" \
       "ExecStart=${REAPER_CONTROLLER} --reap" \
@@ -819,8 +834,10 @@ main() {
   require_name "$QUEUED_RESOURCE" QUEUED_RESOURCE
   require_name "$TPU_NAME" TPU_NAME
   require_name "$ATTEMPT" ATTEMPT
-  [[ "$MESH" == EP8/FSDP8 ]] ||
-    die "legacy bridge is identity-bound to EP8/FSDP8"
+  case "${LAYOUT_PROFILE}:${LAYOUT_CODE}:${MESH}" in
+    ep8fsdp8:ep8-fsdp8:EP8/FSDP8 | ep16fsdp4:ep16-fsdp4:EP16/FSDP4) ;;
+    *) die "legacy bridge layout identity is inconsistent" ;;
+  esac
   require_positive_integer "$FORMATION_TIMEOUT_SECONDS" FORMATION_TIMEOUT_SECONDS
   require_positive_integer \
     "$WORKER_BOOTSTRAP_TIMEOUT_SECONDS" \
@@ -1173,7 +1190,9 @@ EOF
   done
   [[ "$result_count" == 1 ]] ||
     die "expected exactly one process-zero result, found $result_count"
-  "$RESULT_VALIDATOR" "$result_path" >"$STATE_ROOT/result/validation.json"
+  "$RESULT_VALIDATOR" \
+    --layout-profile "$LAYOUT_PROFILE" \
+    "$result_path" >"$STATE_ROOT/result/validation.json"
   qualification_complete=1
   seal_evidence_best_effort
   release_queued_resource_best_effort ||

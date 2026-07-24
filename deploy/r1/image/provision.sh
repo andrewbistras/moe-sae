@@ -191,6 +191,10 @@ EXPECTED = {
         "src/moe_sae/r1/runtime_supervisor.py",
         0o644,
     ),
+    "src/moe_sae/r1/legacy_slice_runtime.py": (
+        "src/moe_sae/r1/legacy_slice_runtime.py",
+        0o644,
+    ),
     "src/moe_sae/r1/runtime_entrypoint.py": (
         "src/moe_sae/r1/runtime_entrypoint.py",
         0o644,

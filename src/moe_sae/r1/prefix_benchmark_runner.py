@@ -6,10 +6,11 @@ import argparse
 import json
 import math
 import os
-from pathlib import Path
 import tempfile
 import time
-from typing import Any, Sequence
+from collections.abc import Mapping, Sequence
+from pathlib import Path
+from typing import Any
 
 from .maxtext_prefix_runtime import (
     PREFIX_MESH_CANDIDATES,
@@ -31,6 +32,25 @@ from .prefix_benchmark import (
 
 class PrefixBenchmarkRunnerError(RuntimeError):
     """The real-device benchmark runner failed its executable boundary."""
+
+
+_DEVICE_MEMORY_STATS_SCHEMA = "moe-sae.r1.v6e-device-memory-stats.v1"
+_DEVICE_MEMORY_STATS_SOURCE = "jax.Device.memory_stats"
+_DEVICE_MEMORY_SAMPLE_PHASE = (
+    "after-final-synchronized-measurement-step-before-duration-and-evidence-gathers"
+)
+_V6E_DOCUMENTED_HBM_BYTES = 32_000_000_000
+_MAXIMUM_HBM_USAGE_NUMERATOR = 17
+_MAXIMUM_HBM_USAGE_DENOMINATOR = 20
+_EXPECTED_PROCESS_COUNT = 16
+_EXPECTED_LOCAL_DEVICE_COUNT = 4
+_MEMORY_WORDS_PER_DEVICE = 12
+_MEMORY_STATUS_NAMES = {
+    0: "returned-none",
+    1: "available",
+    2: "call-error",
+    3: "invalid-return-type",
+}
 
 
 def _mesh_argument(value: str) -> int:
@@ -174,6 +194,267 @@ def _physical_mesh_evidence(mesh: Any, config: Any) -> dict[str, Any]:
     }
 
 
+def _signed_int_words(value: int) -> tuple[int, int]:
+    if type(value) is not int or not -(2**63) <= value < 2**63:
+        raise PrefixBenchmarkRunnerError(
+            "device memory statistic is not a signed 64-bit integer"
+        )
+    encoded = value & ((1 << 64) - 1)
+    return encoded >> 32, encoded & ((1 << 32) - 1)
+
+
+def _signed_int_from_words(high: int, low: int) -> int:
+    encoded = (high << 32) | low
+    if encoded >= 1 << 63:
+        encoded -= 1 << 64
+    return encoded
+
+
+def _memory_stat_words(
+    stats: Mapping[str, Any] | None,
+    key: str,
+) -> tuple[int, int, int]:
+    if stats is None or key not in stats:
+        return 0, 0, 0
+    value = stats[key]
+    if type(value) is not int:
+        return 2, 0, 0
+    high, low = _signed_int_words(value)
+    return 1, high, low
+
+
+def _local_device_memory_words(
+    devices: Sequence[Any],
+    *,
+    process_index: int,
+) -> Any:
+    """Call ``Device.memory_stats`` once per local device and encode fixed words."""
+
+    try:
+        import numpy as np
+    except (ImportError, ModuleNotFoundError) as error:  # pragma: no cover - image
+        raise PrefixBenchmarkRunnerError("NumPy is unavailable") from error
+    if (
+        type(process_index) is not int
+        or not 0 <= process_index < _EXPECTED_PROCESS_COUNT
+    ):
+        raise PrefixBenchmarkRunnerError("JAX process index is invalid")
+    if len(devices) != _EXPECTED_LOCAL_DEVICE_COUNT:
+        raise PrefixBenchmarkRunnerError(
+            "each JAX process must expose exactly four local devices"
+        )
+
+    words = np.zeros(
+        (_EXPECTED_LOCAL_DEVICE_COUNT, _MEMORY_WORDS_PER_DEVICE),
+        dtype=np.uint32,
+    )
+    for row, device in enumerate(devices):
+        try:
+            device_id = int(device.id)
+            device_process_index = int(device.process_index)
+        except (AttributeError, TypeError, ValueError) as error:
+            raise PrefixBenchmarkRunnerError(
+                "local device identity is unavailable"
+            ) from error
+        if (
+            not 0 <= device_id < 2**32
+            or device_process_index != process_index
+        ):
+            raise PrefixBenchmarkRunnerError("local device identity is inconsistent")
+
+        stats: Mapping[str, Any] | None
+        try:
+            raw_stats = device.memory_stats()
+        except Exception:  # noqa: BLE001 - diagnostic failure is evidence
+            memory_status = 2
+            stats = None
+        else:
+            if raw_stats is None:
+                memory_status = 0
+                stats = None
+            elif isinstance(raw_stats, Mapping):
+                memory_status = 1
+                stats = raw_stats
+            else:
+                memory_status = 3
+                stats = None
+
+        peak = _memory_stat_words(stats, "peak_bytes_in_use")
+        limit = _memory_stat_words(stats, "bytes_limit")
+        current = _memory_stat_words(stats, "bytes_in_use")
+        words[row] = (
+            device_id,
+            process_index,
+            memory_status,
+            *peak,
+            *limit,
+            *current,
+        )
+    return words
+
+
+def _decode_device_memory_words(gathered: Any) -> dict[str, Any]:
+    """Validate and decode the exact 64-device bounded gather."""
+
+    try:
+        import numpy as np
+    except (ImportError, ModuleNotFoundError) as error:  # pragma: no cover - image
+        raise PrefixBenchmarkRunnerError("NumPy is unavailable") from error
+    words = np.asarray(gathered)
+    expected_shape = (
+        _EXPECTED_PROCESS_COUNT,
+        _EXPECTED_LOCAL_DEVICE_COUNT,
+        _MEMORY_WORDS_PER_DEVICE,
+    )
+    if words.shape != expected_shape or words.dtype != np.dtype(np.uint32):
+        raise PrefixBenchmarkRunnerError(
+            "device memory gather has the wrong fixed shape or dtype"
+        )
+
+    devices: list[dict[str, Any]] = []
+    observed_device_ids: set[int] = set()
+    for gathered_process_index in range(_EXPECTED_PROCESS_COUNT):
+        for local_index in range(_EXPECTED_LOCAL_DEVICE_COUNT):
+            row = [int(value) for value in words[gathered_process_index, local_index]]
+            device_id, process_index, memory_status = row[:3]
+            if process_index != gathered_process_index:
+                raise PrefixBenchmarkRunnerError(
+                    "device memory gather process identity changed"
+                )
+            if device_id in observed_device_ids:
+                raise PrefixBenchmarkRunnerError(
+                    "device memory gather contains a duplicate device"
+                )
+            observed_device_ids.add(device_id)
+            try:
+                status_name = _MEMORY_STATUS_NAMES[memory_status]
+            except KeyError as error:
+                raise PrefixBenchmarkRunnerError(
+                    "device memory status is invalid"
+                ) from error
+
+            fields: dict[str, Any] = {}
+            any_stat_present = False
+            for name, offset in (
+                ("peak_bytes_in_use", 3),
+                ("bytes_limit", 6),
+                ("bytes_in_use", 9),
+            ):
+                value_status, high, low = row[offset : offset + 3]
+                if value_status not in {0, 1, 2}:
+                    raise PrefixBenchmarkRunnerError(
+                        "device memory key status is invalid"
+                    )
+                key_present = value_status != 0
+                any_stat_present = any_stat_present or key_present
+                fields[f"{name}_key_present"] = key_present
+                fields[name] = (
+                    _signed_int_from_words(high, low)
+                    if value_status == 1
+                    else None
+                )
+            if status_name != "available" and any_stat_present:
+                raise PrefixBenchmarkRunnerError(
+                    "unavailable memory statistics contain reported keys"
+                )
+            devices.append(
+                {
+                    "device_id": device_id,
+                    "process_index": process_index,
+                    "memory_stats_status": status_name,
+                    **fields,
+                }
+            )
+
+    if observed_device_ids != set(range(64)):
+        raise PrefixBenchmarkRunnerError(
+            "device memory gather must cover device IDs 0 through 63"
+        )
+    devices.sort(key=lambda item: item["device_id"])
+
+    passes_headroom = True
+    for device in devices:
+        peak = device["peak_bytes_in_use"]
+        limit = device["bytes_limit"]
+        current = device["bytes_in_use"]
+        if (
+            device["memory_stats_status"] != "available"
+            or device["peak_bytes_in_use_key_present"] is not True
+            or type(peak) is not int
+            or peak <= 0
+        ):
+            passes_headroom = False
+            continue
+        if device["bytes_limit_key_present"]:
+            if type(limit) is not int or limit <= 0:
+                passes_headroom = False
+                continue
+            effective_capacity = min(limit, _V6E_DOCUMENTED_HBM_BYTES)
+        else:
+            effective_capacity = _V6E_DOCUMENTED_HBM_BYTES
+        if device["bytes_in_use_key_present"] and (
+            type(current) is not int or current < 0 or current > peak
+        ):
+            passes_headroom = False
+        if (
+            peak * _MAXIMUM_HBM_USAGE_DENOMINATOR
+            > effective_capacity * _MAXIMUM_HBM_USAGE_NUMERATOR
+        ):
+            passes_headroom = False
+
+    return {
+        "schema": _DEVICE_MEMORY_STATS_SCHEMA,
+        "source": _DEVICE_MEMORY_STATS_SOURCE,
+        "sample_phase": _DEVICE_MEMORY_SAMPLE_PHASE,
+        "documented_v6e_hbm_bytes": _V6E_DOCUMENTED_HBM_BYTES,
+        "maximum_hbm_usage": {
+            "numerator": _MAXIMUM_HBM_USAGE_NUMERATOR,
+            "denominator": _MAXIMUM_HBM_USAGE_DENOMINATOR,
+        },
+        "bounded_gather": {
+            "process_count": _EXPECTED_PROCESS_COUNT,
+            "records_per_process": _EXPECTED_LOCAL_DEVICE_COUNT,
+            "uint32_words_per_record": _MEMORY_WORDS_PER_DEVICE,
+            "total_bytes": int(words.nbytes),
+        },
+        "devices": devices,
+        "passes_15_percent_headroom": passes_headroom,
+    }
+
+
+def _sample_local_device_memory_words() -> Any:
+    """Sample local device statistics without performing any collective."""
+
+    try:
+        import jax
+    except (ImportError, ModuleNotFoundError) as error:  # pragma: no cover - image
+        raise PrefixBenchmarkRunnerError("JAX is unavailable") from error
+    if jax.process_count() != _EXPECTED_PROCESS_COUNT:
+        raise PrefixBenchmarkRunnerError(
+            "device memory evidence requires exactly 16 JAX processes"
+        )
+    return _local_device_memory_words(
+        tuple(jax.local_devices()),
+        process_index=jax.process_index(),
+    )
+
+
+def _gather_device_memory_evidence(local_words: Any) -> dict[str, Any]:
+    """Gather and decode statistics already sampled on all 16 processes."""
+
+    try:
+        import jax
+        from jax.experimental import multihost_utils
+    except (ImportError, ModuleNotFoundError) as error:  # pragma: no cover - image
+        raise PrefixBenchmarkRunnerError("JAX is unavailable") from error
+    if jax.process_count() != _EXPECTED_PROCESS_COUNT:
+        raise PrefixBenchmarkRunnerError(
+            "device memory evidence requires exactly 16 JAX processes"
+        )
+    gathered = multihost_utils.process_allgather(local_words, tiled=False)
+    return _decode_device_memory_words(gathered)
+
+
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
     path = path.absolute()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -240,15 +521,33 @@ def run(argv: Sequence[str] | None = None) -> dict[str, Any] | None:
     prepare_ns = reduce_max_durations_across_jax_processes((local_prepare_ns,))[0]
 
     validation = _validate_output(compiled(batch))
+    sampled_memory_words: Any | None = None
+
+    def reduce_durations_after_memory_sample(
+        local_durations: tuple[int, ...],
+    ) -> tuple[int, ...]:
+        nonlocal sampled_memory_words
+        if sampled_memory_words is not None:
+            raise PrefixBenchmarkRunnerError(
+                "device memory statistics were sampled more than once"
+            )
+        sampled_memory_words = _sample_local_device_memory_words()
+        return reduce_max_durations_across_jax_processes(local_durations)
+
     result = run_synchronized_prefix_benchmark(
         compiled,
         batch,
         packed_shape=PackedStepShape.full_sequences(),
         synchronize=synchronize_prefix_output,
-        reduce_max_durations_ns=reduce_max_durations_across_jax_processes,
+        reduce_max_durations_ns=reduce_durations_after_memory_sample,
     )
+    if sampled_memory_words is None:
+        raise PrefixBenchmarkRunnerError(
+            "benchmark did not sample post-measurement device memory"
+        )
+    device_memory = _gather_device_memory_evidence(sampled_memory_words)
     payload = {
-        "schema": "moe-sae.r1.synthetic-prefix-qualification.v1",
+        "schema": "moe-sae.r1.synthetic-prefix-qualification.v2",
         "mesh": mesh_candidate.name,
         "seed": args.seed,
         "process_count": 16,
@@ -257,6 +556,7 @@ def run(argv: Sequence[str] | None = None) -> dict[str, Any] | None:
         "prepare_seconds": prepare_ns / 1_000_000_000,
         "output_validation": validation,
         "benchmark": result.as_dict(),
+        "device_memory": device_memory,
     }
     if not math.isfinite(payload["prepare_seconds"]):
         raise PrefixBenchmarkRunnerError("prepare timing is not finite")

@@ -552,7 +552,8 @@ fi
 result_count=0
 for result in "$STATE_ROOT"/result/*.json; do
   if jq -e \
-    '.schema == "moe-sae.r1.synthetic-prefix-qualification.v1"' \
+    '(.schema == "moe-sae.r1.synthetic-prefix-qualification.v2") and
+      (.device_memory.passes_15_percent_headroom == true)' \
     "$result" >/dev/null 2>&1; then
     ((result_count += 1))
   fi

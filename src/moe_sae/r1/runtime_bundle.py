@@ -258,6 +258,11 @@ _EXPECTED_CONTEXT_FILES = frozenset(
             "0644",
         ),
         (
+            "src/moe_sae/r1/legacy_slice_runtime.py",
+            "src/moe_sae/r1/legacy_slice_runtime.py",
+            "0644",
+        ),
+        (
             "src/moe_sae/r1/runtime_entrypoint.py",
             "src/moe_sae/r1/runtime_entrypoint.py",
             "0644",

@@ -917,6 +917,21 @@ class WholeSliceRuntime(Protocol):
         admission: RuntimeLaunchAdmissionV1,
     ) -> str: ...
 
+    def bind_stop_request(
+        self,
+        request_stop: Callable[[str], None],
+    ) -> None:
+        """Bind whole-slice member loss to the supervisor's one-way gate."""
+
+    def run_authorized_step(
+        self,
+        *,
+        permit: int,
+        authority: AttemptAuthorityV2,
+        accelerator_step: Callable[[], Any],
+    ) -> Any:
+        """Fan out one leader-authorized accelerator step to the whole slice."""
+
     def terminate(
         self,
         *,
@@ -1199,8 +1214,15 @@ class RuntimeStepContextV1:
     def authority(self) -> AttemptAuthorityV2:
         return self._supervisor._require_authority()
 
-    def authorize_step(self) -> int:
-        return self._supervisor._authorize_step()
+    def run_accelerator_step(
+        self,
+        accelerator_step: Callable[[], Any],
+    ) -> Any:
+        """Authorize and execute one step across the fixed whole-slice adapter."""
+
+        if not callable(accelerator_step):
+            raise TypeError("accelerator_step must be callable")
+        return self._supervisor._run_accelerator_step(accelerator_step)
 
 
 class _SignalScope:
@@ -1277,6 +1299,18 @@ class RuntimeSupervisorV1:
         self._last_control_poll_ms: int | None = None
         self._last_checkpoint: CASPublishedCheckpointPointerV2 | None = None
         self._metadata: GCEMetadataClientV1 | None = None
+        self._run_lock = threading.Lock()
+        self._run_started = False
+        self._slice_initialized_for_run = False
+        self._termination_outcome = "FAILED"
+        self._termination_incident_sha256: str | None = None
+        bind_stop = getattr(self._slice, "bind_stop_request", None)
+        run_step = getattr(self._slice, "run_authorized_step", None)
+        if not callable(bind_stop) or not callable(run_step):
+            raise RuntimeSupervisorError(
+                "whole-slice runtime lacks permit/member-loss execution"
+            )
+        bind_stop(self.request_stop)
 
     @property
     def stop_requested(self) -> bool:
@@ -1395,6 +1429,28 @@ class RuntimeSupervisorV1:
             raise RuntimeStopRequested("runtime stop raced accelerator permit")
         return permit
 
+    def _run_accelerator_step(
+        self,
+        accelerator_step: Callable[[], Any],
+    ) -> Any:
+        """Linearize one permit, fan it out, and require whole-slice completion."""
+
+        permit = self._authorize_step()
+        try:
+            result = self._slice.run_authorized_step(
+                permit=permit,
+                authority=self._require_authority(),
+                accelerator_step=accelerator_step,
+            )
+        except SliceMemberLost:
+            self.request_stop("SLICE_MEMBER_LOST")
+            raise
+        if self.stop_requested:
+            raise RuntimeStopRequested(
+                "runtime stop raced whole-slice accelerator completion"
+            )
+        return result
+
     def _terminal_incident(self) -> ZeroNoticeSliceIncidentV2:
         trigger = self._stop_trigger or "SLICE_MEMBER_LOST"
         latch = self._latch
@@ -1420,6 +1476,28 @@ class RuntimeSupervisorV1:
         *,
         metadata_key: str = LAUNCH_METADATA_KEY,
     ) -> RuntimeSupervisorResultV1:
+        with self._run_lock:
+            if self._run_started:
+                raise RuntimeSupervisorError("runtime supervisor is one-shot")
+            self._run_started = True
+        self._slice_initialized_for_run = False
+        self._termination_outcome = "FAILED"
+        self._termination_incident_sha256 = None
+        with _SignalScope(self.request_stop):
+            try:
+                return self._run_impl(metadata_key=metadata_key)
+            finally:
+                if self._slice_initialized_for_run:
+                    self._slice.terminate(
+                        outcome=self._termination_outcome,
+                        incident_sha256=self._termination_incident_sha256,
+                    )
+
+    def _run_impl(
+        self,
+        *,
+        metadata_key: str,
+    ) -> RuntimeSupervisorResultV1:
         resolved = self._resolver.resolve(metadata_key)
         token = resolved.launch_token
         self._token = token
@@ -1430,8 +1508,12 @@ class RuntimeSupervisorV1:
             minimum=1,
         )
 
+        raw_inventory_sha256 = (
+            self._slice.initialize_device_inventory_sha256(resolved.admission)
+        )
+        self._slice_initialized_for_run = True
         inventory_sha256 = _sha256(
-            self._slice.initialize_device_inventory_sha256(resolved.admission),
+            raw_inventory_sha256,
             "device_inventory_sha256",
         )
         deployment = resolved.admission.deployment
@@ -1635,17 +1717,9 @@ class RuntimeSupervisorV1:
                     )
                 committed = controller.commit(receipt)
         except RuntimeStopRequested:
-            try:
-                incident = self._terminal_incident()
-            except Exception:
-                self._slice.terminate(outcome="FAILED", incident_sha256=None)
-                raise
+            incident = self._terminal_incident()
             authority = self._require_authority()
-            self._slice.terminate(
-                outcome="PREEMPTED",
-                incident_sha256=incident.digest,
-            )
-            return RuntimeSupervisorResultV1(
+            result = RuntimeSupervisorResultV1(
                 outcome="PREEMPTED",
                 authority=authority,
                 completed_units=completed,
@@ -1653,12 +1727,11 @@ class RuntimeSupervisorV1:
                 incident=incident,
                 receipt=None,
             )
-        except Exception:
-            self._slice.terminate(outcome="FAILED", incident_sha256=None)
-            raise
+            self._termination_outcome = "PREEMPTED"
+            self._termination_incident_sha256 = incident.digest
+            return result
 
-        self._slice.terminate(outcome="SUCCEEDED", incident_sha256=None)
-        return RuntimeSupervisorResultV1(
+        result = RuntimeSupervisorResultV1(
             outcome="SUCCEEDED",
             authority=authority,
             completed_units=completed,
@@ -1666,6 +1739,8 @@ class RuntimeSupervisorV1:
             incident=None,
             receipt=committed,
         )
+        self._termination_outcome = "SUCCEEDED"
+        return result
 
 
 __all__ = [
