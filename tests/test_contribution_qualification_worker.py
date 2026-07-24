@@ -25,6 +25,7 @@ from moe_sae.contribution_maxtext import (
     QualificationDiagnostics,
     QualificationHostObservation,
     QualificationPlan,
+    run_qualification_host,
 )
 from moe_sae.contribution_performance import (
     ContributionPerformanceError,
@@ -58,6 +59,7 @@ from moe_sae.contribution_supervisor import (
     SUPERVISION_RESULT_SCHEMA_VERSION,
     build_execution_record,
 )
+from moe_sae.harvest import GrainBatch
 from moe_sae.runtime import MeshCandidate
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -935,3 +937,116 @@ def test_local_writer_chunks_large_logical_steps_without_growing_backlog(
     assert [item["parts"] for item in summary["files"]] == [2, 2]
     assert (tmp_path / "step-00000-part-000.safetensors").is_file()
     assert (tmp_path / "step-00000-part-001.safetensors").is_file()
+
+
+def test_qualification_disambiguates_packed_segments_across_rows_before_chunking(
+    tmp_path: Path,
+) -> None:
+    clock = _Clock()
+    segments = np.asarray(
+        [
+            [1, 1, 2, 2],
+            [1, 1, 2, 2],
+        ],
+        dtype=np.int32,
+    )
+    positions = np.asarray(
+        [
+            [0, 1, 0, 1],
+            [0, 1, 0, 1],
+        ],
+        dtype=np.int32,
+    )
+    batch = GrainBatch(
+        token_ids=np.ones_like(segments),
+        positions=positions,
+        segment_ids=segments,
+    )
+    observed_sequence_ids: list[np.ndarray] = []
+
+    def execute(
+        _token_ids: np.ndarray,
+        _positions: np.ndarray,
+        _segment_ids: np.ndarray,
+        sequence_ids: np.ndarray,
+    ) -> SimpleNamespace:
+        clock.advance(0.1)
+        observed_sequence_ids.append(np.asarray(sequence_ids).copy())
+        rows = int(segments.size)
+        return SimpleNamespace(
+            rows=rows,
+            expert_output=np.zeros((rows, 8, HIDDEN_SIZE), dtype=np.float32),
+            expert_ids=np.broadcast_to(
+                np.arange(8, dtype=np.uint8),
+                (rows, 8),
+            ),
+            router_weights=np.full((rows, 8), 0.125, dtype=np.float32),
+            shared_output=np.zeros((rows, HIDDEN_SIZE), dtype=np.float32),
+            sequence_id=np.asarray(sequence_ids).reshape(-1),
+            position=positions.astype(np.uint16).reshape(-1),
+        )
+
+    writer = LocalQualificationPersist(
+        tmp_path,
+        process_count=4,
+        process_index=2,
+        sequence_length=4,
+        wire_chunk_tokens=5,
+    )
+    try:
+        observation = run_qualification_host(
+            PreparedContributionExecutable(
+                executable=execute,
+                graph={"stablehlo": "test"},
+                compile_seconds=0.1,
+            ),
+            batch,
+            identity=ExactPerformanceIdentity.from_components(
+                graph={"graph": "test"},
+                hardware={"hardware": "test"},
+                config={"config": "test"},
+            ),
+            process_count=4,
+            process_index=2,
+            persist=writer,
+            instrumentation_probe=lambda: InstrumentationObservation(
+                disabled_output_sha256=OUTPUT_SHA,
+                enabled_output_sha256=OUTPUT_SHA,
+                equal=True,
+            ),
+            qualification_started=0.0,
+            plan=QualificationPlan(
+                warmup_steps=1,
+                writer_disabled_steps=1,
+                measured_steps=1,
+            ),
+            diagnostics=QualificationDiagnostics,
+            clock=clock,
+        )
+        summary = writer.summary()
+    finally:
+        writer.close()
+
+    assert observation.local_persisted_tokens == segments.size
+    assert summary["tokens"] == segments.size
+    assert [item["tokens"] for item in summary["files"]] == [5, 3]
+    assert len(observed_sequence_ids) == 3
+    for sequence_ids in observed_sequence_ids:
+        assert sequence_ids.dtype == segments.dtype
+        assert sequence_ids.shape == segments.shape
+        np.testing.assert_array_equal(
+            sequence_ids & np.int32(0xFFFF),
+            segments,
+        )
+        np.testing.assert_array_equal(
+            sequence_ids >> np.int32(24),
+            np.full_like(sequence_ids, 2),
+        )
+        token_keys = np.rec.fromarrays(
+            [
+                sequence_ids.reshape(-1).astype(np.int64),
+                positions.reshape(-1).astype(np.uint16),
+            ],
+            names=("sequence_id", "position"),
+        )
+        assert np.unique(token_keys).size == segments.size

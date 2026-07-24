@@ -54,6 +54,7 @@ from moe_sae.contribution_recomposition import SUPPORTED_ACCUMULATION_ORDER
 from moe_sae.harvest import (
     GrainBatch,
     _block_until_ready,
+    _process_local_array,
     compile_adapter_step,
     extract_grain_batch,
 )
@@ -794,9 +795,108 @@ def _output_rows(output: Any) -> int:
     return rows
 
 
+def _qualification_sequence_ids(
+    segment_ids: Any,
+    *,
+    process_count: int,
+    process_index: int,
+) -> Any:
+    """Build unique packed-sequence IDs without changing graph input identity.
+
+    MaxText's synthetic input supplies packed segment labels, not sequence
+    identities.  Passing those labels directly as the adapter's fourth input
+    makes every batch row emit the same ``(segment, position)`` token keys.
+    Construct process/row/segment IDs in the existing signed-int32 input wire
+    instead.  The result has exactly the same global shape, dtype, and
+    sharding as ``segment_ids``, so the already-lowered executable and its
+    StableHLO identity are unchanged.
+
+    The 31 non-sign bits are ``process:7 | local-row:8 | segment:16``.  The
+    qualification reuses one static batch, so it deliberately needs no batch
+    ordinal.  Production replaces adapter-emitted IDs with authoritative v1
+    source keys before persistence.
+    """
+
+    if (
+        isinstance(process_count, bool)
+        or not isinstance(process_count, int)
+        or not 0 < process_count <= 2**7
+        or isinstance(process_index, bool)
+        or not isinstance(process_index, int)
+        or not 0 <= process_index < process_count
+    ):
+        raise ContributionMaxTextError(
+            "qualification process identity does not fit the token-key wire"
+        )
+    try:
+        local_segments = _process_local_array(
+            segment_ids,
+            "qualification segmentation",
+            process_count=process_count,
+            process_index=process_index,
+        )
+    except (RuntimeError, TypeError, ValueError) as error:
+        raise ContributionMaxTextError(
+            "cannot assemble process-local qualification segmentation"
+        ) from error
+    if local_segments.ndim != 2 or local_segments.shape[0] >= 2**8:
+        raise ContributionMaxTextError(
+            "qualification segmentation must contain fewer than 256 local rows"
+        )
+    if (
+        not np.issubdtype(local_segments.dtype, np.signedinteger)
+        or local_segments.dtype.itemsize < 4
+    ):
+        raise ContributionMaxTextError(
+            "qualification segmentation must use a signed integer dtype "
+            "at least as wide as int32"
+        )
+    if local_segments.size and (
+        int(local_segments.min()) < 0
+        or int(local_segments.max()) >= 2**16
+    ):
+        raise ContributionMaxTextError(
+            "qualification packed segment IDs must lie in [0,65535]"
+        )
+
+    process_bits = np.int64(process_index) << np.int64(24)
+    row_bits = np.arange(
+        local_segments.shape[0],
+        dtype=np.int64,
+    )[:, None] << np.int64(16)
+    local_ids = np.ascontiguousarray(
+        (
+            process_bits
+            | row_bits
+            | local_segments.astype(np.int64, copy=False)
+        ).astype(local_segments.dtype)
+    )
+    if getattr(segment_ids, "addressable_shards", None) is None:
+        return local_ids
+
+    try:
+        import jax
+
+        result = jax.make_array_from_process_local_data(
+            segment_ids.sharding,
+            local_ids,
+            global_shape=tuple(int(size) for size in segment_ids.shape),
+        )
+    except (AttributeError, RuntimeError, TypeError, ValueError) as error:
+        raise ContributionMaxTextError(
+            "cannot assemble globally sharded qualification sequence IDs"
+        ) from error
+    if result.shape != segment_ids.shape or result.dtype != segment_ids.dtype:
+        raise ContributionMaxTextError(
+            "qualification sequence IDs changed graph input shape or dtype"
+        )
+    return result
+
+
 def _timed_step(
     executable: Callable[[Any, Any, Any, Any], Any],
     grain: GrainBatch,
+    sequence_ids: Any,
     *,
     clock: Callable[[], float],
 ) -> tuple[Any, float]:
@@ -805,7 +905,7 @@ def _timed_step(
         grain.token_ids,
         grain.positions,
         grain.segment_ids,
-        grain.segment_ids,
+        sequence_ids,
     )
     _block_until_ready(output)
     elapsed = clock() - started
@@ -839,6 +939,12 @@ def run_qualification_host(
         if isinstance(batch, GrainBatch)
         else extract_grain_batch(batch, expected_sequence_length=1_024)
     )
+    sequence_ids = _qualification_sequence_ids(
+        grain.segment_ids,
+        process_count=process_count,
+        process_index=process_index,
+    )
+    _block_until_ready(sequence_ids)
     _remaining_seconds(
         qualification_started=qualification_started,
         maximum_seconds=plan.maximum_seconds,
@@ -861,7 +967,12 @@ def run_qualification_host(
             maximum_seconds=plan.maximum_seconds,
             clock=clock,
         )
-        output, _ = _timed_step(prepared.executable, grain, clock=clock)
+        output, _ = _timed_step(
+            prepared.executable,
+            grain,
+            sequence_ids,
+            clock=clock,
+        )
         rows = _output_rows(output)
         if static_rows is None:
             static_rows = rows
@@ -876,7 +987,12 @@ def run_qualification_host(
             maximum_seconds=plan.maximum_seconds,
             clock=clock,
         )
-        output, elapsed = _timed_step(prepared.executable, grain, clock=clock)
+        output, elapsed = _timed_step(
+            prepared.executable,
+            grain,
+            sequence_ids,
+            clock=clock,
+        )
         rows = _output_rows(output)
         if rows != static_rows:
             raise ContributionMaxTextError("capture output shape changed after warmup")
@@ -893,7 +1009,12 @@ def run_qualification_host(
             maximum_seconds=plan.maximum_seconds,
             clock=clock,
         )
-        output, elapsed = _timed_step(prepared.executable, grain, clock=clock)
+        output, elapsed = _timed_step(
+            prepared.executable,
+            grain,
+            sequence_ids,
+            clock=clock,
+        )
         rows = _output_rows(output)
         if rows != static_rows:
             raise ContributionMaxTextError("capture output shape changed while timed")
