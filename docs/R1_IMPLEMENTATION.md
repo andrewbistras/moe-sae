@@ -796,8 +796,11 @@ statically checked transform-array limits, a one-shard source/sink protocol,
 and exact crash/resume receipts. Its evidence is synthetic only. The shared
 project lock still points MaxText at the Gemma commit and remains intentionally
 separate; `deploy/r1/runtime/` is the only accepted static R1 lock. Its Packer
-context and systemd entrypoint validate offline but are explicitly `UNBUILT`
-and `production_qualified=false`. Production sealing remains disabled: no
+context now bakes both R1 patches as a twice-built deterministic MaxText wheel
+and includes the 44-leaf restore plus synthetic v6e benchmark closure. The
+systemd entrypoint still stops before launch admission, and the image remains
+explicitly `UNBUILT` and `production_qualified=false`. Production sealing
+remains disabled: no
 published/qualified R1 image, live Compute placement receipt, atomic 16-VM
 runtime admission, controller-authenticated weight prestaging,
 TensorStore/Orbax sink and restore, independent real-payload R1 conversion

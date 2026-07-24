@@ -8,6 +8,8 @@ dependencies = [
     "google-cloud-storage==3.13.0",
     "google-crc32c==1.8.0",
     "grain==0.2.18",
+    "hatch-requirements-txt==0.4.1",
+    "hatchling==1.27.0",
     "jax==0.10.2",
     "jaxlib==0.10.2",
     "libtpu==0.0.43 ; sys_platform == 'linux' and platform_machine == 'x86_64'",

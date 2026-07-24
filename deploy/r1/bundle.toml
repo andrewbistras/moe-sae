@@ -46,43 +46,43 @@ sha256 = "43fd694bd564dd2215f51a6b23f6a3712834850225e629d7781c81c71076092d"
 name = "runtime-pyproject"
 path = "deploy/r1/runtime/pyproject.toml"
 mode = "0644"
-sha256 = "5594d63cd479dab2102149158df3c35a1357c5f2a28085b1e42777ffe3f8aeb4"
+sha256 = "5b4bc0e94e728f81749a16535abea4dd3e0d38fd0f53b45f7bf6b2f6e3b7067b"
 
 [[files]]
 name = "runtime-lock"
 path = "deploy/r1/runtime/uv.lock"
 mode = "0644"
-sha256 = "da612aa55b1022baf6d971f1018bf53ff3e5f15ec0546f7d485904850fce5e64"
+sha256 = "1631b7beed109f3873f49045f6717e165eaa13bc5fa4b78bec9f597c453d2f2d"
 
 [[files]]
 name = "context-spec"
 path = "deploy/r1/context-files.json"
 mode = "0644"
-sha256 = "8f9605ba385941dbc9514f2ec8a93575f7797089f21a557dfa2f17c0a23719cb"
+sha256 = "4849858fb1f9af53f7d075bc37a0bf8b0189fe0db1a65db8ba8718ff88e346fa"
 
 [[files]]
 name = "packer-template"
 path = "deploy/r1/image/r1-v6e.pkr.hcl"
 mode = "0644"
-sha256 = "ea1c51e84ecdd7c281e58119134f5bc20197587b41bb475b8528c6393151c6a9"
+sha256 = "81ede4f04f76290b4e3a53c8b7f541953d193d26e540df814edf8b39f929a9ea"
 
 [[files]]
 name = "provisioner"
 path = "deploy/r1/image/provision.sh"
 mode = "0755"
-sha256 = "0b54d4e55a9bffadb4edf71187ed20f0542022016c4be5344c3b93585a373a26"
+sha256 = "eefc0f49e8eaa20d24e034e6ba317665ed283e271af7e3e75ea2c5c0d2d05926"
 
 [[files]]
 name = "image-measurer"
 path = "deploy/r1/image/measure_image.py"
 mode = "0755"
-sha256 = "6972a305b53bce036a6db00e6de76687175a15c64ea30f5989bfb02f99fe5329"
+sha256 = "63bd2650db51072b8aa9534a47f233651d26ea1a8eec9308fe9d82c2fc3a4e75"
 
 [[files]]
 name = "service-unit"
 path = "deploy/r1/systemd/moe-sae-r1.service"
 mode = "0644"
-sha256 = "d468b96db51fdae6ca483f8927e12bab2c56d014a3fdc15b2339ec3f588dd688"
+sha256 = "f7e10d0a881de21e9aa249452be476f719fc006b5993d0088feecdd4d467b148"
 
 [[files]]
 name = "entrypoint"
@@ -100,4 +100,4 @@ sha256 = "ac41942f43bd1a8a32ac107b7cf6189722f737ca3da3a3c8330024f1c030814a"
 name = "bundle-validator"
 path = "src/moe_sae/r1/runtime_bundle.py"
 mode = "0644"
-sha256 = "788e1adb58b9a12589009b3c3c70a355a28ae9186653d6bf55d62fd776acafc5"
+sha256 = "9c27868feae3bc7e1619137d9b5795d2e1f6cfad031075b9a187c5e6c5d230fd"

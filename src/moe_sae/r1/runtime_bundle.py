@@ -69,6 +69,8 @@ _EXPECTED_DIRECT_DEPENDENCIES = frozenset(
         "google-cloud-storage==3.13.0",
         "google-crc32c==1.8.0",
         "grain==0.2.18",
+        "hatch-requirements-txt==0.4.1",
+        "hatchling==1.27.0",
         "jax==0.10.2",
         "jaxlib==0.10.2",
         "libtpu==0.0.43 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
@@ -85,6 +87,8 @@ _CRITICAL_LOCKED_VERSIONS = {
     "google-cloud-storage": "3.13.0",
     "google-crc32c": "1.8.0",
     "grain": "0.2.18",
+    "hatch-requirements-txt": "0.4.1",
+    "hatchling": "1.27.0",
     "jax": JAX_VERSION,
     "jaxlib": JAXLIB_VERSION,
     "libtpu": LIBTPU_VERSION,
@@ -127,8 +131,28 @@ _EXPECTED_CONTEXT_FILES = frozenset(
             "systemd/moe-sae-r1.service",
             "0644",
         ),
+        (
+            "patches/r1/maxtext/0001-routed-moe-prefix-tap.patch",
+            "patches/r1/maxtext/0001-routed-moe-prefix-tap.patch",
+            "0644",
+        ),
+        (
+            "patches/r1/maxtext/0002-b128-routed-prefix.patch",
+            "patches/r1/maxtext/0002-b128-routed-prefix.patch",
+            "0644",
+        ),
         ("src/moe_sae/__init__.py", "src/moe_sae/__init__.py", "0644"),
         ("src/moe_sae/r1/__init__.py", "src/moe_sae/r1/__init__.py", "0644"),
+        (
+            "src/moe_sae/r1/checkpoint_conversion.py",
+            "src/moe_sae/r1/checkpoint_conversion.py",
+            "0644",
+        ),
+        (
+            "src/moe_sae/r1/checkpoint_inventory.py",
+            "src/moe_sae/r1/checkpoint_inventory.py",
+            "0644",
+        ),
         ("src/moe_sae/r1/protocol.py", "src/moe_sae/r1/protocol.py", "0644"),
         (
             "src/moe_sae/r1/control_store.py",
@@ -141,6 +165,11 @@ _EXPECTED_CONTEXT_FILES = frozenset(
             "0644",
         ),
         (
+            "src/moe_sae/r1/gcs_immutable_byte_store.py",
+            "src/moe_sae/r1/gcs_immutable_byte_store.py",
+            "0644",
+        ),
+        (
             "src/moe_sae/r1/controller.py",
             "src/moe_sae/r1/controller.py",
             "0644",
@@ -153,6 +182,51 @@ _EXPECTED_CONTEXT_FILES = frozenset(
         (
             "src/moe_sae/r1/preemption.py",
             "src/moe_sae/r1/preemption.py",
+            "0644",
+        ),
+        (
+            "src/moe_sae/r1/jax_prefix_restore.py",
+            "src/moe_sae/r1/jax_prefix_restore.py",
+            "0644",
+        ),
+        (
+            "src/moe_sae/r1/maxtext_patch_series.py",
+            "src/moe_sae/r1/maxtext_patch_series.py",
+            "0644",
+        ),
+        (
+            "src/moe_sae/r1/maxtext_prefix_runtime.py",
+            "src/moe_sae/r1/maxtext_prefix_runtime.py",
+            "0644",
+        ),
+        (
+            "src/moe_sae/r1/prefix_batchsplit_contract.py",
+            "src/moe_sae/r1/prefix_batchsplit_contract.py",
+            "0644",
+        ),
+        (
+            "src/moe_sae/r1/prefix_benchmark.py",
+            "src/moe_sae/r1/prefix_benchmark.py",
+            "0644",
+        ),
+        (
+            "src/moe_sae/r1/prefix_benchmark_runner.py",
+            "src/moe_sae/r1/prefix_benchmark_runner.py",
+            "0644",
+        ),
+        (
+            "src/moe_sae/r1/prefix_checkpoint.py",
+            "src/moe_sae/r1/prefix_checkpoint.py",
+            "0644",
+        ),
+        (
+            "src/moe_sae/r1/prefix_checkpoint_v2.py",
+            "src/moe_sae/r1/prefix_checkpoint_v2.py",
+            "0644",
+        ),
+        (
+            "src/moe_sae/r1/prefix_restore_authority.py",
+            "src/moe_sae/r1/prefix_restore_authority.py",
             "0644",
         ),
         ("src/moe_sae/r1/flops.py", "src/moe_sae/r1/flops.py", "0644"),
@@ -486,6 +560,7 @@ def _validate_service(text: str) -> None:
         "ExecStart=/opt/moe-sae-r1/runtime/bin/python -I -m "
         "moe_sae.r1.runtime_entrypoint --metadata-key=moe-sae-r1-launch-ref",
         "StandardInput=null",
+        "Restart=no",
         "NoNewPrivileges=yes",
         "ProtectSystem=strict",
         "ProtectHome=yes",
@@ -501,6 +576,7 @@ def _validate_service(text: str) -> None:
     forbidden = (
         "EnvironmentFile=",
         "PassEnvironment=",
+        "Restart=on",
         "ExecStartPre=",
         "ExecStartPost=",
         "PrivateDevices=",
@@ -569,6 +645,8 @@ def _validate_packer(text: str) -> None:
         "ubuntu-accel-2204-amd64-tpu-v5e-v5p-v6e-v[0-9]{8}",
         "source_image            = local.base_image_name",
         "source_image_project_id = [local.base_image_project_id]",
+        "use_internal_ip         = true",
+        "omit_external_ip        = false",
         'state    = "unqualified"',
         '"BUILD_TIME_ONLY=1"',
         '"BASE_IMAGE_ID=${var.base_image_id}"',

@@ -1298,6 +1298,34 @@ wheels = [
 ]
 
 [[package]]
+name = "hatch-requirements-txt"
+version = "0.4.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "hatchling" },
+    { name = "packaging" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/7c/04/3703d3caa354fd7148a5453724de70577a6010234d1e1f3ff6b98a4d3242/hatch_requirements_txt-0.4.1.tar.gz", hash = "sha256:2c686e5758fd05bb55fa7d0c198fdd481f8d3aaa3c693260f5c0d74ce3547d20", size = 6454, upload-time = "2024-01-24T21:47:22.676Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/98/a3/9a71667d284dff0e5d1c95b99b2383bbfcfc120843209522f8054055c0bb/hatch_requirements_txt-0.4.1-py3-none-any.whl", hash = "sha256:13c6ab7707cbc0aba128b3626dacae4be7065f1dbafc792461c9f547b3c3ffde", size = 7769, upload-time = "2024-01-24T21:47:19.246Z" },
+]
+
+[[package]]
+name = "hatchling"
+version = "1.27.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "packaging" },
+    { name = "pathspec" },
+    { name = "pluggy" },
+    { name = "trove-classifiers" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/8f/8a/cc1debe3514da292094f1c3a700e4ca25442489731ef7c0814358816bb03/hatchling-1.27.0.tar.gz", hash = "sha256:971c296d9819abb3811112fc52c7a9751c8d381898f36533bb16f9791e941fd6", size = 54983, upload-time = "2024-12-15T17:08:11.894Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/08/e7/ae38d7a6dfba0533684e0b2136817d667588ae3ec984c1a4e5df5eb88482/hatchling-1.27.0-py3-none-any.whl", hash = "sha256:d3a2f3567c4f926ea39849cdf924c7e99e6686c9c8e288ae1037c8fa2a5d937b", size = 75794, upload-time = "2024-12-15T17:08:10.364Z" },
+]
+
+[[package]]
 name = "hf-xet"
 version = "1.5.2"
 source = { registry = "https://pypi.org/simple" }
@@ -2079,6 +2107,8 @@ dependencies = [
     { name = "google-cloud-storage" },
     { name = "google-crc32c" },
     { name = "grain" },
+    { name = "hatch-requirements-txt" },
+    { name = "hatchling" },
     { name = "jax" },
     { name = "jaxlib" },
     { name = "libtpu", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
@@ -2096,6 +2126,8 @@ requires-dist = [
     { name = "google-cloud-storage", specifier = "==3.13.0" },
     { name = "google-crc32c", specifier = "==1.8.0" },
     { name = "grain", specifier = "==0.2.18" },
+    { name = "hatch-requirements-txt", specifier = "==0.4.1" },
+    { name = "hatchling", specifier = "==1.27.0" },
     { name = "jax", specifier = "==0.10.2" },
     { name = "jaxlib", specifier = "==0.10.2" },
     { name = "libtpu", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = "==0.0.43" },
@@ -3654,6 +3686,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/f0/2a/d13d3c38862632742d2fe2f7ae307c431db06538fd05ca03020d207b5dcc/treescope-0.1.10.tar.gz", hash = "sha256:20f74656f34ab2d8716715013e8163a0da79bdc2554c16d5023172c50d27ea95", size = 138870, upload-time = "2025-08-08T05:43:48.048Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/43/2b/36e984399089c026a6499ac8f7401d38487cf0183839a4aa78140d373771/treescope-0.1.10-py3-none-any.whl", hash = "sha256:dde52f5314f4c29d22157a6fe4d3bd103f9cae02791c9e672eefa32c9aa1da51", size = 182255, upload-time = "2025-08-08T05:43:46.673Z" },
+]
+
+[[package]]
+name = "trove-classifiers"
+version = "2026.6.1.19"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/c2/e3/7ca82ee24c82d344584abd5b8637b3bd056f2900226e8d82fc22f1184b92/trove_classifiers-2026.6.1.19.tar.gz", hash = "sha256:c5132b4b61a829d11cfbd2d72e97f20a45ed6edb95e45c5efdeb5e00836b2745", size = 17059, upload-time = "2026-06-01T19:41:34.649Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/7c/a4/81502f486f01db95bc8320646a8a12511f5e556cb63d5e224d91816605c4/trove_classifiers-2026.6.1.19-py3-none-any.whl", hash = "sha256:ab4c4ec93cc4a4e7815fa759906e05e6bb3f2fbd92ea0f897288c6a43efd15b3", size = 14211, upload-time = "2026-06-01T19:41:33.434Z" },
 ]
 
 [[package]]

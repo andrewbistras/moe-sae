@@ -19,6 +19,7 @@ from .maxtext_prefix_runtime import (
     create_prefix_mesh,
     create_synthetic_prefix_batch,
     initialize_maxtext_config,
+    initialize_v6e_distributed_runtime,
     synchronize_prefix_output,
 )
 from .prefix_benchmark import (
@@ -155,6 +156,7 @@ def run(argv: Sequence[str] | None = None) -> dict[str, Any] | None:
     """Compile, validate, and benchmark one exact synthetic mesh candidate."""
 
     args = parse_args(argv)
+    initialize_v6e_distributed_runtime()
     assert_real_v6e64_runtime()
     mesh_candidate = PREFIX_MESH_CANDIDATES[args.mesh]
     settings = PrefixRuntimeSettings(

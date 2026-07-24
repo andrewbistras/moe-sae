@@ -19,6 +19,7 @@ from moe_sae.r1.maxtext_prefix_runtime import (
     assert_real_v6e64_runtime,
     create_device_synthetic_prefix_leaves,
     create_synthetic_prefix_batch,
+    initialize_v6e_distributed_runtime,
     prune_output_only_parameters,
     split_restored_prefix_leaves,
     validate_initialized_config,
@@ -282,3 +283,23 @@ def test_real_topology_and_synthetic_batch_fail_closed_on_cpu() -> None:
         assert_real_v6e64_runtime()
     with pytest.raises(MaxTextPrefixRuntimeError, match="global B128"):
         create_synthetic_prefix_batch(object())
+
+
+def test_distributed_initialization_is_explicit_and_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[int] = []
+    monkeypatch.setattr(jax.distributed, "is_initialized", lambda: False)
+    monkeypatch.setattr(
+        jax.distributed,
+        "initialize",
+        lambda *, initialization_timeout: calls.append(initialization_timeout),
+    )
+    initialize_v6e_distributed_runtime(initialization_timeout_seconds=900)
+    assert calls == [900]
+
+    with pytest.raises(MaxTextPrefixRuntimeError, match=r"\[300, 1800\]"):
+        initialize_v6e_distributed_runtime(initialization_timeout_seconds=299)
+    monkeypatch.setattr(jax.distributed, "is_initialized", lambda: True)
+    with pytest.raises(MaxTextPrefixRuntimeError, match="before"):
+        initialize_v6e_distributed_runtime()

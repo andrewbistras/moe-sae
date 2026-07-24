@@ -13,8 +13,7 @@ WorkingDirectory=/var/lib/moe-sae-r1
 RuntimeDirectory=moe-sae-r1
 RuntimeDirectoryMode=0700
 ExecStart=/opt/moe-sae-r1/runtime/bin/python -I -m moe_sae.r1.runtime_entrypoint --metadata-key=moe-sae-r1-launch-ref
-Restart=on-failure
-RestartSec=5
+Restart=no
 TimeoutStopSec=110
 KillMode=mixed
 UMask=0077

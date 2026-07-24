@@ -13,6 +13,7 @@ from moe_sae.r1.prefix_benchmark_runner import (
     _seed_argument,
     _validate_output,
     parse_args,
+    run,
 )
 
 
@@ -50,3 +51,36 @@ def test_output_validation_rejects_host_values_before_reductions() -> None:
         _validate_output(None)
     with pytest.raises(PrefixBenchmarkRunnerError, match="ABI"):
         _validate_output((object(), object(), object()))
+
+
+def test_runner_initializes_distributed_jax_before_topology_query(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    order: list[str] = []
+
+    def initialized() -> None:
+        order.append("initialize")
+
+    def topology() -> None:
+        order.append("topology")
+        raise RuntimeError("stop after ordering proof")
+
+    monkeypatch.setattr(
+        "moe_sae.r1.prefix_benchmark_runner.initialize_v6e_distributed_runtime",
+        initialized,
+    )
+    monkeypatch.setattr(
+        "moe_sae.r1.prefix_benchmark_runner.assert_real_v6e64_runtime",
+        topology,
+    )
+    with pytest.raises(RuntimeError, match="ordering proof"):
+        run(
+            [
+                "--maxtext-base-yml",
+                str(tmp_path / "base.yml"),
+                "--output-directory",
+                str(tmp_path / "output"),
+            ]
+        )
+    assert order == ["initialize", "topology"]

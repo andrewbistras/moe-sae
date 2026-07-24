@@ -14,6 +14,10 @@ readonly UV_ARCHIVE_SHA256=f3b623eb0e6141a7053d571d59a0bdc341e0f238ea8f5f0b4815d
 readonly UV_BINARY_SHA256=b5cbc3a3f35debad0b4770811efd190bcf460b654114d6a3f71e0ce298468e5d
 readonly UV_ARCHIVE_MEMBER=uv-x86_64-unknown-linux-gnu/uv
 readonly PYTHON_VERSION=3.12.11
+readonly MAXTEXT_COMMIT=c03f8bd307d18049fa814fc8c104bd9ec8c292aa
+readonly MAXTEXT_REPOSITORY_URL=https://github.com/AI-Hypercomputer/maxtext.git
+readonly MAXTEXT_SOURCE_DATE_EPOCH=1784735802
+readonly MAXTEXT_WHEEL_NAME=maxtext-0.2.3-py3-none-any.whl
 readonly RUNTIME_USER=moe_sae
 readonly RUNTIME_UID=20001
 readonly RUNTIME_GID=20001
@@ -97,8 +101,24 @@ EXPECTED = {
     "image/provision.sh": ("deploy/r1/image/provision.sh", 0o755),
     "image/r1-v6e.pkr.hcl": ("deploy/r1/image/r1-v6e.pkr.hcl", 0o644),
     "pyproject.toml": ("deploy/r1/runtime/pyproject.toml", 0o644),
+    "patches/r1/maxtext/0001-routed-moe-prefix-tap.patch": (
+        "patches/r1/maxtext/0001-routed-moe-prefix-tap.patch",
+        0o644,
+    ),
+    "patches/r1/maxtext/0002-b128-routed-prefix.patch": (
+        "patches/r1/maxtext/0002-b128-routed-prefix.patch",
+        0o644,
+    ),
     "src/moe_sae/__init__.py": ("src/moe_sae/__init__.py", 0o644),
     "src/moe_sae/r1/__init__.py": ("src/moe_sae/r1/__init__.py", 0o644),
+    "src/moe_sae/r1/checkpoint_conversion.py": (
+        "src/moe_sae/r1/checkpoint_conversion.py",
+        0o644,
+    ),
+    "src/moe_sae/r1/checkpoint_inventory.py": (
+        "src/moe_sae/r1/checkpoint_inventory.py",
+        0o644,
+    ),
     "src/moe_sae/r1/control_store.py": ("src/moe_sae/r1/control_store.py", 0o644),
     "src/moe_sae/r1/controller.py": ("src/moe_sae/r1/controller.py", 0o644),
     "src/moe_sae/r1/flops.py": ("src/moe_sae/r1/flops.py", 0o644),
@@ -106,7 +126,23 @@ EXPECTED = {
         "src/moe_sae/r1/gcs_control_store.py",
         0o644,
     ),
+    "src/moe_sae/r1/gcs_immutable_byte_store.py": (
+        "src/moe_sae/r1/gcs_immutable_byte_store.py",
+        0o644,
+    ),
     "src/moe_sae/r1/image_protocol.py": ("src/moe_sae/r1/image_protocol.py", 0o644),
+    "src/moe_sae/r1/jax_prefix_restore.py": (
+        "src/moe_sae/r1/jax_prefix_restore.py",
+        0o644,
+    ),
+    "src/moe_sae/r1/maxtext_patch_series.py": (
+        "src/moe_sae/r1/maxtext_patch_series.py",
+        0o644,
+    ),
+    "src/moe_sae/r1/maxtext_prefix_runtime.py": (
+        "src/moe_sae/r1/maxtext_prefix_runtime.py",
+        0o644,
+    ),
     "src/moe_sae/r1/mfu.py": ("src/moe_sae/r1/mfu.py", 0o644),
     "src/moe_sae/r1/mfu_authority.py": (
         "src/moe_sae/r1/mfu_authority.py",
@@ -114,6 +150,30 @@ EXPECTED = {
     ),
     "src/moe_sae/r1/mfu_v2.py": ("src/moe_sae/r1/mfu_v2.py", 0o644),
     "src/moe_sae/r1/preemption.py": ("src/moe_sae/r1/preemption.py", 0o644),
+    "src/moe_sae/r1/prefix_batchsplit_contract.py": (
+        "src/moe_sae/r1/prefix_batchsplit_contract.py",
+        0o644,
+    ),
+    "src/moe_sae/r1/prefix_benchmark.py": (
+        "src/moe_sae/r1/prefix_benchmark.py",
+        0o644,
+    ),
+    "src/moe_sae/r1/prefix_benchmark_runner.py": (
+        "src/moe_sae/r1/prefix_benchmark_runner.py",
+        0o644,
+    ),
+    "src/moe_sae/r1/prefix_checkpoint.py": (
+        "src/moe_sae/r1/prefix_checkpoint.py",
+        0o644,
+    ),
+    "src/moe_sae/r1/prefix_checkpoint_v2.py": (
+        "src/moe_sae/r1/prefix_checkpoint_v2.py",
+        0o644,
+    ),
+    "src/moe_sae/r1/prefix_restore_authority.py": (
+        "src/moe_sae/r1/prefix_restore_authority.py",
+        0o644,
+    ),
     "src/moe_sae/r1/protocol.py": ("src/moe_sae/r1/protocol.py", 0o644),
     "src/moe_sae/r1/runtime_entrypoint.py": (
         "src/moe_sae/r1/runtime_entrypoint.py",
@@ -228,7 +288,8 @@ tar \
   die "runtime archive changed during guarded extraction"
 
 uv_tmp=$(mktemp -d)
-trap 'find "$uv_tmp" -depth -delete' EXIT
+maxtext_tmp=$(mktemp -d)
+trap 'find "$uv_tmp" "$maxtext_tmp" -depth -delete' EXIT
 curl \
   --fail \
   --location \
@@ -276,12 +337,128 @@ export PYTHONNOUSERSITE=1
   --project "$SOURCE_DIR" \
   --python "$PYTHON_VERSION"
 
+# The lock resolves upstream MaxText and every runtime dependency. Replace only
+# MaxText with a deterministic wheel built from an independently owned exact
+# checkout plus the two repository-bound patches. The retained wheel and patch
+# attestation make the installed direct_url and RECORD truthful.
+export GIT_CONFIG_NOSYSTEM=1
+export GIT_CONFIG_GLOBAL=/dev/null
+export GIT_TERMINAL_PROMPT=0
+git init --quiet "$maxtext_tmp/source"
+git -C "$maxtext_tmp/source" remote add origin "$MAXTEXT_REPOSITORY_URL"
+git -C "$maxtext_tmp/source" \
+  -c protocol.version=2 \
+  fetch --quiet --depth=1 origin "$MAXTEXT_COMMIT"
+git -C "$maxtext_tmp/source" checkout --quiet --detach FETCH_HEAD
+[[ "$(git -C "$maxtext_tmp/source" rev-parse --verify HEAD^{commit})" == \
+  "$MAXTEXT_COMMIT" ]] || die "fetched MaxText commit mismatch"
+[[ "$(git -C "$maxtext_tmp/source" status --porcelain=v1 --untracked-files=all)" == \
+  "" ]] || die "fresh MaxText checkout is not clean"
+
+"$ENV_DIR/bin/python" -I - \
+  "$maxtext_tmp/source" \
+  "$SOURCE_DIR/patches/r1/maxtext" \
+  "$maxtext_tmp/maxtext-patch-attestation.json" <<'PY'
+from __future__ import annotations
+
+from dataclasses import asdict
+import json
+from pathlib import Path
+import sys
+
+from moe_sae.r1.maxtext_patch_series import apply_pinned_maxtext_patch_series
+
+attestation = apply_pinned_maxtext_patch_series(
+    Path(sys.argv[1]),
+    patch_root=Path(sys.argv[2]),
+)
+raw = (
+    json.dumps(
+        asdict(attestation),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    + b"\n"
+)
+Path(sys.argv[3]).write_bytes(raw)
+PY
+
+export SOURCE_DATE_EPOCH="$MAXTEXT_SOURCE_DATE_EPOCH"
+/usr/local/bin/uv build \
+  --python "$ENV_DIR/bin/python" \
+  --wheel \
+  --no-build-isolation \
+  --out-dir "$maxtext_tmp/wheel-a" \
+  "$maxtext_tmp/source"
+/usr/local/bin/uv build \
+  --python "$ENV_DIR/bin/python" \
+  --wheel \
+  --no-build-isolation \
+  --out-dir "$maxtext_tmp/wheel-b" \
+  "$maxtext_tmp/source"
+maxtext_wheel="$maxtext_tmp/wheel-a/$MAXTEXT_WHEEL_NAME"
+maxtext_wheel_repeat="$maxtext_tmp/wheel-b/$MAXTEXT_WHEEL_NAME"
+maxtext_wheel_files=("$maxtext_tmp/wheel-a"/* "$maxtext_tmp/wheel-b"/*)
+[[ ${#maxtext_wheel_files[@]} == 2 && -f "$maxtext_wheel" && \
+  -f "$maxtext_wheel_repeat" ]] || \
+  die "MaxText builds did not emit two exact wheels"
+[[ "$(sha256_file "$maxtext_wheel")" == \
+  "$(sha256_file "$maxtext_wheel_repeat")" ]] || \
+  die "patched MaxText wheel build is not byte deterministic"
+install -o root -g root -m 0444 \
+  "$maxtext_wheel" \
+  "/usr/local/lib/moe-sae-r1/$MAXTEXT_WHEEL_NAME"
+install -o root -g root -m 0444 \
+  "$maxtext_tmp/maxtext-patch-attestation.json" \
+  /usr/local/lib/moe-sae-r1/maxtext-patch-attestation.json
+"$ENV_DIR/bin/python" -I - \
+  "/usr/local/lib/moe-sae-r1/$MAXTEXT_WHEEL_NAME" \
+  "$MAXTEXT_SOURCE_DATE_EPOCH" \
+  /usr/local/lib/moe-sae-r1/maxtext-wheel-attestation.json <<'PY'
+from __future__ import annotations
+
+import hashlib
+import json
+from pathlib import Path
+import sys
+
+wheel = Path(sys.argv[1])
+record = {
+    "schema": "moe-sae.r1.maxtext-wheel-attestation.v1",
+    "source_date_epoch": int(sys.argv[2]),
+    "wheel_name": wheel.name,
+    "wheel_sha256": hashlib.sha256(wheel.read_bytes()).hexdigest(),
+    "wheel_size": wheel.stat().st_size,
+}
+raw = (
+    json.dumps(
+        record,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    + b"\n"
+)
+Path(sys.argv[3]).write_bytes(raw)
+PY
+chmod 0444 /usr/local/lib/moe-sae-r1/maxtext-wheel-attestation.json
+/usr/local/bin/uv pip install \
+  --python "$ENV_DIR/bin/python" \
+  --no-deps \
+  --reinstall \
+  "/usr/local/lib/moe-sae-r1/$MAXTEXT_WHEEL_NAME"
+
 [[ "$($ENV_DIR/bin/python -c 'import platform; print(platform.python_version())')" == \
   "$PYTHON_VERSION" ]] || die "installed Python version mismatch"
 [[ "$($ENV_DIR/bin/python -c 'import jax; print(jax.__version__)')" == 0.10.2 ]] || \
   die "installed JAX version mismatch"
 [[ "$($ENV_DIR/bin/python -c 'import importlib.metadata as m; print(m.version("libtpu"))')" == \
   0.0.43 ]] || die "installed libtpu version mismatch"
+[[ -r "$ENV_DIR/lib/python3.12/site-packages/maxtext/configs/base.yml" ]] || \
+  die "installed MaxText base configuration is absent"
 
 export BASE_IMAGE_ID BASE_IMAGE_SELF_LINK PROVISIONER_SHA256
 export RUNTIME_ARCHIVE_SHA256 UV_VERSION PYTHON_VERSION

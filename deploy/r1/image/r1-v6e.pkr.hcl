@@ -79,7 +79,10 @@ source "googlecompute" "r1_v6e" {
   disk_type               = "pd-ssd"
   ssh_username            = "packer"
   use_internal_ip         = true
-  omit_external_ip        = true
+  # The project has no Cloud NAT. The short-lived baker needs egress for the
+  # exact uv, Git, and locked PyPI inputs; Packer still connects over the
+  # internal address and deletes the VM after imaging.
+  omit_external_ip        = false
 
   image_labels = {
     workload = "moe-sae-r1"

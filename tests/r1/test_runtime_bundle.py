@@ -163,6 +163,9 @@ def test_runtime_lock_has_hashed_registry_artifacts_and_no_torch() -> None:
     )
     packages = lock["package"]
     assert not any(package["name"] == "torch" for package in packages)
+    versions = {package["name"]: package["version"] for package in packages}
+    assert versions["hatchling"] == "1.27.0"
+    assert versions["hatch-requirements-txt"] == "0.4.1"
     for package in packages:
         if "registry" not in package["source"]:
             continue
@@ -296,6 +299,41 @@ def test_real_context_spec_excludes_gemma_and_shared_project() -> None:
     assert not any(source.startswith("configs/") for source in sources)
     assert not any(source.startswith("scripts/tpu/") for source in sources)
     assert not any(source.startswith("tests/") for source in sources)
+
+
+def test_real_context_contains_the_patched_prefix_benchmark_closure() -> None:
+    spec = json.loads(
+        (REPOSITORY / "deploy/r1/context-files.json").read_text(encoding="utf-8")
+    )
+    sources = {item["source"] for item in spec["files"]}
+    required = {
+        "patches/r1/maxtext/0001-routed-moe-prefix-tap.patch",
+        "patches/r1/maxtext/0002-b128-routed-prefix.patch",
+        "src/moe_sae/r1/jax_prefix_restore.py",
+        "src/moe_sae/r1/maxtext_patch_series.py",
+        "src/moe_sae/r1/maxtext_prefix_runtime.py",
+        "src/moe_sae/r1/prefix_benchmark.py",
+        "src/moe_sae/r1/prefix_benchmark_runner.py",
+        "src/moe_sae/r1/prefix_restore_authority.py",
+    }
+    assert len(spec["files"]) == 34
+    assert required <= sources
+
+    provisioner = (REPOSITORY / "deploy/r1/image/provision.sh").read_text(
+        encoding="utf-8"
+    )
+    assert provisioner.count("/usr/local/bin/uv build \\") == 2
+    assert "apply_pinned_maxtext_patch_series" in provisioner
+    assert "wheel build is not byte deterministic" in provisioner
+    assert "SOURCE_DATE_EPOCH" in provisioner
+    assert "--no-build-isolation" in provisioner
+    assert "/usr/local/lib/moe-sae-r1/$MAXTEXT_WHEEL_NAME" in provisioner
+
+    service = (
+        REPOSITORY / "deploy/r1/systemd/moe-sae-r1.service"
+    ).read_text(encoding="utf-8")
+    assert "Restart=no" in service
+    assert "Restart=on-failure" not in service
 
 
 def _production_context_repository(tmp_path: Path) -> tuple[Path, str]:

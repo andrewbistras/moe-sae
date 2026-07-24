@@ -19,6 +19,34 @@ SOURCE = PREFIX / "source"
 ENVIRONMENT = PREFIX / "runtime"
 OUTPUT = Path("/usr/local/lib/moe-sae-r1/image-observation.json")
 MAXTEXT_REVISION = "c03f8bd307d18049fa814fc8c104bd9ec8c292aa"
+MAXTEXT_PATCH_SHA256 = (
+    "f5b4f810dd981add4f13baad91d5811cf632ec32d17266b67b84644783ae850b",
+    "d78349f83d08993afbaa1b2b346a9ac34f1b034b5015fa02572f71b79b6859fe",
+)
+MAXTEXT_POST_APPLY_SHA256 = (
+    (
+        "src/maxtext/layers/moe.py",
+        "f6fe4ace7538f542747d20b3167e3424219aed4562552bd5a51b178d4f0cf527",
+    ),
+    (
+        "src/maxtext/layers/nnx_decoders.py",
+        "e51522f3249fb7d1bcf8e39ca6f55b3c51c5471fc5adf0ac7b1a5de94e3c90f5",
+    ),
+    (
+        "src/maxtext/models/deepseek_prefix.py",
+        "11fdb7bb64797822c336759df42dafa9524a1c1af50f82b72dc7af8edc8048c0",
+    ),
+)
+MAXTEXT_WHEEL = (
+    Path("/usr/local/lib/moe-sae-r1")
+    / "maxtext-0.2.3-py3-none-any.whl"
+)
+MAXTEXT_PATCH_ATTESTATION = (
+    Path("/usr/local/lib/moe-sae-r1") / "maxtext-patch-attestation.json"
+)
+MAXTEXT_WHEEL_ATTESTATION = (
+    Path("/usr/local/lib/moe-sae-r1") / "maxtext-wheel-attestation.json"
+)
 UV_BINARY_SHA256 = "b5cbc3a3f35debad0b4770811efd190bcf460b654114d6a3f71e0ce298468e5d"
 
 
@@ -127,27 +155,103 @@ def main() -> None:
         "jax": "0.10.2",
         "jaxlib": "0.10.2",
         "libtpu": "0.0.43",
+        "hatch-requirements-txt": "0.4.1",
+        "hatchling": "1.27.0",
         "maxtext": "0.2.3",
         "moe-sae-r1-worker": "0.1.0",
     }
     if {name: versions.get(name) for name in expected} != expected:
         raise RuntimeError("critical installed distribution version mismatch")
-    maxtext_direct = next(
-        distribution.read_text("direct_url.json")
-        for distribution in distributions()
-        if distribution.metadata["Name"].lower().replace("_", "-") == "maxtext"
+    maxtext_distribution = next(
+        item
+        for item in distributions()
+        if item.metadata["Name"].lower().replace("_", "-") == "maxtext"
     )
+    maxtext_direct = maxtext_distribution.read_text("direct_url.json")
     if maxtext_direct is None:
         raise RuntimeError("installed MaxText has no direct_url identity")
     maxtext_source = json.loads(maxtext_direct)
+    expected_direct_url = {
+        "archive_info": {},
+        "url": "file:///usr/local/lib/moe-sae-r1/"
+        "maxtext-0.2.3-py3-none-any.whl",
+    }
+    if maxtext_source != expected_direct_url:
+        raise RuntimeError("installed MaxText is not the retained patched wheel")
+    if not MAXTEXT_WHEEL.is_file():
+        raise RuntimeError("retained patched MaxText wheel is absent")
+    wheel_attestation_raw = MAXTEXT_WHEEL_ATTESTATION.read_bytes()
+    wheel_attestation = json.loads(wheel_attestation_raw)
+    expected_wheel_attestation = {
+        "schema": "moe-sae.r1.maxtext-wheel-attestation.v1",
+        "source_date_epoch": 1_784_735_802,
+        "wheel_name": MAXTEXT_WHEEL.name,
+        "wheel_sha256": sha256(MAXTEXT_WHEEL),
+        "wheel_size": MAXTEXT_WHEEL.stat().st_size,
+    }
+    expected_wheel_raw = (
+        json.dumps(
+            expected_wheel_attestation,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        + b"\n"
+    )
     if (
-        maxtext_source.get("url") != "https://github.com/AI-Hypercomputer/maxtext.git"
-        or maxtext_source.get("vcs_info", {}).get("vcs") != "git"
-        or maxtext_source.get("vcs_info", {}).get("commit_id") != MAXTEXT_REVISION
-        or maxtext_source.get("vcs_info", {}).get("requested_revision")
-        != MAXTEXT_REVISION
+        wheel_attestation != expected_wheel_attestation
+        or wheel_attestation_raw != expected_wheel_raw
     ):
-        raise RuntimeError("installed MaxText direct_url lacks the audited commit")
+        raise RuntimeError("retained patched MaxText wheel identity changed")
+    patch_attestation_raw = MAXTEXT_PATCH_ATTESTATION.read_bytes()
+    patch_attestation = json.loads(patch_attestation_raw)
+    expected_patch_attestation = {
+        "base_commit": MAXTEXT_REVISION,
+        "patch_sha256": list(MAXTEXT_PATCH_SHA256),
+        "post_apply_sha256": [
+            list(item) for item in MAXTEXT_POST_APPLY_SHA256
+        ],
+        "schema": "maxtext-r1-patch-series-attestation-v1",
+    }
+    expected_patch_raw = (
+        json.dumps(
+            expected_patch_attestation,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        + b"\n"
+    )
+    if (
+        patch_attestation != expected_patch_attestation
+        or patch_attestation_raw != expected_patch_raw
+    ):
+        raise RuntimeError("MaxText patch attestation changed")
+    for source_path, expected_sha256 in MAXTEXT_POST_APPLY_SHA256:
+        installed_relative = source_path.removeprefix("src/")
+        installed_path = Path(
+            maxtext_distribution.locate_file(installed_relative)
+        ).resolve(strict=True)
+        try:
+            installed_path.relative_to(ENVIRONMENT)
+        except ValueError as error:
+            raise RuntimeError(
+                "patched MaxText module escapes the sealed environment"
+            ) from error
+        if sha256(installed_path) != expected_sha256:
+            raise RuntimeError(
+                f"installed patched MaxText hash changed: {installed_relative}"
+            )
+    maxtext_base_yml = Path(
+        maxtext_distribution.locate_file("maxtext/configs/base.yml")
+    ).resolve(strict=True)
+    try:
+        maxtext_base_yml.relative_to(ENVIRONMENT)
+    except ValueError as error:
+        raise RuntimeError(
+            "installed MaxText base configuration escapes the runtime"
+        ) from error
+
     runtime_module = import_module("moe_sae.r1.runtime_entrypoint")
     module_file = getattr(runtime_module, "__file__", None)
     if not isinstance(module_file, str):
@@ -164,6 +268,29 @@ def main() -> None:
     source_entrypoint = SOURCE / "src/moe_sae/r1/runtime_entrypoint.py"
     if sha256(installed_entrypoint) != sha256(source_entrypoint):
         raise RuntimeError("installed runtime entrypoint differs from committed source")
+    for module_name in (
+        "jax_prefix_restore",
+        "maxtext_patch_series",
+        "maxtext_prefix_runtime",
+        "prefix_benchmark",
+        "prefix_benchmark_runner",
+    ):
+        module = import_module(f"moe_sae.r1.{module_name}")
+        module_file = getattr(module, "__file__", None)
+        if not isinstance(module_file, str):
+            raise RuntimeError(f"runtime module has no file identity: {module_name}")
+        installed_module = Path(module_file).resolve(strict=True)
+        source_module = SOURCE / f"src/moe_sae/r1/{module_name}.py"
+        try:
+            installed_module.relative_to(ENVIRONMENT)
+        except ValueError as error:
+            raise RuntimeError(
+                f"runtime module escapes sealed environment: {module_name}"
+            ) from error
+        if sha256(installed_module) != sha256(source_module):
+            raise RuntimeError(
+                f"installed runtime module differs from source: {module_name}"
+            )
     python_executable = Path(sys.executable).resolve()
     library_name = sysconfig.get_config_var("LDLIBRARY")
     library_dir = sysconfig.get_config_var("LIBDIR")
@@ -196,6 +323,13 @@ def main() -> None:
         "pyproject_sha256": sha256(SOURCE / "pyproject.toml"),
         "uv_lock_sha256": sha256(SOURCE / "uv.lock"),
         "service_unit_sha256": sha256(Path("/etc/systemd/system/moe-sae-r1.service")),
+        "maxtext_base_yml_sha256": sha256(maxtext_base_yml),
+        "maxtext_patch_attestation_sha256": sha256(MAXTEXT_PATCH_ATTESTATION),
+        "maxtext_patched_files": {
+            path: digest for path, digest in MAXTEXT_POST_APPLY_SHA256
+        },
+        "maxtext_wheel_sha256": sha256(MAXTEXT_WHEEL),
+        "maxtext_wheel_attestation_sha256": sha256(MAXTEXT_WHEEL_ATTESTATION),
         "entrypoint_source_sha256": sha256(source_entrypoint),
         "installed_entrypoint_path": installed_entrypoint_path,
         "installed_entrypoint_sha256": sha256(installed_entrypoint),

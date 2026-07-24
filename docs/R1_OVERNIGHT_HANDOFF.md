@@ -78,7 +78,7 @@ writes only one small local JSON result:
 
 ```zsh
 python -m moe_sae.r1.prefix_benchmark_runner \
-  --maxtext-base-yml /opt/maxtext/src/maxtext/configs/base.yml \
+  --maxtext-base-yml /opt/moe-sae-r1/runtime/lib/python3.12/site-packages/maxtext/configs/base.yml \
   --output-directory /var/tmp/moe-sae-r1/benchmark \
   --mesh EP16/FSDP4 \
   --seed 0 \
@@ -98,9 +98,8 @@ then begin activation capture.
 
 ## Remaining hard gates
 
-- Bake both patches and the new runner into the immutable TPU image; the
-  existing image recipe still installs pristine MaxText and its service
-  entrypoint intentionally aborts.
+- Build/publish the updated immutable image and connect its deliberately
+  stopped systemd boundary to one generation/hash-pinned, one-shot launch.
 - Compile and run on real v6e-64, inspect HLO and parameter input/output aliasing,
   and measure all three layouts.
 - Prove no routed token is dropped at the actual synthetic and real-data loads.

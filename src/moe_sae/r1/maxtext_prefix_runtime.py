@@ -236,6 +236,44 @@ def assert_real_v6e64_runtime() -> None:
         )
 
 
+def initialize_v6e_distributed_runtime(
+    *, initialization_timeout_seconds: int = 900
+) -> None:
+    """Join the TPU runtime before any backend query can create a local client.
+
+    Pinned MaxText initializes TPU distributed JAX only when checkpointing is
+    enabled.  The forward-only benchmark deliberately disables checkpointing,
+    so it must perform this one explicit initialization before calling
+    ``jax.devices()`` or constructing its configuration.  With no explicit
+    coordinator/process arguments JAX uses Cloud TPU's native cluster
+    discovery on every VM in the slice.
+    """
+
+    if (
+        type(initialization_timeout_seconds) is not int
+        or not 300 <= initialization_timeout_seconds <= 1_800
+    ):
+        raise MaxTextPrefixRuntimeError(
+            "distributed initialization timeout must be in [300, 1800] seconds"
+        )
+    try:
+        import jax
+    except (ImportError, ModuleNotFoundError) as error:  # pragma: no cover - TPU image
+        raise MaxTextPrefixRuntimeError("JAX is unavailable") from error
+    if jax.distributed.is_initialized():
+        raise MaxTextPrefixRuntimeError(
+            "distributed JAX was initialized before the fixed prefix boundary"
+        )
+    try:
+        jax.distributed.initialize(
+            initialization_timeout=initialization_timeout_seconds
+        )
+    except Exception as error:
+        raise MaxTextPrefixRuntimeError(
+            "atomic 16-host JAX initialization failed"
+        ) from error
+
+
 def create_prefix_mesh(config: Any) -> Any:
     """Create the one 64-device MaxText mesh selected by the config."""
 
@@ -1004,6 +1042,7 @@ __all__ = [
     "create_prefix_restore_shardings",
     "create_synthetic_prefix_batch",
     "initialize_maxtext_config",
+    "initialize_v6e_distributed_runtime",
     "materialize_rng_state",
     "prune_output_only_parameters",
     "restore_bind_compile_prefix",
