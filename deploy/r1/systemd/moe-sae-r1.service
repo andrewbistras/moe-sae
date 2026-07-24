@@ -24,13 +24,13 @@ Environment=HOME=/var/lib/moe-sae-r1
 Environment=PYTHONNOUSERSITE=1
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=PYTHONUNBUFFERED=1
-Environment=TMPDIR=/var/tmp/moe-sae-r1
+Environment=TMPDIR=/run/moe-sae-r1
 Environment=XDG_CACHE_HOME=/var/cache/moe-sae-r1
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
-ReadWritePaths=/var/lib/moe-sae-r1 /var/cache/moe-sae-r1 /var/tmp/moe-sae-r1 /run/moe-sae-r1 /dev/shm
+ReadWritePaths=/var/lib/moe-sae-r1 /var/cache/moe-sae-r1 /run/moe-sae-r1 /dev/shm
 CapabilityBoundingSet=
 AmbientCapabilities=
 LockPersonality=yes

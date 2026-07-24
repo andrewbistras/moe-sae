@@ -566,8 +566,11 @@ def _validate_service(text: str) -> None:
         "ProtectHome=yes",
         "UMask=0077",
         "CapabilityBoundingSet=",
+        "RuntimeDirectory=moe-sae-r1",
+        "RuntimeDirectoryMode=0700",
+        "Environment=TMPDIR=/run/moe-sae-r1",
         "ReadWritePaths=/var/lib/moe-sae-r1 /var/cache/moe-sae-r1 "
-        "/var/tmp/moe-sae-r1 /run/moe-sae-r1 /dev/shm",
+        "/run/moe-sae-r1 /dev/shm",
     }
     lines = {line.strip() for line in text.splitlines() if line.strip()}
     missing = sorted(required - lines)
@@ -585,6 +588,7 @@ def _validate_service(text: str) -> None:
         "%i",
         "%I",
         "${",
+        "/var/tmp/moe-sae-r1",
     )
     if any(token in text for token in forbidden):
         raise RuntimeBundleError("systemd service contains a mutable/unsafe control")

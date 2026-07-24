@@ -79,7 +79,7 @@ useradd \
 
 install -d -o root -g root -m 0755 "$PREFIX" "$SOURCE_DIR" /usr/local/lib/moe-sae-r1
 install -d -o "$RUNTIME_USER" -g "$RUNTIME_USER" -m 0700 \
-  /var/lib/moe-sae-r1 /var/cache/moe-sae-r1 /var/tmp/moe-sae-r1
+  /var/lib/moe-sae-r1 /var/cache/moe-sae-r1
 [[ "$(find "$SOURCE_DIR" -mindepth 1 -print -quit)" == "" ]] || \
   die "runtime source destination is not empty"
 /usr/bin/python3 -I - /tmp/moe-sae-r1-runtime.tar <<'PY'

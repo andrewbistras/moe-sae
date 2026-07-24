@@ -17,7 +17,7 @@ ENVIRONMENT = {
     "PYTHONNOUSERSITE": "1",
     "PYTHONDONTWRITEBYTECODE": "1",
     "PYTHONUNBUFFERED": "1",
-    "TMPDIR": "/var/tmp/moe-sae-r1",
+    "TMPDIR": "/run/moe-sae-r1",
     "XDG_CACHE_HOME": "/var/cache/moe-sae-r1",
 }
 

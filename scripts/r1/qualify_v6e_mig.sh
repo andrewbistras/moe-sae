@@ -290,11 +290,13 @@ if ! sudo systemd-run \
   --setenv=PYTHONNOUSERSITE=1 \
   --setenv=PYTHONDONTWRITEBYTECODE=1 \
   --setenv=PYTHONUNBUFFERED=1 \
-  --setenv=TMPDIR=/var/tmp/moe-sae-r1 \
+  --setenv=TMPDIR=/run/${UNIT} \
   --setenv=XDG_CACHE_HOME=/var/cache/moe-sae-r1 \
   --property=Type=exec \
   --property=RemainAfterExit=yes \
   --property=Restart=no \
+  --property=RuntimeDirectory=${UNIT} \
+  --property=RuntimeDirectoryMode=0700 \
   --property=RuntimeMaxSec=${BENCHMARK_TIMEOUT_SECONDS} \
   --property=TimeoutStopSec=110 \
   --property=KillMode=control-group \
@@ -303,7 +305,7 @@ if ! sudo systemd-run \
   --property=ProtectSystem=strict \
   --property=ProtectHome=yes \
   --property=PrivateTmp=yes \
-  --property='ReadWritePaths=/var/lib/moe-sae-r1 /var/cache/moe-sae-r1 /var/tmp/moe-sae-r1 /dev/shm' \
+  --property='ReadWritePaths=/var/lib/moe-sae-r1 /var/cache/moe-sae-r1 /run/${UNIT} /dev/shm' \
   --property='RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6' \
   /bin/bash -c 'set -Eeuo pipefail
   /opt/moe-sae-r1/runtime/bin/python -I \

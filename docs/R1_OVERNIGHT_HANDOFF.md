@@ -79,10 +79,10 @@ writes only one small local JSON result:
 ```zsh
 python -m moe_sae.r1.prefix_benchmark_runner \
   --maxtext-base-yml /opt/moe-sae-r1/runtime/lib/python3.12/site-packages/maxtext/configs/base.yml \
-  --output-directory /var/tmp/moe-sae-r1/benchmark \
+  --output-directory /var/lib/moe-sae-r1/qualification/manual \
   --mesh EP16/FSDP4 \
   --seed 0 \
-  --result-json /var/tmp/moe-sae-r1/benchmark/ep16-fsdp4.json
+  --result-json /var/lib/moe-sae-r1/qualification/manual/ep16-fsdp4.json
 ```
 
 Repeat with `EP32/FSDP2` and `EP8/FSDP8`. Each run compiles once, validates the
@@ -96,7 +96,10 @@ For the first image qualification, run
 deliberately narrower than the production launch protocol: it observes one
 already-created bulk MIG, requires exactly 16 running members and an `ACTIVE`
 8×8 topology, then starts the fixed command above on all private workers under
-systemd. It cannot create, repair, resize, or delete TPU resources. Its bounded
+systemd. The launcher creates the result directory and gives each immutable
+attempt a private `/run` directory owned and removed by systemd; it does not
+depend on a persistent `/var/tmp` path. It cannot create, repair, resize, or
+delete TPU resources. Its bounded
 journals, statuses, and sole process-zero JSON remain on the controller disk,
 so a failed compile or preemption produces no GCS upload bill. Override only
 its named environment inputs when qualifying a later immutable template or

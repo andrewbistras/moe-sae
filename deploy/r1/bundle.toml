@@ -70,7 +70,7 @@ sha256 = "81ede4f04f76290b4e3a53c8b7f541953d193d26e540df814edf8b39f929a9ea"
 name = "provisioner"
 path = "deploy/r1/image/provision.sh"
 mode = "0755"
-sha256 = "5a1eb0560e9da091fe6b1db30343f9def912462e5c49a6932367cbc3dec8d8ad"
+sha256 = "538a2d10da018c9c481d17e11d766a0452d05ea2548cd4847add6f480afea3c0"
 
 [[files]]
 name = "image-measurer"
@@ -82,13 +82,13 @@ sha256 = "63bd2650db51072b8aa9534a47f233651d26ea1a8eec9308fe9d82c2fc3a4e75"
 name = "service-unit"
 path = "deploy/r1/systemd/moe-sae-r1.service"
 mode = "0644"
-sha256 = "f7e10d0a881de21e9aa249452be476f719fc006b5993d0088feecdd4d467b148"
+sha256 = "fc8d384ee76bafd343f46ffcbc65db568011e856fe011007055eadf32391a451"
 
 [[files]]
 name = "entrypoint"
 path = "src/moe_sae/r1/runtime_entrypoint.py"
 mode = "0644"
-sha256 = "0ca75e5799839371718c394ace0189614a4485997bcf9a3bebdd0fc05bdb54f7"
+sha256 = "85fa10dd17d483aa0aebec00daaeb1d8d021d76937f7718c6babde2119d92f6e"
 
 [[files]]
 name = "context-builder"
@@ -100,4 +100,4 @@ sha256 = "ac41942f43bd1a8a32ac107b7cf6189722f737ca3da3a3c8330024f1c030814a"
 name = "bundle-validator"
 path = "src/moe_sae/r1/runtime_bundle.py"
 mode = "0644"
-sha256 = "9c27868feae3bc7e1619137d9b5795d2e1f6cfad031075b9a187c5e6c5d230fd"
+sha256 = "6f61adbd7d899f63338e1fbbc4c8586d2b9a09ecaff9ef59a95c54e0befd4ff0"
