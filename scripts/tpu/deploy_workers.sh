@@ -193,11 +193,11 @@ main() {
     die "local checkout is dirty; commit intentional changes before production deployment"
 
   maxtext_commit=$(
-    awk '$1 == "maxtext_commit:" {print $2}' \
-      "$repo_root/configs/gemma4_26b_a4b.yaml"
+    awk '$1 == "maxtext_fork_commit:" {print $2}' \
+      "$repo_root/configs/gemma4_contribution_v1.yaml"
   )
   [[ "$maxtext_commit" =~ ^[0-9a-f]{40}$ ]] || \
-    die "could not read the pinned MaxText commit from the production config"
+    die "could not read the pinned Experiment-2 MaxText fork commit"
 
   temp_dir=$(mktemp -d "${TMPDIR:-/tmp}/moe-sae-deploy.XXXXXX")
   DEPLOY_TEMP_DIR=$temp_dir
@@ -261,7 +261,7 @@ main() {
     --command="$remote_command"
 
   log "all workers are bootstrapped at exact commit $PROJECT_COMMIT"
-  log "next gate: launch the repository's collective qualify-storage command on all workers"
+  log "next gate: run the bounded Experiment-2 contribution qualifier"
 }
 
 main "$@"

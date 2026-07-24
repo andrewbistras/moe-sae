@@ -5,6 +5,178 @@ integrity, MFU, goodput, health, or exact-count gate. Production commands that
 initialize JAX must be launched collectively with the same arguments on all
 four v4-32 controllers; the snippets below show that per-controller command.
 
+## Experiment 2 — qualify the contribution harvester
+
+Use this block only after Stage 3 has deployed one clean commit to all four
+controllers and the converted checkpoint handoff is present. The launcher is
+safe to invoke directly from zsh. It runs qualification only: it cannot start
+capture, SAE training, or any other workload.
+
+```zsh
+cd /Users/abistras/Desktop/moe-sae
+
+export GCP_PROJECT="neural-dragnet"
+export TPU_NAME="<existing READY v4-32 name>"
+export TPU_ZONE="us-central2-b"
+export PROJECT_COMMIT="$(git rev-parse HEAD)"
+
+export TPU_HOME="/home/abistras"
+export TPU_PROJECT_ROOT="$TPU_HOME/moe-sae"
+export REMOTE_UV="$TPU_HOME/.local/bin/uv"
+export LOCAL_BUFFER_ROOT="/dev/shm/moe-sae-local"
+export ARTIFACT_ROOT="$TPU_PROJECT_ROOT/artifacts/gemma4_v1/production"
+
+export MODEL_CHECKPOINT="gs://moe-sae-bucket/moe-sae/gemma4_v1/model/20260718T101406Z-0600f5d98d32/0/items"
+export CHECKPOINT_SHA256="fbb5e2fe394d8ca03a30e15247b7a4171461b913406b63005a29dc47c3ed8281"
+
+# A run ID is immutable. Choose a new one for every deliberate sweep.
+export QUALIFICATION_RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-${PROJECT_COMMIT[1,12]}"
+
+git status --short
+scripts/tpu/qualify_contribution.py --dry-run
+scripts/tpu/qualify_contribution.py
+```
+
+`git status --short` must be empty and `PROJECT_COMMIT` must be the exact
+deployed commit. The operator seals its candidate plan first, then tries only
+these candidates, serially:
+
+1. EP8/FSDP2/TP1, per-device batch 8, global sequence batch 128;
+2. the same mesh at per-device batch 4, global batch 64;
+3. the same mesh at per-device batch 2, global batch 32.
+
+Each candidate fans out to workers 0–3 concurrently. Every controller calls
+only `moe_sae.contribution_qualification_worker launch-host`; its process group
+is terminated and reaped at the 600-second boundary. A smaller candidate is
+allowed only after all four prior processes have terminal, hash-verified
+evidence and the decision is an explicit OOM or bounded persistence/static
+capacity-headroom failure. Reaching the 600-second deadline or missing the 10%
+MFU floor aborts; it never authorizes a smaller candidate. SSH transport,
+identity, parity, numerical, and unknown failures also abort the sweep.
+
+On the first pass, the command prints four authoritative shared paths:
+
+- `coordinator-bundle.json`, containing the exact four-host evidence;
+- `qualification-receipt.json`, the extracted raw receipt consumed by the
+  extended-workload authorization seam;
+- `recomposition-sidecar.json`, copied only after all four restored models
+  emitted byte-identical checkpoint/config/fork/environment-bound sidecars;
+- the candidate control directory containing immutable contracts, child
+  evidence, supervision results, and hash-bound qualification logs.
+
+Mac-side SSH and decision logs remain under
+`artifacts/gemma4_v1/operator-results/experiment2-qualification/$QUALIFICATION_RUN_ID`.
+The launcher then exits and prints that no workload was launched. Do not
+manually start harvesting unless the next operator command consumes both the
+printed raw `qualification-receipt.json` and `recomposition-sidecar.json`.
+The coordinator bundle is audit evidence, not the harvest authorization
+receipt. Reusing the same run ID is rejected rather than overwriting evidence.
+The worst-case three-candidate sweep is roughly 30 minutes plus SSH and
+aggregation overhead.
+
+## Experiment 2 — harvest one contribution phase
+
+Run this only after qualification prints a passing candidate directory. The
+harvest operator consumes the raw receipt for authorization and also consumes
+the coordinator bundle plus operator decision so it can reject a mesh or batch
+different from the one actually qualified.
+
+The first executable gate is the 100,000-token Phase-1 train capture:
+
+```zsh
+cd /Users/abistras/Desktop/moe-sae
+
+# Use the exact passing candidate directory printed by qualification.
+export QUALIFICATION_CONTROL="<printed passing candidate control directory>"
+export CONTRIBUTION_QUALIFICATION_BUNDLE="$QUALIFICATION_CONTROL/coordinator-bundle.json"
+export CONTRIBUTION_QUALIFICATION_RECEIPT="$QUALIFICATION_CONTROL/qualification-receipt.json"
+export CONTRIBUTION_RECOMPOSITION_SIDECAR="$QUALIFICATION_CONTROL/recomposition-sidecar.json"
+export CONTRIBUTION_QUALIFICATION_DECISION="$QUALIFICATION_CONTROL/operator-decision.json"
+
+# These are the already-sealed v1 train inputs.
+export CONTRIBUTION_GRAIN_FILES="$TRAIN_GRAIN_FILES"
+export CONTRIBUTION_STAGED_MANIFEST="$TRAIN_DATASET_MANIFEST"
+export CONTRIBUTION_SOURCE_V1_ROOT="$ARTIFACT_ROOT/captures/train"
+
+# Small control records remain on shared POSIX; bulk tensors go directly to GCS.
+export BULK_GCS_ROOT="gs://moe-sae-bucket/moe-sae/gemma4_v1"
+export CONTRIBUTION_CONTROL_ROOT="$ARTIFACT_ROOT/experiment2/contributions/phase1_smoke/train"
+export CONTRIBUTION_OBJECT_PREFIX="$BULK_GCS_ROOT/experiment2/contributions/train"
+
+# Reused, host-private v1 cache. It must fit at least one complete v1 shard.
+export CONTRIBUTION_SOURCE_CACHE_MAX_BYTES="$((16 * 1024 * 1024 * 1024))"
+export CONTRIBUTION_ATTEMPT_ID="phase1-train-$(date -u +%Y%m%dT%H%M%SZ)-${PROJECT_COMMIT[1,12]}"
+
+git status --short
+scripts/tpu/harvest_contribution.py \
+  --phase phase1_smoke \
+  --split train \
+  --attempt-id "$CONTRIBUTION_ATTEMPT_ID" \
+  --mesh ep8-fsdp2-tp1 \
+  --per-device-sequence-batch 8 \
+  --maximum-runtime-seconds 3600 \
+  --dry-run
+
+scripts/tpu/harvest_contribution.py \
+  --phase phase1_smoke \
+  --split train \
+  --attempt-id "$CONTRIBUTION_ATTEMPT_ID" \
+  --mesh ep8-fsdp2-tp1 \
+  --per-device-sequence-batch 8 \
+  --maximum-runtime-seconds 3600
+```
+
+Replace mesh and batch above only when the passing qualification decision says
+to; the remote attempt initializer checks the decision, bundle, raw receipt,
+and sidecar before any host launch. `git status --short` must be empty, and the
+same exact `PROJECT_COMMIT` must already be deployed cleanly on all four
+controllers.
+
+The operator performs exactly four state transitions:
+
+1. worker 0 creates a self-hashed, create-only attempt plan;
+2. workers 0–3 concurrently run the receipt-gated `launch-host` command with
+   common scientific inputs and separate local buffer/JAX/source-cache paths;
+3. all four commands must produce complete immutable supervised evidence;
+4. only then does worker 0 verify the four records and seal `manifest.json`
+   plus `phase-evidence.json`.
+
+It never lists the bucket to infer progress. If one host fails or SSH exceeds
+the workload deadline plus five minutes, publication is not attempted. Inspect
+the Mac logs under
+`artifacts/gemma4_v1/operator-results/experiment2-harvest/$CONTRIBUTION_ATTEMPT_ID`
+and the explicit shared attempt directory printed by the command. After the
+cause is fixed and every old supervisor is terminal, choose a new attempt ID
+but keep the same phase control root and object prefix; deterministic range
+receipts provide the only resume authority.
+
+Capture Phase-1 eval next, not concurrently. Change `train` to `eval`, select
+`EVAL_GRAIN_FILES`, `EVAL_DATASET_MANIFEST`, and
+`$ARTIFACT_ROOT/captures/eval`, use a new eval control root and attempt ID, and
+set the bulk prefix to `$BULK_GCS_ROOT/experiment2/contributions/eval`.
+
+For Phase 2 and later, keep the split's bulk object prefix unchanged and pass
+the immediate predecessor explicitly:
+
+```zsh
+export CONTRIBUTION_CONTROL_ROOT="$ARTIFACT_ROOT/experiment2/contributions/phase2_mechanism_pilot/train"
+export CONTRIBUTION_ATTEMPT_ID="phase2-train-$(date -u +%Y%m%dT%H%M%SZ)-${PROJECT_COMMIT[1,12]}"
+
+scripts/tpu/harvest_contribution.py \
+  --phase phase2_mechanism_pilot \
+  --split train \
+  --attempt-id "$CONTRIBUTION_ATTEMPT_ID" \
+  --mesh ep8-fsdp2-tp1 \
+  --per-device-sequence-batch 8 \
+  --maximum-runtime-seconds 7200 \
+  --prior-control-root "$ARTIFACT_ROOT/experiment2/contributions/phase1_smoke/train" \
+  --prior-phase-evidence "$ARTIFACT_ROOT/experiment2/contributions/phase1_smoke/train/phase-evidence.json"
+```
+
+Both parent arguments are mandatory together. The worker rejects any parent
+other than the exact sealed immediate predecessor and adopts its receipts
+without copying or relisting GCS objects.
+
 ## Stage 1 — prepare the immutable data and model inputs
 
 Stage 1 happens before the TPU run. It is complete when the packed train and

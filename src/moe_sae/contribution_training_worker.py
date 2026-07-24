@@ -1,0 +1,3101 @@
+"""Standalone qualified training worker for Experiment-2 SAEs.
+
+This module is intentionally independent of :mod:`moe_sae.cli`.  It owns the
+small operational boundary which the scientific trainers do not:
+
+* qualify both resident-forward and rematerialized-microbatch executables;
+* bind the faster passing executable to an exact graph/hardware/config receipt;
+* refuse accelerator work beyond 600 seconds without that >=10% receipt; and
+* advance a sealed v2 input stream and immutable checkpoint pointers in exact
+  update order.
+
+The orchestration core is dependency injected.  Unit tests can therefore prove
+admission and resume semantics on CPU without pretending to emulate a TPU.
+Production dependencies are imported lazily so the outer supervisor process
+does not initialize JAX before it starts the hard-deadlined child.
+"""
+
+from __future__ import annotations
+
+import argparse
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import asdict, dataclass, replace
+import hashlib
+import itertools
+import json
+import math
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import time
+from typing import Any, Literal, Protocol
+
+import numpy as np
+
+from moe_sae.contribution_artifacts import canonical_json_bytes, canonical_sha256
+from moe_sae.contribution_config import (
+    Experiment2Config,
+    load_contribution_config,
+)
+from moe_sae.contribution_performance import (
+    MAX_QUALIFICATION_SECONDS,
+    ExactPerformanceIdentity,
+    authorize_accelerator_run,
+    validate_qualification_receipt,
+)
+from moe_sae.contribution_training_performance import (
+    SAEArithmetic,
+    SAEQualificationObservation,
+    build_sae_qualification_receipt,
+)
+
+
+TRAINING_WORKER_SCHEMA_VERSION = "gemma4-contribution-training-worker-v1"
+TRAINING_MODE_SELECTION_SCHEMA_VERSION = (
+    "gemma4-contribution-sae-mode-selection-v1"
+)
+TRAINING_RUN_IDENTITY_SCHEMA_VERSION = (
+    "gemma4-contribution-sae-run-identity-v1"
+)
+TRAINING_RESULT_SCHEMA_VERSION = "gemma4-contribution-sae-training-result-v1"
+TRAINING_EXECUTION_CONFIG_SCHEMA_VERSION = (
+    "gemma4-contribution-sae-execution-config-v1"
+)
+TRAINING_GRAPH_SCHEMA_VERSION = "gemma4-contribution-sae-stablehlo-v1"
+TRAINING_HARDWARE_SCHEMA_VERSION = "gemma4-contribution-sae-hardware-v1"
+TRAINING_SUPERVISION_SCHEMA_VERSION = (
+    "gemma4-contribution-sae-supervised-qualification-v1"
+)
+PREFETCH_RECEIPT_SCHEMA_VERSION = (
+    "gemma4-contribution-sae-process-lane-prefetch-v1"
+)
+
+InputMode = Literal["resident", "rematerialized"]
+INPUT_MODES: tuple[InputMode, ...] = ("resident", "rematerialized")
+CONDITIONS = ("A", "R", "B", "F", "Q")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+class ContributionTrainingWorkerError(RuntimeError):
+    """The qualified training boundary failed closed."""
+
+
+def _sha256(name: str, value: Any) -> str:
+    if not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None:
+        raise ContributionTrainingWorkerError(f"{name} must be a SHA-256")
+    return value
+
+
+def _positive_int(name: str, value: Any, *, allow_zero: bool = False) -> int:
+    minimum = 0 if allow_zero else 1
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        qualifier = "nonnegative" if allow_zero else "positive"
+        raise ContributionTrainingWorkerError(
+            f"{name} must be a {qualifier} integer"
+        )
+    return value
+
+
+def _finite_nonnegative(name: str, value: Any) -> float:
+    selected = float(value)
+    if not math.isfinite(selected) or selected < 0.0:
+        raise ContributionTrainingWorkerError(
+            f"{name} must be finite and nonnegative"
+        )
+    return selected
+
+
+def _read_json(path: str | Path, *, name: str) -> dict[str, Any]:
+    source = Path(path).expanduser().resolve()
+    if not source.is_file() or source.is_symlink():
+        raise ContributionTrainingWorkerError(f"{name} is absent or not regular")
+    try:
+        value = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ContributionTrainingWorkerError(f"cannot read {name}") from error
+    if not isinstance(value, dict):
+        raise ContributionTrainingWorkerError(f"{name} must be a JSON object")
+    return value
+
+
+def _write_create_only_json(path: str | Path, value: Mapping[str, Any]) -> Path:
+    """Publish one immutable, fsynced JSON record without replacement."""
+
+    destination = Path(path).expanduser().resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    payload = canonical_json_bytes(dict(value)) + b"\n"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    try:
+        descriptor = os.open(destination, flags, 0o640)
+    except FileExistsError:
+        try:
+            existing = json.loads(destination.read_text(encoding="ascii"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ContributionTrainingWorkerError(
+                f"immutable record already exists and cannot be read: {destination}"
+            ) from error
+        if existing != dict(value):
+            raise ContributionTrainingWorkerError(
+                f"immutable record differs from replay: {destination}"
+            )
+        return destination
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        directory = os.open(destination.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except BaseException:
+        destination.unlink(missing_ok=True)
+        raise
+    return destination
+
+
+@dataclass(frozen=True, slots=True)
+class TrainingWorkerPlan:
+    """One exact phase/condition/seed token and schedule plan."""
+
+    phase_name: str
+    condition: str
+    seed: int
+    total_tokens: int
+    planned_updates: int
+    warmup_updates: int
+    global_microbatch_tokens: int
+    microbatches_per_update: int
+    checkpoint_tokens: tuple[int, ...]
+    randomization_key: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.phase_name, str) or not self.phase_name:
+            raise ContributionTrainingWorkerError("phase_name is empty")
+        if self.condition not in CONDITIONS:
+            raise ContributionTrainingWorkerError("unsupported SAE condition")
+        for name in (
+            "seed",
+            "total_tokens",
+            "planned_updates",
+            "warmup_updates",
+            "global_microbatch_tokens",
+            "microbatches_per_update",
+            "randomization_key",
+        ):
+            _positive_int(
+                name,
+                getattr(self, name),
+                allow_zero=name in {"seed", "warmup_updates", "randomization_key"},
+            )
+        if self.warmup_updates >= self.planned_updates:
+            raise ContributionTrainingWorkerError(
+                "warmup must finish before the final update"
+            )
+        expected_updates = math.ceil(self.total_tokens / self.effective_batch_tokens)
+        if self.planned_updates != expected_updates:
+            raise ContributionTrainingWorkerError(
+                "planned updates differ from the exact token plan"
+            )
+        if (
+            tuple(sorted(set(self.checkpoint_tokens))) != self.checkpoint_tokens
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or not 0 < value <= self.total_tokens
+                for value in self.checkpoint_tokens
+            )
+        ):
+            raise ContributionTrainingWorkerError(
+                "checkpoint tokens must be unique, ordered, and in range"
+            )
+
+    @property
+    def effective_batch_tokens(self) -> int:
+        return self.global_microbatch_tokens * self.microbatches_per_update
+
+    def expected_tokens_after(self, updates: int) -> int:
+        _positive_int("updates", updates, allow_zero=True)
+        if updates > self.planned_updates:
+            raise ContributionTrainingWorkerError("update exceeds the token plan")
+        return min(updates * self.effective_batch_tokens, self.total_tokens)
+
+    @classmethod
+    def from_config(
+        cls,
+        config: Experiment2Config,
+        *,
+        phase: str,
+        condition: str,
+        seed: int,
+    ) -> "TrainingWorkerPlan":
+        config.validate()
+        selected = config.phase(phase)
+        if selected.layout_set == "none":
+            raise ContributionTrainingWorkerError(
+                "selected phase has no SAE training layouts"
+            )
+        if condition not in CONDITIONS:
+            raise ContributionTrainingWorkerError("unsupported SAE condition")
+        if seed not in selected.seeds:
+            raise ContributionTrainingWorkerError(
+                "seed is not authorized by the selected phase"
+            )
+        if condition not in {
+            layout.condition for layout in config.layouts_for_phase(phase)
+        }:
+            raise ContributionTrainingWorkerError(
+                "condition is absent from the selected phase"
+            )
+        assert selected.planned_updates is not None
+        assert selected.warmup_updates is not None
+        return cls(
+            phase_name=selected.name,
+            condition=condition,
+            seed=seed,
+            total_tokens=selected.train_tokens,
+            planned_updates=selected.planned_updates,
+            warmup_updates=selected.warmup_updates,
+            global_microbatch_tokens=config.runtime.microbatch_tokens,
+            microbatches_per_update=(
+                config.runtime.effective_batch_tokens
+                // config.runtime.microbatch_tokens
+            ),
+            checkpoint_tokens=selected.checkpoint_tokens,
+            randomization_key=seed,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedTrainingExecutable:
+    """Opaque lowered executable plus its observed exact identity."""
+
+    handle: Any
+    identity: ExactPerformanceIdentity
+    graph_manifest: Mapping[str, Any]
+    hardware_manifest: Mapping[str, Any]
+    execution_config: Mapping[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class RestoredTrainingState:
+    state: Any
+    metadata: Mapping[str, Any]
+
+
+class TrainingSource(Protocol):
+    total_tokens: int
+    planned_updates: int
+
+    def iter_updates(self) -> Any: ...
+
+
+@dataclass(frozen=True, slots=True)
+class TrainingLoopDependencies:
+    """Injected state/executable/checkpoint operations used by the core loop."""
+
+    initialize_state: Callable[[], Any]
+    lower: Callable[[InputMode, Any, Any, Any], PreparedTrainingExecutable]
+    compile: Callable[[PreparedTrainingExecutable], float]
+    step: Callable[
+        [PreparedTrainingExecutable, Any, Any, Any],
+        tuple[Any, Mapping[str, Any]],
+    ]
+    synchronize: Callable[[Any], None]
+    progress: Callable[[Any], tuple[int, int]]
+    restore: Callable[
+        [Any, Mapping[str, Any]],
+        RestoredTrainingState | None,
+    ]
+    save: Callable[
+        [Any, Mapping[str, Any], Mapping[str, Any], bool],
+        Mapping[str, Any],
+    ]
+    clock: Callable[[], float] = time.perf_counter
+
+
+def _mode_candidate(
+    mode: InputMode,
+    observation: SAEQualificationObservation,
+    arithmetic: SAEArithmetic,
+    *,
+    total_wall_seconds: float,
+    peak_flops_per_second: int,
+    minimum_useful_mfu: float,
+) -> dict[str, Any]:
+    adjusted = replace(
+        observation,
+        qualification_wall_seconds=max(
+            float(observation.measured_device_seconds),
+            total_wall_seconds,
+        ),
+    )
+    evidence, bundle = build_sae_qualification_receipt(
+        adjusted,
+        arithmetic,
+        peak_flops_per_second=peak_flops_per_second,
+        minimum_useful_mfu=minimum_useful_mfu,
+    )
+    unsigned = {
+        "mode": mode,
+        "status": "passed",
+        "identity": adjusted.identity.to_dict(),
+        "identity_sha256": adjusted.identity.identity_sha256,
+        "scientific_tokens": adjusted.scientific_tokens,
+        "measured_device_seconds": adjusted.measured_device_seconds,
+        "tokens_per_second": (
+            adjusted.scientific_tokens / adjusted.measured_device_seconds
+        ),
+        "useful_mfu": evidence.useful_prefix_mfu,
+        "source_evidence": bundle["source_evidence"],
+        "useful_flops_ledger": bundle["useful_flops_ledger"],
+        "qualification_receipt": bundle["qualification_receipt"],
+    }
+    return {
+        **unsigned,
+        "candidate_sha256": canonical_sha256(unsigned),
+    }
+
+
+def qualify_training_modes(
+    probe: Callable[[InputMode], SAEQualificationObservation],
+    arithmetic: SAEArithmetic,
+    *,
+    peak_flops_per_second: int,
+    minimum_useful_mfu: float = 0.10,
+    maximum_seconds: int = MAX_QUALIFICATION_SECONDS,
+    workload_context: Mapping[str, Any] | None = None,
+    qualification_started: float | None = None,
+    elapsed_transform: Callable[[float], float] | None = None,
+    clock: Callable[[], float] = time.perf_counter,
+) -> dict[str, Any]:
+    """Benchmark both graph modes and seal the fastest passing exact receipt.
+
+    The total wall time—not two independent per-mode budgets—is written into
+    every passing receipt.  A caller must still place this function inside the
+    process-group supervisor; the local check is evidence, not a kill switch.
+    """
+
+    if maximum_seconds > MAX_QUALIFICATION_SECONDS:
+        raise ContributionTrainingWorkerError(
+            "SAE qualification cannot exceed 600 seconds"
+        )
+    _positive_int("maximum_seconds", maximum_seconds)
+    _positive_int("peak_flops_per_second", peak_flops_per_second)
+    started = clock() if qualification_started is None else float(qualification_started)
+    if not math.isfinite(started):
+        raise ContributionTrainingWorkerError(
+            "qualification start time is invalid"
+        )
+    raw: list[tuple[InputMode, SAEQualificationObservation | BaseException]] = []
+    for mode in INPUT_MODES:
+        try:
+            observation = probe(mode)
+            if type(observation) is not SAEQualificationObservation:
+                raise ContributionTrainingWorkerError(
+                    "mode probe returned the wrong observation type"
+                )
+            raw.append((mode, observation))
+        except Exception as error:  # retain both mode attempts
+            raw.append((mode, error))
+    elapsed = float(clock() - started)
+    if elapsed_transform is not None:
+        elapsed = float(elapsed_transform(elapsed))
+    if not math.isfinite(elapsed) or elapsed < 0:
+        raise ContributionTrainingWorkerError(
+            "qualification clock returned an invalid duration"
+        )
+    if elapsed > maximum_seconds:
+        raise ContributionTrainingWorkerError(
+            "SAE mode qualification exceeded its 600-second total deadline"
+        )
+
+    candidates: list[dict[str, Any]] = []
+    for mode, result in raw:
+        if isinstance(result, BaseException):
+            unsigned = {
+                "mode": mode,
+                "status": "failed",
+                "error_type": type(result).__name__,
+                "error_message": str(result),
+            }
+            candidates.append(
+                {
+                    **unsigned,
+                    "candidate_sha256": canonical_sha256(unsigned),
+                }
+            )
+            continue
+        try:
+            candidates.append(
+                _mode_candidate(
+                    mode,
+                    result,
+                    arithmetic,
+                    total_wall_seconds=elapsed,
+                    peak_flops_per_second=peak_flops_per_second,
+                    minimum_useful_mfu=minimum_useful_mfu,
+                )
+            )
+        except Exception as error:
+            unsigned = {
+                "mode": mode,
+                "status": "failed",
+                "identity": result.identity.to_dict(),
+                "identity_sha256": result.identity.identity_sha256,
+                "error_type": type(error).__name__,
+                "error_message": str(error),
+            }
+            candidates.append(
+                {
+                    **unsigned,
+                    "candidate_sha256": canonical_sha256(unsigned),
+                }
+            )
+    passing = [item for item in candidates if item["status"] == "passed"]
+    if not passing:
+        failures = "; ".join(
+            f"{item['mode']}: {item['error_type']}: {item['error_message']}"
+            for item in candidates
+        )
+        raise ContributionTrainingWorkerError(
+            f"neither SAE input mode qualified: {failures}"
+        )
+    # Deterministic tie-break favors resident-forward: it performs no
+    # deliberately duplicated rematerialized arithmetic.
+    chosen = max(
+        passing,
+        key=lambda item: (
+            float(item["tokens_per_second"]),
+            item["mode"] == "resident",
+        ),
+    )
+    unsigned = {
+        "schema_version": TRAINING_MODE_SELECTION_SCHEMA_VERSION,
+        "qualification_total_wall_seconds": elapsed,
+        "qualification_max_seconds": maximum_seconds,
+        "minimum_useful_mfu": float(minimum_useful_mfu),
+        "arithmetic": asdict(arithmetic),
+        "workload_context": dict(workload_context or {}),
+        "candidate_order": list(INPUT_MODES),
+        "candidates": candidates,
+        "chosen_mode": chosen["mode"],
+        "chosen_identity_sha256": chosen["identity_sha256"],
+        "chosen_receipt_sha256": chosen["qualification_receipt"]["receipt_sha256"],
+    }
+    return {
+        **unsigned,
+        "selection_sha256": canonical_sha256(unsigned),
+    }
+
+
+def validate_training_mode_selection(
+    value: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Revalidate hashes, both attempts, chosen mode, and hard-gate receipt."""
+
+    expected = {
+        "schema_version",
+        "qualification_total_wall_seconds",
+        "qualification_max_seconds",
+        "minimum_useful_mfu",
+        "arithmetic",
+        "workload_context",
+        "candidate_order",
+        "candidates",
+        "chosen_mode",
+        "chosen_identity_sha256",
+        "chosen_receipt_sha256",
+        "selection_sha256",
+    }
+    if set(value) != expected:
+        raise ContributionTrainingWorkerError(
+            "mode-selection fields do not match the schema"
+        )
+    selected = dict(value)
+    claimed = _sha256("selection_sha256", selected.pop("selection_sha256"))
+    if selected["schema_version"] != TRAINING_MODE_SELECTION_SCHEMA_VERSION:
+        raise ContributionTrainingWorkerError("mode-selection schema changed")
+    if canonical_sha256(selected) != claimed:
+        raise ContributionTrainingWorkerError(
+            "mode-selection self-hash is invalid"
+        )
+    elapsed = _finite_nonnegative(
+        "qualification_total_wall_seconds",
+        selected["qualification_total_wall_seconds"],
+    )
+    maximum = _positive_int(
+        "qualification_max_seconds",
+        selected["qualification_max_seconds"],
+    )
+    if maximum > MAX_QUALIFICATION_SECONDS or elapsed > maximum:
+        raise ContributionTrainingWorkerError(
+            "mode selection exceeded the hard qualification deadline"
+        )
+    if selected["candidate_order"] != list(INPUT_MODES):
+        raise ContributionTrainingWorkerError(
+            "mode selection did not benchmark both frozen modes"
+        )
+    if not isinstance(selected["workload_context"], Mapping):
+        raise ContributionTrainingWorkerError(
+            "mode-selection workload context is malformed"
+        )
+    candidates = selected["candidates"]
+    if (
+        not isinstance(candidates, list)
+        or [item.get("mode") for item in candidates] != list(INPUT_MODES)
+    ):
+        raise ContributionTrainingWorkerError(
+            "mode-selection candidate order is invalid"
+        )
+    chosen_mode = selected["chosen_mode"]
+    if chosen_mode not in INPUT_MODES:
+        raise ContributionTrainingWorkerError("chosen input mode is invalid")
+    chosen: Mapping[str, Any] | None = None
+    for candidate in candidates:
+        if not isinstance(candidate, Mapping):
+            raise ContributionTrainingWorkerError(
+                "mode-selection candidate is malformed"
+            )
+        candidate_copy = dict(candidate)
+        candidate_hash = _sha256(
+            "candidate_sha256",
+            candidate_copy.pop("candidate_sha256", None),
+        )
+        if canonical_sha256(candidate_copy) != candidate_hash:
+            raise ContributionTrainingWorkerError(
+                "mode-selection candidate self-hash is invalid"
+            )
+        if candidate.get("status") == "passed":
+            raw_identity = candidate.get("identity")
+            if not isinstance(raw_identity, Mapping):
+                raise ContributionTrainingWorkerError(
+                    "passing candidate identity is malformed"
+                )
+            identity = ExactPerformanceIdentity(
+                graph_sha256=_sha256(
+                    "candidate graph SHA-256",
+                    raw_identity.get("graph_sha256"),
+                ),
+                hardware_sha256=_sha256(
+                    "candidate hardware SHA-256",
+                    raw_identity.get("hardware_sha256"),
+                ),
+                config_sha256=_sha256(
+                    "candidate config SHA-256",
+                    raw_identity.get("config_sha256"),
+                ),
+            )
+            receipt = candidate.get("qualification_receipt")
+            if not isinstance(receipt, Mapping):
+                raise ContributionTrainingWorkerError(
+                    "passing candidate lacks a receipt"
+                )
+            validate_qualification_receipt(
+                receipt,
+                expected_identity=identity,
+                minimum_useful_mfu=float(selected["minimum_useful_mfu"]),
+                qualification_max_seconds=maximum,
+            )
+        if candidate.get("mode") == chosen_mode:
+            chosen = candidate
+    if chosen is None or chosen.get("status") != "passed":
+        raise ContributionTrainingWorkerError("chosen mode is not passing")
+    if (
+        chosen.get("identity_sha256") != selected["chosen_identity_sha256"]
+        or chosen["qualification_receipt"].get("receipt_sha256")
+        != selected["chosen_receipt_sha256"]
+    ):
+        raise ContributionTrainingWorkerError(
+            "chosen mode does not match its identity/receipt"
+        )
+    selected["selection_sha256"] = claimed
+    return selected
+
+
+def chosen_mode_evidence(
+    selection: Mapping[str, Any],
+) -> tuple[InputMode, ExactPerformanceIdentity, dict[str, Any]]:
+    checked = validate_training_mode_selection(selection)
+    mode: InputMode = checked["chosen_mode"]
+    candidate = next(
+        item for item in checked["candidates"] if item["mode"] == mode
+    )
+    raw = candidate["identity"]
+    identity = ExactPerformanceIdentity(
+        graph_sha256=raw["graph_sha256"],
+        hardware_sha256=raw["hardware_sha256"],
+        config_sha256=raw["config_sha256"],
+    )
+    return mode, identity, dict(candidate["qualification_receipt"])
+
+
+def _metric_record(value: Mapping[str, Any], *, expected_l0: int) -> dict[str, Any]:
+    required = {
+        "loss",
+        "sse",
+        "sst",
+        "l0",
+        "valid_tokens",
+        "topk_valid",
+        "grad_norm",
+        "learning_rate",
+    }
+    if set(value) != required:
+        raise ContributionTrainingWorkerError(
+            "training metric fields do not match the worker schema"
+        )
+    result = dict(value)
+    for name in ("loss", "sse", "sst", "l0", "grad_norm", "learning_rate"):
+        selected = float(result[name])
+        if not math.isfinite(selected):
+            raise ContributionTrainingWorkerError(
+                f"training metric {name} is non-finite"
+            )
+        result[name] = selected
+    tokens = _positive_int("metric valid_tokens", result["valid_tokens"])
+    result["valid_tokens"] = tokens
+    if type(result["topk_valid"]) is not bool or not result["topk_valid"]:
+        raise ContributionTrainingWorkerError(
+            "training update violated exact positive TopK"
+        )
+    if not math.isclose(float(result["l0"]), expected_l0, abs_tol=1e-5):
+        raise ContributionTrainingWorkerError(
+            "training update L0 differs from the frozen layout"
+        )
+    if result["sst"] <= 0.0:
+        raise ContributionTrainingWorkerError("training update SST is not positive")
+    return result
+
+
+def _run_identity(
+    plan: TrainingWorkerPlan,
+    *,
+    selection_sha256: str,
+    identity: ExactPerformanceIdentity,
+    mode: InputMode,
+) -> dict[str, Any]:
+    unsigned = {
+        "schema_version": TRAINING_RUN_IDENTITY_SCHEMA_VERSION,
+        "plan": {
+            **asdict(plan),
+            "checkpoint_tokens": list(plan.checkpoint_tokens),
+        },
+        "input_mode": mode,
+        "performance_identity": identity.to_dict(),
+        "performance_identity_sha256": identity.identity_sha256,
+        "mode_selection_sha256": _sha256(
+            "mode selection SHA-256",
+            selection_sha256,
+        ),
+    }
+    return {
+        **unsigned,
+        "run_identity_sha256": canonical_sha256(unsigned),
+    }
+
+
+def run_qualified_training(
+    plan: TrainingWorkerPlan,
+    source: TrainingSource,
+    mean: Any,
+    selection: Mapping[str, Any],
+    dependencies: TrainingLoopDependencies,
+    *,
+    expected_l0: int,
+    maximum_runtime_seconds: int,
+    metric_sink: Callable[[Mapping[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """Run or resume one exact fixed-order condition after admission.
+
+    Checkpoint callbacks receive the complete run identity and cumulative
+    timing.  They must publish immutable payloads before changing a mutable
+    ``latest`` pointer.  The core never infers progress from payload listings.
+    """
+
+    if source.total_tokens != plan.total_tokens:
+        raise ContributionTrainingWorkerError(
+            "training source token count differs from the phase plan"
+        )
+    if source.planned_updates != plan.planned_updates:
+        raise ContributionTrainingWorkerError(
+            "training source update count differs from the phase plan"
+        )
+    _positive_int("expected_l0", expected_l0)
+    maximum = _positive_int("maximum_runtime_seconds", maximum_runtime_seconds)
+    mode, receipt_identity, receipt = chosen_mode_evidence(selection)
+    checked_selection = validate_training_mode_selection(selection)
+
+    initial = dependencies.initialize_state()
+    # The immutable checkpoint namespace can be known before lowering because
+    # its exact performance identity comes from the chosen passing receipt.
+    provisional_identity = _run_identity(
+        plan,
+        selection_sha256=checked_selection["selection_sha256"],
+        identity=receipt_identity,
+        mode=mode,
+    )
+    restored = dependencies.restore(initial, provisional_identity)
+    state = initial if restored is None else restored.state
+    if restored is not None:
+        if dict(restored.metadata).get("run_identity_sha256") != (
+            provisional_identity["run_identity_sha256"]
+        ):
+            raise ContributionTrainingWorkerError(
+                "restored checkpoint metadata belongs to another run"
+            )
+    start_step, start_tokens = dependencies.progress(state)
+    _positive_int("restored step", start_step, allow_zero=True)
+    _positive_int("restored tokens", start_tokens, allow_zero=True)
+    expected_start = plan.expected_tokens_after(start_step)
+    if start_tokens != expected_start:
+        raise ContributionTrainingWorkerError(
+            "restored state is not on the deterministic fixed-order boundary"
+        )
+    if start_step > plan.planned_updates:
+        raise ContributionTrainingWorkerError(
+            "restored state exceeds the phase update plan"
+        )
+
+    iterator = itertools.islice(source.iter_updates(), start_step, None)
+    if start_step == plan.planned_updates:
+        unsigned = {
+            "schema_version": TRAINING_RESULT_SCHEMA_VERSION,
+            "status": "already_complete",
+            "run_identity": provisional_identity,
+            "input_mode": mode,
+            "steps": start_step,
+            "tokens": start_tokens,
+            "compile_seconds": 0.0,
+            "optimizer_wall_seconds": 0.0,
+            "checkpoint_seconds": 0.0,
+            "chip_seconds": 0.0,
+            "metric_count": 0,
+            "last_metric": None,
+            "authorization_basis": "existing_complete_checkpoint",
+            "checkpoint_receipts": [],
+        }
+        return {
+            **unsigned,
+            "result_sha256": canonical_sha256(unsigned),
+        }
+
+    input_started = dependencies.clock()
+    try:
+        first = next(iterator)
+    except StopIteration as error:
+        raise ContributionTrainingWorkerError(
+            "training source ended before the restored phase boundary"
+        ) from error
+    first_input_seconds = dependencies.clock() - input_started
+    if first_input_seconds < 0:
+        raise ContributionTrainingWorkerError("training clock moved backwards")
+
+    lowered_started = dependencies.clock()
+    prepared = dependencies.lower(mode, state, first, mean)
+    lowering_seconds = dependencies.clock() - lowered_started
+    if prepared.identity != receipt_identity:
+        raise ContributionTrainingWorkerError(
+            "lowered graph/hardware/config differs from the chosen qualification"
+        )
+    authorization = authorize_accelerator_run(
+        identity=prepared.identity,
+        maximum_runtime_seconds=maximum,
+        purpose="workload",
+        qualification_receipt=receipt if maximum > MAX_QUALIFICATION_SECONDS else None,
+    )
+    compile_seconds = _finite_nonnegative(
+        "compile_seconds",
+        dependencies.compile(prepared),
+    )
+
+    metrics: list[dict[str, Any]] = []
+    checkpoints: list[dict[str, Any]] = []
+    optimizer_seconds = 0.0
+    checkpoint_seconds = 0.0
+    next_checkpoints = iter(plan.checkpoint_tokens)
+    checkpoint_target = next(next_checkpoints, None)
+    while checkpoint_target is not None and checkpoint_target <= start_tokens:
+        checkpoint_target = next(next_checkpoints, None)
+
+    pending: Any | None = first
+    previous_step = start_step
+    previous_tokens = start_tokens
+    while previous_step < plan.planned_updates:
+        step_started = dependencies.clock()
+        if pending is None:
+            try:
+                group = next(iterator)
+            except StopIteration as error:
+                raise ContributionTrainingWorkerError(
+                    "training source ended before the exact phase plan"
+                ) from error
+            input_seconds = 0.0
+        else:
+            group = pending
+            pending = None
+            input_seconds = first_input_seconds
+        state, raw_metric = dependencies.step(prepared, state, group, mean)
+        dependencies.synchronize(state)
+        elapsed = input_seconds + (dependencies.clock() - step_started)
+        if not math.isfinite(elapsed) or elapsed < 0:
+            raise ContributionTrainingWorkerError(
+                "optimizer timing is invalid"
+            )
+        optimizer_seconds += elapsed
+        metric = _metric_record(raw_metric, expected_l0=expected_l0)
+        step, tokens = dependencies.progress(state)
+        if step != previous_step + 1:
+            raise ContributionTrainingWorkerError(
+                "optimizer state did not advance exactly one update"
+            )
+        if tokens != previous_tokens + metric["valid_tokens"]:
+            raise ContributionTrainingWorkerError(
+                "optimizer token state differs from the scientific batch count"
+            )
+        if tokens != plan.expected_tokens_after(step):
+            raise ContributionTrainingWorkerError(
+                "optimizer state left the fixed phase token plan"
+            )
+        metric_row = {
+            **metric,
+            "step": step,
+            "tokens_seen": tokens,
+            "optimizer_wall_seconds": optimizer_seconds,
+        }
+        metrics.append(metric_row)
+        if metric_sink is not None:
+            metric_sink(metric_row)
+        previous_step, previous_tokens = step, tokens
+
+        should_checkpoint = (
+            checkpoint_target is not None and tokens >= checkpoint_target
+        )
+        is_final = step == plan.planned_updates
+        if should_checkpoint or is_final:
+            checkpoint_started = dependencies.clock()
+            timing = {
+                "compile_seconds": compile_seconds,
+                "lowering_seconds": lowering_seconds,
+                "optimizer_wall_seconds": optimizer_seconds,
+                "checkpoint_seconds_before_save": checkpoint_seconds,
+            }
+            record = dict(
+                dependencies.save(
+                    state,
+                    provisional_identity,
+                    timing,
+                    is_final,
+                )
+            )
+            checkpoints.append(record)
+            checkpoint_seconds += dependencies.clock() - checkpoint_started
+            while checkpoint_target is not None and checkpoint_target <= tokens:
+                checkpoint_target = next(next_checkpoints, None)
+
+    try:
+        next(iterator)
+    except StopIteration:
+        pass
+    else:
+        raise ContributionTrainingWorkerError(
+            "training source yielded rows beyond the exact phase plan"
+        )
+    if previous_tokens != plan.total_tokens:
+        raise ContributionTrainingWorkerError(
+            "training finished without consuming the exact token count"
+        )
+
+    # MFU remains diagnostic during production training; chip-seconds and
+    # tokens/s are authoritative.  The actual global chip count is sealed into
+    # the hardware manifest used by the passing receipt.
+    hardware = prepared.hardware_manifest
+    chip_count = hardware.get("global_chip_count")
+    _positive_int("global_chip_count", chip_count)
+    unsigned = {
+        "schema_version": TRAINING_RESULT_SCHEMA_VERSION,
+        "status": "completed",
+        "run_identity": provisional_identity,
+        "input_mode": mode,
+        "steps": previous_step,
+        "tokens": previous_tokens,
+        "compile_seconds": compile_seconds,
+        "lowering_seconds": lowering_seconds,
+        "optimizer_wall_seconds": optimizer_seconds,
+        "checkpoint_seconds": checkpoint_seconds,
+        "chip_seconds": optimizer_seconds * chip_count,
+        "tokens_per_second": previous_tokens / optimizer_seconds,
+        "metric_count": len(metrics),
+        "last_metric": metrics[-1],
+        "authorization_basis": authorization.basis,
+        "qualification_receipt_sha256": (
+            authorization.qualification_receipt_sha256
+        ),
+        "checkpoint_receipts": checkpoints,
+    }
+    return {
+        **unsigned,
+        "result_sha256": canonical_sha256(unsigned),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Production TPU adapter
+
+
+class _ResidentOnlyObjectStore:
+    """Sentinel proving that the training process cannot refill from GCS."""
+
+    def _blocked(self, *_args: Any, **_kwargs: Any) -> Any:
+        raise ContributionTrainingWorkerError(
+            "qualified resident v2 cache attempted an object-store operation"
+        )
+
+    put_if_absent = _blocked
+    download = _blocked
+    verify = _blocked
+    delete = _blocked
+
+
+def _prefetch_object_summary(
+    dataset: Any,
+    *,
+    range_start: int,
+    range_end: int,
+) -> dict[str, Any]:
+    identities = tuple(
+        dataset.token_range_object_identities(range_start, range_end)
+    )
+    if not identities:
+        raise ContributionTrainingWorkerError(
+            "process lane intersects no sealed contribution objects"
+        )
+    encoded = [identity.as_dict() for identity in identities]
+    if len({(item["uri"], item["generation"]) for item in encoded}) != len(encoded):
+        raise ContributionTrainingWorkerError(
+            "process lane contains duplicate immutable object identities"
+        )
+    return {
+        "object_count": len(encoded),
+        "object_bytes": sum(int(item["size_bytes"]) for item in encoded),
+        "object_set_sha256": canonical_sha256(encoded),
+    }
+
+
+def validate_prefetch_receipt(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate one non-JAX, process-local resident-cache proof."""
+
+    fields = {
+        "schema_version",
+        "config_sha256",
+        "phase",
+        "source_revision",
+        "capture_manifest_sha256",
+        "object_prefix",
+        "cache_root",
+        "cache_max_bytes",
+        "process_partition",
+        "object_count",
+        "object_bytes",
+        "object_set_sha256",
+        "elapsed_seconds",
+        "resident_only_complete",
+        "receipt_sha256",
+    }
+    selected = dict(value)
+    if set(selected) != fields:
+        raise ContributionTrainingWorkerError(
+            "prefetch receipt fields are not exact"
+        )
+    claimed = _sha256("prefetch receipt_sha256", selected.pop("receipt_sha256"))
+    if selected["schema_version"] != PREFETCH_RECEIPT_SCHEMA_VERSION:
+        raise ContributionTrainingWorkerError("prefetch receipt schema is incompatible")
+    for name in (
+        "config_sha256",
+        "capture_manifest_sha256",
+        "object_set_sha256",
+    ):
+        _sha256(f"prefetch {name}", selected[name])
+    if (
+        not isinstance(selected["source_revision"], str)
+        or re.fullmatch(r"[0-9a-f]{40}", selected["source_revision"]) is None
+    ):
+        raise ContributionTrainingWorkerError(
+            "prefetch source_revision must be a 40-character Git commit"
+        )
+    if not isinstance(selected["phase"], str) or not selected["phase"]:
+        raise ContributionTrainingWorkerError("prefetch phase is empty")
+    if (
+        not isinstance(selected["object_prefix"], str)
+        or not selected["object_prefix"].startswith("gs://")
+    ):
+        raise ContributionTrainingWorkerError("prefetch object_prefix is invalid")
+    cache_root = Path(str(selected["cache_root"]))
+    if not cache_root.is_absolute():
+        raise ContributionTrainingWorkerError("prefetch cache_root is not absolute")
+    _positive_int("prefetch cache_max_bytes", selected["cache_max_bytes"])
+    _positive_int("prefetch object_count", selected["object_count"])
+    _positive_int("prefetch object_bytes", selected["object_bytes"])
+    _finite_nonnegative("prefetch elapsed_seconds", selected["elapsed_seconds"])
+    if selected["resident_only_complete"] is not True:
+        raise ContributionTrainingWorkerError(
+            "prefetch receipt lacks a resident-only completeness proof"
+        )
+    partition = selected["process_partition"]
+    if not isinstance(partition, Mapping) or set(partition) != {
+        "strategy",
+        "process_count",
+        "process_index",
+        "range_start",
+        "range_end",
+        "tokens",
+    }:
+        raise ContributionTrainingWorkerError(
+            "prefetch process partition fields are incompatible"
+        )
+    from moe_sae.contribution_input import PROCESS_PARTITION_STRATEGY
+
+    if partition["strategy"] != PROCESS_PARTITION_STRATEGY:
+        raise ContributionTrainingWorkerError(
+            "prefetch process partition strategy is incompatible"
+        )
+    # Uneven lanes cannot recover total_tokens from one lane alone.  Exact
+    # topology/range validation is therefore repeated against the phase plan
+    # by _prove_prefetch_for_plan; this check still rejects malformed bounds.
+    for name in ("process_count", "tokens"):
+        _positive_int(f"prefetch process_partition.{name}", partition[name])
+    _positive_int(
+        "prefetch process_partition.process_index",
+        partition["process_index"],
+        allow_zero=True,
+    )
+    _positive_int(
+        "prefetch process_partition.range_start",
+        partition["range_start"],
+        allow_zero=True,
+    )
+    _positive_int(
+        "prefetch process_partition.range_end",
+        partition["range_end"],
+    )
+    if (
+        int(partition["process_index"]) >= int(partition["process_count"])
+        or int(partition["range_end"]) <= int(partition["range_start"])
+        or int(partition["tokens"])
+        != int(partition["range_end"]) - int(partition["range_start"])
+    ):
+        raise ContributionTrainingWorkerError(
+            "prefetch process partition bounds are invalid"
+        )
+    if canonical_sha256(selected) != claimed:
+        raise ContributionTrainingWorkerError("prefetch receipt self-hash is invalid")
+    return {**selected, "receipt_sha256": claimed}
+
+
+def prefetch_process_lane(
+    *,
+    config: Experiment2Config,
+    phase: str,
+    source_revision: str,
+    capture_control_root: str | Path,
+    object_prefix: str,
+    cache_root: str | Path,
+    cache_max_bytes: int,
+    process_count: int,
+    process_index: int,
+    recomposition_sidecar: Mapping[str, Any] | None,
+    object_store: Any | None = None,
+    clock: Callable[[], float] = time.perf_counter,
+) -> dict[str, Any]:
+    """Hash-verify and materialize exactly one process-contiguous token lane."""
+
+    from moe_sae.contribution_input import process_partition_identity
+    from moe_sae.contribution_storage import ContributionDataset
+    from moe_sae.object_store import GCSObjectStore, ShardCache
+
+    config.validate()
+    selected_phase = config.phase(phase)
+    if selected_phase.layout_set == "none":
+        raise ContributionTrainingWorkerError(
+            "prefetch requires a phase with SAE training layouts"
+        )
+    cache_max_bytes = _positive_int("cache_max_bytes", cache_max_bytes)
+    partition = process_partition_identity(
+        selected_phase.train_tokens,
+        process_count=process_count,
+        process_index=process_index,
+    )
+    selected_cache_root = Path(cache_root).expanduser().resolve()
+    store = GCSObjectStore() if object_store is None else object_store
+    cache = ShardCache(
+        selected_cache_root,
+        store,
+        max_bytes=cache_max_bytes,
+        resident_only=False,
+    )
+    dataset = ContributionDataset(
+        capture_control_root,
+        object_prefix=object_prefix,
+        cache=cache,
+        recomposition_sidecar=recomposition_sidecar,
+    )
+    if int(dataset.total_tokens) != int(selected_phase.train_tokens):
+        raise ContributionTrainingWorkerError(
+            "prefetch requires the exact phase-specific sealed train capture"
+        )
+    summary = _prefetch_object_summary(
+        dataset,
+        range_start=int(partition["range_start"]),
+        range_end=int(partition["range_end"]),
+    )
+    if int(summary["object_bytes"]) > cache_max_bytes:
+        raise ContributionTrainingWorkerError(
+            "process lane objects exceed resident-cache max bytes; provision "
+            "larger local storage before prefetch"
+        )
+    started = clock()
+    try:
+        materialized = dataset.prefetch_token_range(
+            int(partition["range_start"]),
+            int(partition["range_end"]),
+        )
+        resident_cache = ShardCache(
+            selected_cache_root,
+            _ResidentOnlyObjectStore(),
+            max_bytes=cache_max_bytes,
+            resident_only=True,
+        )
+        resident_dataset = ContributionDataset(
+            capture_control_root,
+            object_prefix=object_prefix,
+            cache=resident_cache,
+            recomposition_sidecar=recomposition_sidecar,
+        )
+        resident = resident_dataset.require_resident_token_range(
+            int(partition["range_start"]),
+            int(partition["range_end"]),
+        )
+    except Exception as error:
+        raise ContributionTrainingWorkerError(
+            "process-lane prefetch or resident-only proof failed"
+        ) from error
+    elapsed = max(0.0, float(clock() - started))
+    expected_counts = {
+        "objects": int(summary["object_count"]),
+        "bytes": int(summary["object_bytes"]),
+    }
+    if materialized != expected_counts or resident != expected_counts:
+        raise ContributionTrainingWorkerError(
+            "prefetch/materialized/resident object counts differ"
+        )
+    unsigned = {
+        "schema_version": PREFETCH_RECEIPT_SCHEMA_VERSION,
+        "config_sha256": config.config_hash,
+        "phase": selected_phase.name,
+        "source_revision": source_revision,
+        "capture_manifest_sha256": dataset.manifest_sha256,
+        "object_prefix": object_prefix.rstrip("/"),
+        "cache_root": str(selected_cache_root),
+        "cache_max_bytes": cache_max_bytes,
+        "process_partition": partition,
+        **summary,
+        "elapsed_seconds": elapsed,
+        "resident_only_complete": True,
+    }
+    return validate_prefetch_receipt(
+        {**unsigned, "receipt_sha256": canonical_sha256(unsigned)}
+    )
+
+
+def _prove_prefetch_for_plan(
+    receipt: Mapping[str, Any],
+    *,
+    config: Experiment2Config,
+    plan: TrainingWorkerPlan,
+    source_revision: str,
+    capture_control_root: str | Path,
+    object_prefix: str,
+    cache_root: str | Path,
+    cache_max_bytes: int,
+    recomposition_sidecar: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Re-derive one receipt and prove it remains complete without GCS."""
+
+    from moe_sae.contribution_input import process_partition_identity
+    from moe_sae.contribution_storage import ContributionDataset
+    from moe_sae.object_store import ShardCache
+
+    selected = validate_prefetch_receipt(receipt)
+    partition = selected["process_partition"]
+    expected_partition = process_partition_identity(
+        plan.total_tokens,
+        process_count=int(partition["process_count"]),
+        process_index=int(partition["process_index"]),
+    )
+    fixed = {
+        "config_sha256": config.config_hash,
+        "phase": plan.phase_name,
+        "source_revision": source_revision,
+        "object_prefix": object_prefix.rstrip("/"),
+        "cache_root": str(Path(cache_root).expanduser().resolve()),
+        "cache_max_bytes": int(cache_max_bytes),
+        "process_partition": expected_partition,
+    }
+    if any(selected[name] != value for name, value in fixed.items()):
+        raise ContributionTrainingWorkerError(
+            "prefetch receipt differs from the requested training workload"
+        )
+    cache = ShardCache(
+        cache_root,
+        _ResidentOnlyObjectStore(),
+        max_bytes=cache_max_bytes,
+        resident_only=True,
+    )
+    dataset = ContributionDataset(
+        capture_control_root,
+        object_prefix=object_prefix,
+        cache=cache,
+        recomposition_sidecar=recomposition_sidecar,
+    )
+    if (
+        dataset.manifest_sha256 != selected["capture_manifest_sha256"]
+        or int(dataset.total_tokens) != plan.total_tokens
+    ):
+        raise ContributionTrainingWorkerError(
+            "prefetch receipt and sealed contribution capture differ"
+        )
+    summary = _prefetch_object_summary(
+        dataset,
+        range_start=int(expected_partition["range_start"]),
+        range_end=int(expected_partition["range_end"]),
+    )
+    for name in ("object_count", "object_bytes", "object_set_sha256"):
+        if selected[name] != summary[name]:
+            raise ContributionTrainingWorkerError(
+                "prefetch receipt object set differs from the sealed process lane"
+            )
+    try:
+        resident = dataset.require_resident_token_range(
+            int(expected_partition["range_start"]),
+            int(expected_partition["range_end"]),
+        )
+    except Exception as error:
+        raise ContributionTrainingWorkerError(
+            "prefetched process lane is no longer resident and hash-valid"
+        ) from error
+    if resident != {
+        "objects": int(summary["object_count"]),
+        "bytes": int(summary["object_bytes"]),
+    }:
+        raise ContributionTrainingWorkerError(
+            "resident process-lane proof has inconsistent counts"
+        )
+    return selected
+
+
+@dataclass(slots=True)
+class _PreparedHandle:
+    trainer: Any
+    lowered: Any
+    device_batch: Any
+    mean: Any
+    process_local: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _ProductionWorkload:
+    source: Any
+    mean: np.ndarray
+    routed_layout: Any | None
+    q_config: Any | None
+    optimizer: Any | None
+    distributed: Any
+    mesh: Any
+    bank_capacity: int | None
+    arithmetic: SAEArithmetic
+    workload_context: Mapping[str, Any]
+    checkpoint_training_config: Any
+
+    @property
+    def expected_l0(self) -> int:
+        if self.routed_layout is not None:
+            return int(self.routed_layout.total_l0)
+        assert self.q_config is not None
+        return int(self.q_config.k)
+
+
+def _collective_records(value: Mapping[str, Any]) -> tuple[dict[str, Any], ...]:
+    """All-gather bounded canonical JSON records in process-index order."""
+
+    import jax
+
+    payload = canonical_json_bytes(dict(value))
+    if len(payload) > 1024 * 1024:
+        raise ContributionTrainingWorkerError(
+            "collective training identity record exceeds one MiB"
+        )
+    if jax.process_count() == 1:
+        return (dict(value),)
+    from jax.experimental import multihost_utils
+
+    lengths = np.asarray(
+        multihost_utils.process_allgather(
+            np.asarray([len(payload)], dtype=np.int32),
+            tiled=False,
+        ),
+        dtype=np.int32,
+    ).reshape(-1)
+    if lengths.size != jax.process_count() or np.any(lengths <= 0):
+        raise ContributionTrainingWorkerError(
+            "collective training identity lengths are invalid"
+        )
+    width = int(np.max(lengths))
+    local = np.zeros((width,), dtype=np.uint8)
+    local[: len(payload)] = np.frombuffer(payload, dtype=np.uint8)
+    gathered = np.asarray(
+        multihost_utils.process_allgather(local, tiled=False),
+        dtype=np.uint8,
+    ).reshape(jax.process_count(), width)
+    records: list[dict[str, Any]] = []
+    for index, length in enumerate(lengths):
+        try:
+            decoded = json.loads(gathered[index, : int(length)].tobytes())
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ContributionTrainingWorkerError(
+                "collective training identity record cannot be decoded"
+            ) from error
+        if not isinstance(decoded, dict):
+            raise ContributionTrainingWorkerError(
+                "collective training identity record is not an object"
+            )
+        records.append(decoded)
+    return tuple(records)
+
+
+def _collective_max_seconds(value: float) -> float:
+    import jax
+
+    if jax.process_count() == 1:
+        return float(value)
+    from jax.experimental import multihost_utils
+
+    gathered = multihost_utils.process_allgather(
+        np.asarray([value], dtype=np.float64),
+        tiled=False,
+    )
+    return float(np.max(np.asarray(gathered, dtype=np.float64)))
+
+
+def _collective_barrier(label: str) -> None:
+    import jax
+
+    if jax.process_count() > 1:
+        from jax.experimental import multihost_utils
+
+        multihost_utils.sync_global_devices(label)
+
+
+def _state_sha256(state: Any) -> str:
+    """Hash scalable on-device sufficient checksums of every state leaf.
+
+    The qualifier separately performs an exact device-side leaf comparison
+    between transition and replay.  This digest is the compact durable name of
+    that equality result; it deliberately avoids copying multi-gigabyte F
+    parameters and Adam moments to host merely to hash their bytes.
+    """
+
+    import jax
+    import jax.numpy as jnp
+
+    records: list[dict[str, Any]] = []
+    for leaf_index, leaf in enumerate(jax.tree_util.tree_leaves(state)):
+        value = jnp.asarray(leaf)
+        as_float = value.astype(jnp.float32)
+        finite = jnp.all(jnp.isfinite(as_float))
+        summary = jax.device_get(
+            (
+                jnp.sum(as_float, dtype=jnp.float32),
+                jnp.sum(as_float * as_float, dtype=jnp.float32),
+                jnp.min(as_float),
+                jnp.max(as_float),
+                finite,
+            )
+        )
+        if not bool(summary[4]):
+            raise ContributionTrainingWorkerError(
+                "qualification state checksum observed non-finite state"
+            )
+        records.append(
+            {
+                "leaf": leaf_index,
+                "shape": list(leaf.shape),
+                "dtype": str(leaf.dtype),
+                "sum": float(summary[0]),
+                "sum_squares": float(summary[1]),
+                "minimum": float(summary[2]),
+                "maximum": float(summary[3]),
+            }
+        )
+    return canonical_sha256(
+        {
+            "schema_version": "gemma4-contribution-sae-state-summary-v1",
+            "leaves": records,
+        }
+    )
+
+
+def _states_exact_equal(left: Any, right: Any) -> bool:
+    import jax
+    import jax.numpy as jnp
+
+    left_leaves = jax.tree_util.tree_leaves(left)
+    right_leaves = jax.tree_util.tree_leaves(right)
+    if len(left_leaves) != len(right_leaves):
+        return False
+    checks = [
+        jnp.array_equal(left_leaf, right_leaf)
+        for left_leaf, right_leaf in zip(left_leaves, right_leaves, strict=True)
+    ]
+    return all(bool(value) for value in jax.device_get(checks))
+
+
+def _stablehlo_manifest(lowered: Any, *, condition: str, mode: InputMode) -> dict[str, Any]:
+    compiler_ir = getattr(lowered, "compiler_ir", None)
+    if not callable(compiler_ir):
+        raise ContributionTrainingWorkerError(
+            "lowered SAE graph does not expose StableHLO"
+        )
+    try:
+        stablehlo = str(compiler_ir(dialect="stablehlo"))
+    except TypeError:
+        stablehlo = str(compiler_ir())
+    if not stablehlo or "stablehlo" not in stablehlo.lower():
+        raise ContributionTrainingWorkerError(
+            "lowered SAE graph produced no StableHLO text"
+        )
+    unsigned = {
+        "schema_version": TRAINING_GRAPH_SCHEMA_VERSION,
+        "condition": condition,
+        "input_mode": mode,
+        "stablehlo_sha256": hashlib.sha256(stablehlo.encode("utf-8")).hexdigest(),
+        "stablehlo_bytes": len(stablehlo.encode("utf-8")),
+    }
+    return {
+        **unsigned,
+        "graph_manifest_sha256": canonical_sha256(unsigned),
+    }
+
+
+def _hardware_manifest(mesh: Any, *, peak_flops_per_second: int) -> dict[str, Any]:
+    import jax
+
+    devices = sorted(
+        jax.devices(),
+        key=lambda item: (int(item.process_index), int(item.id)),
+    )
+    records = []
+    for device in devices:
+        records.append(
+            {
+                "id": int(device.id),
+                "process_index": int(device.process_index),
+                "platform": str(device.platform),
+                "device_kind": str(device.device_kind),
+                "coords": (
+                    [int(value) for value in device.coords]
+                    if getattr(device, "coords", None) is not None
+                    else None
+                ),
+                "core_on_chip": (
+                    int(device.core_on_chip)
+                    if getattr(device, "core_on_chip", None) is not None
+                    else None
+                ),
+            }
+        )
+    unsigned = {
+        "schema_version": TRAINING_HARDWARE_SCHEMA_VERSION,
+        "global_chip_count": len(devices),
+        "process_count": int(jax.process_count()),
+        "local_device_count": int(jax.local_device_count()),
+        "peak_flops_per_second": _positive_int(
+            "peak_flops_per_second",
+            peak_flops_per_second,
+        ),
+        "mesh_shape": {name: int(size) for name, size in mesh.shape.items()},
+        "mesh_axis_names": list(mesh.axis_names),
+        "devices": records,
+    }
+    return {
+        **unsigned,
+        "hardware_manifest_sha256": canonical_sha256(unsigned),
+    }
+
+
+def _execution_config(
+    config: Experiment2Config,
+    plan: TrainingWorkerPlan,
+    workload: _ProductionWorkload,
+    *,
+    mode: InputMode,
+    source_revision: str,
+) -> dict[str, Any]:
+    import jax
+
+    try:
+        import jaxlib
+
+        jaxlib_version = str(jaxlib.__version__)
+    except (ImportError, AttributeError):
+        jaxlib_version = "unknown"
+    unsigned = {
+        "schema_version": TRAINING_EXECUTION_CONFIG_SCHEMA_VERSION,
+        "experiment_config_sha256": config.config_hash,
+        "maxtext_fork_commit": config.provenance.maxtext_fork_commit,
+        "source_revision": source_revision,
+        "plan": {
+            **asdict(plan),
+            "checkpoint_tokens": list(plan.checkpoint_tokens),
+        },
+        "input_mode": mode,
+        "rematerialize_microbatch": mode == "rematerialized",
+        "routed_layout": (
+            asdict(workload.routed_layout)
+            if workload.routed_layout is not None
+            else None
+        ),
+        "q_config": (
+            asdict(workload.q_config)
+            if workload.q_config is not None
+            else None
+        ),
+        "optimizer": (
+            asdict(workload.optimizer)
+            if workload.optimizer is not None
+            else None
+        ),
+        "distributed": asdict(workload.distributed),
+        "workload_context": dict(workload.workload_context),
+        "jax_version": str(jax.__version__),
+        "jaxlib_version": jaxlib_version,
+        "xla_flags": os.environ.get("XLA_FLAGS", ""),
+        "parameter_residency": "feature_sharded_device",
+        "input_residency": "sealed_v2_resident_only_cache",
+    }
+    return {
+        **unsigned,
+        "execution_config_sha256": canonical_sha256(unsigned),
+    }
+
+
+class _ProductionEngine:
+    def __init__(
+        self,
+        config: Experiment2Config,
+        plan: TrainingWorkerPlan,
+        workload: _ProductionWorkload,
+        *,
+        source_revision: str,
+        peak_flops_per_second: int,
+    ) -> None:
+        self.config = config
+        self.plan = plan
+        self.workload = workload
+        self.source_revision = source_revision
+        self.peak_flops_per_second = peak_flops_per_second
+
+    def initialize_state(self) -> Any:
+        import jax
+
+        if self.workload.routed_layout is not None:
+            from moe_sae.contribution_distributed import (
+                init_contribution_distributed_state,
+            )
+
+            return init_contribution_distributed_state(
+                jax.random.key(self.plan.seed),
+                self.workload.mesh,
+                self.workload.routed_layout,
+                self.workload.optimizer,
+                self.workload.distributed,
+            )
+        from moe_sae.contribution_shared import init_shared_q_state
+
+        assert self.workload.q_config is not None
+        return init_shared_q_state(
+            jax.random.key(self.plan.seed),
+            self.workload.mesh,
+            self.workload.q_config,
+            self.workload.distributed,
+        )
+
+    def lower(
+        self,
+        mode: InputMode,
+        state: Any,
+        batch: Any,
+        mean: Any,
+    ) -> PreparedTrainingExecutable:
+        rematerialize = mode == "rematerialized"
+        process_local = int(self.workload.source.process_count) > 1
+        if self.workload.routed_layout is not None:
+            from moe_sae.contribution_distributed import (
+                ContributionDistributedTrainer,
+            )
+
+            trainer = ContributionDistributedTrainer(
+                self.workload.mesh,
+                self.workload.routed_layout,
+                self.workload.optimizer,
+                self.workload.distributed,
+                bank_capacity=self.workload.bank_capacity,
+                rematerialize_microbatch=rematerialize,
+            )
+        else:
+            from moe_sae.contribution_shared import SharedQDistributedTrainer
+
+            assert self.workload.q_config is not None
+            trainer = SharedQDistributedTrainer(
+                self.workload.mesh,
+                self.workload.q_config,
+                self.workload.distributed,
+                rematerialize_microbatch=rematerialize,
+            )
+        device_batch, device_mean = trainer._prepare(
+            batch,
+            mean,
+            process_local=process_local,
+        )
+        lowered = trainer._compiled.lower(state, device_batch, device_mean)
+        graph = _stablehlo_manifest(
+            lowered,
+            condition=self.plan.condition,
+            mode=mode,
+        )
+        hardware = _hardware_manifest(
+            self.workload.mesh,
+            peak_flops_per_second=self.peak_flops_per_second,
+        )
+        execution = _execution_config(
+            self.config,
+            self.plan,
+            self.workload,
+            mode=mode,
+            source_revision=self.source_revision,
+        )
+        identity = ExactPerformanceIdentity.from_components(
+            graph=graph,
+            hardware=hardware,
+            config=execution,
+        )
+        return PreparedTrainingExecutable(
+            handle=_PreparedHandle(
+                trainer=trainer,
+                lowered=lowered,
+                device_batch=device_batch,
+                mean=device_mean,
+                process_local=process_local,
+            ),
+            identity=identity,
+            graph_manifest=graph,
+            hardware_manifest=hardware,
+            execution_config=execution,
+        )
+
+    @staticmethod
+    def compile(prepared: PreparedTrainingExecutable) -> float:
+        handle: _PreparedHandle = prepared.handle
+        started = time.perf_counter()
+        handle.trainer._executable = handle.lowered.compile()
+        return _collective_max_seconds(time.perf_counter() - started)
+
+    @staticmethod
+    def step(
+        prepared: PreparedTrainingExecutable,
+        state: Any,
+        batch: Any,
+        mean: Any,
+    ) -> tuple[Any, Mapping[str, Any]]:
+        handle: _PreparedHandle = prepared.handle
+        updated, metrics = handle.trainer.step(
+            state,
+            batch,
+            mean,
+            process_local=handle.process_local,
+        )
+        import jax
+
+        host = jax.device_get(metrics)
+        return updated, {
+            "loss": float(host.loss),
+            "sse": float(host.sse),
+            "sst": float(host.sst),
+            "l0": float(host.l0),
+            "valid_tokens": int(host.valid_tokens),
+            "topk_valid": bool(host.topk_valid),
+            "grad_norm": float(host.grad_norm),
+            "learning_rate": float(host.learning_rate),
+        }
+
+    @staticmethod
+    def resident_step(
+        prepared: PreparedTrainingExecutable,
+        state: Any,
+    ) -> tuple[Any, Mapping[str, Any]]:
+        """Qualifier-only step over the already device-resident static batch."""
+
+        handle: _PreparedHandle = prepared.handle
+        updated, metrics = handle.trainer.step(
+            state,
+            handle.device_batch,
+            handle.mean,
+            process_local=False,
+        )
+        import jax
+
+        host = jax.device_get(metrics)
+        return updated, {
+            "loss": float(host.loss),
+            "sse": float(host.sse),
+            "sst": float(host.sst),
+            "l0": float(host.l0),
+            "valid_tokens": int(host.valid_tokens),
+            "topk_valid": bool(host.topk_valid),
+            "grad_norm": float(host.grad_norm),
+            "learning_rate": float(host.learning_rate),
+        }
+
+    @staticmethod
+    def synchronize(state: Any) -> None:
+        import jax
+
+        jax.block_until_ready(state)
+
+    @staticmethod
+    def progress(state: Any) -> tuple[int, int]:
+        import jax
+
+        step, tokens = jax.device_get((state.step, state.tokens_seen))
+        return int(step), int(tokens)
+
+
+class _OrbaxCheckpointBackend:
+    """Immutable Orbax payloads plus small atomic POSIX control pointers."""
+
+    def __init__(
+        self,
+        *,
+        control_root: str | Path,
+        payload_root: str,
+        mesh: Any,
+        training_config: Any,
+    ) -> None:
+        from moe_sae.checkpointing import normalize_payload_root
+
+        self.control_root = Path(control_root).expanduser().resolve()
+        self.payload_root = normalize_payload_root(payload_root)
+        self.mesh = mesh
+        self.training_config = training_config
+
+    def restore(
+        self,
+        template: Any,
+        run_identity: Mapping[str, Any],
+    ) -> RestoredTrainingState | None:
+        import jax
+        from moe_sae.checkpointing import pointer_path
+        from moe_sae.distributed import restore_distributed_checkpoint
+
+        pointer = pointer_path(self.control_root, "latest")
+        local_exists = pointer.is_file()
+        statuses = _collective_records(
+            {
+                "process_index": int(jax.process_index()),
+                "latest_exists": local_exists,
+            }
+        )
+        if len({bool(item["latest_exists"]) for item in statuses}) != 1:
+            raise ContributionTrainingWorkerError(
+                "checkpoint latest-pointer visibility differs across processes"
+            )
+        if not local_exists:
+            return None
+        restored, metadata = restore_distributed_checkpoint(
+            pointer,
+            template,
+            self.mesh,
+            self.training_config,
+            checkpoint_payload_root=self.payload_root,
+            checkpoint_identity=run_identity,
+        )
+        return RestoredTrainingState(restored, metadata)
+
+    def save(
+        self,
+        state: Any,
+        run_identity: Mapping[str, Any],
+        timing: Mapping[str, Any],
+        final: bool,
+    ) -> Mapping[str, Any]:
+        import jax
+        from jax.experimental import multihost_utils
+
+        from moe_sae.checkpointing import (
+            checkpoint_payload_uri,
+            final_pointer_from_latest,
+            make_pointer,
+            new_attempt_id,
+            publish_pointer,
+        )
+        from moe_sae.distributed import save_distributed_checkpoint
+
+        local_attempt = (
+            bytes.fromhex(new_attempt_id())
+            if jax.process_index() == 0
+            else bytes(16)
+        )
+        attempt_bytes = np.asarray(
+            multihost_utils.broadcast_one_to_all(
+                np.frombuffer(local_attempt, dtype=np.uint8).copy(),
+                is_source=jax.process_index() == 0,
+            ),
+            dtype=np.uint8,
+        ).tobytes()
+        attempt_id = attempt_bytes.hex()
+        if attempt_id == "0" * 32:
+            raise ContributionTrainingWorkerError(
+                "checkpoint coordinator did not publish an attempt ID"
+            )
+        step, tokens = _ProductionEngine.progress(state)
+        payload_uri = checkpoint_payload_uri(
+            self.payload_root,
+            run_identity,
+            step=step,
+            tokens_seen=tokens,
+            attempt_id=attempt_id,
+        )
+        metadata = {
+            "run_identity_sha256": run_identity["run_identity_sha256"],
+            "training_worker_schema_version": TRAINING_WORKER_SCHEMA_VERSION,
+            "timing": dict(timing),
+        }
+        save_distributed_checkpoint(
+            payload_uri,
+            state,
+            self.mesh,
+            self.training_config,
+            metadata=metadata,
+        )
+        _collective_barrier(f"contribution-sae-payload-{step}-{tokens}")
+        latest = make_pointer(
+            kind="latest",
+            payload_uri=payload_uri,
+            step=step,
+            tokens_seen=tokens,
+            attempt_id=attempt_id,
+            run_identity=run_identity,
+        )
+        latest_path: str | None = None
+        final_path: str | None = None
+        if jax.process_index() == 0:
+            latest_path = str(publish_pointer(self.control_root, latest))
+            if final:
+                final_path = str(
+                    publish_pointer(
+                        self.control_root,
+                        final_pointer_from_latest(latest),
+                    )
+                )
+        _collective_barrier(f"contribution-sae-pointer-{step}-{tokens}")
+        return {
+            "payload_uri": payload_uri,
+            "step": step,
+            "tokens": tokens,
+            "attempt_id": attempt_id,
+            "latest_pointer": latest_path,
+            "final_pointer": final_path,
+            "final": bool(final),
+            "latest_pointer_sha256": latest["pointer_sha256"],
+        }
+
+
+def _pooled_routed_mean(dataset: Any) -> tuple[np.ndarray, str]:
+    from moe_sae.contribution_artifacts import validate_contribution_statistics
+
+    manifest = getattr(dataset, "manifest", None)
+    statistics = manifest.get("statistics") if isinstance(manifest, Mapping) else None
+    if not isinstance(statistics, Mapping):
+        raise ContributionTrainingWorkerError(
+            "sealed v2 training manifest lacks pooled statistics"
+        )
+    checked = validate_contribution_statistics(
+        statistics,
+        expected_tokens=int(dataset.total_tokens),
+    )
+    pooled = checked["pooled_expert_output"]
+    count = int(pooled["count"])
+    if count != int(dataset.total_tokens) * 8:
+        raise ContributionTrainingWorkerError(
+            "pooled expert statistic count differs from tokens × routes"
+        )
+    mean = (
+        np.asarray(pooled["sum"], dtype=np.float64) / count
+    ).astype(np.float32)
+    mean = np.ascontiguousarray(mean)
+    digest = hashlib.sha256()
+    digest.update(b"gemma4-contribution-centering-mean-v1\0")
+    digest.update(mean.astype("<f4", copy=False).tobytes(order="C"))
+    return mean, digest.hexdigest()
+
+
+def _phase_layout(config: Experiment2Config, plan: TrainingWorkerPlan) -> Any:
+    matches = [
+        item
+        for item in config.layouts_for_phase(plan.phase_name)
+        if item.condition == plan.condition
+    ]
+    if len(matches) != 1:
+        raise ContributionTrainingWorkerError(
+            "selected phase/condition does not have one exact layout"
+        )
+    return matches[0]
+
+
+def _build_production_workload(
+    config: Experiment2Config,
+    plan: TrainingWorkerPlan,
+    *,
+    capture_control_root: str | Path,
+    object_prefix: str,
+    resident_cache_root: str | Path,
+    resident_cache_max_bytes: int,
+    recomposition_sidecar: Mapping[str, Any] | None,
+    prefetch_receipt: Mapping[str, Any],
+    expected_context: Mapping[str, Any] | None = None,
+) -> _ProductionWorkload:
+    """Build a no-refill process-local source and its collective identity."""
+
+    import jax
+
+    from moe_sae.contribution_input import (
+        CapacityReceipt,
+        ContributionProcessInput,
+        merge_capacity_receipts,
+    )
+    from moe_sae.contribution_sae import ContributionSAEConfig
+    from moe_sae.contribution_shared import (
+        SharedQLayout,
+        SharedQProcessInput,
+        build_shared_q_centering,
+        shared_q_sae_config,
+    )
+    from moe_sae.contribution_storage import ContributionDataset
+    from moe_sae.contribution_training import ContributionOptimizerConfig
+    from moe_sae.distributed import DistributedConfig, create_mesh
+    from moe_sae.object_store import ShardCache
+    from moe_sae.pipeline import TrainingConfig
+
+    cache = ShardCache(
+        resident_cache_root,
+        _ResidentOnlyObjectStore(),
+        max_bytes=_positive_int(
+            "resident_cache_max_bytes",
+            resident_cache_max_bytes,
+        ),
+        resident_only=True,
+    )
+    dataset = ContributionDataset(
+        capture_control_root,
+        object_prefix=object_prefix,
+        cache=cache,
+        recomposition_sidecar=recomposition_sidecar,
+    )
+    if int(dataset.total_tokens) != plan.total_tokens:
+        raise ContributionTrainingWorkerError(
+            "training requires the exact phase-specific sealed v2 manifest"
+        )
+    distributed = DistributedConfig(
+        data_axis_size=int(jax.process_count()),
+        feature_axis_size=int(jax.local_device_count()),
+        microbatches_per_update=plan.microbatches_per_update,
+    )
+    mesh = create_mesh(distributed)
+    selected_layout = _phase_layout(config, plan)
+    routed_layout: Any | None = None
+    q_config: Any | None = None
+    optimizer: Any | None = None
+    bank_capacity: int | None = None
+    capacity_records: tuple[dict[str, Any], ...] = ()
+
+    if plan.condition == "Q":
+        if recomposition_sidecar is None:
+            raise ContributionTrainingWorkerError(
+                "shared Q requires the recomposition sidecar"
+            )
+        centering = build_shared_q_centering(dataset, recomposition_sidecar)
+        source = SharedQProcessInput(
+            dataset,
+            recomposition_sidecar,
+            centering,
+            role="train",
+            total_tokens=plan.total_tokens,
+            global_microbatch_tokens=plan.global_microbatch_tokens,
+            microbatches_per_update=plan.microbatches_per_update,
+            process_count=int(jax.process_count()),
+            process_index=int(jax.process_index()),
+        )
+        q_layout = SharedQLayout(
+            hidden_dim=config.model.hidden_size,
+            total_features=selected_layout.bank_width,
+            k=selected_layout.topk_per_component,
+        )
+        q_config = shared_q_sae_config(
+            q_layout,
+            parameter_dtype=config.optimizer.parameter_dtype,
+            adam_beta1=config.optimizer.adam_beta1,
+            adam_beta2=config.optimizer.adam_beta2,
+            adam_eps=config.optimizer.adam_epsilon,
+            grad_clip=config.optimizer.global_gradient_clip,
+            peak_lr=config.optimizer.peak_learning_rate,
+            min_lr=config.optimizer.minimum_learning_rate,
+            warmup_steps=plan.warmup_updates,
+            total_steps=plan.planned_updates,
+        )
+        mean = centering.mean
+        mean_sha256 = centering.mean_sha256
+        centering_identity = {
+            "kind": "shared_q",
+            "contract_sha256": centering.contract_sha256,
+            "mean_sha256": centering.mean_sha256,
+            "recomposition_sidecar_sha256": (
+                centering.recomposition_sidecar_sha256
+            ),
+        }
+        arithmetic = SAEArithmetic.shared_q(
+            hidden_dim=q_layout.hidden_dim,
+            total_features=q_layout.total_features,
+            k=q_layout.k,
+        )
+        checkpoint_sae = q_config
+    else:
+        routed_layout = ContributionSAEConfig(
+            condition=plan.condition,
+            hidden_dim=config.model.hidden_size,
+            num_experts=config.model.num_routed_experts,
+            top_routed=config.model.experts_per_token,
+            bank_width=selected_layout.bank_width,
+            k_per_contribution=selected_layout.topk_per_component,
+            randomization_key=plan.randomization_key,
+        )
+        source = ContributionProcessInput(
+            dataset,
+            routed_layout,
+            total_tokens=plan.total_tokens,
+            global_microbatch_tokens=plan.global_microbatch_tokens,
+            microbatches_per_update=plan.microbatches_per_update,
+            process_count=int(jax.process_count()),
+            process_index=int(jax.process_index()),
+        )
+        optimizer = ContributionOptimizerConfig(
+            parameter_dtype=config.optimizer.parameter_dtype,
+            adam_beta1=config.optimizer.adam_beta1,
+            adam_beta2=config.optimizer.adam_beta2,
+            adam_eps=config.optimizer.adam_epsilon,
+            grad_clip=config.optimizer.global_gradient_clip,
+            peak_lr=config.optimizer.peak_learning_rate,
+            min_lr=config.optimizer.minimum_learning_rate,
+            warmup_steps=plan.warmup_updates,
+            total_steps=plan.planned_updates,
+        )
+        mean, mean_sha256 = _pooled_routed_mean(dataset)
+        centering_identity = {
+            "kind": "pooled_raw_expert",
+            "mean_sha256": mean_sha256,
+        }
+        arithmetic = SAEArithmetic.from_contribution_layout(routed_layout)
+        from moe_sae.contribution_training import optimizer_sae_config
+
+        checkpoint_sae = optimizer_sae_config(routed_layout, optimizer)
+
+    input_records = _collective_records(asdict(source.receipt))
+    if [int(item["process_index"]) for item in input_records] != list(
+        range(jax.process_count())
+    ):
+        raise ContributionTrainingWorkerError(
+            "collective process input receipts are not process ordered"
+        )
+    if len({item["receipt_sha256"] for item in input_records}) != len(input_records):
+        raise ContributionTrainingWorkerError(
+            "collective process input receipts contain duplicates"
+        )
+    checked_prefetch = validate_prefetch_receipt(prefetch_receipt)
+    expected_partition = {
+        "strategy": source.process_partition_strategy,
+        "process_count": source.process_count,
+        "process_index": source.process_index,
+        "range_start": source.process_range_start,
+        "range_end": source.process_range_end,
+        "tokens": source.process_range_end - source.process_range_start,
+    }
+    if checked_prefetch["process_partition"] != expected_partition:
+        raise ContributionTrainingWorkerError(
+            "prefetch receipt does not match the process-local training lane"
+        )
+    prefetch_records = _collective_records(checked_prefetch)
+    if [int(item["process_partition"]["process_index"]) for item in prefetch_records] != list(
+        range(jax.process_count())
+    ):
+        raise ContributionTrainingWorkerError(
+            "collective prefetch receipts are not process ordered"
+        )
+    if len(
+        {item["receipt_sha256"] for item in prefetch_records}
+    ) != len(prefetch_records):
+        raise ContributionTrainingWorkerError(
+            "collective prefetch receipts contain duplicates"
+        )
+
+    if plan.condition in {"A", "R"}:
+        if expected_context is None:
+            local_capacity = source.scan_local_capacity(
+                margin_fraction=config.runtime.capacity_margin_fraction,
+            )
+            capacity_records = _collective_records(asdict(local_capacity))
+            capacity_receipts = tuple(
+                CapacityReceipt(**item) for item in capacity_records
+            )
+            merged = merge_capacity_receipts(capacity_receipts)
+            bank_capacity = int(merged.capacity)
+            merged_capacity = merged.to_dict()
+        else:
+            raw_capacity = expected_context.get("capacity_receipts")
+            if not isinstance(raw_capacity, list):
+                raise ContributionTrainingWorkerError(
+                    "qualified A/R context lacks capacity receipts"
+                )
+            capacity_records = tuple(dict(item) for item in raw_capacity)
+            capacity_receipts = tuple(
+                CapacityReceipt(**item) for item in capacity_records
+            )
+            merged = merge_capacity_receipts(capacity_receipts)
+            bank_capacity = int(merged.capacity)
+            merged_capacity = merged.to_dict()
+    else:
+        merged_capacity = None
+
+    workload_context = {
+        "capture_manifest_sha256": dataset.manifest_sha256,
+        "input_receipts": list(input_records),
+        "input_receipt_set_sha256": canonical_sha256(input_records),
+        "prefetch_receipts": list(prefetch_records),
+        "prefetch_receipt_set_sha256": canonical_sha256(prefetch_records),
+        "centering": centering_identity,
+        "mean_sha256": mean_sha256,
+        "capacity_receipts": list(capacity_records),
+        "merged_capacity_receipt": merged_capacity,
+        "bank_capacity": bank_capacity,
+        "resident_cache_policy": "resident_only_no_refill",
+    }
+    if expected_context is not None and workload_context != dict(expected_context):
+        raise ContributionTrainingWorkerError(
+            "resident v2 input/capacity/centering context drifted after qualification"
+        )
+    training_config = TrainingConfig(
+        sae=checkpoint_sae,
+        seed=plan.seed,
+        total_tokens=plan.total_tokens,
+        effective_batch_tokens=plan.effective_batch_tokens,
+        microbatch_tokens=plan.global_microbatch_tokens,
+        checkpoint_every_tokens=plan.total_tokens,
+        health_gate_tokens=plan.total_tokens,
+        a_capacity=bank_capacity,
+    )
+    return _ProductionWorkload(
+        source=source,
+        mean=mean,
+        routed_layout=routed_layout,
+        q_config=q_config,
+        optimizer=optimizer,
+        distributed=distributed,
+        mesh=mesh,
+        bank_capacity=bank_capacity,
+        arithmetic=arithmetic,
+        workload_context=workload_context,
+        checkpoint_training_config=training_config,
+    )
+
+
+def _run_production_qualification(
+    config: Experiment2Config,
+    plan: TrainingWorkerPlan,
+    workload: _ProductionWorkload,
+    *,
+    source_revision: str,
+    peak_flops_per_second: int,
+    warmup_steps: int,
+    measured_steps: int,
+    qualification_started: float | None = None,
+) -> dict[str, Any]:
+    """Compile/replay both exact graphs over one device-resident v2 batch."""
+
+    _positive_int("qualification warmup_steps", warmup_steps)
+    _positive_int("qualification measured_steps", measured_steps)
+    engine = _ProductionEngine(
+        config,
+        plan,
+        workload,
+        source_revision=source_revision,
+        peak_flops_per_second=peak_flops_per_second,
+    )
+    try:
+        static_batch = next(iter(workload.source.iter_updates()))
+    except StopIteration as error:
+        raise ContributionTrainingWorkerError(
+            "qualified training source contains no updates"
+        ) from error
+
+    def probe(mode: InputMode) -> SAEQualificationObservation:
+        mode_started = time.perf_counter()
+        initial = engine.initialize_state()
+        prepared = engine.lower(mode, initial, static_batch, workload.mean)
+        compile_count = 0
+        try:
+            engine.compile(prepared)
+            compile_count += 1
+            warm = initial
+            warm_metric: Mapping[str, Any] | None = None
+            for _ in range(warmup_steps):
+                warm, warm_metric = engine.resident_step(prepared, warm)
+            engine.synchronize(warm)
+            warm_step, warm_tokens = engine.progress(warm)
+
+            transition = warm
+            scientific_tokens = 0
+            exact_l0 = True
+            measured_started = time.perf_counter()
+            for _ in range(measured_steps):
+                transition, raw_metric = engine.resident_step(
+                    prepared,
+                    transition,
+                )
+                metric = _metric_record(
+                    raw_metric,
+                    expected_l0=workload.expected_l0,
+                )
+                scientific_tokens += int(metric["valid_tokens"])
+                exact_l0 = exact_l0 and math.isclose(
+                    float(metric["l0"]),
+                    workload.expected_l0,
+                    abs_tol=1e-5,
+                )
+            engine.synchronize(transition)
+            measured_seconds = _collective_max_seconds(
+                time.perf_counter() - measured_started
+            )
+            transition_step, transition_tokens = engine.progress(transition)
+
+            replay = warm
+            for _ in range(measured_steps):
+                replay, raw_metric = engine.resident_step(prepared, replay)
+                _metric_record(
+                    raw_metric,
+                    expected_l0=workload.expected_l0,
+                )
+            engine.synchronize(replay)
+            replay_step, replay_tokens = engine.progress(replay)
+            deterministic = _states_exact_equal(transition, replay)
+            transition_sha = _state_sha256(transition)
+            replay_sha = _state_sha256(replay)
+            if not deterministic or transition_sha != replay_sha:
+                raise ContributionTrainingWorkerError(
+                    "qualified SAE transition is not exactly replayable"
+                )
+            state_progress_exact = (
+                transition_step == warm_step + measured_steps
+                and replay_step == transition_step
+                and transition_tokens == warm_tokens + scientific_tokens
+                and replay_tokens == transition_tokens
+            )
+            del warm_metric
+            return SAEQualificationObservation(
+                identity=prepared.identity,
+                qualification_wall_seconds=_collective_max_seconds(
+                    time.perf_counter() - mode_started
+                ),
+                measured_device_seconds=measured_seconds,
+                scientific_tokens=scientific_tokens,
+                warmup_steps=warmup_steps,
+                measured_steps=measured_steps,
+                compile_count=compile_count,
+                recompilations_after_warmup=0,
+                oom_events=0,
+                nonfinite_events=0,
+                capacity_overflow_events=0,
+                exact_l0=exact_l0,
+                state_progress_exact=state_progress_exact,
+                parameters_resident_before_timing=True,
+                inputs_resident_before_timing=True,
+                synchronized_device_timing=True,
+                transition_output_sha256=transition_sha,
+                replay_output_sha256=replay_sha,
+            )
+        except Exception:
+            raise
+
+    return qualify_training_modes(
+        probe,
+        workload.arithmetic,
+        peak_flops_per_second=peak_flops_per_second,
+        minimum_useful_mfu=config.runtime.accelerator_min_useful_mfu,
+        maximum_seconds=config.runtime.accelerator_qualification_max_seconds,
+        workload_context=workload.workload_context,
+        qualification_started=qualification_started,
+        elapsed_transform=_collective_max_seconds,
+    )
+
+
+def _run_production_training(
+    config: Experiment2Config,
+    plan: TrainingWorkerPlan,
+    workload: _ProductionWorkload,
+    selection: Mapping[str, Any],
+    *,
+    source_revision: str,
+    peak_flops_per_second: int,
+    checkpoint_control_root: str | Path,
+    checkpoint_payload_root: str,
+    maximum_runtime_seconds: int,
+    metric_path: str | Path | None,
+) -> dict[str, Any]:
+    engine = _ProductionEngine(
+        config,
+        plan,
+        workload,
+        source_revision=source_revision,
+        peak_flops_per_second=peak_flops_per_second,
+    )
+    checkpoint = _OrbaxCheckpointBackend(
+        control_root=checkpoint_control_root,
+        payload_root=checkpoint_payload_root,
+        mesh=workload.mesh,
+        training_config=workload.checkpoint_training_config,
+    )
+    metric_destination = (
+        None if metric_path is None else Path(metric_path).expanduser().resolve()
+    )
+
+    def metric_sink(value: Mapping[str, Any]) -> None:
+        if metric_destination is None:
+            return
+        # Process zero is the sole control-plane writer; every process has
+        # already synchronized and observed the same globally reduced metric.
+        import jax
+
+        if jax.process_index() != 0:
+            return
+        metric_destination.parent.mkdir(parents=True, exist_ok=True)
+        with metric_destination.open("ab", buffering=0) as handle:
+            handle.write(canonical_json_bytes(dict(value)) + b"\n")
+            os.fsync(handle.fileno())
+
+    dependencies = TrainingLoopDependencies(
+        initialize_state=engine.initialize_state,
+        lower=engine.lower,
+        compile=engine.compile,
+        step=engine.step,
+        synchronize=engine.synchronize,
+        progress=engine.progress,
+        restore=checkpoint.restore,
+        save=checkpoint.save,
+    )
+    return run_qualified_training(
+        plan,
+        workload.source,
+        workload.mean,
+        selection,
+        dependencies,
+        expected_l0=workload.expected_l0,
+        maximum_runtime_seconds=maximum_runtime_seconds,
+        metric_sink=metric_sink,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Standalone CLI and hard supervisor
+
+
+def _source_revision(value: str) -> str:
+    if re.fullmatch(r"[0-9a-f]{40}", value) is None:
+        raise argparse.ArgumentTypeError(
+            "source revision must be a lowercase 40-character Git commit"
+        )
+    return value
+
+
+def _absolute_path(value: str) -> str:
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        raise argparse.ArgumentTypeError("path must be absolute")
+    return str(path.resolve(strict=False))
+
+
+def _load_sidecar(path: str | None) -> dict[str, Any] | None:
+    return None if path is None else _read_json(path, name="recomposition sidecar")
+
+
+def _verify_repository_revision(expected: str) -> None:
+    """Require the child to execute the exact committed, clean source tree."""
+
+    try:
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        ).stdout.strip()
+        dirty = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=all"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        ).stdout
+    except (OSError, subprocess.SubprocessError) as error:
+        raise ContributionTrainingWorkerError(
+            "cannot verify the training worker repository revision"
+        ) from error
+    if head != expected:
+        raise ContributionTrainingWorkerError(
+            f"source revision drifted: expected {expected}, observed {head}"
+        )
+    if dirty.strip():
+        raise ContributionTrainingWorkerError(
+            "authoritative SAE qualification/training requires a clean source tree"
+        )
+
+
+def _add_workload_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--config",
+        default="configs/gemma4_contribution_v1.yaml",
+    )
+    parser.add_argument(
+        "--phase",
+        default="phase2_mechanism_pilot",
+    )
+    parser.add_argument("--condition", required=True, choices=CONDITIONS)
+    parser.add_argument("--seed", required=True, type=int)
+    parser.add_argument(
+        "--capture-control-root",
+        required=True,
+        type=_absolute_path,
+    )
+    parser.add_argument("--object-prefix", required=True)
+    parser.add_argument(
+        "--resident-cache-root",
+        required=True,
+        type=_absolute_path,
+    )
+    parser.add_argument(
+        "--resident-cache-max-bytes",
+        required=True,
+        type=int,
+    )
+    parser.add_argument(
+        "--prefetch-receipt-path",
+        required=True,
+        type=_absolute_path,
+    )
+    parser.add_argument(
+        "--recomposition-sidecar",
+        type=_absolute_path,
+    )
+    parser.add_argument(
+        "--source-revision",
+        required=True,
+        type=_source_revision,
+    )
+    parser.add_argument(
+        "--peak-flops-per-second",
+        type=int,
+        default=4_400_000_000_000_000,
+    )
+
+
+def _add_prefetch_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--config",
+        default="configs/gemma4_contribution_v1.yaml",
+    )
+    parser.add_argument(
+        "--phase",
+        default="phase2_mechanism_pilot",
+    )
+    parser.add_argument(
+        "--capture-control-root",
+        required=True,
+        type=_absolute_path,
+    )
+    parser.add_argument("--object-prefix", required=True)
+    parser.add_argument(
+        "--resident-cache-root",
+        required=True,
+        type=_absolute_path,
+    )
+    parser.add_argument(
+        "--resident-cache-max-bytes",
+        required=True,
+        type=int,
+    )
+    parser.add_argument("--process-count", required=True, type=int)
+    parser.add_argument("--process-index", required=True, type=int)
+    parser.add_argument(
+        "--prefetch-receipt-path",
+        required=True,
+        type=_absolute_path,
+    )
+    parser.add_argument(
+        "--recomposition-sidecar",
+        type=_absolute_path,
+    )
+    parser.add_argument(
+        "--source-revision",
+        required=True,
+        type=_source_revision,
+    )
+
+
+def _add_supervisor_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--supervision-dir",
+        required=True,
+        type=_absolute_path,
+    )
+    parser.add_argument("--host-id", required=True)
+    parser.add_argument(
+        "--working-directory",
+        required=True,
+        type=_absolute_path,
+    )
+    parser.add_argument(
+        "--termination-grace-seconds",
+        type=float,
+        default=15.0,
+    )
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="moe-sae-contribution-training",
+        description="Qualified Experiment-2 SAE training worker",
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    prefetch = commands.add_parser(
+        "prefetch",
+        help="materialize and prove one process-contiguous lane without JAX",
+    )
+    _add_prefetch_arguments(prefetch)
+
+    qualify = commands.add_parser(
+        "qualify",
+        help="hard-supervise a two-mode <=600s qualification",
+    )
+    _add_workload_arguments(qualify)
+    _add_supervisor_arguments(qualify)
+    qualify.add_argument("--selection-path", required=True, type=_absolute_path)
+    qualify.add_argument("--warmup-steps", type=int, default=1)
+    qualify.add_argument("--measured-steps", type=int, default=3)
+
+    qualify_child = commands.add_parser(
+        "qualify-child",
+        help="internal child; invoke through qualify",
+    )
+    _add_workload_arguments(qualify_child)
+    qualify_child.add_argument(
+        "--selection-path",
+        required=True,
+        type=_absolute_path,
+    )
+    qualify_child.add_argument("--warmup-steps", type=int, default=1)
+    qualify_child.add_argument("--measured-steps", type=int, default=3)
+
+    train = commands.add_parser(
+        "train",
+        help="supervise an exactly qualified fixed-order training run",
+    )
+    _add_workload_arguments(train)
+    _add_supervisor_arguments(train)
+    train.add_argument("--selection-path", required=True, type=_absolute_path)
+    train.add_argument(
+        "--checkpoint-control-root",
+        required=True,
+        type=_absolute_path,
+    )
+    train.add_argument("--checkpoint-payload-root", required=True)
+    train.add_argument("--maximum-runtime-seconds", required=True, type=int)
+    train.add_argument("--result-path", required=True, type=_absolute_path)
+    train.add_argument("--metric-path", type=_absolute_path)
+
+    train_child = commands.add_parser(
+        "train-child",
+        help="internal child; invoke through train",
+    )
+    _add_workload_arguments(train_child)
+    train_child.add_argument(
+        "--selection-path",
+        required=True,
+        type=_absolute_path,
+    )
+    train_child.add_argument(
+        "--checkpoint-control-root",
+        required=True,
+        type=_absolute_path,
+    )
+    train_child.add_argument("--checkpoint-payload-root", required=True)
+    train_child.add_argument("--maximum-runtime-seconds", required=True, type=int)
+    train_child.add_argument("--result-path", required=True, type=_absolute_path)
+    train_child.add_argument("--metric-path", type=_absolute_path)
+    return parser
+
+
+def _workload_argv(args: argparse.Namespace) -> list[str]:
+    result = [
+        "--config",
+        str(Path(args.config).expanduser().resolve()),
+        "--phase",
+        args.phase,
+        "--condition",
+        args.condition,
+        "--seed",
+        str(args.seed),
+        "--capture-control-root",
+        args.capture_control_root,
+        "--object-prefix",
+        args.object_prefix,
+        "--resident-cache-root",
+        args.resident_cache_root,
+        "--resident-cache-max-bytes",
+        str(args.resident_cache_max_bytes),
+        "--prefetch-receipt-path",
+        args.prefetch_receipt_path,
+        "--source-revision",
+        args.source_revision,
+        "--peak-flops-per-second",
+        str(args.peak_flops_per_second),
+    ]
+    if args.recomposition_sidecar is not None:
+        result.extend(
+            ["--recomposition-sidecar", args.recomposition_sidecar]
+        )
+    return result
+
+
+def _supervision_paths(
+    args: argparse.Namespace,
+    *,
+    operation: str,
+) -> dict[str, Path]:
+    root = Path(args.supervision_dir).expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", args.host_id) is None:
+        raise ContributionTrainingWorkerError("host-id is invalid")
+    prefix = f"{operation}-{args.condition}-seed{args.seed}-{args.host_id}"
+    return {
+        "log_path": root / f"{prefix}.log",
+        "execution_record_path": root / f"{prefix}.execution.json",
+        "result_path": root / f"{prefix}.supervision.json",
+    }
+
+
+def _prelaunch_identity(
+    args: argparse.Namespace,
+    *,
+    child_command: Sequence[str],
+) -> ExactPerformanceIdentity:
+    module_path = Path(__file__).resolve()
+    module_sha = hashlib.sha256(module_path.read_bytes()).hexdigest()
+    return ExactPerformanceIdentity.from_components(
+        graph={
+            "schema_version": "gemma4-contribution-sae-prelaunch-source-v1",
+            "module_sha256": module_sha,
+            "source_revision": args.source_revision,
+        },
+        hardware={
+            "schema_version": "gemma4-contribution-sae-requested-hardware-v1",
+            "platform": "tpu",
+            "accelerator": "v4-32",
+            "global_chip_count": 16,
+            "peak_flops_per_second": args.peak_flops_per_second,
+        },
+        config={
+            "schema_version": "gemma4-contribution-sae-prelaunch-command-v1",
+            "argv": list(child_command),
+        },
+    )
+
+
+def _supervise(
+    args: argparse.Namespace,
+    *,
+    child_command: Sequence[str],
+    identity: ExactPerformanceIdentity,
+    maximum_seconds: int,
+    qualification_receipt: Mapping[str, Any] | None,
+    operation: str,
+) -> dict[str, Any]:
+    from moe_sae.contribution_supervisor import supervise_authorized_process
+
+    purpose = "qualification" if operation == "qualify" else "workload"
+    authorization = authorize_accelerator_run(
+        identity=identity,
+        maximum_runtime_seconds=maximum_seconds,
+        purpose=purpose,
+        qualification_receipt=qualification_receipt,
+    )
+    paths = _supervision_paths(args, operation=operation)
+    result = supervise_authorized_process(
+        authorization=authorization,
+        qualification_receipt=qualification_receipt,
+        command=child_command,
+        environment=dict(os.environ),
+        working_directory=args.working_directory,
+        termination_grace_seconds=args.termination_grace_seconds,
+        **paths,
+    )
+    if result["status"] != "completed" or result["returncode"] != 0:
+        raise ContributionTrainingWorkerError(
+            f"{operation} child failed under supervisor: "
+            f"status={result['status']}, returncode={result['returncode']}; "
+            f"log={paths['log_path']}"
+        )
+    return result
+
+
+def _prefetch_command(args: argparse.Namespace) -> int:
+    """Run the bounded-cache asynchronous transfer without importing JAX."""
+
+    _verify_repository_revision(args.source_revision)
+    config = load_contribution_config(args.config)
+    sidecar = _load_sidecar(args.recomposition_sidecar)
+    receipt = prefetch_process_lane(
+        config=config,
+        phase=args.phase,
+        source_revision=args.source_revision,
+        capture_control_root=args.capture_control_root,
+        object_prefix=args.object_prefix,
+        cache_root=args.resident_cache_root,
+        cache_max_bytes=args.resident_cache_max_bytes,
+        process_count=args.process_count,
+        process_index=args.process_index,
+        recomposition_sidecar=sidecar,
+    )
+    _write_create_only_json(args.prefetch_receipt_path, receipt)
+    print(
+        json.dumps(
+            {
+                "receipt_sha256": receipt["receipt_sha256"],
+                "process_partition": receipt["process_partition"],
+                "objects": receipt["object_count"],
+                "bytes": receipt["object_bytes"],
+                "elapsed_seconds": receipt["elapsed_seconds"],
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+    return 0
+
+
+def _qualify_command(args: argparse.Namespace) -> int:
+    child = [
+        sys.executable,
+        "-m",
+        "moe_sae.contribution_training_worker",
+        "qualify-child",
+        *_workload_argv(args),
+        "--selection-path",
+        args.selection_path,
+        "--warmup-steps",
+        str(args.warmup_steps),
+        "--measured-steps",
+        str(args.measured_steps),
+    ]
+    identity = _prelaunch_identity(args, child_command=child)
+    result = _supervise(
+        args,
+        child_command=child,
+        identity=identity,
+        maximum_seconds=MAX_QUALIFICATION_SECONDS,
+        qualification_receipt=None,
+        operation="qualify",
+    )
+    selection = validate_training_mode_selection(
+        _read_json(args.selection_path, name="mode selection")
+    )
+    print(
+        json.dumps(
+            {
+                "supervision_result_sha256": result["result_sha256"],
+                "selection_sha256": selection["selection_sha256"],
+                "chosen_mode": selection["chosen_mode"],
+                "chosen_identity_sha256": selection["chosen_identity_sha256"],
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def _qualify_child_command(args: argparse.Namespace) -> int:
+    qualification_started = time.perf_counter()
+    from moe_sae.runtime import initialize_jax_distributed, require_v4_32_runtime
+
+    _verify_repository_revision(args.source_revision)
+    config = load_contribution_config(args.config)
+    plan = TrainingWorkerPlan.from_config(
+        config,
+        phase=args.phase,
+        condition=args.condition,
+        seed=args.seed,
+    )
+    sidecar = _load_sidecar(args.recomposition_sidecar)
+    prefetch_receipt = _prove_prefetch_for_plan(
+        _read_json(args.prefetch_receipt_path, name="prefetch receipt"),
+        config=config,
+        plan=plan,
+        source_revision=args.source_revision,
+        capture_control_root=args.capture_control_root,
+        object_prefix=args.object_prefix,
+        cache_root=args.resident_cache_root,
+        cache_max_bytes=args.resident_cache_max_bytes,
+        recomposition_sidecar=sidecar,
+    )
+    initialize_jax_distributed()
+    require_v4_32_runtime()
+    workload = _build_production_workload(
+        config,
+        plan,
+        capture_control_root=args.capture_control_root,
+        object_prefix=args.object_prefix,
+        resident_cache_root=args.resident_cache_root,
+        resident_cache_max_bytes=args.resident_cache_max_bytes,
+        recomposition_sidecar=sidecar,
+        prefetch_receipt=prefetch_receipt,
+    )
+    selection = _run_production_qualification(
+        config,
+        plan,
+        workload,
+        source_revision=args.source_revision,
+        peak_flops_per_second=args.peak_flops_per_second,
+        warmup_steps=args.warmup_steps,
+        measured_steps=args.measured_steps,
+        qualification_started=qualification_started,
+    )
+    import jax
+
+    if jax.process_index() == 0:
+        _write_create_only_json(args.selection_path, selection)
+    _collective_barrier(
+        f"contribution-sae-selection-{plan.condition}-{plan.seed}"
+    )
+    observed = validate_training_mode_selection(
+        _read_json(args.selection_path, name="mode selection")
+    )
+    if observed != selection:
+        raise ContributionTrainingWorkerError(
+            "published mode selection differs from this process's evidence"
+        )
+    print(
+        json.dumps(
+            {
+                "process_index": int(jax.process_index()),
+                "selection_sha256": selection["selection_sha256"],
+                "chosen_mode": selection["chosen_mode"],
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+    return 0
+
+
+def _train_command(args: argparse.Namespace) -> int:
+    selection = validate_training_mode_selection(
+        _read_json(args.selection_path, name="mode selection")
+    )
+    _mode, identity, receipt = chosen_mode_evidence(selection)
+    child = [
+        sys.executable,
+        "-m",
+        "moe_sae.contribution_training_worker",
+        "train-child",
+        *_workload_argv(args),
+        "--selection-path",
+        args.selection_path,
+        "--checkpoint-control-root",
+        args.checkpoint_control_root,
+        "--checkpoint-payload-root",
+        args.checkpoint_payload_root,
+        "--maximum-runtime-seconds",
+        str(args.maximum_runtime_seconds),
+        "--result-path",
+        args.result_path,
+    ]
+    if args.metric_path is not None:
+        child.extend(["--metric-path", args.metric_path])
+    result = _supervise(
+        args,
+        child_command=child,
+        identity=identity,
+        maximum_seconds=args.maximum_runtime_seconds,
+        qualification_receipt=(
+            receipt
+            if args.maximum_runtime_seconds > MAX_QUALIFICATION_SECONDS
+            else None
+        ),
+        operation="train",
+    )
+    training = _read_json(args.result_path, name="training result")
+    print(
+        json.dumps(
+            {
+                "supervision_result_sha256": result["result_sha256"],
+                "training_result_sha256": training["result_sha256"],
+                "status": training["status"],
+                "tokens": training["tokens"],
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def _train_child_command(args: argparse.Namespace) -> int:
+    from moe_sae.runtime import initialize_jax_distributed, require_v4_32_runtime
+
+    _verify_repository_revision(args.source_revision)
+    selection = validate_training_mode_selection(
+        _read_json(args.selection_path, name="mode selection")
+    )
+    context = selection["workload_context"]
+    config = load_contribution_config(args.config)
+    plan = TrainingWorkerPlan.from_config(
+        config,
+        phase=args.phase,
+        condition=args.condition,
+        seed=args.seed,
+    )
+    sidecar = _load_sidecar(args.recomposition_sidecar)
+    prefetch_receipt = _prove_prefetch_for_plan(
+        _read_json(args.prefetch_receipt_path, name="prefetch receipt"),
+        config=config,
+        plan=plan,
+        source_revision=args.source_revision,
+        capture_control_root=args.capture_control_root,
+        object_prefix=args.object_prefix,
+        cache_root=args.resident_cache_root,
+        cache_max_bytes=args.resident_cache_max_bytes,
+        recomposition_sidecar=sidecar,
+    )
+    initialize_jax_distributed()
+    require_v4_32_runtime()
+    workload = _build_production_workload(
+        config,
+        plan,
+        capture_control_root=args.capture_control_root,
+        object_prefix=args.object_prefix,
+        resident_cache_root=args.resident_cache_root,
+        resident_cache_max_bytes=args.resident_cache_max_bytes,
+        recomposition_sidecar=sidecar,
+        prefetch_receipt=prefetch_receipt,
+        expected_context=context,
+    )
+    result = _run_production_training(
+        config,
+        plan,
+        workload,
+        selection,
+        source_revision=args.source_revision,
+        peak_flops_per_second=args.peak_flops_per_second,
+        checkpoint_control_root=args.checkpoint_control_root,
+        checkpoint_payload_root=args.checkpoint_payload_root,
+        maximum_runtime_seconds=args.maximum_runtime_seconds,
+        metric_path=args.metric_path,
+    )
+    import jax
+
+    if jax.process_index() == 0:
+        _write_create_only_json(args.result_path, result)
+    _collective_barrier(
+        f"contribution-sae-result-{plan.condition}-{plan.seed}"
+    )
+    observed = _read_json(args.result_path, name="training result")
+    if observed != result:
+        raise ContributionTrainingWorkerError(
+            "published training result differs across processes"
+        )
+    print(
+        json.dumps(
+            {
+                "process_index": int(jax.process_index()),
+                "result_sha256": result["result_sha256"],
+                "status": result["status"],
+                "tokens": result["tokens"],
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+    return 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    try:
+        if args.command == "prefetch":
+            return _prefetch_command(args)
+        if args.command == "qualify":
+            return _qualify_command(args)
+        if args.command == "qualify-child":
+            return _qualify_child_command(args)
+        if args.command == "train":
+            return _train_command(args)
+        if args.command == "train-child":
+            return _train_child_command(args)
+    except ContributionTrainingWorkerError as error:
+        print(f"ERROR: {error}", file=sys.stderr, flush=True)
+        return 2
+    raise AssertionError("unreachable contribution training command")
+
+
+if __name__ == "__main__":  # pragma: no cover - exercised via module CLI
+    raise SystemExit(main())
+
+
+__all__ = [
+    "CONDITIONS",
+    "INPUT_MODES",
+    "TRAINING_MODE_SELECTION_SCHEMA_VERSION",
+    "TRAINING_RESULT_SCHEMA_VERSION",
+    "TRAINING_RUN_IDENTITY_SCHEMA_VERSION",
+    "TRAINING_WORKER_SCHEMA_VERSION",
+    "PREFETCH_RECEIPT_SCHEMA_VERSION",
+    "ContributionTrainingWorkerError",
+    "PreparedTrainingExecutable",
+    "RestoredTrainingState",
+    "TrainingLoopDependencies",
+    "TrainingWorkerPlan",
+    "chosen_mode_evidence",
+    "main",
+    "prefetch_process_lane",
+    "qualify_training_modes",
+    "run_qualified_training",
+    "validate_training_mode_selection",
+    "validate_prefetch_receipt",
+]

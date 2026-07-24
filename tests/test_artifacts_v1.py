@@ -131,6 +131,37 @@ def test_content_addressed_roundtrip_and_integrated_statistics(tmp_path):
     assert all(shard.batch.activation.dtype == np.uint16 for shard in wire_shards)
 
 
+def test_token_key_range_reads_exact_cross_shard_identity_without_activations(
+    tmp_path,
+):
+    root = tmp_path / "capture"
+    writer = ArtifactWriter(root, "worker-0", metadata())
+    writer.write_range("c4-train-000", 0, 2, batch(2))
+    second = batch(3, 2.0)
+    second = CaptureBatch(
+        activation=second.activation,
+        expert_ids=second.expert_ids,
+        router_weights=second.router_weights,
+        sequence_id=np.arange(102, 105, dtype=np.int64),
+        position=np.arange(2, 5, dtype=np.uint16),
+    )
+    writer.write_range("c4-train-001", 2, 5, second)
+    writer.finalize_host()
+    publish_manifest(root, metadata(), expected_hosts=1, expected_tokens=5)
+
+    pieces = list(ArtifactDataset(root).iter_token_keys_range(1, 4))
+
+    assert len(pieces) == 2
+    assert np.array_equal(
+        np.concatenate([piece[0] for piece in pieces]),
+        np.asarray([101, 102, 103], dtype=np.int64),
+    )
+    assert np.array_equal(
+        np.concatenate([piece[1] for piece in pieces]),
+        np.asarray([1, 2, 3], dtype=np.uint16),
+    )
+
+
 def test_multiple_hosts_publish_in_input_range_order(tmp_path):
     root = tmp_path / "capture"
     high = ArtifactWriter(root, "host-b", metadata())

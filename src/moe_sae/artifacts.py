@@ -1974,6 +1974,75 @@ class ArtifactDataset:
                 f"manifest yielded {yielded} router rows for [{start},{end})"
             )
 
+    def iter_token_keys_range(
+        self, start: int, end: int
+    ) -> Iterator[tuple[np.ndarray, np.ndarray]]:
+        """Read only ``(sequence_id, position)`` for ``[start,end)``.
+
+        Contribution-v2 publication uses this narrow view to prove that every
+        captured row is aligned to the sealed aggregate-v1 token stream.  It
+        deliberately avoids loading the 2,816-wide aggregate activation merely
+        to compare token identities.  Remote shards still pass through the
+        generation- and SHA-bound :class:`ShardCache`.
+        """
+
+        for name, value in (("start", start), ("end", end)):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{name} must be an integer")
+        if not 0 <= start <= end <= self.total_tokens:
+            raise ValueError(
+                f"token range must satisfy 0 <= start <= end <= {self.total_tokens}"
+            )
+
+        offset = 0
+        yielded = 0
+        for entry in self.manifest["shards"]:
+            shard_start = offset
+            shard_end = offset + int(entry["tokens"])
+            offset = shard_end
+            overlap_start = max(start, shard_start)
+            overlap_end = min(end, shard_end)
+            if overlap_start >= overlap_end:
+                continue
+            _validate_entry_shape(entry)
+            path = self._materialize(entry)
+            if not path.is_file():
+                raise IntegrityError(f"missing shard {path}")
+            try:
+                with safe_open(path, framework="numpy") as handle:
+                    metadata = handle.metadata() or {}
+                    if metadata.get("schema_version") != SCHEMA_VERSION:
+                        raise LegacySchemaError(
+                            f"shard {path} is not schema {SCHEMA_VERSION}"
+                        )
+                    sequence_id = handle.get_tensor("sequence_id")
+                    position = handle.get_tensor("position")
+            except (LegacySchemaError, IntegrityError):
+                raise
+            except Exception as error:
+                raise IntegrityError(
+                    f"cannot read token keys from sealed shard {path}"
+                ) from error
+            tokens = int(entry["tokens"])
+            if sequence_id.dtype != np.int64 or sequence_id.shape != (tokens,):
+                raise SchemaError(f"invalid sequence_id tensor in {path}")
+            if position.dtype != np.uint16 or position.shape != (tokens,):
+                raise SchemaError(f"invalid position tensor in {path}")
+            local_start = overlap_start - shard_start
+            local_end = overlap_end - shard_start
+            selected_sequence = np.asarray(
+                sequence_id[local_start:local_end], dtype=np.int64
+            )
+            selected_position = np.asarray(
+                position[local_start:local_end], dtype=np.uint16
+            )
+            yielded += selected_sequence.shape[0]
+            yield selected_sequence, selected_position
+        if yielded != end - start:
+            raise IntegrityError(
+                f"manifest yielded {yielded} token keys for [{start},{end})"
+            )
+
     def iter_token_range(self, start: int, end: int) -> Iterator[CaptureBatch]:
         """Yield exactly ``[start,end)`` in cumulative manifest token order.
 

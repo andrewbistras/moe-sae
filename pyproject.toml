@@ -33,6 +33,7 @@ data = [
 
 [project.scripts]
 moe-sae = "moe_sae.cli:main"
+moe-sae-contribution-training = "moe_sae.contribution_training_worker:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -45,7 +46,9 @@ packages = ["src/moe_sae"]
 package = true
 
 [tool.uv.sources]
-maxtext = { git = "https://github.com/AI-Hypercomputer/maxtext.git", rev = "48c7da3e28e8f57fe36ddf09d00eec53072a2ea0" }
+# Experiment 2 needs the opt-in selected-output return in RoutedMoE.  The fork
+# is a one-commit, manifest-verified child of the pinned upstream revision.
+maxtext = { git = "https://github.com/andrewbistras/maxtext.git", rev = "73bafe53569eb17dc18542f2568dd591a8db9e28" }
 torch = { index = "pytorch-cpu" }
 
 [[tool.uv.index]]

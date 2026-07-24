@@ -84,6 +84,39 @@ def test_feature_sharded_topk_matches_unsharded_membership() -> None:
     np.testing.assert_allclose(actual.values, expected.values)
 
 
+def test_ordered_local_topk_skips_redundant_candidate_argsort() -> None:
+    scores = jnp.asarray(
+        [
+            [3.0, 1.0, 5.0, 5.0, 2.0, 4.0],
+            [0.0, 7.0, 3.0, 6.0, 1.0, 5.0],
+        ],
+        jnp.float32,
+    )
+    ids = jnp.asarray([[8, 9, 10, 11, 12, 13]], jnp.int32)
+    generic = local_topk_candidates(scores, ids, 3)
+    ordered = local_topk_candidates(
+        scores,
+        ids,
+        3,
+        ids_are_sorted=True,
+    )
+    np.testing.assert_array_equal(ordered.latent_ids, generic.latent_ids)
+    np.testing.assert_allclose(ordered.values, generic.values)
+
+    jaxpr = str(
+        jax.make_jaxpr(
+            lambda value: local_topk_candidates(
+                value,
+                ids,
+                3,
+                ids_are_sorted=True,
+            )
+        )(scores)
+    )
+    assert "argsort" not in jaxpr
+    assert "sort[" not in jaxpr
+
+
 def test_condition_a_visibility_and_grouped_plan() -> None:
     cfg = tiny_config("A")
     # Every bank has distinct positive bias, so selected ids reveal exactly

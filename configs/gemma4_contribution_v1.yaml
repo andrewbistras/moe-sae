@@ -1,0 +1,264 @@
+schema_version: gemma4-contribution-run-config-v1
+protocol_id: gemma4-contribution-v1-20260724
+provenance:
+  model_id: google/gemma-4-26B-A4B
+  model_revision: 24548b62aa021d562695c04aaf7758a1ea47990b
+  tokenizer_path: google/gemma-4-26B-A4B
+  maxtext_base_commit: 48c7da3e28e8f57fe36ddf09d00eec53072a2ea0
+  maxtext_selected_outputs_patch_sha256: 9da1ec2a0792a569123093c8840c20d9ee09891854f2665a972d3d7340d8c42d
+  # Published branch: andrewbistras/maxtext:gemma4-contribution-v1
+  maxtext_fork_commit: 73bafe53569eb17dc18542f2568dd591a8db9e28
+  dataset_name: allenai/c4
+  dataset_config: en
+  dataset_revision: 1588ec454efa1a09f29cd18ddd04fe05fc8653a2
+  train_split: train
+  eval_split: validation
+model:
+  maxtext_model_name: gemma4-26b
+  num_decoder_layers: 30
+  hidden_size: 2816
+  num_query_heads: 16
+  num_kv_heads: 8
+  global_num_kv_heads: 2
+  head_dim: 256
+  global_head_dim: 512
+  mlp_dim: 2112
+  moe_mlp_dim: 704
+  num_routed_experts: 128
+  experts_per_token: 8
+  num_shared_experts: 1
+  target_layer_one_indexed: 15
+  sequence_length: 1024
+  sliding_window_size: 1024
+  dtype: bfloat16
+  weight_dtype: bfloat16
+  use_multimodal: false
+  scan_layers: false
+  pure_nnx_decoder: true
+  share_kv_projections: true
+  use_post_attn_norm: true
+  use_post_ffw_norm: true
+  dropout_rate: 0.0
+  load_balance_loss_weight: 0.0
+  norm_topk_prob: true
+  use_random_routing: false
+  float32_gate_logits: false
+  capacity_factor: -1.0
+  attention: dot_product
+  sparse_matmul: true
+  use_ring_of_experts: false
+  ragged_buffer_factor: -1.0
+  tensor_parallelism: 1
+  hash_routing: false
+  serve_quantization: false
+  float32_weight_sum: true
+  matmul_precision: default
+runtime:
+  capture_schema_version: gemma4-expert-contribution-v2
+  capture_site: routed_moe.selected_outputs.pre_router_weight
+  shared_capture_site: shared_expert.raw_output
+  max_shard_tokens: 16384
+  effective_batch_tokens: 16384
+  microbatch_tokens: 4096
+  writer_backlog_max_batches: 2
+  phase1_min_persisted_goodput_fraction: 0.85
+  phase1_min_auxiliary_throughput_fraction: 0.90
+  # No accelerator job may be authorized beyond ten minutes unless this exact
+  # graph/hardware/configuration has already passed the bounded MFU qualifier.
+  accelerator_mfu_policy: hard_gate_exact_graph_hardware_config
+  accelerator_min_useful_mfu: 0.10
+  accelerator_ungated_max_seconds: 600
+  accelerator_qualification_max_seconds: 600
+  router_order: weight_desc_expert_id_asc
+  pooled_centering: one_raw_expert_output_mean
+  contribution_loss: normalized_router_weighted_sse
+  router_weight_math_dtype: float32
+  topk_requires_strictly_positive: true
+  topk_tie_break: global_latent_id_ascending
+  capacity_margin_fraction: 0.10
+  capacity_overflow_policy: hard_error
+  phase2_min_g2_percent: 10.0
+  phase3_min_g2_percent: 10.0
+  phase3_max_c2_percent: 50.0
+  bootstrap_replicates: 20000
+  paired_confidence_level: 0.95
+optimizer:
+  parameter_dtype: bfloat16
+  matmul_dtype: bfloat16
+  moment_dtype: float32
+  reduction_dtype: float32
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1.0e-8
+  weight_decay: 0.0
+  global_gradient_clip: 1.0
+  peak_learning_rate: 0.0003
+  minimum_learning_rate: 0.00003
+  schedule: linear_warmup_cosine_decay
+  decoder_init: unit_norm_columns
+  encoder_init: decoder_transpose
+  bias_init: zeros
+  tangent_decoder_gradient_projection: true
+  decoder_column_renormalization: true
+pilot_layouts:
+  - condition: A
+    target: raw_selected_expert_output
+    bank_identity: true_expert_id
+    bank_count: 128
+    bank_width: 256
+    components_per_token: 8
+    topk_per_component: 2
+  - condition: R
+    target: raw_selected_expert_output
+    bank_identity: per_sequence_randomized_expert_id
+    bank_count: 128
+    bank_width: 256
+    components_per_token: 8
+    topk_per_component: 2
+  - condition: B
+    target: raw_selected_expert_output
+    bank_identity: router_rank
+    bank_count: 8
+    bank_width: 256
+    components_per_token: 8
+    topk_per_component: 2
+  - condition: F
+    target: raw_selected_expert_output
+    bank_identity: router_rank
+    bank_count: 8
+    bank_width: 4096
+    components_per_token: 8
+    topk_per_component: 2
+full_layouts:
+  - condition: A
+    target: raw_selected_expert_output
+    bank_identity: true_expert_id
+    bank_count: 128
+    bank_width: 1024
+    components_per_token: 8
+    topk_per_component: 8
+  - condition: R
+    target: raw_selected_expert_output
+    bank_identity: per_sequence_randomized_expert_id
+    bank_count: 128
+    bank_width: 1024
+    components_per_token: 8
+    topk_per_component: 8
+  - condition: B
+    target: raw_selected_expert_output
+    bank_identity: router_rank
+    bank_count: 8
+    bank_width: 1024
+    components_per_token: 8
+    topk_per_component: 8
+  - condition: F
+    target: raw_selected_expert_output
+    bank_identity: router_rank
+    bank_count: 8
+    bank_width: 16384
+    components_per_token: 8
+    topk_per_component: 8
+shared_q:
+  condition: Q
+  target: normalized_shared_branch
+  bank_identity: global_shared
+  bank_count: 1
+  bank_width: 8192
+  components_per_token: 1
+  topk_per_component: 64
+phases:
+  - ordinal: 1
+    name: phase1_smoke
+    extends_phase: null
+    train_tokens: 100000
+    eval_tokens: 25000
+    seeds: []
+    layout_set: none
+    planned_updates: null
+    warmup_updates: null
+    tail_mask_tokens: null
+    checkpoint_tokens: []
+    escalation_gates:
+      - all_capture_exactness_checks_pass
+      - bf16_roundtrip_bit_exact
+      - interrupted_resume_shard_identity
+      - multihost_ranges_no_gaps_or_duplicates
+      - no_routed_token_drops
+      - writer_queue_bounded
+      - persisted_goodput_ge_0.85_device_output
+      - no_recompilation_after_warmup
+      - auxiliary_tokens_per_second_ge_0.90_writer_disabled
+    blind_relative_quality_until_health: false
+    require_f_compile_smoke: false
+    shared_q_resume_phase: null
+  - ordinal: 2
+    name: phase2_mechanism_pilot
+    extends_phase: phase1_smoke
+    train_tokens: 2000000
+    eval_tokens: 250000
+    seeds: [0]
+    layout_set: pilot
+    planned_updates: 123
+    # Protocol clarification: 12 updates, rather than inheriting the old
+    # 250-update warmup and leaving this entire 123-update pilot in warmup.
+    warmup_updates: 12
+    tail_mask_tokens: 15232
+    checkpoint_tokens: [2000000]
+    escalation_gates:
+      - all_conditions_finite_exact_l0_no_overflow_falling_loss
+      - a_minus_r_positive
+      - a_minus_r_paired_sequence_ci_excludes_zero
+      - a_minus_b_positive
+      - a_minus_b_paired_sequence_ci_excludes_zero
+      - f_minus_b_positive
+      - f_minus_b_paired_sequence_ci_excludes_zero
+      - g2_ge_10_percent
+      - a_minus_b_sign_agrees_on_recomposed_routed_ev
+      - coverage_requirements_pass
+    blind_relative_quality_until_health: true
+    require_f_compile_smoke: true
+    shared_q_resume_phase: null
+  - ordinal: 3
+    name: phase3_full_width_pilot
+    extends_phase: phase2_mechanism_pilot
+    train_tokens: 10000000
+    eval_tokens: 1000000
+    seeds: [0]
+    layout_set: full
+    planned_updates: 611
+    warmup_updates: 61
+    tail_mask_tokens: 10624
+    checkpoint_tokens: [2000000, 5000000, 10000000]
+    escalation_gates:
+      - all_phase2_directional_gates_pass
+      - g2_ge_10_percent
+      - c2_lt_50_percent
+      - a_learning_curve_has_no_material_late_collapse
+    blind_relative_quality_until_health: true
+    require_f_compile_smoke: false
+    shared_q_resume_phase: phase2_mechanism_pilot
+  - ordinal: 4
+    name: phase4_confirmatory
+    extends_phase: phase3_full_width_pilot
+    train_tokens: 50000000
+    eval_tokens: 2000000
+    seeds: [1, 2, 3]
+    layout_set: full
+    planned_updates: 3052
+    warmup_updates: 250
+    tail_mask_tokens: 3968
+    checkpoint_tokens:
+      - 2000000
+      - 5000000
+      - 10000000
+      - 20000000
+      - 30000000
+      - 40000000
+      - 50000000
+    escalation_gates:
+      - all_conditions_pass_health_before_unblinding
+      - three_seed_report_complete
+      - unstable_denominator_labeled_when_required
+    blind_relative_quality_until_health: true
+    require_f_compile_smoke: false
+    shared_q_resume_phase: null

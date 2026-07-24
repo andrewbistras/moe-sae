@@ -53,7 +53,7 @@ HARVEST_MESHES = (
     MeshCandidate("ep8-fsdp2-tp1", 8, 2, 1),
     MeshCandidate("ep8-fsdp1-tp2", 8, 1, 2),
 )
-PER_DEVICE_SEQUENCE_BATCHES = (1, 2, 4)
+PER_DEVICE_SEQUENCE_BATCHES = (1, 2, 4, 8)
 
 
 @dataclass(frozen=True, slots=True)
@@ -454,7 +454,7 @@ def build_maxtext_argv(
     if not checkpoint_path:
         raise ValueError("checkpoint_path is required")
     if per_device_sequence_batch not in PER_DEVICE_SEQUENCE_BATCHES:
-        raise ValueError("per-device sequence batch must be one of 1, 2, or 4")
+        raise ValueError("per-device sequence batch must be one of 1, 2, 4, or 8")
     if not synthetic and (not grain_train_files or not grain_eval_files):
         raise ValueError("pre-staged Grain train and eval files are required")
     argv = [base_config_path or maxtext_base_config_path()]

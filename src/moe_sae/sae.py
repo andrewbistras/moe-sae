@@ -379,7 +379,11 @@ def positive_topk(scores: jax.Array, latent_ids: jax.Array, k: int) -> Selection
 
 
 def local_topk_candidates(
-    local_scores: jax.Array, global_latent_ids: jax.Array, k: int
+    local_scores: jax.Array,
+    global_latent_ids: jax.Array,
+    k: int,
+    *,
+    ids_are_sorted: bool = False,
 ) -> Selection:
     """Return up to k deterministic candidates from one feature shard.
 
@@ -394,9 +398,10 @@ def local_topk_candidates(
         ids = jnp.broadcast_to(ids[None, :], scores.shape)
     if scores.shape[1] < k:
         raise ValueError("each feature shard must contain at least k candidates")
-    order = jnp.argsort(ids, axis=1, stable=True)
-    ids = jnp.take_along_axis(ids, order, axis=1)
-    scores = jnp.take_along_axis(scores, order, axis=1)
+    if not ids_are_sorted:
+        order = jnp.argsort(ids, axis=1, stable=True)
+        ids = jnp.take_along_axis(ids, order, axis=1)
+        scores = jnp.take_along_axis(scores, order, axis=1)
 
     positive = scores > 0.0
     ranked = jnp.where(positive, scores, -jnp.inf)
@@ -418,7 +423,11 @@ def local_topk_candidates(
 
 
 def merge_feature_shard_topk(
-    shard_values: jax.Array, shard_ids: jax.Array, k: int
+    shard_values: jax.Array,
+    shard_ids: jax.Array,
+    k: int,
+    *,
+    ids_are_sorted: bool = False,
 ) -> Selection:
     """Merge ``[shards, tokens, k]`` local candidates into exact global TopK."""
 
@@ -428,7 +437,12 @@ def merge_feature_shard_topk(
         raise ValueError("shard values/ids must have equal [shards, tokens, k] shape")
     values = jnp.swapaxes(values, 0, 1).reshape(values.shape[1], -1)
     ids = jnp.swapaxes(ids, 0, 1).reshape(ids.shape[1], -1)
-    # Sentinel ids have zero values and therefore cannot be selected.
+    # Sentinel ids have zero values and therefore cannot be selected.  When
+    # feature shards own contiguous ranges and each local selection is emitted
+    # in ascending ID order, the shard-major flatten is already globally
+    # sorted and the expensive second argsort is unnecessary.
+    if ids_are_sorted:
+        return _positive_topk_sorted_ids(values, ids, k)
     return positive_topk(values, ids, k)
 
 

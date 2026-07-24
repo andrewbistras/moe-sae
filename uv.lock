@@ -1754,7 +1754,7 @@ wheels = [
 [[package]]
 name = "maxtext"
 version = "0.2.3"
-source = { git = "https://github.com/AI-Hypercomputer/maxtext.git?rev=48c7da3e28e8f57fe36ddf09d00eec53072a2ea0#48c7da3e28e8f57fe36ddf09d00eec53072a2ea0" }
+source = { git = "https://github.com/andrewbistras/maxtext.git?rev=73bafe53569eb17dc18542f2568dd591a8db9e28#73bafe53569eb17dc18542f2568dd591a8db9e28" }
 
 [package.optional-dependencies]
 tpu = [
@@ -2120,8 +2120,8 @@ requires-dist = [
     { name = "huggingface-hub", marker = "extra == 'conversion'", specifier = "==1.23.0" },
     { name = "huggingface-hub", marker = "extra == 'data'", specifier = "==1.23.0" },
     { name = "jax", specifier = ">=0.8.0,<0.11" },
-    { name = "maxtext", extras = ["tpu"], marker = "extra == 'conversion'", git = "https://github.com/AI-Hypercomputer/maxtext.git?rev=48c7da3e28e8f57fe36ddf09d00eec53072a2ea0" },
-    { name = "maxtext", extras = ["tpu"], marker = "extra == 'tpu'", git = "https://github.com/AI-Hypercomputer/maxtext.git?rev=48c7da3e28e8f57fe36ddf09d00eec53072a2ea0" },
+    { name = "maxtext", extras = ["tpu"], marker = "extra == 'conversion'", git = "https://github.com/andrewbistras/maxtext.git?rev=73bafe53569eb17dc18542f2568dd591a8db9e28" },
+    { name = "maxtext", extras = ["tpu"], marker = "extra == 'tpu'", git = "https://github.com/andrewbistras/maxtext.git?rev=73bafe53569eb17dc18542f2568dd591a8db9e28" },
     { name = "numpy", specifier = ">=2.0" },
     { name = "orbax-checkpoint", marker = "extra == 'tpu'", specifier = ">=0.12.1,<0.13" },
     { name = "pyyaml", specifier = ">=6.0" },
