@@ -329,6 +329,8 @@ def test_real_context_contains_the_patched_prefix_benchmark_closure() -> None:
     assert "--no-build-isolation" in provisioner
     assert "/usr/local/lib/moe-sae-r1/$MAXTEXT_WHEEL_NAME" in provisioner
     assert '"uv $UV_VERSION (x86_64-unknown-linux-gnu)"' in provisioner
+    assert 'chmod -R u=rwX,go=rX "$PREFIX"' in provisioner
+    assert '/usr/sbin/runuser --user "$RUNTIME_USER"' in provisioner
 
     service = (
         REPOSITORY / "deploy/r1/systemd/moe-sae-r1.service"

@@ -858,6 +858,8 @@ def validate_runtime_bundle(repository_root: str | Path) -> RuntimeBundleIdentit
         "runtime archive does not contain the exact member allowlist",
         "--no-same-owner",
         "--no-same-permissions",
+        "chmod -r u=rwx,go=rx",
+        "/usr/sbin/runuser --user",
     )
     if any(token not in provisioner for token in required_provisioner):
         raise RuntimeBundleError(

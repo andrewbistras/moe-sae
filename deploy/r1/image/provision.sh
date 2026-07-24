@@ -47,7 +47,7 @@ sha256_file() {
 
 # The exact base image must already contain this small build tool surface. The
 # provisioner never consults a moving OS package repository.
-for command in awk chmod chown curl find git groupadd install mktemp sed sha256sum systemctl systemd-analyze tar useradd; do
+for command in awk chmod chown curl find git groupadd install mktemp runuser sed sha256sum systemctl systemd-analyze tar useradd; do
   command -v "$command" >/dev/null 2>&1 || die "base image lacks $command"
 done
 [[ -x /usr/bin/python3 ]] || die "base image lacks /usr/bin/python3"
@@ -520,7 +520,10 @@ systemd-analyze verify /etc/systemd/system/moe-sae-r1.service
 systemctl enable moe-sae-r1.service
 
 chown -R root:root "$PREFIX" /usr/local/lib/moe-sae-r1
-chmod -R go-w "$PREFIX" /usr/local/lib/moe-sae-r1
+chmod -R u=rwX,go=rX "$PREFIX" /usr/local/lib/moe-sae-r1
+/usr/sbin/runuser --user "$RUNTIME_USER" -- \
+  "$ENV_DIR/bin/python" -I -c \
+  'import os; import jax; import maxtext; from moe_sae.r1.runtime_entrypoint import EXPECTED_UID; assert os.getuid() == EXPECTED_UID'
 "$ENV_DIR/bin/python" "$SOURCE_DIR/image/measure_image.py"
 find /tmp -maxdepth 1 -type f \
   \( -name 'moe-sae-r1-runtime.tar' -o \
