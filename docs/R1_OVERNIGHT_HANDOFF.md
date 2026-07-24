@@ -91,6 +91,34 @@ steps. For the frozen full B128×1024 workload, 51% MFU requires an aggregate
 step time no greater than 163.551 ms. Allocation, compile, output validation,
 and warmups are reported separately.
 
+For the first image qualification, run
+`scripts/r1/qualify_v6e_mig.sh` on the persistent controller. The script is
+deliberately narrower than the production launch protocol: it observes one
+already-created bulk MIG, requires exactly 16 running members and an `ACTIVE`
+8×8 topology, then starts the fixed command above on all private workers under
+systemd. It cannot create, repair, resize, or delete TPU resources. Its bounded
+journals, statuses, and sole process-zero JSON remain on the controller disk,
+so a failed compile or preemption produces no GCS upload bill. Override only
+its named environment inputs when qualifying a later immutable template or
+mesh:
+
+```zsh
+sudo env \
+  PROJECT=neural-dragnet \
+  ZONE=us-east1-d \
+  MIG=r1-v6e-bench-27e25e5-ue1d-a1 \
+  EXPECTED_TEMPLATE=r1-v6e-spot-stop-27e25e5-us-east1-v1 \
+  ATTEMPT=ue1d-a1-ep16-fsdp4 \
+  MESH=EP16/FSDP4 \
+  /usr/local/sbin/qualify_v6e_mig.sh
+```
+
+The Compute API rejects Spot `DELETE` for members of a managed instance group,
+despite the standalone TPU Spot guide recommending it. The executable template
+therefore uses `STOP` plus MIG `DO_NOTHING`. A stopped member is never resumed:
+the controller treats it as whole-slice loss and requires a fresh MIG, launch
+reference, and fence.
+
 Do not stage the real checkpoint until this ladder identifies a viable layout.
 Afterward, run the same winner through the generation-pinned 44-leaf restore,
 record cache remote/local byte counters, perform full-prefix parity, and only
