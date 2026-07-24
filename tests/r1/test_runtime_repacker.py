@@ -634,6 +634,290 @@ def test_default_runner_reports_bounded_subprocess_diagnostics(
     assert "x" * 4097 not in str(failure.value)
 
 
+def test_worker_permissions_are_normalized_for_the_runtime_identity(
+    tmp_path: Path,
+) -> None:
+    site = tmp_path / "runtime/lib/python3.12/site-packages"
+    package = site / "moe_sae"
+    nested = package / "r1"
+    dist_info = site / "moe_sae_r1_worker-0.1.0.dist-info"
+    nested.mkdir(parents=True)
+    dist_info.mkdir()
+    package_file = nested / "worker.py"
+    metadata_file = dist_info / "METADATA"
+    package_file.write_bytes(b"VALUE = 1\n")
+    metadata_file.write_bytes(b"Name: moe-sae-r1-worker\n")
+    for directory in (package, nested, dist_info):
+        directory.chmod(0o700)
+    for file_path in (package_file, metadata_file):
+        file_path.chmod(0o600)
+
+    repacker._normalize_worker_permissions(
+        tmp_path / "runtime",
+        owner_uid=os.geteuid(),
+        owner_gid=os.getegid(),
+    )
+
+    for directory in (package, nested, dist_info):
+        assert stat.S_IMODE(directory.stat().st_mode) == 0o755
+    for file_path in (package_file, metadata_file):
+        assert stat.S_IMODE(file_path.stat().st_mode) == 0o644
+    repacker._require_worker_permissions_exact(
+        tmp_path / "runtime",
+        owner_uid=os.geteuid(),
+        owner_gid=os.getegid(),
+    )
+
+
+def test_worker_permission_normalization_rejects_a_symlink(
+    tmp_path: Path,
+) -> None:
+    site = tmp_path / "runtime/lib/python3.12/site-packages"
+    package = site / "moe_sae"
+    dist_info = site / "moe_sae_r1_worker-0.1.0.dist-info"
+    package.mkdir(parents=True)
+    dist_info.mkdir()
+    (package / "escape").symlink_to(tmp_path, target_is_directory=True)
+
+    with pytest.raises(repacker.RepackError, match="directory is unsafe"):
+        repacker._normalize_worker_permissions(
+            tmp_path / "runtime",
+            owner_uid=os.geteuid(),
+            owner_gid=os.getegid(),
+        )
+
+
+def test_worker_permission_normalization_rejects_a_hard_link(
+    tmp_path: Path,
+) -> None:
+    site = tmp_path / "runtime/lib/python3.12/site-packages"
+    package = site / "moe_sae"
+    dist_info = site / "moe_sae_r1_worker-0.1.0.dist-info"
+    package.mkdir(parents=True)
+    dist_info.mkdir()
+    protected = site / "protected_distribution.py"
+    protected.write_bytes(b"protected\n")
+    protected.chmod(0o600)
+    os.link(protected, package / "worker.py")
+
+    with pytest.raises(repacker.RepackError, match="worker file is unsafe"):
+        repacker._normalize_worker_permissions(
+            tmp_path / "runtime",
+            owner_uid=os.geteuid(),
+            owner_gid=os.getegid(),
+        )
+    assert stat.S_IMODE(protected.stat().st_mode) == 0o600
+
+
+def test_runtime_import_probe_drops_to_the_admitted_identity() -> None:
+    calls: list[tuple[str, ...]] = []
+    expected_imports = [
+        {
+            "installed_path": f"lib/{name}.py",
+            "module": name,
+            "sha256": "a" * 64,
+        }
+        for name in repacker._IMPORT_PROBES
+    ]
+
+    def runner(argv: object, environment: object) -> subprocess.CompletedProcess[str]:
+        del environment
+        command = tuple(argv)  # type: ignore[arg-type]
+        calls.append(command)
+        payload = {
+            "egid": repacker.RUNTIME_GID,
+            "euid": repacker.RUNTIME_UID,
+            "gid": repacker.RUNTIME_GID,
+            "groups": [repacker.RUNTIME_GID],
+            "modules": [
+                {"installed_path": f"lib/{name}.py", "module": name}
+                for name in repacker._IMPORT_PROBES
+            ],
+            "resgid": [repacker.RUNTIME_GID] * 3,
+            "resuid": [repacker.RUNTIME_UID] * 3,
+            "uid": repacker.RUNTIME_UID,
+        }
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            json.dumps(payload, sort_keys=True, separators=(",", ":")),
+            "",
+        )
+
+    result = repacker.verify_runtime_user_imports(
+        Path("/opt/moe-sae-r1/runtime/bin/python"),
+        Path("/opt/moe-sae-r1/runtime"),
+        expected_imports,
+        runner=runner,
+    )
+
+    assert result["uid"] == 20_001
+    assert result["gid"] == 20_001
+    assert len(calls) == 1
+    assert calls[0][:4] == (
+        "/usr/sbin/runuser",
+        "--user",
+        "moe_sae",
+        "--",
+    )
+    assert "/opt/moe-sae-r1/runtime/bin/python" in calls[0]
+
+
+def test_runtime_import_probe_rejects_the_wrong_effective_identity() -> None:
+    expected_imports = [
+        {
+            "installed_path": f"lib/{name}.py",
+            "module": name,
+            "sha256": "a" * 64,
+        }
+        for name in repacker._IMPORT_PROBES
+    ]
+
+    def runner(argv: object, environment: object) -> subprocess.CompletedProcess[str]:
+        del environment
+        payload = {
+            "egid": 0,
+            "euid": 0,
+            "gid": 0,
+            "groups": [0],
+            "modules": [
+                {"installed_path": f"lib/{name}.py", "module": name}
+                for name in repacker._IMPORT_PROBES
+            ],
+            "resgid": [0] * 3,
+            "resuid": [0] * 3,
+            "uid": 0,
+        }
+        return subprocess.CompletedProcess(
+            tuple(argv),  # type: ignore[arg-type]
+            0,
+            json.dumps(payload, sort_keys=True, separators=(",", ":")),
+            "",
+        )
+
+    with pytest.raises(repacker.RepackError, match="wrong identity"):
+        repacker.verify_runtime_user_imports(
+            Path("/opt/moe-sae-r1/runtime/bin/python"),
+            Path("/opt/moe-sae-r1/runtime"),
+            expected_imports,
+            runner=runner,
+        )
+
+
+def test_runtime_import_probe_rejects_a_supplementary_root_group() -> None:
+    expected_imports = [
+        {
+            "installed_path": f"lib/{name}.py",
+            "module": name,
+            "sha256": "a" * 64,
+        }
+        for name in repacker._IMPORT_PROBES
+    ]
+
+    def runner(argv: object, environment: object) -> subprocess.CompletedProcess[str]:
+        del environment
+        payload = {
+            "egid": repacker.RUNTIME_GID,
+            "euid": repacker.RUNTIME_UID,
+            "gid": repacker.RUNTIME_GID,
+            "groups": [0, repacker.RUNTIME_GID],
+            "modules": [
+                {"installed_path": item["installed_path"], "module": item["module"]}
+                for item in expected_imports
+            ],
+            "resgid": [repacker.RUNTIME_GID] * 3,
+            "resuid": [repacker.RUNTIME_UID] * 3,
+            "uid": repacker.RUNTIME_UID,
+        }
+        return subprocess.CompletedProcess(
+            tuple(argv),  # type: ignore[arg-type]
+            0,
+            json.dumps(payload, sort_keys=True, separators=(",", ":")),
+            "",
+        )
+
+    with pytest.raises(repacker.RepackError, match="wrong identity"):
+        repacker.verify_runtime_user_imports(
+            Path("/opt/moe-sae-r1/runtime/bin/python"),
+            Path("/opt/moe-sae-r1/runtime"),
+            expected_imports,
+            runner=runner,
+        )
+
+
+def test_runtime_import_probe_binds_root_verified_module_origins() -> None:
+    expected_imports = [
+        {
+            "installed_path": f"lib/{name}.py",
+            "module": name,
+            "sha256": "a" * 64,
+        }
+        for name in repacker._IMPORT_PROBES
+    ]
+
+    def runner(argv: object, environment: object) -> subprocess.CompletedProcess[str]:
+        del environment
+        mismatched = [
+            {"installed_path": item["installed_path"], "module": item["module"]}
+            for item in expected_imports
+        ]
+        mismatched[0]["installed_path"] = "lib/wrong.py"
+        payload = {
+            "egid": repacker.RUNTIME_GID,
+            "euid": repacker.RUNTIME_UID,
+            "gid": repacker.RUNTIME_GID,
+            "groups": [],
+            "modules": mismatched,
+            "resgid": [repacker.RUNTIME_GID] * 3,
+            "resuid": [repacker.RUNTIME_UID] * 3,
+            "uid": repacker.RUNTIME_UID,
+        }
+        return subprocess.CompletedProcess(
+            tuple(argv),  # type: ignore[arg-type]
+            0,
+            json.dumps(payload, sort_keys=True, separators=(",", ":")),
+            "",
+        )
+
+    with pytest.raises(repacker.RepackError, match="wrong identity"):
+        repacker.verify_runtime_user_imports(
+            Path("/opt/moe-sae-r1/runtime/bin/python"),
+            Path("/opt/moe-sae-r1/runtime"),
+            expected_imports,
+            runner=runner,
+        )
+
+
+def test_runtime_identity_requires_the_exact_runuser_executable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = SimpleNamespace(
+        pw_uid=repacker.RUNTIME_UID,
+        pw_gid=repacker.RUNTIME_GID,
+        pw_dir=repacker.RUNTIME_HOME,
+        pw_shell=repacker.RUNTIME_SHELL,
+    )
+    monkeypatch.setattr(repacker.pwd, "getpwnam", lambda _name: identity)
+    runuser = tmp_path / "runuser"
+    runuser.write_bytes(b"executable\n")
+    runuser.chmod(0o755)
+
+    repacker.require_runtime_identity(
+        runuser=runuser,
+        owner_uid=os.geteuid(),
+        owner_gid=os.getegid(),
+    )
+
+    runuser.chmod(0o775)
+    with pytest.raises(repacker.RepackError, match="executable is unsafe"):
+        repacker.require_runtime_identity(
+            runuser=runuser,
+            owner_uid=os.geteuid(),
+            owner_gid=os.getegid(),
+        )
+
+
 def test_installed_worker_tree_rejects_unrecorded_stale_file(
     tmp_path: Path,
 ) -> None:

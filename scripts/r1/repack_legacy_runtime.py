@@ -27,6 +27,7 @@ import io
 import json
 import os
 import posixpath
+import pwd
 import re
 import shutil
 import stat
@@ -47,6 +48,12 @@ REPACKER_PROTOCOL_VERSION = 1
 CONTEXT_MANIFEST_SCHEMA = "moe-sae.r1.runtime-context-manifest.v1"
 WORKER_DISTRIBUTION = "moe-sae-r1-worker"
 WORKER_VERSION = "0.1.0"
+RUNTIME_USER = "moe_sae"
+RUNTIME_UID = 20_001
+RUNTIME_GID = 20_001
+RUNTIME_HOME = "/var/lib/moe-sae-r1"
+RUNTIME_SHELL = "/usr/sbin/nologin"
+RUNUSER = Path("/usr/sbin/runuser")
 SOURCE_DATE_EPOCH = 315_532_800  # 1980-01-01, also the ZIP timestamp floor.
 MAX_CONTEXT_ARCHIVE_BYTES = 16 * 1024 * 1024
 MAX_CONTEXT_FILE_BYTES = 2 * 1024 * 1024
@@ -1157,6 +1164,108 @@ def _remove_worker_bytecode(environment: Path) -> None:
         shutil.rmtree(candidate)
 
 
+def _worker_install_entries(
+    environment: Path,
+    *,
+    owner_uid: int = 0,
+    owner_gid: int = 0,
+) -> tuple[tuple[Path, ...], tuple[Path, ...]]:
+    environment_root = environment.resolve(strict=True)
+    site_packages = list(environment.glob("lib/python*/site-packages"))
+    if len(site_packages) != 1:
+        raise RepackError("runtime site-packages root is absent or ambiguous")
+    site_root = site_packages[0]
+    roots = (
+        site_root / "moe_sae",
+        site_root / "moe_sae_r1_worker-0.1.0.dist-info",
+    )
+    directories: list[Path] = []
+    files: list[Path] = []
+    for package_root in roots:
+        if package_root.is_symlink() or not package_root.is_dir():
+            raise RepackError("installed worker root is absent or unsafe")
+        try:
+            package_root.resolve(strict=True).relative_to(environment_root)
+        except ValueError as error:
+            raise RepackError("installed worker root escapes the runtime") from error
+        for root, child_directories, child_files in os.walk(
+            package_root,
+            followlinks=False,
+        ):
+            child_directories.sort()
+            child_files.sort()
+            root_path = Path(root)
+            observed_root = root_path.lstat()
+            if (
+                not stat.S_ISDIR(observed_root.st_mode)
+                or observed_root.st_uid != owner_uid
+                or observed_root.st_gid != owner_gid
+            ):
+                raise RepackError("installed worker directory ownership is unsafe")
+            directories.append(root_path)
+            for child in child_directories:
+                observed = (root_path / child).lstat()
+                if (
+                    not stat.S_ISDIR(observed.st_mode)
+                    or stat.S_ISLNK(observed.st_mode)
+                    or observed.st_uid != owner_uid
+                    or observed.st_gid != owner_gid
+                ):
+                    raise RepackError("installed worker directory is unsafe")
+            for child in child_files:
+                candidate = root_path / child
+                observed = candidate.lstat()
+                if (
+                    not stat.S_ISREG(observed.st_mode)
+                    or stat.S_ISLNK(observed.st_mode)
+                    or observed.st_nlink != 1
+                    or observed.st_uid != owner_uid
+                    or observed.st_gid != owner_gid
+                ):
+                    raise RepackError("installed worker file is unsafe")
+                files.append(candidate)
+    return tuple(directories), tuple(files)
+
+
+def _require_worker_permissions_exact(
+    environment: Path,
+    *,
+    owner_uid: int = 0,
+    owner_gid: int = 0,
+) -> None:
+    directories, files = _worker_install_entries(
+        environment,
+        owner_uid=owner_uid,
+        owner_gid=owner_gid,
+    )
+    if any(_mode(path) != 0o755 for path in directories):
+        raise RepackError("installed worker directory mode is not 0755")
+    if any(_mode(path) != 0o644 for path in files):
+        raise RepackError("installed worker file mode is not 0644")
+
+
+def _normalize_worker_permissions(
+    environment: Path,
+    *,
+    owner_uid: int = 0,
+    owner_gid: int = 0,
+) -> None:
+    directories, files = _worker_install_entries(
+        environment,
+        owner_uid=owner_uid,
+        owner_gid=owner_gid,
+    )
+    for directory in directories:
+        os.chmod(directory, 0o755)
+    for file_path in files:
+        os.chmod(file_path, 0o644)
+    _require_worker_permissions_exact(
+        environment,
+        owner_uid=owner_uid,
+        owner_gid=owner_gid,
+    )
+
+
 def _require_worker_filesystem_exact(
     environment: Path,
     worker: Mapping[str, object],
@@ -1240,6 +1349,57 @@ print(json.dumps(result, sort_keys=True, separators=(",", ":"), ensure_ascii=Fal
 """
 
 
+_RUNTIME_USER_IMPORT_PROGRAM = r"""
+from __future__ import annotations
+import importlib
+import json
+import os
+from pathlib import Path
+import sys
+
+environment = Path(sys.argv[1]).resolve(strict=True)
+expected_uid = int(sys.argv[2])
+expected_gid = int(sys.argv[3])
+groups = sorted(os.getgroups())
+resuid = list(os.getresuid())
+resgid = list(os.getresgid())
+if (
+    os.getuid() != expected_uid
+    or os.geteuid() != expected_uid
+    or os.getgid() != expected_gid
+    or os.getegid() != expected_gid
+    or resuid != [expected_uid, expected_uid, expected_uid]
+    or resgid != [expected_gid, expected_gid, expected_gid]
+    or any(group != expected_gid for group in groups)
+):
+    raise RuntimeError("runtime import probe did not drop to the admitted identity")
+result = []
+for name in sys.argv[4:]:
+    module = importlib.import_module(name)
+    raw_path = getattr(module, "__file__", None)
+    if not isinstance(raw_path, str):
+        raise RuntimeError(f"module has no origin: {name}")
+    installed = Path(raw_path).resolve(strict=True)
+    installed_relative = installed.relative_to(environment).as_posix()
+    result.append({"module": name, "installed_path": installed_relative})
+print(json.dumps(
+    {
+        "egid": os.getegid(),
+        "euid": os.geteuid(),
+        "gid": os.getgid(),
+        "groups": groups,
+        "modules": result,
+        "resgid": resgid,
+        "resuid": resuid,
+        "uid": os.getuid(),
+    },
+    sort_keys=True,
+    separators=(",", ":"),
+    ensure_ascii=False,
+))
+"""
+
+
 def verify_import_identity(
     runtime_python: Path,
     environment: Path,
@@ -1273,6 +1433,115 @@ def verify_import_identity(
         raise RepackError("import probe returned malformed JSON") from error
     if not isinstance(value, list) or len(value) != len(modules):
         raise RepackError("import probe returned an incomplete module set")
+    return value
+
+
+def require_runtime_identity(
+    *,
+    runuser: Path = RUNUSER,
+    owner_uid: int = 0,
+    owner_gid: int = 0,
+) -> None:
+    try:
+        identity = pwd.getpwnam(RUNTIME_USER)
+    except KeyError as error:
+        raise RepackError("runtime user is absent") from error
+    if (
+        identity.pw_uid != RUNTIME_UID
+        or identity.pw_gid != RUNTIME_GID
+        or identity.pw_dir != RUNTIME_HOME
+        or identity.pw_shell != RUNTIME_SHELL
+    ):
+        raise RepackError("runtime user identity drifted")
+    try:
+        observed = runuser.lstat()
+    except FileNotFoundError as error:
+        raise RepackError("runuser is absent") from error
+    if (
+        not stat.S_ISREG(observed.st_mode)
+        or runuser.is_symlink()
+        or stat.S_IMODE(observed.st_mode) != 0o755
+        or observed.st_uid != owner_uid
+        or observed.st_gid != owner_gid
+    ):
+        raise RepackError("runuser executable is unsafe")
+
+
+def verify_runtime_user_imports(
+    runtime_python: Path,
+    environment: Path,
+    expected_imports: Sequence[Mapping[str, object]],
+    *,
+    runner: CommandRunner = _default_runner,
+) -> Mapping[str, object]:
+    expected_origins: list[dict[str, str]] = []
+    modules: list[str] = []
+    for item in expected_imports:
+        module = item.get("module")
+        installed_path = item.get("installed_path")
+        if (
+            not isinstance(module, str)
+            or not isinstance(installed_path, str)
+            or module not in _IMPORT_PROBES
+        ):
+            raise RepackError("root import probe identity is malformed")
+        modules.append(module)
+        expected_origins.append({"installed_path": installed_path, "module": module})
+    if tuple(modules) != _IMPORT_PROBES:
+        raise RepackError("root import probe module order drifted")
+    result = runner(
+        (
+            str(RUNUSER),
+            "--user",
+            RUNTIME_USER,
+            "--",
+            str(runtime_python),
+            "-I",
+            "-B",
+            "-c",
+            _RUNTIME_USER_IMPORT_PROGRAM,
+            str(environment),
+            str(RUNTIME_UID),
+            str(RUNTIME_GID),
+            *modules,
+        ),
+        {
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "PATH": "/usr/bin:/bin",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONNOUSERSITE": "1",
+        },
+    )
+    try:
+        value = json.loads(result.stdout, object_pairs_hook=_strict_pairs)
+    except json.JSONDecodeError as error:
+        raise RepackError(
+            "runtime-user import probe returned malformed JSON"
+        ) from error
+    if (
+        not isinstance(value, dict)
+        or set(value)
+        != {
+            "egid",
+            "euid",
+            "gid",
+            "groups",
+            "modules",
+            "resgid",
+            "resuid",
+            "uid",
+        }
+        or value["uid"] != RUNTIME_UID
+        or value["euid"] != RUNTIME_UID
+        or value["gid"] != RUNTIME_GID
+        or value["egid"] != RUNTIME_GID
+        or value["resuid"] != [RUNTIME_UID, RUNTIME_UID, RUNTIME_UID]
+        or value["resgid"] != [RUNTIME_GID, RUNTIME_GID, RUNTIME_GID]
+        or value["groups"] not in ([], [RUNTIME_GID])
+        or value["modules"] != expected_origins
+    ):
+        raise RepackError("runtime-user import probe returned the wrong identity")
     return value
 
 
@@ -1663,6 +1932,7 @@ def repack(
     before_digest = _inventory_digest(before)
     protected_before = _protected_inventory(before)
     protected_digest = _inventory_digest(protected_before)
+    require_runtime_identity()
 
     request.work_root.mkdir(mode=0o700, parents=True)
     _atomic_write(
@@ -1725,12 +1995,14 @@ def repack(
         runner=runner,
     )
     _remove_worker_bytecode(environment)
+    _normalize_worker_permissions(environment)
     after = installed_inventory(runtime_python, environment, runner=runner)
     require_critical_versions(after)
     if _protected_inventory(after) != protected_before:
         raise RepackError("worker install mutated a protected distribution")
     worker_after = _distribution(after, WORKER_DISTRIBUTION)
     _require_worker_filesystem_exact(environment, worker_after)
+    _require_worker_permissions_exact(environment)
     if (
         _installed_worker_package_payload_sha256(worker_after)
         != wheel.package_payload_sha256
@@ -1741,6 +2013,12 @@ def repack(
         runtime_python,
         environment,
         target_source,
+        runner=runner,
+    )
+    runtime_user_import_probe = verify_runtime_user_imports(
+        runtime_python,
+        environment,
+        import_probe,
         runner=runner,
     )
     release_inventory = installed_inventory(
@@ -1754,6 +2032,7 @@ def repack(
         raise RepackError("release-boundary protected inventory changed")
     worker_release = _distribution(release_inventory, WORKER_DISTRIBUTION)
     _require_worker_filesystem_exact(environment, worker_release)
+    _require_worker_permissions_exact(environment)
     if (
         _installed_worker_package_payload_sha256(worker_release)
         != wheel.package_payload_sha256
@@ -1833,11 +2112,15 @@ def repack(
                     _protected_inventory(release_inventory)
                 ),
                 "import_probe_sha256": _sha256_bytes(_canonical_bytes(import_probe)),
+                "runtime_user_import_probe_sha256": _sha256_bytes(
+                    _canonical_bytes(runtime_user_import_probe)
+                ),
             },
             "invariants": {
                 "context_delta": "src/moe_sae/** plus exact inert image validators",
                 "inert_context_deltas": list(inert_context_deltas),
                 "install": "uv pip install --offline --no-deps --reinstall",
+                "runtime_user": "moe_sae:20001:20001",
                 "archive": "GNU-tar+gzip; uid/gid/mtime=0; gzip-mtime=0",
                 "python_version": observation.get("python_version"),
                 "uv_version": recipe.get("uv_version"),
