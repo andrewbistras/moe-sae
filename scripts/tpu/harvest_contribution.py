@@ -38,10 +38,10 @@ QUALIFICATION_RECEIPT_SCHEMA_VERSION = (
     "gemma4-contribution-performance-qualification-v2"
 )
 COORDINATOR_BUNDLE_SCHEMA_VERSION = (
-    "gemma4-contribution-qualification-coordinator-bundle-v3"
+    "gemma4-contribution-qualification-coordinator-bundle-v4"
 )
 OPERATOR_DECISION_SCHEMA_VERSION = (
-    "gemma4-contribution-qualification-operator-decision-v1"
+    "gemma4-contribution-qualification-operator-decision-v2"
 )
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -109,29 +109,33 @@ class Settings:
             f"{self.phase}/{self.split}/{self.attempt_id}"
         )
 
-    def local_host_buffer(self, process_index: int) -> str:
-        return f"{self.local_attempt_root}/host-p{process_index:05d}/buffer"
+    def local_controller_buffer(self, controller_index: int) -> str:
+        return (
+            f"{self.local_attempt_root}/" f"controller-c{controller_index:05d}/buffer"
+        )
 
-    def source_cache(self, process_index: int) -> str:
+    def source_cache(self, controller_index: int) -> str:
         # This path is stable across attempts so a retry does not reread every
         # immutable v1 source shard from GCS.
         return (
             f"{self.local_buffer_root}/experiment2/source-cache/"
-            f"{self.split}/host-p{process_index:05d}"
+            f"{self.split}/controller-c{controller_index:05d}"
         )
 
-    def jax_cache(self, process_index: int) -> str:
+    def jax_cache(self, controller_index: int) -> str:
         # Graph cache identity is explicit in the path; host suffixes prevent
         # concurrent controllers from mutating one local cache directory.
         return (
             f"{self.local_buffer_root}/experiment2/jax-cache/"
             f"{self.project_commit}/{self.mesh}/"
-            f"b{self.per_device_sequence_batch}/host-p{process_index:05d}"
+            f"b{self.per_device_sequence_batch}/"
+            f"controller-c{controller_index:05d}"
         )
 
-    def supervised_evidence(self, process_index: int) -> str:
+    def supervised_evidence(self, controller_index: int) -> str:
         return (
-            f"{self.attempt_root}/host-p{process_index:05d}/" "supervised-evidence.json"
+            f"{self.attempt_root}/controller-c{controller_index:05d}/"
+            "supervised-evidence.json"
         )
 
 
@@ -513,12 +517,12 @@ def _init_command(settings: Settings) -> list[str]:
 
 def _host_command(
     settings: Settings,
-    process_index: int,
+    controller_index: int,
 ) -> tuple[list[str], str]:
-    local_buffer = settings.local_host_buffer(process_index)
-    source_cache = settings.source_cache(process_index)
-    jax_cache = settings.jax_cache(process_index)
-    evidence = settings.supervised_evidence(process_index)
+    local_buffer = settings.local_controller_buffer(controller_index)
+    source_cache = settings.source_cache(controller_index)
+    jax_cache = settings.jax_cache(controller_index)
+    evidence = settings.supervised_evidence(controller_index)
     command = [
         settings.remote_uv,
         "run",
@@ -536,8 +540,8 @@ def _host_command(
         local_buffer,
         "--jax-cache-dir",
         jax_cache,
-        "--process-index",
-        str(process_index),
+        "--controller-index",
+        str(controller_index),
         "--attempt-root",
         settings.attempt_root,
         "--termination-grace-seconds",
@@ -563,17 +567,17 @@ def _host_command(
             "exit 91; fi"
         ),
         (
-            'printf "terminal phase=%s split=%s process=%s status=%s\\n" '
+            'printf "terminal phase=%s split=%s controller=%s status=%s\\n" '
             f"{shlex.quote(settings.phase)} "
             f"{shlex.quote(settings.split)} "
-            f'{process_index} "$harvest_status"'
+            f'{controller_index} "$harvest_status"'
         ),
         'exit "$harvest_status"',
     ]
     return (
         _gcloud(
             settings,
-            worker=process_index,
+            worker=controller_index,
             remote_command=_bash_payload(lines),
         ),
         evidence,
@@ -657,7 +661,7 @@ def _validate_self_hash(
     return unsigned, claimed
 
 
-def _qualification_linkage(args: argparse.Namespace) -> dict[str, str]:
+def _qualification_linkage(args: argparse.Namespace) -> dict[str, object]:
     receipt = _read_json(Path(args.qualification_receipt), name="qualification receipt")
     receipt_unsigned, receipt_sha256 = _validate_self_hash(
         receipt,
@@ -686,8 +690,29 @@ def _qualification_linkage(args: argparse.Namespace) -> dict[str, str]:
         hash_field="coordinator_bundle_sha256",
         name="qualification coordinator bundle",
     )
+    qualified_mapping = bundle_unsigned.get("controller_to_jax_process_index")
+    mapping_shape_is_exact = (
+        isinstance(qualified_mapping, list)
+        and len(qualified_mapping) == PROCESS_COUNT
+        and all(
+            isinstance(item, Mapping)
+            and set(item) == {"controller_index", "process_index"}
+            for item in qualified_mapping
+        )
+    )
+    mapping_is_exact = False
+    if mapping_shape_is_exact:
+        controller_indices = [item["controller_index"] for item in qualified_mapping]
+        process_indices = [item["process_index"] for item in qualified_mapping]
+        mapping_is_exact = (
+            all(type(value) is int for value in controller_indices)
+            and all(type(value) is int for value in process_indices)
+            and sorted(controller_indices) == list(range(PROCESS_COUNT))
+            and sorted(process_indices) == list(range(PROCESS_COUNT))
+        )
     if (
         bundle_unsigned.get("schema_version") != COORDINATOR_BUNDLE_SCHEMA_VERSION
+        or not mapping_is_exact
         or _canonical_json_bytes(bundle_unsigned.get("qualification_receipt"))
         != _canonical_json_bytes(receipt)
         or bundle_unsigned.get("recomposition_sidecar_sha256") != sidecar_sha256
@@ -734,6 +759,7 @@ def _qualification_linkage(args: argparse.Namespace) -> dict[str, str]:
         "qualification_decision_sha256": decision_sha256,
         "recomposition_sidecar_sha256": sidecar_sha256,
         "recomposition_sidecar_canonical_sha256": sidecar_canonical_sha256,
+        "qualified_controller_to_jax_process_index": qualified_mapping,
     }
 
 
@@ -983,7 +1009,8 @@ def _fanout(
 
 def _dry_run(settings: Settings) -> int:
     built = [
-        _host_command(settings, process_index) for process_index in range(PROCESS_COUNT)
+        _host_command(settings, controller_index)
+        for controller_index in range(PROCESS_COUNT)
     ]
     payload = {
         "attempt_id": settings.attempt_id,
@@ -1025,7 +1052,8 @@ def run(settings: Settings) -> int:
         )
 
     built = [
-        _host_command(settings, process_index) for process_index in range(PROCESS_COUNT)
+        _host_command(settings, controller_index)
+        for controller_index in range(PROCESS_COUNT)
     ]
     commands = [command for command, _ in built]
     evidence_paths = [evidence for _, evidence in built]

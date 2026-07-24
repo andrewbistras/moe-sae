@@ -366,7 +366,7 @@ def _fake_dependencies(
 def _invocation_and_records(
     tmp_path: Path,
     *,
-    process_index: int = 0,
+    controller_index: int = 0,
     plan: QualificationPlan | None = None,
 ) -> tuple[ChildInvocation, dict, dict]:
     selected_plan = plan or QualificationPlan()
@@ -392,7 +392,7 @@ def _invocation_and_records(
         recomposition_sidecar_path=tmp_path / "recomposition-sidecar.json",
         mesh=MESH,
         per_device_sequence_batch=1,
-        process_index=process_index,
+        controller_index=controller_index,
         plan=selected_plan,
     )
     return invocation, contract, execution
@@ -447,6 +447,7 @@ def test_child_initializes_distributed_first_and_seals_observation(
     assert events[-1] == "close_runtime"
     assert observation.process_count == 4
     assert observation.process_index == 0
+    assert checked["controller_index"] == 0
     assert observation.measured_capture_compile_count == 1
     assert observation.parity_oracle_compile_count == 1
     assert observation.total_compile_count == 2
@@ -471,6 +472,30 @@ def test_child_initializes_distributed_first_and_seals_observation(
     )
     assert events.index("create_adapter") < events.index("extract_sidecar")
     assert events.index("extract_sidecar") < events.index("prepare")
+
+
+def test_child_binds_transport_controller_separately_from_jax_process(
+    tmp_path: Path,
+) -> None:
+    invocation, _, _ = _invocation_and_records(
+        tmp_path,
+        controller_index=1,
+    )
+    record = run_qualification_child(
+        invocation,
+        dependencies=_fake_dependencies(
+            _Clock(),
+            [],
+            process_index=2,
+        ),
+        qualification_started=0.0,
+    )
+    checked = validate_child_evidence(record)
+    observation = _observation_from_dict(checked["observation"])
+
+    assert checked["controller_index"] == 1
+    assert observation.process_index == 2
+    assert checked["persistence"]["process_index"] == 2
 
 
 def test_child_rejects_contract_drift_before_distributed_initialization(
@@ -548,7 +573,7 @@ def test_launcher_uses_contract_identity_and_labels_observed_identity(
         observation = QualificationHostObservation(
             identity=observed_identity,
             process_count=4,
-            process_index=0,
+            process_index=2,
             qualification_wall_seconds=0.4,
             compile_seconds=0.1,
             measured_device_seconds=0.01,
@@ -575,8 +600,9 @@ def test_launcher_uses_contract_identity_and_labels_observed_identity(
         child = _child_record(
             contract=contract,
             execution_sha256=execution["execution_sha256"],
+            controller_index=1,
             observation=observation,
-            persistence=_writer_summary(process_index=0, tokens=4_096),
+            persistence=_writer_summary(process_index=2, tokens=4_096),
             checkpoint_sha256=CHECKPOINT_SHA,
             maxtext_fork_commit=MAXTEXT_FORK_COMMIT,
             effective_runtime={"fake": True},
@@ -596,7 +622,7 @@ def test_launcher_uses_contract_identity_and_labels_observed_identity(
         scratch_root=tmp_path / "scratch",
         mesh=MESH,
         per_device_sequence_batch=1,
-        process_index=0,
+        controller_index=1,
         plan=plan,
         environment={"PATH": "/usr/bin"},
         supervisor=fake_supervisor,
@@ -617,6 +643,16 @@ def test_launcher_uses_contract_identity_and_labels_observed_identity(
         != checked["observed_executable_identity"]["identity_sha256"]
     )
     assert checked["observation"]["qualification_wall_seconds"] == 0.5
+    assert checked["controller_index"] == 1
+    assert checked["process_index"] == 2
+    assert "--controller-index" in seen["command"]
+    assert "--process-index" not in seen["command"]
+    assert (
+        tmp_path
+        / "control"
+        / "controller-c00001"
+        / "host-evidence.json"
+    ).is_file()
 
 
 def test_four_supervised_hosts_aggregate_on_observed_identity(
@@ -631,13 +667,15 @@ def test_four_supervised_hosts_aggregate_on_observed_identity(
     base_observation = _observation_from_dict(base["observation"])
     result = _result(execution["execution_sha256"], elapsed=0.5)
     hosts = []
-    for index in range(4):
-        observation = replace(base_observation, process_index=index)
+    observed_process_indices = (0, 2, 3, 1)
+    for controller_index, process_index in enumerate(observed_process_indices):
+        observation = replace(base_observation, process_index=process_index)
         child = _child_record(
             contract=contract,
             execution_sha256=execution["execution_sha256"],
+            controller_index=controller_index,
             observation=observation,
-            persistence=_writer_summary(process_index=index),
+            persistence=_writer_summary(process_index=process_index),
             checkpoint_sha256=CHECKPOINT_SHA,
             maxtext_fork_commit=MAXTEXT_FORK_COMMIT,
             effective_runtime={"fake": True},
@@ -649,7 +687,7 @@ def test_four_supervised_hosts_aggregate_on_observed_identity(
                 child=child,
                 execution=execution,
                 result=result,
-                expected_process_index=index,
+                expected_controller_index=controller_index,
             )
         )
     bundle = aggregate_supervised_host_evidence(
@@ -670,6 +708,54 @@ def test_four_supervised_hosts_aggregate_on_observed_identity(
     assert bundle["recomposition_sidecar_canonical_sha256"] == canonical_sha256(
         _sidecar()
     )
+    assert bundle["controller_to_jax_process_index"] == [
+        {"controller_index": 0, "process_index": 0},
+        {"controller_index": 1, "process_index": 2},
+        {"controller_index": 2, "process_index": 3},
+        {"controller_index": 3, "process_index": 1},
+    ]
+
+    duplicated_process_observation = replace(
+        base_observation,
+        process_index=0,
+    )
+    duplicated_process_child = _child_record(
+        contract=contract,
+        execution_sha256=execution["execution_sha256"],
+        controller_index=3,
+        observation=duplicated_process_observation,
+        persistence=_writer_summary(process_index=0),
+        checkpoint_sha256=CHECKPOINT_SHA,
+        maxtext_fork_commit=MAXTEXT_FORK_COMMIT,
+        effective_runtime={"fake": True},
+        recomposition_sidecar=_sidecar(),
+    )
+    duplicated_process_host = _supervised_host_record(
+        contract=contract,
+        child=duplicated_process_child,
+        execution=execution,
+        result=result,
+        expected_controller_index=3,
+    )
+    with pytest.raises(
+        ContributionQualificationWorkerError,
+        match="JAX process inventory",
+    ):
+        aggregate_supervised_host_evidence(
+            [*hosts[:3], duplicated_process_host],
+            batch_sequences=16,
+            sequence_length=1_024,
+        )
+
+    with pytest.raises(
+        ContributionQualificationWorkerError,
+        match="controller inventory",
+    ):
+        aggregate_supervised_host_evidence(
+            [*hosts[:3], hosts[2]],
+            batch_sequences=16,
+            sequence_length=1_024,
+        )
 
 
 def test_extended_workload_is_callable_only_after_observed_receipt_match() -> None:

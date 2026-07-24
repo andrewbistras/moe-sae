@@ -21,7 +21,9 @@ query, verifies the exact clean MaxText fork, restores Gemma, reuses one static
 synthetic batch, lowers/compiles the contribution graph once, and writes one
 immutable host observation.  A final immutable wrapper binds that observation
 to the supervisor's execution and terminal records for coordinator
-aggregation.
+aggregation.  The gcloud worker/controller ordinal is a transport identity,
+not a prediction of ``jax.process_index()``; both identities are recorded and
+their independent four-host permutations are verified at aggregation.
 
 This module does not provision or delete accelerator resources.
 """
@@ -116,12 +118,12 @@ DEFAULT_QUALIFICATION_PLAN = QualificationPlan()
 AUTHORIZATION_CONTRACT_SCHEMA_VERSION = (
     "gemma4-contribution-qualification-authorization-contract-v1"
 )
-CHILD_EVIDENCE_SCHEMA_VERSION = "gemma4-contribution-qualification-child-evidence-v3"
+CHILD_EVIDENCE_SCHEMA_VERSION = "gemma4-contribution-qualification-child-evidence-v4"
 SUPERVISED_HOST_EVIDENCE_SCHEMA_VERSION = (
-    "gemma4-contribution-supervised-host-evidence-v3"
+    "gemma4-contribution-supervised-host-evidence-v4"
 )
 COORDINATOR_BUNDLE_SCHEMA_VERSION = (
-    "gemma4-contribution-qualification-coordinator-bundle-v3"
+    "gemma4-contribution-qualification-coordinator-bundle-v4"
 )
 QUALIFICATION_WRITER_SCHEMA_VERSION = (
     "gemma4-contribution-qualification-local-writer-v1"
@@ -207,7 +209,7 @@ class ChildInvocation:
     recomposition_sidecar_path: Path
     mesh: MeshCandidate
     per_device_sequence_batch: int
-    process_index: int
+    controller_index: int
     plan: QualificationPlan
 
 
@@ -293,6 +295,18 @@ def _process_index(value: Any, *, process_count: int = 4) -> int:
     ):
         raise ContributionQualificationWorkerError(
             f"process_index must lie in [0, {process_count - 1}]"
+        )
+    return value
+
+
+def _controller_index(value: Any, *, controller_count: int = 4) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 0 <= value < controller_count
+    ):
+        raise ContributionQualificationWorkerError(
+            f"controller_index must lie in [0, {controller_count - 1}]"
         )
     return value
 
@@ -1319,6 +1333,7 @@ def _child_record(
     *,
     contract: Mapping[str, Any],
     execution_sha256: str,
+    controller_index: int,
     observation: QualificationHostObservation,
     persistence: Mapping[str, Any],
     checkpoint_sha256: str,
@@ -1339,6 +1354,7 @@ def _child_record(
             **observation.identity.to_dict(),
             "identity_sha256": observation.identity.identity_sha256,
         },
+        "controller_index": _controller_index(controller_index),
         "execution_sha256": execution_sha256,
         "checkpoint_sha256": checkpoint_sha256,
         "maxtext_fork_commit": maxtext_fork_commit,
@@ -1367,6 +1383,7 @@ def validate_child_evidence(value: Mapping[str, Any]) -> dict[str, Any]:
         "authorization_contract_sha256",
         "authorization_contract_identity",
         "observed_executable_identity",
+        "controller_index",
         "execution_sha256",
         "checkpoint_sha256",
         "maxtext_fork_commit",
@@ -1403,6 +1420,7 @@ def validate_child_evidence(value: Mapping[str, Any]) -> dict[str, Any]:
         "authorization_contract_sha256",
         selected["authorization_contract_sha256"],
     )
+    _controller_index(selected["controller_index"])
     _sha256("execution_sha256", selected["execution_sha256"])
     _sha256("checkpoint_sha256", selected["checkpoint_sha256"])
     _sha256(
@@ -1439,6 +1457,11 @@ def validate_child_evidence(value: Mapping[str, Any]) -> dict[str, Any]:
         raise ContributionQualificationWorkerError(
             "child observation and observed executable identity differ"
         )
+    if observation.process_count != 4:
+        raise ContributionQualificationWorkerError(
+            "child observation does not describe four JAX processes"
+        )
+    _process_index(observation.process_index)
     persistence = selected["persistence"]
     if not isinstance(persistence, Mapping):
         raise ContributionQualificationWorkerError(
@@ -1452,6 +1475,8 @@ def validate_child_evidence(value: Mapping[str, Any]) -> dict[str, Any]:
     writer_unsigned.pop("writer_evidence_sha256", None)
     if (
         writer_unsigned.get("schema_version") != QUALIFICATION_WRITER_SCHEMA_VERSION
+        or writer_unsigned.get("process_count") != observation.process_count
+        or writer_unsigned.get("process_index") != observation.process_index
         or _canonical_hash(
             writer_unsigned,
             name="qualification writer evidence",
@@ -1526,16 +1551,13 @@ def run_qualification_child(
     # This must be the first dependency boundary capable of querying a backend.
     deps.initialize_distributed()
     devices, process_count, observed_index, global_chips = deps.process_context()
-    if (
-        process_count != 4
-        or global_chips != 16
-        or observed_index != invocation.process_index
-    ):
+    if process_count != 4 or global_chips != 16:
         raise ContributionQualificationWorkerError(
-            "distributed JAX process identity does not match the required v4-32 "
-            f"host {invocation.process_index}: count={process_count}, "
+            "distributed JAX topology does not match the required v4-32 "
+            f"controller {invocation.controller_index}: count={process_count}, "
             f"index={observed_index}, chips={global_chips}"
         )
+    _process_index(observed_index, process_count=process_count)
     maxtext_provenance = dict(deps.verify_maxtext(invocation.maxtext_root))
     if set(maxtext_provenance) != {
         "mode",
@@ -1705,6 +1727,7 @@ def run_qualification_child(
         record = _child_record(
             contract=contract,
             execution_sha256=execution["execution_sha256"],
+            controller_index=invocation.controller_index,
             observation=observation,
             persistence=persistence,
             checkpoint_sha256=checkpoint,
@@ -1775,8 +1798,8 @@ def _child_command(
         invocation.mesh.name,
         "--per-device-sequence-batch",
         str(invocation.per_device_sequence_batch),
-        "--process-index",
-        str(invocation.process_index),
+        "--controller-index",
+        str(invocation.controller_index),
         "--warmup-steps",
         str(invocation.plan.warmup_steps),
         "--writer-disabled-steps",
@@ -1797,7 +1820,7 @@ def _supervised_host_record(
     child: Mapping[str, Any] | None,
     execution: Mapping[str, Any],
     result: Mapping[str, Any],
-    expected_process_index: int,
+    expected_controller_index: int,
 ) -> dict[str, Any]:
     completed = result["status"] == "completed" and child is not None
     observation: dict[str, Any] | None = None
@@ -1805,9 +1828,11 @@ def _supervised_host_record(
     child_hash: str | None = None
     sidecar_sha256: str | None = None
     sidecar_canonical_sha256: str | None = None
+    process_index: int | None = None
     if child is not None:
         checked_child = validate_child_evidence(child)
         parsed = _observation_from_dict(checked_child["observation"])
+        process_index = parsed.process_index
         # The parent supervisor starts its clock before Popen.  Use the larger
         # wall so Python startup and child import time cannot disappear from a
         # receipt's qualification budget.
@@ -1829,7 +1854,7 @@ def _supervised_host_record(
             checked_child["authorization_contract_sha256"]
             != contract["authorization_contract_sha256"]
             or checked_child["execution_sha256"] != execution["execution_sha256"]
-            or parsed.process_index != expected_process_index
+            or checked_child["controller_index"] != expected_controller_index
         ):
             raise ContributionQualificationWorkerError(
                 "child evidence does not belong to this supervised launch"
@@ -1837,7 +1862,8 @@ def _supervised_host_record(
     unsigned = {
         "schema_version": SUPERVISED_HOST_EVIDENCE_SCHEMA_VERSION,
         "status": "coordinator_ready" if completed else "failed",
-        "process_index": expected_process_index,
+        "controller_index": _controller_index(expected_controller_index),
+        "process_index": process_index,
         "identity_relationship": (
             "authorization_contract_identity_is_prelaunch_only;"
             "observed_executable_identity_is_receipt_authority;"
@@ -1870,6 +1896,7 @@ def validate_supervised_host_evidence(
     expected = {
         "schema_version",
         "status",
+        "controller_index",
         "process_index",
         "identity_relationship",
         "authorization_contract_sha256",
@@ -1901,7 +1928,7 @@ def validate_supervised_host_evidence(
         raise ContributionQualificationWorkerError(
             "supervised host evidence self-hash is invalid"
         )
-    _process_index(selected["process_index"])
+    _controller_index(selected["controller_index"])
     _sha256(
         "authorization_contract_sha256",
         selected["authorization_contract_sha256"],
@@ -1941,6 +1968,7 @@ def validate_supervised_host_evidence(
             or selected["recomposition_sidecar_canonical_sha256"] is None
             or selected["observed_executable_identity"] is None
             or selected["observation"] is None
+            or selected["process_index"] is None
         ):
             raise ContributionQualificationWorkerError(
                 "coordinator-ready host evidence is incomplete"
@@ -1962,15 +1990,22 @@ def validate_supervised_host_evidence(
             name="observed_executable_identity",
         )
         observation = _observation_from_dict(selected["observation"])
-        if observation.identity != observed:
+        process_index = _process_index(selected["process_index"])
+        if (
+            observation.identity != observed
+            or observation.process_count != 4
+            or observation.process_index != process_index
+        ):
             raise ContributionQualificationWorkerError(
-                "supervised observation identity is inconsistent"
+                "supervised observation identity or JAX process index is inconsistent"
             )
     elif status == "failed":
         if selected["supervisor_status"] == "completed":
             raise ContributionQualificationWorkerError(
                 "completed supervisor result cannot be labeled failed"
             )
+        if selected["process_index"] is not None:
+            _process_index(selected["process_index"])
     else:
         raise ContributionQualificationWorkerError(
             "supervised host evidence status is invalid"
@@ -1993,7 +2028,7 @@ def launch_qualification_host(
     scratch_root: str | Path,
     mesh: MeshCandidate,
     per_device_sequence_batch: int,
-    process_index: int,
+    controller_index: int,
     plan: QualificationPlan = DEFAULT_QUALIFICATION_PLAN,
     environment: Mapping[str, str] | None = None,
     termination_grace_seconds: float = DEFAULT_TERMINATION_GRACE_SECONDS,
@@ -2001,7 +2036,7 @@ def launch_qualification_host(
 ) -> dict[str, Any]:
     """Publish intent, supervise one TPU child, and seal coordinator evidence."""
 
-    index = _process_index(process_index)
+    index = _controller_index(controller_index)
     config_file = _absolute_file(config_path, name="config_path")
     repo = _absolute_directory(repo_root, name="repo_root")
     maxtext = (
@@ -2012,8 +2047,8 @@ def launch_qualification_host(
     cache = _absolute_directory(jax_cache_dir, name="jax_cache_dir")
     control = _absolute_directory(control_root, name="control_root")
     scratch = _absolute_directory(scratch_root, name="scratch_root")
-    host_control = control / f"host-{index:05d}"
-    host_scratch = scratch / f"host-{index:05d}"
+    host_control = control / f"controller-c{index:05d}"
+    host_scratch = scratch / f"controller-c{index:05d}"
     host_control.mkdir(parents=True, exist_ok=True)
     host_scratch.mkdir(parents=True, exist_ok=True)
     config = load_contribution_config(config_file)
@@ -2062,7 +2097,7 @@ def launch_qualification_host(
         recomposition_sidecar_path=sidecar_path,
         mesh=mesh,
         per_device_sequence_batch=per_device_sequence_batch,
-        process_index=index,
+        controller_index=index,
         plan=plan,
     )
     command = _child_command(invocation)
@@ -2097,7 +2132,7 @@ def launch_qualification_host(
         child=child,
         execution=execution,
         result=result,
-        expected_process_index=index,
+        expected_controller_index=index,
     )
     validate_supervised_host_evidence(host)
     _atomic_create_json(final_path, host)
@@ -2122,10 +2157,19 @@ def aggregate_supervised_host_evidence(
         raise ContributionQualificationWorkerError(
             "coordinator requires exactly four host records"
         )
-    ordered = sorted(checked, key=lambda item: item["process_index"])
-    if [item["process_index"] for item in ordered] != [0, 1, 2, 3]:
+    ordered = sorted(checked, key=lambda item: item["controller_index"])
+    if [item["controller_index"] for item in ordered] != [0, 1, 2, 3]:
         raise ContributionQualificationWorkerError(
-            "coordinator host inventory is incomplete or duplicated"
+            "coordinator controller inventory is incomplete or duplicated"
+        )
+    if any(item["status"] != "coordinator_ready" for item in ordered):
+        raise ContributionQualificationWorkerError(
+            "coordinator cannot aggregate failed host evidence"
+        )
+    process_indices = [item["process_index"] for item in ordered]
+    if sorted(process_indices) != [0, 1, 2, 3]:
+        raise ContributionQualificationWorkerError(
+            "coordinator JAX process inventory is incomplete or duplicated"
         )
     contract_hashes = {item["authorization_contract_sha256"] for item in ordered}
     if len(contract_hashes) != 1:
@@ -2154,6 +2198,13 @@ def aggregate_supervised_host_evidence(
         ),
         "authorization_contract_sha256": next(iter(contract_hashes)),
         "host_evidence_sha256": [item["host_evidence_sha256"] for item in ordered],
+        "controller_to_jax_process_index": [
+            {
+                "controller_index": item["controller_index"],
+                "process_index": item["process_index"],
+            }
+            for item in ordered
+        ],
         "observed_executable_identity": ordered[0]["observed_executable_identity"],
         "recomposition_sidecar_sha256": next(iter(sidecar_hashes)),
         "recomposition_sidecar_canonical_sha256": next(
@@ -2196,7 +2247,16 @@ def _add_common_child_arguments(parser: argparse.ArgumentParser) -> None:
         required=True,
         choices=CONTRIBUTION_PER_DEVICE_SEQUENCE_BATCHES,
     )
-    parser.add_argument("--process-index", type=int, required=True)
+    parser.add_argument(
+        "--controller-index",
+        type=int,
+        required=True,
+        help=(
+            "gcloud TPU worker/controller ordinal used only for transport and "
+            "controller-local control paths; JAX process_index is observed "
+            "after distributed initialization"
+        ),
+    )
     parser.add_argument("--warmup-steps", type=int, default=5)
     parser.add_argument("--writer-disabled-steps", type=int, default=10)
     parser.add_argument("--measured-steps", type=int, default=10)
@@ -2294,7 +2354,7 @@ def _invocation_from_args(args: argparse.Namespace) -> ChildInvocation:
         ),
         mesh=_mesh_by_name(args.mesh),
         per_device_sequence_batch=args.per_device_sequence_batch,
-        process_index=_process_index(args.process_index),
+        controller_index=_controller_index(args.controller_index),
         plan=_plan_from_args(args),
     )
 
@@ -2320,7 +2380,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             scratch_root=args.scratch_root,
             mesh=_mesh_by_name(args.mesh),
             per_device_sequence_batch=args.per_device_sequence_batch,
-            process_index=args.process_index,
+            controller_index=args.controller_index,
             plan=_plan_from_args(args),
             termination_grace_seconds=args.termination_grace_seconds,
         )

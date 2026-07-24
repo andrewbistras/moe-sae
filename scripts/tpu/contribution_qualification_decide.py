@@ -43,7 +43,7 @@ from moe_sae.contribution_supervisor import (
 )
 
 PLAN_SCHEMA_VERSION = "gemma4-contribution-qualification-operator-plan-v1"
-DECISION_SCHEMA_VERSION = "gemma4-contribution-qualification-operator-decision-v1"
+DECISION_SCHEMA_VERSION = "gemma4-contribution-qualification-operator-decision-v2"
 
 PASS_EXIT = 0
 FALLBACK_EXIT = 20
@@ -247,11 +247,17 @@ def _validated_host_records(
         )
         for path in paths
     ]
-    checked.sort(key=lambda item: int(item[1]["process_index"]))
-    if [int(item[1]["process_index"]) for item in checked] != [0, 1, 2, 3]:
+    checked.sort(key=lambda item: int(item[1]["controller_index"]))
+    if [int(item[1]["controller_index"]) for item in checked] != [0, 1, 2, 3]:
         raise QualificationDecisionError(
-            "host evidence process indexes are incomplete or duplicated"
+            "host evidence controller indexes are incomplete or duplicated"
         )
+    if all(host["status"] == "coordinator_ready" for _, host in checked):
+        process_indices = [int(host["process_index"]) for _, host in checked]
+        if sorted(process_indices) != [0, 1, 2, 3]:
+            raise QualificationDecisionError(
+                "host evidence JAX process indexes are incomplete or duplicated"
+            )
     return checked
 
 
@@ -301,32 +307,38 @@ def _terminal_failure_classification(
     if not failed:
         return None
 
-    oom_hosts: list[int] = []
+    oom_controllers: list[int] = []
     unknown: list[str] = []
     for path, host in failed:
         result, log = _validated_supervisor_log(path, host)
         status = result["status"]
-        process_index = int(host["process_index"])
+        controller_index = int(host["controller_index"])
         if status in {"terminated_at_deadline", "killed_at_deadline"}:
             unknown.append(
-                f"host {process_index}: hard deadline reached ({status})"
+                f"controller {controller_index}: hard deadline reached ({status})"
             )
         elif status == "failed" and any(pattern.search(log) for pattern in _OOM_PATTERNS):
-            oom_hosts.append(process_index)
+            oom_controllers.append(controller_index)
         else:
-            unknown.append(f"host {process_index}: supervisor_status={status}")
-    if oom_hosts:
+            unknown.append(
+                f"controller {controller_index}: supervisor_status={status}"
+            )
+    if unknown:
+        raise QualificationDecisionError(
+            "candidate has a deadline or unknown controller failure; explicit "
+            "OOM evidence on another controller cannot authorize fallback; "
+            + "; ".join(unknown)
+        )
+    if oom_controllers:
         return (
             "explicit_oom",
             (
                 "a hash-verified supervisor log contains an explicit OOM marker on "
-                f"hosts {oom_hosts}"
+                f"controllers {oom_controllers}"
             ),
         )
     raise QualificationDecisionError(
-        "candidate failed without an explicit OOM; deadline and unknown "
-        "failures abort rather than authorizing a smaller candidate; "
-        + "; ".join(unknown)
+        "candidate failed without an explicit OOM; fallback is not authorized"
     )
 
 

@@ -95,6 +95,12 @@ def _attempt_args(operator, tmp_path: Path, *, batch: int = 8):
         {
             "schema_version": operator.COORDINATOR_BUNDLE_SCHEMA_VERSION,
             "qualification_receipt": receipt,
+            "controller_to_jax_process_index": [
+                {"controller_index": 0, "process_index": 0},
+                {"controller_index": 1, "process_index": 2},
+                {"controller_index": 2, "process_index": 3},
+                {"controller_index": 3, "process_index": 1},
+            ],
             "recomposition_sidecar_sha256": sidecar["sidecar_sha256"],
             "recomposition_sidecar_canonical_sha256": (
                 operator._canonical_sha256(sidecar)
@@ -227,7 +233,8 @@ def test_four_host_commands_share_identity_but_use_private_paths(
 ) -> None:
     settings = _settings(operator, tmp_path)
     built = [
-        operator._host_command(settings, process_index) for process_index in range(4)
+        operator._host_command(settings, controller_index)
+        for controller_index in range(4)
     ]
     assert [
         next(value for value in command if value.startswith("--worker="))
@@ -243,11 +250,12 @@ def test_four_host_commands_share_identity_but_use_private_paths(
         assert settings.qualification_receipt in command
         assert settings.attempt_root in command
     for index, command in enumerate(joined):
-        assert f"--process-index {index}" in command
-        assert f"source-cache/train/host-p{index:05d}" in command
-        assert f"host-p{index:05d}/buffer" in command
+        assert f"--controller-index {index}" in command
+        assert "--process-index" not in command
+        assert f"source-cache/train/controller-c{index:05d}" in command
+        assert f"controller-c{index:05d}/buffer" in command
         for other in set(range(4)) - {index}:
-            assert f"source-cache/train/host-p{other:05d}" not in command
+            assert f"source-cache/train/controller-c{other:05d}" not in command
     publish = " ".join(
         operator._publish_command(settings, [evidence for _, evidence in built])
     )
@@ -281,6 +289,46 @@ def test_attempt_rejects_explicit_batch_different_from_decision(
 ) -> None:
     args = _attempt_args(operator, tmp_path, batch=4)
     with pytest.raises(operator.OperatorError, match="mesh/batch"):
+        operator.initialize_attempt(args)
+    assert not Path(args.attempt_root).exists()
+
+
+@pytest.mark.parametrize("invalid_index", (False, "0"))
+def test_attempt_rejects_non_integer_qualification_topology_indices(
+    operator,
+    tmp_path: Path,
+    invalid_index: object,
+) -> None:
+    args = _attempt_args(operator, tmp_path)
+    bundle_path = Path(args.qualification_bundle)
+    bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+    bundle.pop("coordinator_bundle_sha256")
+    bundle["controller_to_jax_process_index"][0]["controller_index"] = invalid_index
+    bundle = _self_hash(
+        operator,
+        bundle,
+        "coordinator_bundle_sha256",
+    )
+    bundle_path.write_text(
+        json.dumps(bundle, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+
+    decision_path = Path(args.qualification_decision)
+    decision = json.loads(decision_path.read_text(encoding="utf-8"))
+    decision.pop("operator_decision_sha256")
+    decision["coordinator_bundle_sha256"] = bundle["coordinator_bundle_sha256"]
+    decision = _self_hash(
+        operator,
+        decision,
+        "operator_decision_sha256",
+    )
+    decision_path.write_text(
+        json.dumps(decision, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(operator.OperatorError, match="coordinator bundle"):
         operator.initialize_attempt(args)
     assert not Path(args.attempt_root).exists()
 

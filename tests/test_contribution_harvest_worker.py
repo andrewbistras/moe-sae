@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+import time
 from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-import time
 
 import numpy as np
 import pytest
@@ -43,7 +43,6 @@ from moe_sae.contribution_storage import (
 from moe_sae.contribution_supervisor import build_execution_record
 from moe_sae.object_store import LocalObjectStore
 from moe_sae.runtime import HARVEST_MESHES
-
 
 CONFIG_PATH = (
     Path(__file__).resolve().parents[1] / "configs" / "gemma4_contribution_v1.yaml"
@@ -193,6 +192,8 @@ def _case(
     phase_name: str = "phase1_smoke",
     prepared_graph: dict | None = None,
     receipt_graph: dict | None = None,
+    controller_index: int = 0,
+    observed_process_index: int = 0,
 ) -> SimpleNamespace:
     config = load_contribution_config(CONFIG_PATH)
     source_manifest = _source_manifest(config)
@@ -277,7 +278,7 @@ def _case(
         maxtext_root=None,
         mesh=mesh,
         per_device_sequence_batch=8,
-        process_index=0,
+        controller_index=controller_index,
         maximum_runtime_seconds=maximum_runtime,
         child_evidence_path=tmp_path / "child-evidence.json",
         execution_record_path=execution_path,
@@ -289,6 +290,7 @@ def _case(
         train_iterator=iter((_raw_batch(),)),
         eval_iterator=iter((_raw_batch(),)),
     )
+
     def executable(*_args):
         return None
 
@@ -345,7 +347,12 @@ def _case(
 
     dependencies = worker.HarvestWorkerDependencies(
         initialize_distributed=lambda: None,
-        process_context=lambda: (devices, 4, 0, 16),
+        process_context=lambda: (
+            devices,
+            4,
+            observed_process_index,
+            16,
+        ),
         verify_maxtext=lambda _root: {
             "mode": "locked_pep610_install",
             "commit": MAXTEXT_FORK_COMMIT,
@@ -408,6 +415,34 @@ def test_long_harvest_reuses_qualified_prepared_executable_and_seals_evidence(
     assert case.invocation.child_evidence_path.read_bytes() == canonical_json_bytes(
         evidence
     )
+
+
+def test_controller_ordinal_does_not_override_observed_jax_process_ownership(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Live v4-32 observation: gcloud controller 1 was JAX process 2.
+    case = _case(
+        tmp_path,
+        monkeypatch,
+        controller_index=1,
+        observed_process_index=2,
+    )
+
+    evidence = worker.run_harvest_child(
+        case.invocation,
+        dependencies=case.dependencies,
+    )
+
+    checked = worker.validate_child_evidence(evidence)
+    assert checked["controller_index"] == 1
+    assert checked["process_index"] == 2
+    assert checked["host_id"] == "p00002"
+    assert checked["harvest"]["process_index"] == 2
+    assert case.writer_state["writer"].host_id == "p00002"
+    command = worker._child_command(case.invocation)
+    assert command[command.index("--controller-index") + 1] == "1"
+    assert "--process-index" not in command
 
 
 def test_identity_mismatch_fails_before_writer_or_harvest_side_effect(
@@ -491,6 +526,9 @@ def test_phase2_adopts_exact_phase1_parent_before_appending(
         "contribution_manifest_sha256": prior_manifest_sha,
         "qualification_receipt_sha256": case.receipt["receipt_sha256"],
         "observed_identity_sha256": case.identity.identity_sha256,
+        # Live mapping inverted to process order:
+        # controller->process 0->0, 1->2, 2->3, 3->1.
+        "controller_index_by_process": [0, 3, 1, 2],
         "host_evidence_sha256_by_process": [f"{index + 10:064x}" for index in range(4)],
     }
     phase_evidence = worker._self_hash(
@@ -498,6 +536,23 @@ def test_phase2_adopts_exact_phase1_parent_before_appending(
         hash_field="phase_evidence_sha256",
     )
     worker.validate_phase_evidence(phase_evidence)
+    for invalid_controllers in (
+        [0, 3, 1, 1],
+        [False, 1, 2, 3],
+        ["0", 1, 2, 3],
+    ):
+        invalid_mapping = worker._self_hash(
+            {
+                **phase_evidence_unsigned,
+                "controller_index_by_process": invalid_controllers,
+            },
+            hash_field="phase_evidence_sha256",
+        )
+        with pytest.raises(
+            worker.ContributionHarvestWorkerError,
+            match="controller mapping",
+        ):
+            worker.validate_phase_evidence(invalid_mapping)
     prior_evidence_path = tmp_path / "phase1-evidence.json"
     _write_json(prior_evidence_path, phase_evidence)
     prior_root = tmp_path / "phase1-control"
@@ -538,6 +593,54 @@ def test_phase2_adopts_exact_phase1_parent_before_appending(
     )
 
 
+@pytest.mark.parametrize(
+    ("controller_indices", "process_indices"),
+    (
+        ([0, 0, 2, 3], [0, 1, 2, 3]),
+        ([0, 1, 2, 3], [0, 1, 1, 3]),
+    ),
+)
+def test_publication_requires_independent_controller_and_process_permutations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    controller_indices: list[int],
+    process_indices: list[int],
+) -> None:
+    records = [
+        {
+            "status": "complete",
+            "controller_index": controller_index,
+            "process_index": process_index,
+        }
+        for controller_index, process_index in zip(
+            controller_indices,
+            process_indices,
+            strict=True,
+        )
+    ]
+    monkeypatch.setattr(
+        worker,
+        "validate_supervised_evidence",
+        lambda value: value,
+    )
+    with pytest.raises(
+        worker.ContributionHarvestWorkerError,
+        match="independent exact controller-index and JAX-process-index",
+    ):
+        worker.publish_harvest_phase(
+            config_path=CONFIG_PATH,
+            phase_name="phase1_smoke",
+            split="train",
+            control_root=tmp_path / "control",
+            source_v1_dataset=object(),
+            object_prefix=OBJECT_PREFIX,
+            object_store=LocalObjectStore(tmp_path / "objects"),
+            recomposition_sidecar={},
+            supervised_host_evidence=records,
+            phase_evidence_path=tmp_path / "phase-evidence.json",
+        )
+
+
 def test_production_writer_factory_is_exact_and_worker_has_no_stale_fork(
     tmp_path: Path,
 ) -> None:
@@ -576,7 +679,7 @@ def test_production_writer_factory_is_exact_and_worker_has_no_stale_fork(
         maxtext_root=None,
         mesh=HARVEST_MESHES[1],
         per_device_sequence_batch=8,
-        process_index=0,
+        controller_index=0,
         maximum_runtime_seconds=3_600,
         child_evidence_path=tmp_path / "child",
         execution_record_path=tmp_path / "execution",

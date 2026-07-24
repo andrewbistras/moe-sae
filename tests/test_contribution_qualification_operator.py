@@ -105,8 +105,8 @@ def test_candidate_order_is_only_b128_b64_b32_on_known_best_mesh(
     settings = _settings(operator, tmp_path)
     for candidate in operator.CANDIDATES:
         built = [
-            operator._qualification_command(settings, candidate, process_index)
-            for process_index in range(4)
+            operator._qualification_command(settings, candidate, controller_index)
+            for controller_index in range(4)
         ]
         assert [
             next(
@@ -120,7 +120,14 @@ def test_candidate_order_is_only_b128_b64_b32_on_known_best_mesh(
         assert "moe_sae.contribution_qualification_worker" in joined
         assert "launch-host" in joined
         assert "--maximum-seconds 600" in joined
+        assert "--controller-index" in joined
+        assert "--process-index" not in joined
         assert "contribution_harvest_worker" not in joined
+        for controller_index, (_, evidence, _) in enumerate(built):
+            assert (
+                f"/controller-c{controller_index:05d}/host-evidence.json"
+                in evidence
+            )
 
 
 def test_operator_source_has_no_workload_launch_path() -> None:

@@ -3,8 +3,10 @@
 
 Run this executable from zsh on the operator machine.  It starts the same
 bounded ``launch-host`` command on TPU workers 0--3 concurrently, waits for
-all four terminal records, and asks controller 0 to seal the exact aggregate.
-It stops after the first passing receipt and contains no workload launch path.
+all four terminal records, and asks transport controller 0 to seal the exact
+aggregate.  TPU worker/controller ordinals address SSH and control paths only;
+each child records its independently observed JAX process index.  It stops
+after the first passing receipt and contains no workload launch path.
 """
 
 from __future__ import annotations
@@ -202,13 +204,16 @@ def _bash_payload(lines: Sequence[str]) -> str:
 def _qualification_command(
     settings: Settings,
     candidate: Candidate,
-    process_index: int,
+    controller_index: int,
 ) -> tuple[list[str], str, str]:
     candidate_control = f"{settings.shared_run_root}/{candidate.identifier}"
     candidate_local = f"{settings.local_run_root}/{candidate.identifier}"
     cache = f"{candidate_local}/jax-cache"
     scratch = f"{candidate_local}/scratch"
-    evidence = f"{candidate_control}/host-{process_index:05d}/host-evidence.json"
+    evidence = (
+        f"{candidate_control}/controller-c{controller_index:05d}/"
+        "host-evidence.json"
+    )
     qualification = [
         settings.remote_uv,
         "run",
@@ -237,8 +242,8 @@ def _qualification_command(
         MESH,
         "--per-device-sequence-batch",
         str(candidate.per_device_sequence_batch),
-        "--process-index",
-        str(process_index),
+        "--controller-index",
+        str(controller_index),
         "--warmup-steps",
         "5",
         "--writer-disabled-steps",
@@ -274,16 +279,16 @@ def _qualification_command(
             "exit 91; fi"
         ),
         (
-            'printf "terminal candidate=%s process=%s child_status=%s\\n" '
+            'printf "terminal candidate=%s controller=%s child_status=%s\\n" '
             f"{shlex.quote(candidate.identifier)} "
-            f"{process_index} \"$qualification_status\""
+            f"{controller_index} \"$qualification_status\""
         ),
         "exit 0",
     ]
     return (
         _gcloud(
             settings,
-            worker=process_index,
+            worker=controller_index,
             remote_command=_bash_payload(lines),
         ),
         evidence,

@@ -21,16 +21,16 @@ distributed JAX.
 from __future__ import annotations
 
 import argparse
-from collections.abc import Callable, Iterable, Mapping, Sequence
-from contextlib import AbstractContextManager
-from dataclasses import asdict, dataclass
 import itertools
 import json
 import os
-from pathlib import Path
 import re
 import sys
 import time
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from contextlib import AbstractContextManager
+from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any, Protocol
 
 from moe_sae.artifacts import (
@@ -48,8 +48,8 @@ from moe_sae.contribution_artifacts import (
 )
 from moe_sae.contribution_config import (
     MAXTEXT_ROUTED_MOE_PATCHED_SHA256,
-    Experiment2Config,
     ContributionPhase,
+    Experiment2Config,
     load_contribution_config,
 )
 from moe_sae.contribution_harvest import (
@@ -74,6 +74,8 @@ from moe_sae.contribution_performance import (
 from moe_sae.contribution_qualification_worker import (
     AuthorizedContributionExecutable,
     authorize_extended_workload_after_lowering,
+)
+from moe_sae.contribution_qualification_worker import (
     production_dependencies as qualification_production_dependencies,
 )
 from moe_sae.contribution_ranges import (
@@ -111,12 +113,11 @@ from moe_sae.runtime import (
     maxtext_mesh_context,
 )
 
-
-CHILD_EVIDENCE_SCHEMA_VERSION = "gemma4-contribution-harvest-child-evidence-v1"
+CHILD_EVIDENCE_SCHEMA_VERSION = "gemma4-contribution-harvest-child-evidence-v2"
 SUPERVISED_EVIDENCE_SCHEMA_VERSION = (
-    "gemma4-contribution-harvest-supervised-evidence-v1"
+    "gemma4-contribution-harvest-supervised-evidence-v2"
 )
-PHASE_EVIDENCE_SCHEMA_VERSION = "gemma4-contribution-harvest-phase-evidence-v1"
+PHASE_EVIDENCE_SCHEMA_VERSION = "gemma4-contribution-harvest-phase-evidence-v2"
 EXPECTED_PROCESS_COUNT = 4
 EXPECTED_GLOBAL_CHIPS = 16
 
@@ -174,7 +175,7 @@ class HarvestInvocation:
     maxtext_root: Path | None
     mesh: MeshCandidate
     per_device_sequence_batch: int
-    process_index: int
+    controller_index: int
     maximum_runtime_seconds: int
     child_evidence_path: Path
     execution_record_path: Path
@@ -258,16 +259,24 @@ def _positive_int(name: str, value: Any) -> int:
     return value
 
 
-def _process_index(value: Any) -> int:
+def _bounded_index(name: str, value: Any) -> int:
     if (
         isinstance(value, bool)
         or not isinstance(value, int)
         or not 0 <= value < EXPECTED_PROCESS_COUNT
     ):
         raise ContributionHarvestWorkerError(
-            f"process_index must lie in [0,{EXPECTED_PROCESS_COUNT - 1}]"
+            f"{name} must lie in [0,{EXPECTED_PROCESS_COUNT - 1}]"
         )
     return value
+
+
+def _process_index(value: Any) -> int:
+    return _bounded_index("process_index", value)
+
+
+def _controller_index(value: Any) -> int:
+    return _bounded_index("controller_index", value)
 
 
 def _read_json(path: Path, *, name: str) -> dict[str, Any]:
@@ -635,6 +644,7 @@ def _authorize_prepared(
 def _child_evidence(
     *,
     invocation: HarvestInvocation,
+    process_index: int,
     config: Experiment2Config,
     phase: ContributionPhase,
     execution: Mapping[str, Any],
@@ -663,7 +673,8 @@ def _child_evidence(
         "split": invocation.split,
         "phase_total_tokens": _phase_tokens(phase, invocation.split),
         "process_count": EXPECTED_PROCESS_COUNT,
-        "process_index": invocation.process_index,
+        "controller_index": invocation.controller_index,
+        "process_index": process_index,
         "host_id": harvest.host_id,
         "checkpoint_sha256": invocation.checkpoint_sha256,
         "source_v1_manifest_sha256": range_plan.source_manifest_sha256,
@@ -710,6 +721,7 @@ def validate_child_evidence(value: Mapping[str, Any]) -> dict[str, Any]:
         "split",
         "phase_total_tokens",
         "process_count",
+        "controller_index",
         "process_index",
         "host_id",
         "checkpoint_sha256",
@@ -773,6 +785,7 @@ def validate_child_evidence(value: Mapping[str, Any]) -> dict[str, Any]:
         raise ContributionHarvestWorkerError(
             "harvest evidence is not from a four-controller v4-32"
         )
+    _controller_index(selected["controller_index"])
     _process_index(selected["process_index"])
     if (
         not isinstance(selected["split"], str)
@@ -897,7 +910,7 @@ def run_harvest_child(
     config = load_contribution_config(invocation.config_path)
     phase = config.phase(invocation.phase)
     phase_total = _phase_tokens(phase, invocation.split)
-    _process_index(invocation.process_index)
+    _controller_index(invocation.controller_index)
     _positive_int(
         "maximum_runtime_seconds",
         invocation.maximum_runtime_seconds,
@@ -910,15 +923,12 @@ def run_harvest_child(
     # This is the first dependency allowed to query an accelerator backend.
     deps.initialize_distributed()
     devices, process_count, observed_index, global_chips = deps.process_context()
-    if (
-        process_count != EXPECTED_PROCESS_COUNT
-        or global_chips != EXPECTED_GLOBAL_CHIPS
-        or observed_index != invocation.process_index
-    ):
+    if process_count != EXPECTED_PROCESS_COUNT or global_chips != EXPECTED_GLOBAL_CHIPS:
         raise ContributionHarvestWorkerError(
             "distributed JAX identity differs from the required v4-32 host: "
             f"count={process_count}, index={observed_index}, chips={global_chips}"
         )
+    process_index = _process_index(observed_index)
     maxtext_provenance = dict(deps.verify_maxtext(invocation.maxtext_root))
     if set(maxtext_provenance) != {
         "mode",
@@ -1098,7 +1108,7 @@ def run_harvest_child(
             # the exact observed identity has passed the line above.
             assignments = range_plan.for_process(
                 phase_total,
-                invocation.process_index,
+                process_index,
             )
             if not assignments:
                 raise ContributionHarvestWorkerError(
@@ -1126,7 +1136,7 @@ def run_harvest_child(
                 range_plan=range_plan,
                 phase_total_tokens=phase_total,
                 process_count=process_count,
-                process_index=invocation.process_index,
+                process_index=process_index,
                 recomposition_sidecar=sidecar,
                 sequence_length=config.model.sequence_length,
                 max_pending_writes=1,
@@ -1136,6 +1146,7 @@ def run_harvest_child(
             host_index = writer.finalize_host()
         evidence = _child_evidence(
             invocation=invocation,
+            process_index=process_index,
             config=config,
             phase=phase,
             execution=execution,
@@ -1188,7 +1199,7 @@ def _supervised_evidence(
     completed = result["status"] == "completed" and child is not None
     checked_child = None if child is None else validate_child_evidence(child)
     if checked_child is not None and (
-        checked_child["process_index"] != invocation.process_index
+        checked_child["controller_index"] != invocation.controller_index
         or checked_child["supervisor_execution_sha256"] != execution["execution_sha256"]
         or checked_child["qualification_receipt_sha256"] != receipt["receipt_sha256"]
         or checked_child["authorization"] != asdict(authorization)
@@ -1199,7 +1210,10 @@ def _supervised_evidence(
     unsigned = {
         "schema_version": SUPERVISED_EVIDENCE_SCHEMA_VERSION,
         "status": "complete" if completed else "failed",
-        "process_index": invocation.process_index,
+        "controller_index": invocation.controller_index,
+        "process_index": (
+            None if checked_child is None else checked_child["process_index"]
+        ),
         "qualification_receipt_sha256": receipt["receipt_sha256"],
         "authorization": asdict(authorization),
         "supervisor_execution_sha256": execution["execution_sha256"],
@@ -1218,6 +1232,7 @@ def validate_supervised_evidence(value: Mapping[str, Any]) -> dict[str, Any]:
     expected = {
         "schema_version",
         "status",
+        "controller_index",
         "process_index",
         "qualification_receipt_sha256",
         "authorization",
@@ -1246,7 +1261,7 @@ def validate_supervised_evidence(value: Mapping[str, Any]) -> dict[str, Any]:
         raise ContributionHarvestWorkerError(
             "supervised harvest evidence is incompatible or has a bad self-hash"
         )
-    _process_index(selected["process_index"])
+    _controller_index(selected["controller_index"])
     for name in (
         "qualification_receipt_sha256",
         "supervisor_execution_sha256",
@@ -1258,12 +1273,14 @@ def validate_supervised_evidence(value: Mapping[str, Any]) -> dict[str, Any]:
     completed = (
         selected["status"] == "complete"
         and selected["supervisor_status"] == "completed"
+        and selected["process_index"] is not None
         and child is not None
         and child_hash is not None
     )
     failed = (
         selected["status"] == "failed"
         and selected["supervisor_status"] != "completed"
+        and selected["process_index"] is None
         and child is None
         and child_hash is None
     )
@@ -1272,9 +1289,11 @@ def validate_supervised_evidence(value: Mapping[str, Any]) -> dict[str, Any]:
             "supervised harvest terminal fields are inconsistent"
         )
     if completed:
+        _process_index(selected["process_index"])
         checked = validate_child_evidence(child)
         if (
             checked["child_evidence_sha256"] != child_hash
+            or checked["controller_index"] != selected["controller_index"]
             or checked["process_index"] != selected["process_index"]
             or checked["qualification_receipt_sha256"]
             != selected["qualification_receipt_sha256"]
@@ -1334,8 +1353,8 @@ def _child_command(invocation: HarvestInvocation) -> list[str]:
         invocation.mesh.name,
         "--per-device-sequence-batch",
         str(invocation.per_device_sequence_batch),
-        "--process-index",
-        str(invocation.process_index),
+        "--controller-index",
+        str(invocation.controller_index),
         "--maximum-runtime-seconds",
         str(invocation.maximum_runtime_seconds),
         "--child-evidence",
@@ -1470,6 +1489,7 @@ def _phase_evidence(
         "contribution_manifest_sha256": manifest["manifest_sha256"],
         "qualification_receipt_sha256": first["qualification_receipt_sha256"],
         "observed_identity_sha256": first["observed_identity_sha256"],
+        "controller_index_by_process": [host["controller_index"] for host in hosts],
         "host_evidence_sha256_by_process": [
             host["supervised_evidence_sha256"] for host in hosts
         ],
@@ -1497,6 +1517,7 @@ def validate_phase_evidence(value: Mapping[str, Any]) -> dict[str, Any]:
         "contribution_manifest_sha256",
         "qualification_receipt_sha256",
         "observed_identity_sha256",
+        "controller_index_by_process",
         "host_evidence_sha256_by_process",
         "phase_evidence_sha256",
     }
@@ -1536,6 +1557,16 @@ def validate_phase_evidence(value: Mapping[str, Any]) -> dict[str, Any]:
             _sha256(name, selected[name])
     if selected["process_count"] != EXPECTED_PROCESS_COUNT:
         raise ContributionHarvestWorkerError("phase evidence process count is not four")
+    controllers = selected["controller_index_by_process"]
+    if (
+        not isinstance(controllers, list)
+        or len(controllers) != EXPECTED_PROCESS_COUNT
+        or any(type(value) is not int for value in controllers)
+        or sorted(controllers) != list(range(EXPECTED_PROCESS_COUNT))
+    ):
+        raise ContributionHarvestWorkerError(
+            "phase evidence controller mapping is not an exact permutation"
+        )
     hosts = selected["host_evidence_sha256_by_process"]
     if (
         not isinstance(hosts, list)
@@ -1568,19 +1599,22 @@ def publish_harvest_phase(
 
     config = load_contribution_config(config_path)
     phase = config.phase(phase_name)
-    hosts = sorted(
-        (validate_supervised_evidence(value) for value in supervised_host_evidence),
-        key=lambda item: item["process_index"],
-    )
+    validated_hosts = [
+        validate_supervised_evidence(value) for value in supervised_host_evidence
+    ]
     if (
-        len(hosts) != EXPECTED_PROCESS_COUNT
-        or [host["process_index"] for host in hosts]
+        len(validated_hosts) != EXPECTED_PROCESS_COUNT
+        or any(host["status"] != "complete" for host in validated_hosts)
+        or sorted(host["controller_index"] for host in validated_hosts)
         != list(range(EXPECTED_PROCESS_COUNT))
-        or any(host["status"] != "complete" for host in hosts)
+        or sorted(host["process_index"] for host in validated_hosts)
+        != list(range(EXPECTED_PROCESS_COUNT))
     ):
         raise ContributionHarvestWorkerError(
-            "publication requires one successful supervised record per controller"
+            "publication requires successful records with independent exact "
+            "controller-index and JAX-process-index permutations"
         )
+    hosts = sorted(validated_hosts, key=lambda item: item["process_index"])
     children = [host["child_evidence"] for host in hosts]
     first = children[0]
     common_fields = (
@@ -1847,8 +1881,8 @@ def _jax_batch_collective(
     local_needs_execution: bool,
 ) -> tuple[bool, bool]:
     try:
-        from jax.experimental import multihost_utils
         import numpy as np
+        from jax.experimental import multihost_utils
     except ImportError as error:  # pragma: no cover - TPU boundary
         raise ContributionHarvestWorkerError(
             "multi-host harvest coordination requires JAX"
@@ -1938,7 +1972,7 @@ def _add_common_host_arguments(parser: argparse.ArgumentParser) -> None:
         type=int,
         required=True,
     )
-    parser.add_argument("--process-index", type=int, required=True)
+    parser.add_argument("--controller-index", type=int, required=True)
     parser.add_argument("--maximum-runtime-seconds", type=int, required=True)
 
 
@@ -1983,7 +2017,7 @@ def _parser() -> argparse.ArgumentParser:
         "--host-evidence",
         action="append",
         default=[],
-        help="repeat exactly four times, in any process order",
+        help="repeat exactly four times, in any controller order",
     )
     publish.add_argument("--phase-evidence", required=True)
     return parser
@@ -2065,7 +2099,7 @@ def _invocation_from_args(
             "per_device_sequence_batch",
             args.per_device_sequence_batch,
         ),
-        process_index=_process_index(args.process_index),
+        controller_index=_controller_index(args.controller_index),
         maximum_runtime_seconds=_positive_int(
             "maximum_runtime_seconds",
             args.maximum_runtime_seconds,
@@ -2094,7 +2128,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if args.command == "launch-host":
         attempt = _absolute_path(args.attempt_root, name="attempt_root")
-        host = attempt / f"host-p{_process_index(args.process_index):05d}"
+        host = attempt / (f"controller-c{_controller_index(args.controller_index):05d}")
         invocation = _invocation_from_args(
             args,
             child_evidence_path=host / "child-evidence.json",
@@ -2181,11 +2215,11 @@ __all__ = [
     "CHILD_EVIDENCE_SCHEMA_VERSION",
     "EXPECTED_GLOBAL_CHIPS",
     "EXPECTED_PROCESS_COUNT",
-    "HarvestInvocation",
-    "HarvestWorkerDependencies",
     "PHASE_EVIDENCE_SCHEMA_VERSION",
     "SUPERVISED_EVIDENCE_SCHEMA_VERSION",
     "ContributionHarvestWorkerError",
+    "HarvestInvocation",
+    "HarvestWorkerDependencies",
     "launch_harvest_host",
     "main",
     "production_dependencies",
