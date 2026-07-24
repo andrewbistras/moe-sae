@@ -138,6 +138,91 @@ def test_candidate_order_is_only_b128_b64_b32_on_known_best_mesh(
             )
 
 
+def test_nonzero_gcloud_transport_requires_four_exact_terminal_markers(
+    operator,
+    tmp_path: Path,
+) -> None:
+    candidate = operator.CANDIDATES[0]
+    logs = []
+    expected_statuses = [0, 0, 7, 0]
+    for controller_index, child_status in enumerate(expected_statuses):
+        path = tmp_path / f"host-{controller_index:05d}.ssh.log"
+        path.write_text(
+            "gcloud transport diagnostic\n"
+            f"terminal candidate={candidate.identifier} "
+            f"controller={controller_index} child_status={child_status}\n",
+            encoding="utf-8",
+        )
+        logs.append(path)
+
+    assert operator._validated_transport_completion(
+        candidate=candidate,
+        returncodes=[1, 1, 1, 1],
+        log_paths=logs,
+    ) == expected_statuses
+
+
+def test_run_reaches_coordinator_after_nonzero_transports_with_exact_markers(
+    operator,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(operator, tmp_path)
+    monkeypatch.setattr(operator.shutil, "which", lambda _name: "/usr/bin/gcloud")
+    monkeypatch.setattr(operator, "_verify_local_checkout", lambda _settings: None)
+
+    def fanout(_commands, log_paths):
+        candidate = operator.CANDIDATES[0]
+        for controller_index, log_path in enumerate(log_paths):
+            log_path.write_text(
+                f"terminal candidate={candidate.identifier} "
+                f"controller={controller_index} child_status=0\n",
+                encoding="utf-8",
+            )
+        return [1, 1, 1, 1]
+
+    decision_calls = []
+
+    def run_logged(_command, log_path):
+        if log_path.name == "decision.log":
+            decision_calls.append(log_path)
+        return argparse.Namespace(returncode=0)
+
+    monkeypatch.setattr(operator, "_fanout", fanout)
+    monkeypatch.setattr(operator, "_run_logged", run_logged)
+
+    assert operator.run(settings) == operator.PASS_EXIT
+    assert len(decision_calls) == 1
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        "",
+        (
+            "terminal candidate=b128-ep8-fsdp2 controller=0 child_status=0\n"
+            "terminal candidate=b128-ep8-fsdp2 controller=0 child_status=0\n"
+        ),
+        "terminal candidate=b64-ep8-fsdp2 controller=0 child_status=0\n",
+        "terminal candidate=b128-ep8-fsdp2 controller=1 child_status=0\n",
+        "terminal candidate=b128-ep8-fsdp2 controller=0 child_status=unknown\n",
+    ],
+)
+def test_transport_marker_is_fail_closed(
+    operator,
+    tmp_path: Path,
+    marker: str,
+) -> None:
+    log = tmp_path / "host-00000.ssh.log"
+    log.write_text(marker, encoding="utf-8")
+    with pytest.raises(operator.OperatorError, match="terminal marker"):
+        operator._terminal_child_status(
+            log,
+            candidate=operator.CANDIDATES[0],
+            controller_index=0,
+        )
+
+
 def test_operator_source_has_no_workload_launch_path() -> None:
     source = OPERATOR_PATH.read_text(encoding="utf-8")
     forbidden = (
@@ -244,3 +329,118 @@ def test_only_explicit_admission_messages_allow_fallback(decider) -> None:
         pattern.search("checkpoint identity mismatch")
         for pattern in decider._OOM_PATTERNS
     )
+    assert decider._LOW_MFU_ADMISSION_MESSAGE not in (
+        decider._FALLBACK_ADMISSION_MESSAGES
+    )
+
+
+def test_low_mfu_seals_abort_decision_with_measured_metrics(
+    decider,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    evidence_paths = []
+    output_tokens = 128 * 1_024 * 10
+    checked = []
+    sidecar = _sidecar()
+    for controller_index in range(4):
+        path = tmp_path / f"host-{controller_index:05d}.json"
+        path.write_text("{}", encoding="utf-8")
+        evidence_paths.append(str(path))
+        checked.append(
+            (
+                path,
+                {
+                    "status": "coordinator_ready",
+                    "controller_index": controller_index,
+                    "host_evidence_sha256": f"{controller_index + 1:064x}",
+                    "recomposition_sidecar_sha256": sidecar["sidecar_sha256"],
+                    "recomposition_sidecar_canonical_sha256": canonical_sha256(
+                        sidecar
+                    ),
+                    "observation": {
+                        "synchronized_measurement_steps": 10,
+                        "global_output_tokens": output_tokens,
+                        "local_persisted_tokens": output_tokens // 4,
+                        "writer_disabled_global_output_tokens": output_tokens,
+                        "measured_device_seconds": 1_000.0,
+                        "persisted_window_seconds": 1_010.0,
+                        "writer_disabled_device_seconds": 990.0,
+                    },
+                },
+            )
+        )
+
+    monkeypatch.setattr(
+        decider,
+        "_validated_host_records",
+        lambda _paths: checked,
+    )
+    monkeypatch.setattr(
+        decider,
+        "_identical_recomposition_sidecar",
+        lambda _checked: sidecar,
+    )
+
+    def reject_low_mfu(*_args, **_kwargs):
+        raise decider.ContributionPerformanceError(
+            decider._LOW_MFU_ADMISSION_MESSAGE
+        )
+
+    monkeypatch.setattr(
+        decider,
+        "aggregate_supervised_host_evidence",
+        reject_low_mfu,
+    )
+    args = argparse.Namespace(
+        candidate_id="b128-ep8-fsdp2",
+        mesh="ep8-fsdp2-tp1",
+        per_device_sequence_batch=8,
+        batch_sequences=128,
+        sequence_length=1_024,
+        host_evidence=evidence_paths,
+        output=str(tmp_path / "coordinator-bundle.json"),
+        decision=str(tmp_path / "operator-decision.json"),
+        qualification_receipt=str(tmp_path / "qualification-receipt.json"),
+        recomposition_sidecar=str(tmp_path / "recomposition-sidecar.json"),
+    )
+
+    assert decider.decide_candidate(args) == decider.ABORT_EXIT
+    decision = json.loads(
+        Path(args.decision).read_text(encoding="utf-8")
+    )
+    unsigned = dict(decision)
+    claimed = unsigned.pop("operator_decision_sha256")
+    assert canonical_sha256(unsigned) == claimed
+    assert decision["outcome"] == "aborted"
+    assert decision["reason_code"] == "useful_mfu_below_hard_gate"
+    assert decision["reason"] == decider._LOW_MFU_ADMISSION_MESSAGE
+    assert decision["next_action"] == "abort_operator_investigation_required"
+    assert (
+        decision["qualification_metrics"]["minimum_useful_prefix_mfu"]
+        == 0.10
+    )
+    expected_flops = decider.useful_flops_ledger(
+        batch_sequences=128,
+        sequence_length=1_024,
+        measured_steps=10,
+    )["useful_flops"]
+    assert decision["qualification_metrics"]["useful_flops"] == expected_flops
+    assert decision["qualification_metrics"]["useful_prefix_mfu"] == pytest.approx(
+        expected_flops / (decider.V4_32_BF16_PEAK_FLOPS * 1_000.0)
+    )
+    assert 0.0 < decision["qualification_metrics"]["useful_prefix_mfu"] < 0.10
+    assert decision["qualification_metrics"]["output_tokens"] == output_tokens
+    assert (
+        decision["qualification_metrics"]["persisted_tokens"]
+        == output_tokens
+    )
+    assert decision["qualification_metrics"][
+        "device_output_tokens_per_second"
+    ] == pytest.approx(output_tokens / 1_000.0)
+    assert decision["qualification_metrics"][
+        "persisted_tokens_per_second"
+    ] == pytest.approx(output_tokens / 1_010.0)
+    assert not Path(args.output).exists()
+    assert not Path(args.qualification_receipt).exists()
+    assert not Path(args.recomposition_sidecar).exists()

@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import sys
@@ -32,6 +33,7 @@ from moe_sae.contribution_artifacts import (
     canonical_sha256,
     validate_recomposition_sidecar,
 )
+from moe_sae.contribution_maxtext import useful_flops_ledger
 from moe_sae.contribution_performance import ContributionPerformanceError
 from moe_sae.contribution_qualification_worker import (
     aggregate_supervised_host_evidence,
@@ -41,6 +43,7 @@ from moe_sae.contribution_supervisor import (
     validate_execution_record,
     validate_supervision_result,
 )
+from moe_sae.runtime import V4_32_BF16_PEAK_FLOPS
 
 PLAN_SCHEMA_VERSION = "gemma4-contribution-qualification-operator-plan-v1"
 DECISION_SCHEMA_VERSION = "gemma4-contribution-qualification-operator-decision-v2"
@@ -69,6 +72,7 @@ _FALLBACK_ADMISSION_MESSAGES = {
     "auxiliary capture throughput is below 90% of writer-disabled":
         "persistence_headroom",
 }
+_LOW_MFU_ADMISSION_MESSAGE = "useful-prefix MFU is below the 10% hard gate"
 _DECLARED_CANDIDATES = (
     {
         "candidate_id": "b128-ep8-fsdp2",
@@ -381,6 +385,7 @@ def _decision_record(
     reason: str,
     coordinator_bundle_sha256: str | None,
     recomposition_sidecar_sha256: str | None,
+    qualification_metrics: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
     body = {
         "schema_version": DECISION_SCHEMA_VERSION,
@@ -396,6 +401,9 @@ def _decision_record(
         ],
         "coordinator_bundle_sha256": coordinator_bundle_sha256,
         "recomposition_sidecar_sha256": recomposition_sidecar_sha256,
+        "qualification_metrics": (
+            None if qualification_metrics is None else dict(qualification_metrics)
+        ),
         "next_action": (
             "stop_no_workload_launch"
             if outcome == "passed"
@@ -407,6 +415,109 @@ def _decision_record(
         ),
     }
     return _self_hashed(body, hash_field="operator_decision_sha256")
+
+
+def _qualification_metrics(
+    checked: Sequence[tuple[Path, Mapping[str, Any]]],
+    *,
+    batch_sequences: int,
+    sequence_length: int,
+) -> dict[str, Any]:
+    """Recover the exact measured scalars after a clean admission rejection."""
+
+    observations = [host["observation"] for _, host in checked]
+    if len(observations) != 4 or not all(
+        isinstance(value, Mapping) for value in observations
+    ):
+        raise QualificationDecisionError(
+            "low-MFU decision lacks four validated host observations"
+        )
+
+    def common_int(name: str) -> int:
+        values = [value.get(name) for value in observations]
+        if (
+            any(isinstance(value, bool) or not isinstance(value, int) for value in values)
+            or len(set(values)) != 1
+        ):
+            raise QualificationDecisionError(
+                f"low-MFU host observations disagree on {name}"
+            )
+        return int(values[0])
+
+    def positive_max(name: str) -> float:
+        values = [value.get(name) for value in observations]
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) <= 0.0
+            for value in values
+        ):
+            raise QualificationDecisionError(
+                f"low-MFU host observations contain invalid {name}"
+            )
+        return max(float(value) for value in values)
+
+    measured_steps = common_int("synchronized_measurement_steps")
+    global_output_tokens = common_int("global_output_tokens")
+    writer_disabled_output_tokens = common_int(
+        "writer_disabled_global_output_tokens"
+    )
+    local_persisted = [
+        value.get("local_persisted_tokens") for value in observations
+    ]
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for value in local_persisted
+    ):
+        raise QualificationDecisionError(
+            "low-MFU host observations contain invalid persisted token counts"
+        )
+    measured_seconds = positive_max("measured_device_seconds")
+    persisted_seconds = positive_max("persisted_window_seconds")
+    writer_disabled_seconds = positive_max("writer_disabled_device_seconds")
+    ledger = useful_flops_ledger(
+        batch_sequences=batch_sequences,
+        sequence_length=sequence_length,
+        measured_steps=measured_steps,
+    )
+    useful_flops = int(ledger["useful_flops"])
+    persisted_tokens = sum(int(value) for value in local_persisted)
+    device_output_tps = global_output_tokens / measured_seconds
+    persisted_tps = persisted_tokens / persisted_seconds
+    writer_disabled_tps = (
+        writer_disabled_output_tokens / writer_disabled_seconds
+    )
+    useful_mfu = useful_flops / (
+        float(V4_32_BF16_PEAK_FLOPS) * measured_seconds
+    )
+    metrics = {
+        "useful_prefix_mfu": useful_mfu,
+        "minimum_useful_prefix_mfu": 0.10,
+        "useful_flops": useful_flops,
+        "measured_device_seconds": measured_seconds,
+        "device_output_tokens_per_second": device_output_tps,
+        "persisted_tokens_per_second": persisted_tps,
+        "writer_disabled_tokens_per_second": writer_disabled_tps,
+        "auxiliary_throughput_fraction": (
+            device_output_tps / writer_disabled_tps
+        ),
+        "output_tokens": global_output_tokens,
+        "persisted_tokens": persisted_tokens,
+        "synchronized_measurement_steps": measured_steps,
+    }
+    if (
+        not 0.0 < useful_mfu < 0.10
+        or any(
+            not math.isfinite(float(value))
+            for value in metrics.values()
+            if isinstance(value, float)
+        )
+    ):
+        raise QualificationDecisionError(
+            "low-MFU admission error is inconsistent with measured metrics"
+        )
+    return metrics
 
 
 def decide_candidate(args: argparse.Namespace) -> int:
@@ -429,6 +540,7 @@ def decide_candidate(args: argparse.Namespace) -> int:
     reason_code = "qualification_passed"
     reason = "all four exact host observations passed aggregation"
     exit_code = PASS_EXIT
+    qualification_metrics: dict[str, Any] | None = None
 
     if terminal_failure is not None:
         reason_code, reason = terminal_failure
@@ -444,14 +556,25 @@ def decide_candidate(args: argparse.Namespace) -> int:
             )
         except ContributionPerformanceError as error:
             reason = str(error)
-            reason_code = _FALLBACK_ADMISSION_MESSAGES.get(reason, "")
+            if reason == _LOW_MFU_ADMISSION_MESSAGE:
+                reason_code = "useful_mfu_below_hard_gate"
+                outcome = "aborted"
+                exit_code = ABORT_EXIT
+                qualification_metrics = _qualification_metrics(
+                    checked,
+                    batch_sequences=args.batch_sequences,
+                    sequence_length=args.sequence_length,
+                )
+            else:
+                reason_code = _FALLBACK_ADMISSION_MESSAGES.get(reason, "")
             if not reason_code:
                 raise QualificationDecisionError(
                     "qualification admission failed for a non-headroom reason: "
                     f"{reason}"
                 ) from error
-            outcome = "fallback_allowed"
-            exit_code = FALLBACK_EXIT
+            if reason != _LOW_MFU_ADMISSION_MESSAGE:
+                outcome = "fallback_allowed"
+                exit_code = FALLBACK_EXIT
 
     bundle_sha256: str | None = None
     if bundle is not None:
@@ -482,6 +605,7 @@ def decide_candidate(args: argparse.Namespace) -> int:
         recomposition_sidecar_sha256=(
             None if sidecar is None else str(sidecar["sidecar_sha256"])
         ),
+        qualification_metrics=qualification_metrics,
     )
     _atomic_create_json(Path(args.decision), decision)
     print(json.dumps(decision, sort_keys=True), flush=True)

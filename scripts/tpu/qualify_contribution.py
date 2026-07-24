@@ -496,6 +496,90 @@ def _fanout(
             handle.close()
 
 
+def _terminal_child_status(
+    log_path: Path,
+    *,
+    candidate: Candidate,
+    controller_index: int,
+) -> int:
+    """Read one exact remote terminal marker from a completed SSH log.
+
+    ``gcloud ... ssh`` can return a local transport status of one after the
+    remote shell has completed successfully.  The marker authorizes only a
+    coordinator validation attempt; it never substitutes for the immutable,
+    self-hashed host evidence checked by that coordinator.
+    """
+
+    try:
+        lines = log_path.read_bytes().splitlines()
+    except OSError as error:
+        raise OperatorError(
+            f"cannot read controller {controller_index} SSH log: {log_path}"
+        ) from error
+    marker_lines = [
+        line for line in lines if line.startswith(b"terminal candidate=")
+    ]
+    if len(marker_lines) != 1:
+        raise OperatorError(
+            f"controller {controller_index} SSH log has "
+            f"{len(marker_lines)} terminal markers; exactly one is required"
+        )
+    expected_prefix = (
+        f"terminal candidate={candidate.identifier} "
+        f"controller={controller_index} child_status="
+    ).encode("ascii")
+    marker = marker_lines[0]
+    if not marker.startswith(expected_prefix):
+        raise OperatorError(
+            f"controller {controller_index} SSH terminal marker does not "
+            "match the exact candidate/controller"
+        )
+    raw_status = marker[len(expected_prefix) :]
+    if re.fullmatch(rb"(?:0|[1-9][0-9]{0,2})", raw_status) is None:
+        raise OperatorError(
+            f"controller {controller_index} SSH terminal marker has an "
+            "invalid child status"
+        )
+    status = int(raw_status)
+    if status > 255:
+        raise OperatorError(
+            f"controller {controller_index} SSH terminal marker child status "
+            "is outside the shell exit-code range"
+        )
+    return status
+
+
+def _validated_transport_completion(
+    *,
+    candidate: Candidate,
+    returncodes: Sequence[int],
+    log_paths: Sequence[Path],
+) -> list[int]:
+    """Require exact remote completion before attempting coordinator checks."""
+
+    if len(returncodes) != PROCESS_COUNT or len(log_paths) != PROCESS_COUNT:
+        raise OperatorError(
+            "transport completion requires exactly four codes and logs"
+        )
+    child_statuses = [
+        _terminal_child_status(
+            log_path,
+            candidate=candidate,
+            controller_index=controller_index,
+        )
+        for controller_index, log_path in enumerate(log_paths)
+    ]
+    nonzero = [int(code) for code in returncodes if int(code) != 0]
+    if nonzero:
+        print(
+            "[exp2-qualification] local gcloud transport returned nonzero "
+            f"codes {list(returncodes)} after all four exact terminal markers; "
+            "continuing only to immutable coordinator validation",
+            flush=True,
+        )
+    return child_statuses
+
+
 def _dry_run(settings: Settings) -> int:
     payload: dict[str, object] = {
         "run_id": settings.run_id,
@@ -555,19 +639,16 @@ def run(settings: Settings) -> int:
             f"global-B={candidate.global_sequence_batch}",
             flush=True,
         )
-        returncodes = _fanout(
-            commands,
-            [
-                candidate_logs / f"host-{index:05d}.ssh.log"
-                for index in range(PROCESS_COUNT)
-            ],
+        log_paths = [
+            candidate_logs / f"host-{index:05d}.ssh.log"
+            for index in range(PROCESS_COUNT)
+        ]
+        returncodes = _fanout(commands, log_paths)
+        _validated_transport_completion(
+            candidate=candidate,
+            returncodes=returncodes,
+            log_paths=log_paths,
         )
-        if any(code != 0 for code in returncodes):
-            raise OperatorError(
-                "one or more SSH transports ended without terminal host "
-                f"evidence (codes={returncodes}); aborting before fallback; "
-                f"inspect {candidate_logs}"
-            )
 
         decision_log = candidate_logs / "decision.log"
         decision = _run_logged(
@@ -602,7 +683,9 @@ def run(settings: Settings) -> int:
             continue
         raise OperatorError(
             "candidate decision was not an explicit OOM/headroom fallback "
-            f"(code={decision.returncode}); aborting; inspect {decision_log}"
+            f"(code={decision.returncode}); aborting; inspect {decision_log}; "
+            "sealed decision (when available): "
+            f"{candidate_control}/operator-decision.json"
         )
 
     raise OperatorError(
