@@ -713,6 +713,7 @@ def test_qualifier_and_real_harvest_share_one_performance_launch_identity(
         "use_ring_of_experts": False,
         "float32_weight_sum": True,
         "matmul_precision": "default",
+        "attention": config.model.attention,
         "max_target_length": 1_024,
         "per_device_batch_size": 8,
         "ici_expert_parallelism": 8,

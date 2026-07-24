@@ -28,7 +28,7 @@ from moe_sae.contribution_config import (
 ROOT = Path(__file__).resolve().parents[1]
 CHECKED_IN_CONFIG = ROOT / "configs" / "gemma4_contribution_v1.yaml"
 DEFAULT_CONFIG_SHA256 = (
-    "ca41145b5cc58be6f2a2c4f46efeb80c5f9621934d2bd7c31432719dd7190c4a"
+    "acab4ae914dfc32a4b9de319c2c598ba22260d8584f5907ed0966a0278006de9"
 )
 
 

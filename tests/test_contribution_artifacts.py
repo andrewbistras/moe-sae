@@ -283,6 +283,20 @@ def test_batch_enforces_shard_limit_route_and_token_invariants():
     with pytest.raises(ContributionSchemaError, match="sum to one"):
         validate_contribution_batch(dataclass_replace(original, router_weights=bad_sum))
 
+    nonfinite_expert = original.expert_output.copy()
+    nonfinite_expert[0, 0, 0] = np.uint16(0x7F80)
+    with pytest.raises(ContributionSchemaError, match="expert_output.*non-finite"):
+        validate_contribution_batch(
+            dataclass_replace(original, expert_output=nonfinite_expert)
+        )
+
+    nonfinite_shared = original.shared_output.copy()
+    nonfinite_shared[0, 0] = np.uint16(0x7FC0)
+    with pytest.raises(ContributionSchemaError, match="shared_output.*non-finite"):
+        validate_contribution_batch(
+            dataclass_replace(original, shared_output=nonfinite_shared)
+        )
+
     duplicate_tokens = dataclass_replace(
         original,
         sequence_id=np.asarray([100, 100], dtype=np.int64),

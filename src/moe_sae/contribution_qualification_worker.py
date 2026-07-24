@@ -49,6 +49,7 @@ from typing import Any, Protocol
 import numpy as np
 
 from moe_sae.contribution_artifacts import (
+    MAX_SHARD_TOKENS,
     ContributionSchemaError,
     canonical_json_bytes,
     canonical_sha256,
@@ -61,7 +62,7 @@ from moe_sae.contribution_config import (
     load_contribution_config,
 )
 from moe_sae.contribution_harvest import (
-    contribution_capture_to_wire,
+    contribution_capture_to_wire_chunks,
 )
 from moe_sae.contribution_maxtext import (
     CONTRIBUTION_GRAPH_SCHEMA_VERSION,
@@ -126,7 +127,7 @@ COORDINATOR_BUNDLE_SCHEMA_VERSION = (
     "gemma4-contribution-qualification-coordinator-bundle-v4"
 )
 QUALIFICATION_WRITER_SCHEMA_VERSION = (
-    "gemma4-contribution-qualification-local-writer-v1"
+    "gemma4-contribution-qualification-local-writer-v2"
 )
 SOURCE_GRAPH_CONTRACT_SCHEMA_VERSION = "gemma4-contribution-source-graph-contract-v1"
 EXPECTED_HARDWARE_CONTRACT_SCHEMA_VERSION = (
@@ -135,9 +136,12 @@ EXPECTED_HARDWARE_CONTRACT_SCHEMA_VERSION = (
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _SOURCE_GRAPH_FILES = (
+    "src/moe_sae/runtime.py",
     "src/moe_sae/model.py",
     "src/moe_sae/harvest.py",
     "src/moe_sae/contribution_model.py",
+    "src/moe_sae/contribution_artifacts.py",
+    "src/moe_sae/contribution_harvest.py",
     "src/moe_sae/contribution_maxtext.py",
     "src/moe_sae/contribution_qualification_worker.py",
     "patches/maxtext/0001-gemma4-return-selected-outputs.patch",
@@ -911,6 +915,7 @@ def _validate_effective_runtime(
         "sparse_matmul": True,
         "use_ring_of_experts": False,
         "float32_weight_sum": True,
+        "attention": config.model.attention,
         "max_target_length": config.model.sequence_length,
         "per_device_batch_size": per_device_sequence_batch,
         "ici_expert_parallelism": mesh.expert_parallelism,
@@ -999,28 +1004,38 @@ class LocalQualificationPersist:
         process_count: int,
         process_index: int,
         sequence_length: int,
+        wire_chunk_tokens: int = MAX_SHARD_TOKENS,
     ) -> None:
         self.root = root.expanduser().resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.process_count = process_count
         self.process_index = process_index
         self.sequence_length = sequence_length
+        if (
+            isinstance(wire_chunk_tokens, bool)
+            or not isinstance(wire_chunk_tokens, int)
+            or not 0 < wire_chunk_tokens <= MAX_SHARD_TOKENS
+        ):
+            raise ContributionQualificationWorkerError(
+                f"wire_chunk_tokens must be in [1,{MAX_SHARD_TOKENS}]"
+            )
+        self.wire_chunk_tokens = wire_chunk_tokens
         self.max_observed_backlog = 0
         self.queue_drained = False
         self._executor = ThreadPoolExecutor(
             max_workers=1,
             thread_name_prefix="contribution-qualification-writer",
         )
-        self._pending: list[Future[dict[str, Any]]] = []
+        self._pending: list[Future[list[dict[str, Any]]]] = []
         self._records: list[dict[str, Any]] = []
         self._step = 0
         self._closed = False
 
     def _reap(self, *, wait: bool) -> None:
-        remaining: list[Future[dict[str, Any]]] = []
+        remaining: list[Future[list[dict[str, Any]]]] = []
         for future in self._pending:
             if wait or future.done():
-                self._records.append(future.result())
+                self._records.extend(future.result())
             else:
                 remaining.append(future)
         self._pending = remaining
@@ -1034,28 +1049,45 @@ class LocalQualificationPersist:
             replicated_partition_unit=self.sequence_length,
         )
 
-    def _write(self, step: int, wire: Any) -> dict[str, Any]:
-        destination = self.root / f"step-{step:05d}.safetensors"
-        tensors = {
-            name: np.ascontiguousarray(getattr(wire, name))
-            for name in wire.__dataclass_fields__
-        }
-        size, digest = _write_safetensors_create_only(
-            destination,
-            tensors,
-            metadata={
-                "schema_version": QUALIFICATION_WRITER_SCHEMA_VERSION,
-                "process_index": str(self.process_index),
-                "step": str(step),
-            },
-        )
-        return {
-            "step": step,
-            "file": destination.name,
-            "tokens": int(wire.tokens),
-            "bytes": size,
-            "sha256": digest,
-        }
+    def _write(
+        self,
+        step: int,
+        wires: tuple[Any, ...],
+    ) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        parts = len(wires)
+        for part, wire in enumerate(wires):
+            destination = (
+                self.root
+                / f"step-{step:05d}-part-{part:03d}.safetensors"
+            )
+            tensors = {
+                name: np.ascontiguousarray(getattr(wire, name))
+                for name in wire.__dataclass_fields__
+            }
+            size, digest = _write_safetensors_create_only(
+                destination,
+                tensors,
+                metadata={
+                    "schema_version": QUALIFICATION_WRITER_SCHEMA_VERSION,
+                    "process_index": str(self.process_index),
+                    "step": str(step),
+                    "part": str(part),
+                    "parts": str(parts),
+                },
+            )
+            records.append(
+                {
+                    "step": step,
+                    "part": part,
+                    "parts": parts,
+                    "file": destination.name,
+                    "tokens": int(wire.tokens),
+                    "bytes": size,
+                    "sha256": digest,
+                }
+            )
+        return records
 
     def __call__(self, output: Any) -> int:
         if self._closed:
@@ -1064,7 +1096,7 @@ class LocalQualificationPersist:
         self._reap(wait=False)
         if self._pending:
             self._reap(wait=True)
-        wire = contribution_capture_to_wire(
+        wires = contribution_capture_to_wire_chunks(
             expert_output=self._local(output.expert_output, "expert_output"),
             expert_ids=self._local(output.expert_ids, "expert_ids"),
             router_weights=self._local(
@@ -1074,15 +1106,16 @@ class LocalQualificationPersist:
             shared_output=self._local(output.shared_output, "shared_output"),
             sequence_id=self._local(output.sequence_id, "sequence_id"),
             position=self._local(output.position, "position"),
+            max_tokens=self.wire_chunk_tokens,
         )
         step = self._step
         self._step += 1
-        self._pending.append(self._executor.submit(self._write, step, wire))
+        self._pending.append(self._executor.submit(self._write, step, wires))
         self.max_observed_backlog = max(
             self.max_observed_backlog,
             len(self._pending),
         )
-        return int(wire.tokens)
+        return sum(int(wire.tokens) for wire in wires)
 
     def flush(self) -> None:
         self._reap(wait=True)
@@ -1102,7 +1135,10 @@ class LocalQualificationPersist:
             raise ContributionQualificationWorkerError(
                 "qualification writer summary requested before drain"
             )
-        ordered = sorted(self._records, key=lambda item: item["step"])
+        ordered = sorted(
+            self._records,
+            key=lambda item: (item["step"], item["part"]),
+        )
         unsigned = {
             "schema_version": QUALIFICATION_WRITER_SCHEMA_VERSION,
             "process_count": self.process_count,
@@ -1587,6 +1623,7 @@ def run_qualification_child(
         grain_eval_files="",
         mesh=invocation.mesh,
         per_device_sequence_batch=invocation.per_device_sequence_batch,
+        attention=config.model.attention,
         jax_cache_dir=invocation.jax_cache_dir,
         synthetic=True,
     )

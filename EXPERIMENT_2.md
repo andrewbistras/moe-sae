@@ -565,14 +565,28 @@ Only an explicit OOM or static-headroom rejection advances to the next smaller
 batch; identity, transport, parity, timeout, and unknown failures abort. The
 candidates never overlap, and the first passing receipt ends the sweep.
 
+The frozen attention setting is explicitly `autoselected`, which selects
+MaxText's TPU-native Splash/Flash implementation at sequence length 1,024.
+Both qualification and harvesting pass that value rather than inheriting a
+mutable default, and the observed effective runtime must report the same value.
+The attention kernel does not change the scientific capture boundary, but it
+is part of the exact graph identity and materially affects the admission MFU.
+
 The target shared branch adds only about 1.1% to the old prefix FLOPs. The main
 risk is materializing and persisting the selected tensor:
 
 ```text
-about 52 MiB additional device output per chip per step
-about 208 MB per controller per step
-about 1.0--1.2 GB/s aggregate persistence at the prior token rate
+about 396 MiB total contribution output per chip per B128 step
+about 1.55 GiB per controller per B128 step
+about 6.19 GiB aggregate per B128 step
 ```
+
+Those figures include all eight raw expert outputs, the shared output, router
+IDs/weights, and token identity. The writer therefore splits each
+controller-local step into independently validated shards of at most 16,384
+tokens and bitcasts native BF16 directly to its exact uint16 wire
+representation; it must not expand capture-sized tensors through FP32 merely
+for serialization or finiteness checks.
 
 Benchmark the exact auxiliary-return graph rather than extrapolating from the
 aggregate harvester. Host assembly, FP64 statistics, hashing, and compiler

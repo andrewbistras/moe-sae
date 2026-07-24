@@ -18,9 +18,10 @@ import hashlib
 import json
 import math
 import re
+from collections.abc import Mapping, Sequence
 from dataclasses import MISSING, dataclass, field, fields
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 SCHEMA_VERSION = "gemma4-contribution-run-config-v1"
 PROTOCOL_ID = "gemma4-contribution-v1-20260724"
@@ -236,7 +237,7 @@ class ContributionModelContract:
     use_random_routing: bool = False
     float32_gate_logits: bool = False
     capacity_factor: float = -1.0
-    attention: str = "dot_product"
+    attention: str = "autoselected"
     sparse_matmul: bool = True
     use_ring_of_experts: bool = False
     ragged_buffer_factor: float = -1.0
@@ -848,7 +849,7 @@ class Experiment2Config:
         )
         return (*routed, self.shared_q)
 
-    def with_maxtext_fork_commit(self, commit: str) -> "Experiment2Config":
+    def with_maxtext_fork_commit(self, commit: str) -> Experiment2Config:
         """Accept only the already-pinned published fork identity."""
 
         if commit != self.provenance.maxtext_fork_commit:
@@ -926,7 +927,7 @@ class Experiment2Config:
         return target
 
     @classmethod
-    def from_mapping(cls, value: Any) -> "Experiment2Config":
+    def from_mapping(cls, value: Any) -> Experiment2Config:
         expected = {item.name for item in fields(cls)}
         raw = _require_exact_keys(value, expected, owner="experiment2")
 
@@ -1043,18 +1044,10 @@ def save_contribution_config(
 
 
 __all__ = [
-    "CAPTURE_SCHEMA_VERSION",
     "C4_REPOSITORY",
     "C4_REVISION",
+    "CAPTURE_SCHEMA_VERSION",
     "CONDITIONS",
-    "ContributionConfigError",
-    "ContributionLayout",
-    "ContributionModelContract",
-    "ContributionOptimizer",
-    "ContributionPhase",
-    "ContributionProvenance",
-    "ContributionRuntime",
-    "Experiment2Config",
     "MAXTEXT_BASE_COMMIT",
     "MAXTEXT_FORK_COMMIT",
     "MAXTEXT_SELECTED_OUTPUTS_PATCH_SHA256",
@@ -1063,6 +1056,14 @@ __all__ = [
     "PHASE_NAMES",
     "PROTOCOL_ID",
     "SCHEMA_VERSION",
+    "ContributionConfigError",
+    "ContributionLayout",
+    "ContributionModelContract",
+    "ContributionOptimizer",
+    "ContributionPhase",
+    "ContributionProvenance",
+    "ContributionRuntime",
+    "Experiment2Config",
     "load_contribution_config",
     "save_contribution_config",
 ]

@@ -43,6 +43,7 @@ from moe_sae.contribution_qualification_worker import (
     _contract_identity,
     _observation_from_dict,
     _supervised_host_record,
+    _validate_effective_runtime,
     aggregate_supervised_host_evidence,
     authorize_extended_workload_after_lowering,
     build_authorization_contract,
@@ -224,7 +225,7 @@ def _runtime() -> SimpleNamespace:
         "use_ring_of_experts": False,
         "float32_weight_sum": True,
         "matmul_precision": "default",
-        "attention": "dot_product",
+        "attention": "autoselected",
         "dtype": "bfloat16",
         "weight_dtype": "bfloat16",
         "max_target_length": 1_024,
@@ -414,10 +415,10 @@ def test_authorization_contract_is_self_hashed_and_source_bound(
     )
     assert checked["graph_contract"]["maxtext_fork_commit"] == MAXTEXT_FORK_COMMIT
     assert {item["path"] for item in checked["graph_contract"]["source_files"]} >= {
+        "src/moe_sae/runtime.py",
         "src/moe_sae/contribution_model.py",
         "patches/maxtext/0001-gemma4-return-selected-outputs.patch",
     }
-
     tampered = json.loads(json.dumps(contract))
     tampered["launch_contract"]["qualification_plan"]["measured_steps"] += 1
     with pytest.raises(
@@ -425,6 +426,19 @@ def test_authorization_contract_is_self_hashed_and_source_bound(
         match="self-hash",
     ):
         validate_authorization_contract(tampered)
+
+
+def test_qualification_runtime_rejects_attention_drift() -> None:
+    config = load_contribution_config(CONFIG_PATH)
+    runtime = _runtime()
+    runtime.config.attention = "dot_product"
+    with pytest.raises(ContributionQualificationWorkerError, match="attention"):
+        _validate_effective_runtime(
+            runtime,
+            config=config,
+            mesh=MESH,
+            per_device_sequence_batch=1,
+        )
 
 
 def test_child_initializes_distributed_first_and_seals_observation(
@@ -863,7 +877,7 @@ def test_local_writer_uses_create_only_safetensors_and_self_hashed_summary(
     assert summary["tokens"] == rows
     assert summary["max_observed_backlog"] == 1
     assert summary["queue_drained"] is True
-    assert (tmp_path / "step-00000.safetensors").is_file()
+    assert (tmp_path / "step-00000-part-000.safetensors").is_file()
     unsigned = dict(summary)
     claimed = unsigned.pop("writer_evidence_sha256")
     assert canonical_sha256(unsigned) == claimed
@@ -884,3 +898,40 @@ def test_local_writer_uses_create_only_safetensors_and_self_hashed_summary(
     finally:
         with pytest.raises(ContributionQualificationWorkerError):
             duplicate.close()
+
+
+def test_local_writer_chunks_large_logical_steps_without_growing_backlog(
+    tmp_path: Path,
+) -> None:
+    rows = 2
+    output = SimpleNamespace(
+        expert_output=np.zeros((rows, 8, 2_816), dtype=np.float32),
+        expert_ids=np.broadcast_to(
+            np.arange(8, dtype=np.uint8),
+            (rows, 8),
+        ),
+        router_weights=np.full((rows, 8), 0.125, dtype=np.float32),
+        shared_output=np.zeros((rows, 2_816), dtype=np.float32),
+        sequence_id=np.arange(rows, dtype=np.int64),
+        position=np.arange(rows, dtype=np.uint16),
+    )
+    writer = LocalQualificationPersist(
+        tmp_path,
+        process_count=1,
+        process_index=0,
+        sequence_length=1,
+        wire_chunk_tokens=1,
+    )
+    try:
+        assert writer(output) == rows
+        writer.flush()
+        summary = writer.summary()
+    finally:
+        writer.close()
+
+    assert summary["tokens"] == rows
+    assert summary["max_observed_backlog"] == 1
+    assert [item["part"] for item in summary["files"]] == [0, 1]
+    assert [item["parts"] for item in summary["files"]] == [2, 2]
+    assert (tmp_path / "step-00000-part-000.safetensors").is_file()
+    assert (tmp_path / "step-00000-part-001.safetensors").is_file()

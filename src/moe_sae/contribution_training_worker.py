@@ -18,18 +18,18 @@ does not initialize JAX before it starts the hard-deadlined child.
 from __future__ import annotations
 
 import argparse
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict, dataclass, replace
 import hashlib
 import itertools
 import json
 import math
 import os
-from pathlib import Path
 import re
 import subprocess
 import sys
 import time
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import asdict, dataclass, replace
+from pathlib import Path
 from typing import Any, Literal, Protocol
 
 import numpy as np
@@ -50,7 +50,6 @@ from moe_sae.contribution_training_performance import (
     SAEQualificationObservation,
     build_sae_qualification_receipt,
 )
-
 
 TRAINING_WORKER_SCHEMA_VERSION = "gemma4-contribution-training-worker-v1"
 TRAINING_MODE_SELECTION_SCHEMA_VERSION = (
@@ -231,7 +230,7 @@ class TrainingWorkerPlan:
         phase: str,
         condition: str,
         seed: int,
-    ) -> "TrainingWorkerPlan":
+    ) -> TrainingWorkerPlan:
         config.validate()
         selected = config.phase(phase)
         if selected.layout_set == "none":
@@ -399,7 +398,9 @@ def qualify_training_modes(
                     "mode probe returned the wrong observation type"
                 )
             raw.append((mode, observation))
-        except Exception as error:  # retain both mode attempts
+        # Retain terminal evidence for both predeclared modes; the outer
+        # process-group supervisor still bounds the combined attempt.
+        except Exception as error:  # noqa: BLE001
             raw.append((mode, error))
     elapsed = float(clock() - started)
     if elapsed_transform is not None:
@@ -440,7 +441,9 @@ def qualify_training_modes(
                     minimum_useful_mfu=minimum_useful_mfu,
                 )
             )
-        except Exception as error:
+        # A validation failure rejects this mode without hiding the other
+        # predeclared candidate's independently measured evidence.
+        except Exception as error:  # noqa: BLE001
             unsigned = {
                 "mode": mode,
                 "status": "failed",
@@ -740,13 +743,12 @@ def run_qualified_training(
     )
     restored = dependencies.restore(initial, provisional_identity)
     state = initial if restored is None else restored.state
-    if restored is not None:
-        if dict(restored.metadata).get("run_identity_sha256") != (
-            provisional_identity["run_identity_sha256"]
-        ):
-            raise ContributionTrainingWorkerError(
-                "restored checkpoint metadata belongs to another run"
-            )
+    if restored is not None and dict(restored.metadata).get(
+        "run_identity_sha256"
+    ) != provisional_identity["run_identity_sha256"]:
+        raise ContributionTrainingWorkerError(
+            "restored checkpoint metadata belongs to another run"
+        )
     start_step, start_tokens = dependencies.progress(state)
     _positive_int("restored step", start_step, allow_zero=True)
     _positive_int("restored tokens", start_tokens, allow_zero=True)
@@ -1806,6 +1808,7 @@ class _OrbaxCheckpointBackend:
         run_identity: Mapping[str, Any],
     ) -> RestoredTrainingState | None:
         import jax
+
         from moe_sae.checkpointing import pointer_path
         from moe_sae.distributed import restore_distributed_checkpoint
 
@@ -2342,7 +2345,7 @@ def _run_production_qualification(
                 transition_output_sha256=transition_sha,
                 replay_output_sha256=replay_sha,
             )
-        except Exception:
+        except Exception:  # noqa: TRY203
             raise
 
     return qualify_training_modes(
@@ -2597,9 +2600,21 @@ def _parser() -> argparse.ArgumentParser:
 
     prefetch = commands.add_parser(
         "prefetch",
-        help="materialize and prove one process-contiguous lane without JAX",
+        help="hard-supervise one process-lane prefetch without JAX",
     )
     _add_prefetch_arguments(prefetch)
+    _add_supervisor_arguments(prefetch)
+    prefetch.add_argument(
+        "--maximum-runtime-seconds",
+        type=int,
+        default=MAX_QUALIFICATION_SECONDS,
+    )
+
+    prefetch_child = commands.add_parser(
+        "prefetch-child",
+        help="internal child; invoke through prefetch",
+    )
+    _add_prefetch_arguments(prefetch_child)
 
     qualify = commands.add_parser(
         "qualify",
@@ -2704,7 +2719,12 @@ def _supervision_paths(
     root.mkdir(parents=True, exist_ok=True)
     if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", args.host_id) is None:
         raise ContributionTrainingWorkerError("host-id is invalid")
-    prefix = f"{operation}-{args.condition}-seed{args.seed}-{args.host_id}"
+    if operation == "prefetch":
+        prefix = (
+            f"prefetch-p{int(args.process_index):05d}-{args.host_id}"
+        )
+    else:
+        prefix = f"{operation}-{args.condition}-seed{args.seed}-{args.host_id}"
     return {
         "log_path": root / f"{prefix}.log",
         "execution_record_path": root / f"{prefix}.execution.json",
@@ -2716,6 +2736,7 @@ def _prelaunch_identity(
     args: argparse.Namespace,
     *,
     child_command: Sequence[str],
+    uses_accelerator: bool = True,
 ) -> ExactPerformanceIdentity:
     module_path = Path(__file__).resolve()
     module_sha = hashlib.sha256(module_path.read_bytes()).hexdigest()
@@ -2725,13 +2746,26 @@ def _prelaunch_identity(
             "module_sha256": module_sha,
             "source_revision": args.source_revision,
         },
-        hardware={
-            "schema_version": "gemma4-contribution-sae-requested-hardware-v1",
-            "platform": "tpu",
-            "accelerator": "v4-32",
-            "global_chip_count": 16,
-            "peak_flops_per_second": args.peak_flops_per_second,
-        },
+        hardware=(
+            {
+                "schema_version": (
+                    "gemma4-contribution-sae-requested-hardware-v1"
+                ),
+                "platform": "tpu",
+                "accelerator": "v4-32",
+                "global_chip_count": 16,
+                "peak_flops_per_second": args.peak_flops_per_second,
+            }
+            if uses_accelerator
+            else {
+                "schema_version": (
+                    "gemma4-contribution-prefetch-host-runtime-v1"
+                ),
+                "platform": "host",
+                "accelerator": None,
+                "jax_initialized": False,
+            }
+        ),
         config={
             "schema_version": "gemma4-contribution-sae-prelaunch-command-v1",
             "argv": list(child_command),
@@ -2776,8 +2810,89 @@ def _supervise(
     return result
 
 
+def _prefetch_argv(args: argparse.Namespace) -> list[str]:
+    result = [
+        "--config",
+        str(Path(args.config).expanduser().resolve()),
+        "--phase",
+        args.phase,
+        "--capture-control-root",
+        args.capture_control_root,
+        "--object-prefix",
+        args.object_prefix,
+        "--resident-cache-root",
+        args.resident_cache_root,
+        "--resident-cache-max-bytes",
+        str(args.resident_cache_max_bytes),
+        "--process-count",
+        str(args.process_count),
+        "--process-index",
+        str(args.process_index),
+        "--prefetch-receipt-path",
+        args.prefetch_receipt_path,
+        "--source-revision",
+        args.source_revision,
+    ]
+    if args.recomposition_sidecar is not None:
+        result.extend(
+            ["--recomposition-sidecar", args.recomposition_sidecar]
+        )
+    return result
+
+
 def _prefetch_command(args: argparse.Namespace) -> int:
-    """Run the bounded-cache asynchronous transfer without importing JAX."""
+    """Supervise the JAX-free transfer under one hard process-group deadline."""
+
+    maximum = _positive_int(
+        "maximum_runtime_seconds",
+        args.maximum_runtime_seconds,
+    )
+    if maximum > MAX_QUALIFICATION_SECONDS:
+        raise ContributionTrainingWorkerError(
+            "process-lane prefetch cannot exceed 600 seconds"
+        )
+    child = [
+        sys.executable,
+        "-m",
+        "moe_sae.contribution_training_worker",
+        "prefetch-child",
+        *_prefetch_argv(args),
+    ]
+    identity = _prelaunch_identity(
+        args,
+        child_command=child,
+        uses_accelerator=False,
+    )
+    result = _supervise(
+        args,
+        child_command=child,
+        identity=identity,
+        maximum_seconds=maximum,
+        qualification_receipt=None,
+        operation="prefetch",
+    )
+    receipt = validate_prefetch_receipt(
+        _read_json(args.prefetch_receipt_path, name="prefetch receipt")
+    )
+    print(
+        json.dumps(
+            {
+                "supervision_result_sha256": result["result_sha256"],
+                "receipt_sha256": receipt["receipt_sha256"],
+                "process_partition": receipt["process_partition"],
+                "objects": receipt["object_count"],
+                "bytes": receipt["object_bytes"],
+                "elapsed_seconds": receipt["elapsed_seconds"],
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+    return 0
+
+
+def _prefetch_child_command(args: argparse.Namespace) -> int:
+    """Run the bounded-cache transfer without importing JAX."""
 
     _verify_repository_revision(args.source_revision)
     config = load_contribution_config(args.config)
@@ -3060,6 +3175,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.command == "prefetch":
             return _prefetch_command(args)
+        if args.command == "prefetch-child":
+            return _prefetch_child_command(args)
         if args.command == "qualify":
             return _qualify_command(args)
         if args.command == "qualify-child":
@@ -3081,11 +3198,11 @@ if __name__ == "__main__":  # pragma: no cover - exercised via module CLI
 __all__ = [
     "CONDITIONS",
     "INPUT_MODES",
+    "PREFETCH_RECEIPT_SCHEMA_VERSION",
     "TRAINING_MODE_SELECTION_SCHEMA_VERSION",
     "TRAINING_RESULT_SCHEMA_VERSION",
     "TRAINING_RUN_IDENTITY_SCHEMA_VERSION",
     "TRAINING_WORKER_SCHEMA_VERSION",
-    "PREFETCH_RECEIPT_SCHEMA_VERSION",
     "ContributionTrainingWorkerError",
     "PreparedTrainingExecutable",
     "RestoredTrainingState",
@@ -3096,6 +3213,6 @@ __all__ = [
     "prefetch_process_lane",
     "qualify_training_modes",
     "run_qualified_training",
-    "validate_training_mode_selection",
     "validate_prefetch_receipt",
+    "validate_training_mode_selection",
 ]

@@ -8,10 +8,10 @@ imports JAX nor constructs MaxText at module import time.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping
-from dataclasses import asdict, dataclass
 import math
 import time
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import asdict, dataclass
 from typing import Any
 
 import numpy as np
@@ -19,9 +19,9 @@ import numpy as np
 from moe_sae.artifacts import ArtifactDataset, load_manifest
 from moe_sae.contribution_artifacts import (
     HIDDEN_SIZE,
+    MAX_SHARD_TOKENS,
     TOP_K_EXPERTS,
     ContributionBatch,
-    bf16_bits_to_float32,
     float32_to_bf16_bits,
     validate_contribution_batch,
 )
@@ -42,7 +42,6 @@ from moe_sae.harvest import (
     make_sequence_ids,
 )
 from moe_sae.runtime import BoundedArtifactSink, scientific_token_mask
-
 
 EXCLUDED_TOKEN_IDS = (0, 1, 2)
 
@@ -104,14 +103,18 @@ def _to_bf16_bits(name: str, value: Any) -> np.ndarray:
     array = np.asarray(value)
     if array.dtype == np.uint16:
         bits = np.ascontiguousarray(array)
+    elif array.dtype.itemsize == 2 and array.dtype.name == "bfloat16":
+        # NumPy classifies ml_dtypes.bfloat16 as kind ``V`` rather than a
+        # floating subtype.  Its in-memory representation is already the exact
+        # uint16 BF16 wire representation, so bitcast it without an expensive
+        # BF16 -> FP32 -> BF16 round trip.
+        bits = np.ascontiguousarray(array).view(np.uint16)
     elif np.issubdtype(array.dtype, np.floating):
         bits = float32_to_bf16_bits(np.asarray(array, dtype=np.float32))
     else:
         raise ContributionHarvestError(
             f"{name} must be floating-point or exact BF16 uint16 bits"
         )
-    if not np.isfinite(bf16_bits_to_float32(bits)).all():
-        raise ContributionHarvestError(f"{name} contains non-finite BF16 values")
     return bits
 
 
@@ -123,6 +126,7 @@ def contribution_capture_to_wire(
     shared_output: Any,
     sequence_id: Any,
     position: Any,
+    max_tokens: int = MAX_SHARD_TOKENS,
 ) -> ContributionBatch:
     """Convert one process-local compacted capture to the exact v2 wire."""
 
@@ -144,11 +148,63 @@ def contribution_capture_to_wire(
             sequence_id=np.ascontiguousarray(sequences.astype(np.int64)),
             position=np.ascontiguousarray(positions.astype(np.uint16)),
         )
-        return validate_contribution_batch(result)
+        return validate_contribution_batch(result, max_tokens=max_tokens)
     except (ValueError, TypeError) as error:
         raise ContributionHarvestError(
             "adapter output does not satisfy the contribution-v2 wire schema"
         ) from error
+
+
+def contribution_capture_to_wire_chunks(
+    *,
+    expert_output: Any,
+    expert_ids: Any,
+    router_weights: Any,
+    shared_output: Any,
+    sequence_id: Any,
+    position: Any,
+    max_tokens: int = MAX_SHARD_TOKENS,
+) -> tuple[ContributionBatch, ...]:
+    """Split one process-local output into independently valid wire batches."""
+
+    if (
+        isinstance(max_tokens, bool)
+        or not isinstance(max_tokens, int)
+        or not 0 < max_tokens <= MAX_SHARD_TOKENS
+    ):
+        raise ContributionHarvestError(
+            f"max_tokens must be in [1,{MAX_SHARD_TOKENS}]"
+        )
+    arrays = {
+        "expert_output": np.asarray(expert_output),
+        "expert_ids": np.asarray(expert_ids),
+        "router_weights": np.asarray(router_weights),
+        "shared_output": np.asarray(shared_output),
+        "sequence_id": np.asarray(sequence_id),
+        "position": np.asarray(position),
+    }
+    if any(value.ndim == 0 for value in arrays.values()):
+        raise ContributionHarvestError(
+            "adapter output fields must expose a leading token axis"
+        )
+    token_counts = {int(value.shape[0]) for value in arrays.values()}
+    if len(token_counts) != 1:
+        raise ContributionHarvestError(
+            "adapter output fields disagree on their leading token count"
+        )
+    tokens = token_counts.pop()
+    if tokens <= 0:
+        raise ContributionHarvestError("adapter output contains no tokens")
+    return tuple(
+        contribution_capture_to_wire(
+            **{
+                name: value[start : start + max_tokens]
+                for name, value in arrays.items()
+            },
+            max_tokens=max_tokens,
+        )
+        for start in range(0, tokens, max_tokens)
+    )
 
 
 class _AssignmentAccumulator:
@@ -612,7 +668,7 @@ def harvest_contribution_host(
                 # when a qualified larger static batch replays the same
                 # immutable record stream.
                 new_sequence = expected_batch_sequence[resumed_in_batch:desired]
-                compacted = contribution_capture_to_wire(
+                compacted_chunks = contribution_capture_to_wire_chunks(
                     expert_output=expert[selected_indices],
                     expert_ids=ids[selected_indices],
                     router_weights=weights[selected_indices],
@@ -620,36 +676,40 @@ def harvest_contribution_host(
                     sequence_id=new_sequence,
                     position=new_position,
                 )
-                appended = 0
-                while appended < compacted.tokens:
-                    if accumulator is None:
-                        raise ContributionHarvestError(
-                            "captured more tokens than the range plan permits"
-                        )
-                    appended += accumulator.append(compacted, appended)
-                    if accumulator.full:
-                        assignment = accumulator.assignment
-                        assignment_offset = sum(
-                            item.tokens for item in assignments[:assignment_index]
-                        )
-                        source_slice = slice(
-                            assignment_offset,
-                            assignment_offset + assignment.tokens,
-                        )
-                        sink.submit(
-                            assignment,
-                            range_ids[assignment_index],
-                            accumulator.take(),
-                            expected_sequence[source_slice],
-                            expected_position[source_slice],
-                        )
-                        new_tokens += assignment.tokens
-                        assignment_index += 1
-                        accumulator = (
-                            None
-                            if assignment_index == len(assignments)
-                            else _AssignmentAccumulator(assignments[assignment_index])
-                        )
+                for compacted in compacted_chunks:
+                    appended = 0
+                    while appended < compacted.tokens:
+                        if accumulator is None:
+                            raise ContributionHarvestError(
+                                "captured more tokens than the range plan permits"
+                            )
+                        appended += accumulator.append(compacted, appended)
+                        if accumulator.full:
+                            assignment = accumulator.assignment
+                            assignment_offset = sum(
+                                item.tokens
+                                for item in assignments[:assignment_index]
+                            )
+                            source_slice = slice(
+                                assignment_offset,
+                                assignment_offset + assignment.tokens,
+                            )
+                            sink.submit(
+                                assignment,
+                                range_ids[assignment_index],
+                                accumulator.take(),
+                                expected_sequence[source_slice],
+                                expected_position[source_slice],
+                            )
+                            new_tokens += assignment.tokens
+                            assignment_index += 1
+                            accumulator = (
+                                None
+                                if assignment_index == len(assignments)
+                                else _AssignmentAccumulator(
+                                    assignments[assignment_index]
+                                )
+                            )
 
             local_cursor += desired
             batches_scanned += 1

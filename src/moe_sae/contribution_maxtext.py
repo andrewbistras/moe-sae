@@ -19,12 +19,12 @@ seconds.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import asdict, dataclass
 import hashlib
 import math
-from pathlib import Path
 import time
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -63,7 +63,6 @@ from moe_sae.runtime import (
     build_maxtext_argv,
     estimate_useful_prefix_flops,
 )
-
 
 QUALIFICATION_HOST_SCHEMA_VERSION = (
     "gemma4-contribution-qualification-host-observation-v2"
@@ -137,6 +136,9 @@ class QualificationPlan:
             raise ContributionMaxTextError(
                 "qualification maximum_seconds must lie in [1, 600]"
             )
+
+
+DEFAULT_QUALIFICATION_PLAN = QualificationPlan()
 
 
 @dataclass(frozen=True, slots=True)
@@ -362,15 +364,18 @@ def build_contribution_maxtext_argv(
     grain_eval_files: str,
     mesh: MeshCandidate,
     per_device_sequence_batch: int,
+    attention: str,
     jax_cache_dir: str | Path,
     synthetic: bool = False,
     base_config_path: str | None = None,
 ) -> list[str]:
     """Build the exact fork-compatible capture argv.
 
-    ``use_ragged_sort=true`` comes from the shared builder.  A nonempty local
-    persistent cache is mandatory so retries on the same TPU VM do not pay the
-    XLA compilation cost again; the cache is not placed in GCS.
+    ``use_ragged_sort=true`` comes from the shared builder.  ``attention`` is
+    required rather than inherited from MaxText's mutable default so the
+    configured kernel is identical in qualification and production.  A
+    nonempty local persistent cache is mandatory so retries on the same TPU VM
+    do not pay the XLA compilation cost again; the cache is not placed in GCS.
     """
 
     cache = Path(jax_cache_dir).expanduser()
@@ -386,6 +391,7 @@ def build_contribution_maxtext_argv(
         base_config_path=base_config_path,
     )
     argv = _replace_setting(argv, "run_name", "gemma4-contribution-v1")
+    argv = _replace_setting(argv, "attention", attention)
     argv = _replace_setting(argv, "jax_cache_dir", str(cache))
     return argv
 
@@ -653,6 +659,7 @@ def effective_performance_runtime_manifest(
         "sparse_matmul": True,
         "use_ring_of_experts": False,
         "float32_weight_sum": True,
+        "attention": config.model.attention,
         "max_target_length": config.model.sequence_length,
         "per_device_batch_size": per_device_sequence_batch,
         "ici_expert_parallelism": mesh.expert_parallelism,
@@ -817,7 +824,7 @@ def run_qualification_host(
     persist: Callable[[Any], int],
     instrumentation_probe: Callable[[], InstrumentationObservation],
     qualification_started: float,
-    plan: QualificationPlan = QualificationPlan(),
+    plan: QualificationPlan = DEFAULT_QUALIFICATION_PLAN,
     diagnostics: Callable[[], QualificationDiagnostics] = (
         QualificationDiagnostics
     ),

@@ -123,10 +123,18 @@ def test_candidate_order_is_only_b128_b64_b32_on_known_best_mesh(
         assert "--controller-index" in joined
         assert "--process-index" not in joined
         assert "contribution_harvest_worker" not in joined
-        for controller_index, (_, evidence, _) in enumerate(built):
+        for controller_index, (command, evidence, _) in enumerate(built):
             assert (
                 f"/controller-c{controller_index:05d}/host-evidence.json"
                 in evidence
+            )
+            assert (
+                "/experiment2/jax-cache/"
+                + "a" * 40
+                + "/ep8-fsdp2-tp1/"
+                + f"b{candidate.per_device_sequence_batch}/"
+                + f"controller-c{controller_index:05d}"
+                in " ".join(command)
             )
 
 

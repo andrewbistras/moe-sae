@@ -22,6 +22,7 @@ from moe_sae.contribution_artifacts import (
 )
 from moe_sae.contribution_harvest import (
     ContributionHarvestError,
+    contribution_capture_to_wire_chunks,
     harvest_contribution_host,
 )
 from moe_sae.contribution_ranges import build_contribution_range_plan
@@ -36,7 +37,6 @@ from moe_sae.harvest import make_sequence_ids
 from moe_sae.object_store import LocalObjectStore, ShardCache
 from moe_sae.runtime import scientific_token_mask
 
-
 CHECKPOINT_SHA = "1" * 64
 DATASET_SHA = "2" * 64
 CONFIG_SHA = "3" * 64
@@ -49,6 +49,42 @@ WEIGHTS = np.asarray(
     [0.25, 0.1875, 0.15625, 0.125, 0.09375, 0.078125, 0.0625, 0.046875],
     dtype=np.float32,
 )
+
+
+def test_wire_conversion_bitcasts_ml_dtypes_bfloat16_and_chunks() -> None:
+    ml_dtypes = pytest.importorskip("ml_dtypes")
+    rows = 3
+    expert = np.zeros(
+        (rows, TOP_K_EXPERTS, HIDDEN_SIZE),
+        dtype=ml_dtypes.bfloat16,
+    )
+    shared = np.zeros(
+        (rows, HIDDEN_SIZE),
+        dtype=ml_dtypes.bfloat16,
+    )
+    weights = np.broadcast_to(
+        WEIGHTS.astype(ml_dtypes.bfloat16),
+        (rows, TOP_K_EXPERTS),
+    ).copy()
+    chunks = contribution_capture_to_wire_chunks(
+        expert_output=expert,
+        expert_ids=np.broadcast_to(
+            np.arange(TOP_K_EXPERTS, dtype=np.uint8),
+            (rows, TOP_K_EXPERTS),
+        ),
+        router_weights=weights,
+        shared_output=shared,
+        sequence_id=np.arange(rows, dtype=np.int64),
+        position=np.arange(rows, dtype=np.uint16),
+        max_tokens=2,
+    )
+
+    assert [chunk.tokens for chunk in chunks] == [2, 1]
+    assert all(chunk.expert_output.dtype == np.uint16 for chunk in chunks)
+    assert np.array_equal(
+        chunks[0].router_weights,
+        weights[:2].view(np.uint16),
+    )
 
 
 def raw_batch(scientific_tokens: int) -> dict[str, np.ndarray]:

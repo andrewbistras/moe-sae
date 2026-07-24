@@ -1016,6 +1016,7 @@ def run_harvest_child(
         grain_eval_files=invocation.grain_files,
         mesh=invocation.mesh,
         per_device_sequence_batch=invocation.per_device_sequence_batch,
+        attention=config.model.attention,
         jax_cache_dir=invocation.jax_cache_dir,
         synthetic=False,
     )

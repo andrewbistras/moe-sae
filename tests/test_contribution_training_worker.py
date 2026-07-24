@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
+import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from moe_sae import contribution_training_worker as training_worker_module
 from moe_sae.contribution_config import load_contribution_config
 from moe_sae.contribution_performance import ExactPerformanceIdentity
 from moe_sae.contribution_training_performance import (
@@ -19,8 +21,8 @@ from moe_sae.contribution_training_worker import (
     RestoredTrainingState,
     TrainingLoopDependencies,
     TrainingWorkerPlan,
-    _prove_prefetch_for_plan,
     _parser,
+    _prove_prefetch_for_plan,
     chosen_mode_evidence,
     prefetch_process_lane,
     qualify_training_modes,
@@ -28,7 +30,6 @@ from moe_sae.contribution_training_worker import (
     validate_training_mode_selection,
 )
 from moe_sae.object_store import ObjectIdentity
-
 
 CONFIG = Path(__file__).parents[1] / "configs" / "gemma4_contribution_v1.yaml"
 
@@ -200,10 +201,126 @@ def test_standalone_cli_exposes_supervised_parent_and_hidden_child_commands() ->
             "/cache/prefetch.json",
             "--source-revision",
             "a" * 40,
+            "--supervision-dir",
+            "/control/prefetch-supervision",
+            "--host-id",
+            "worker-0",
+            "--working-directory",
+            "/repo",
         ]
     )
     assert prefetch.command == "prefetch"
     assert prefetch.process_index == 2
+    assert prefetch.maximum_runtime_seconds == 600
+
+    prefetch_child = parser.parse_args(
+        [
+            "prefetch-child",
+            "--phase",
+            "phase2_mechanism_pilot",
+            "--capture-control-root",
+            "/capture",
+            "--object-prefix",
+            "gs://bucket/contributions",
+            "--resident-cache-root",
+            "/cache",
+            "--resident-cache-max-bytes",
+            "1000000",
+            "--process-count",
+            "4",
+            "--process-index",
+            "2",
+            "--prefetch-receipt-path",
+            "/cache/prefetch.json",
+            "--source-revision",
+            "a" * 40,
+        ]
+    )
+    assert prefetch_child.command == "prefetch-child"
+
+
+def test_prefetch_parent_is_hard_bounded_and_launches_only_its_hidden_child(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    parser = _parser()
+    arguments = [
+        "prefetch",
+        "--phase",
+        "phase2_mechanism_pilot",
+        "--capture-control-root",
+        "/capture",
+        "--object-prefix",
+        "gs://bucket/contributions",
+        "--resident-cache-root",
+        "/cache",
+        "--resident-cache-max-bytes",
+        "1000000",
+        "--process-count",
+        "4",
+        "--process-index",
+        "2",
+        "--prefetch-receipt-path",
+        "/cache/prefetch.json",
+        "--source-revision",
+        "a" * 40,
+        "--supervision-dir",
+        "/control/prefetch-supervision",
+        "--host-id",
+        "controller-c00001-p00002",
+        "--working-directory",
+        "/repo",
+    ]
+    too_long = parser.parse_args(
+        [*arguments, "--maximum-runtime-seconds", "601"]
+    )
+    with pytest.raises(
+        ContributionTrainingWorkerError,
+        match="cannot exceed 600",
+    ):
+        training_worker_module._prefetch_command(too_long)
+
+    args = parser.parse_args(
+        [*arguments, "--maximum-runtime-seconds", "600"]
+    )
+    captured: dict[str, Any] = {}
+
+    def supervise(_args, **kwargs):
+        captured.update(kwargs)
+        return {"result_sha256": "b" * 64}
+
+    receipt = {
+        "receipt_sha256": "c" * 64,
+        "process_partition": {"process_index": 2},
+        "object_count": 31,
+        "object_bytes": 123,
+        "elapsed_seconds": 4.0,
+    }
+    monkeypatch.setattr(training_worker_module, "_supervise", supervise)
+    monkeypatch.setattr(
+        training_worker_module,
+        "_read_json",
+        lambda *_args, **_kwargs: receipt,
+    )
+    monkeypatch.setattr(
+        training_worker_module,
+        "validate_prefetch_receipt",
+        lambda value: value,
+    )
+    assert training_worker_module._prefetch_command(args) == 0
+    assert captured["maximum_seconds"] == 600
+    assert captured["qualification_receipt"] is None
+    assert captured["operation"] == "prefetch"
+    child = captured["child_command"]
+    assert child[:4] == [
+        child[0],
+        "-m",
+        "moe_sae.contribution_training_worker",
+        "prefetch-child",
+    ]
+    assert "qualify-child" not in child
+    assert "train-child" not in child
+    assert json.loads(capsys.readouterr().out)["receipt_sha256"] == "c" * 64
 
 
 def test_process_lane_prefetch_is_near_one_copy_and_missing_cache_fails_closed(

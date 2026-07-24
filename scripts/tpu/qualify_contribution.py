@@ -208,7 +208,15 @@ def _qualification_command(
 ) -> tuple[list[str], str, str]:
     candidate_control = f"{settings.shared_run_root}/{candidate.identifier}"
     candidate_local = f"{settings.local_run_root}/{candidate.identifier}"
-    cache = f"{candidate_local}/jax-cache"
+    # Keep the persistent XLA cache stable across immutable operator attempts
+    # and identical to the production harvester path.  Cache keys still bind
+    # the executable; the path itself is host-local and never authorizes work.
+    cache = (
+        f"{settings.local_buffer_root}/experiment2/jax-cache/"
+        f"{settings.project_commit}/{MESH}/"
+        f"b{candidate.per_device_sequence_batch}/"
+        f"controller-c{controller_index:05d}"
+    )
     scratch = f"{candidate_local}/scratch"
     evidence = (
         f"{candidate_control}/controller-c{controller_index:05d}/"

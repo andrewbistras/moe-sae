@@ -9,7 +9,7 @@ import pytest
 
 from moe_sae.config import Gemma4Config
 from moe_sae.contribution_artifacts import validate_recomposition_sidecar
-from moe_sae.contribution_config import Experiment2Config, MAXTEXT_FORK_COMMIT
+from moe_sae.contribution_config import MAXTEXT_FORK_COMMIT, Experiment2Config
 from moe_sae.contribution_maxtext import (
     ContributionMaxTextError,
     InstrumentationObservation,
@@ -18,6 +18,7 @@ from moe_sae.contribution_maxtext import (
     QualificationPlan,
     aggregate_qualification_hosts,
     build_contribution_maxtext_argv,
+    effective_performance_runtime_manifest,
     estimate_contribution_prefix_flops,
     exact_performance_identity,
     extract_recomposition_sidecar,
@@ -33,7 +34,6 @@ from moe_sae.runtime import (
     MeshCandidate,
     estimate_useful_prefix_flops,
 )
-
 
 _SHA = "a" * 64
 _MESH = MeshCandidate("ep16-fsdp1-tp1", 16, 1, 1)
@@ -67,19 +67,66 @@ def test_contribution_flops_add_exact_target_shared_expert() -> None:
 def test_contribution_argv_accepts_b128_and_keeps_route_optimizations(
     tmp_path,
 ) -> None:
+    config = Experiment2Config()
     argv = build_contribution_maxtext_argv(
         checkpoint_path="gs://bucket/model/items",
         grain_train_files="gs://bucket/data/train",
         grain_eval_files="gs://bucket/data/eval",
         mesh=_MESH,
         per_device_sequence_batch=8,
+        attention=config.model.attention,
         jax_cache_dir=tmp_path / "jax-cache",
     )
     assert "use_ragged_sort=true" in argv
     assert "per_device_batch_size=8" in argv
+    assert f"attention={config.model.attention}" in argv
     assert "run_name=gemma4-contribution-v1" in argv
     assert f"jax_cache_dir={tmp_path / 'jax-cache'}" in argv
+    assert sum(value.startswith("attention=") for value in argv) == 1
     assert sum(value.startswith("jax_cache_dir=") for value in argv) == 1
+
+
+def test_effective_runtime_rejects_attention_drift() -> None:
+    config = Experiment2Config()
+    runtime_config = SimpleNamespace(
+        use_multimodal=False,
+        scan_layers=False,
+        pure_nnx_decoder=True,
+        enable_dropout=False,
+        use_ragged_sort=True,
+        sparse_matmul=True,
+        use_ring_of_experts=False,
+        float32_weight_sum=True,
+        attention=config.model.attention,
+        matmul_precision="default",
+        max_target_length=config.model.sequence_length,
+        per_device_batch_size=8,
+        ici_expert_parallelism=_MESH.expert_parallelism,
+        ici_fsdp_parallelism=_MESH.fsdp_parallelism,
+        ici_tensor_parallelism=_MESH.tensor_parallelism,
+    )
+    runtime_mesh = SimpleNamespace(
+        axis_names=("expert", "fsdp", "tensor"),
+        devices=np.empty((16, 1, 1), dtype=object),
+    )
+    manifest = effective_performance_runtime_manifest(
+        runtime_config,
+        runtime_mesh,
+        config=config,
+        mesh=_MESH,
+        per_device_sequence_batch=8,
+    )
+    assert manifest["attention"] == config.model.attention
+
+    runtime_config.attention = "dot_product"
+    with pytest.raises(ContributionMaxTextError, match="attention"):
+        effective_performance_runtime_manifest(
+            runtime_config,
+            runtime_mesh,
+            config=config,
+            mesh=_MESH,
+            per_device_sequence_batch=8,
+        )
 
 
 class _Device:
@@ -137,7 +184,7 @@ class _Clock:
 class _Output:
     rows = 16_384
 
-    def block_until_ready(self) -> "_Output":
+    def block_until_ready(self) -> _Output:
         return self
 
 

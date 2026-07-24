@@ -247,6 +247,22 @@ def bf16_bits_to_float32(values: Any) -> np.ndarray:
     return (array.astype(np.uint32) << np.uint32(16)).view(np.float32)
 
 
+def _bf16_bits_all_finite(values: np.ndarray) -> bool:
+    """Check BF16 finiteness without expanding a capture-sized FP32 array."""
+
+    flat = np.asarray(values).reshape(-1)
+    # Keep temporary masks bounded.  A full B128 controller payload contains
+    # hundreds of millions of expert elements; expanding it to FP32 merely to
+    # inspect the exponent doubled both host traffic and peak memory.
+    block_elements = 8 * 1024 * 1024
+    exponent_mask = np.uint16(0x7F80)
+    for start in range(0, int(flat.size), block_elements):
+        block = flat[start : start + block_elements]
+        if np.any(np.bitwise_and(block, exponent_mask) == exponent_mask):
+            return False
+    return True
+
+
 def _as_batch(value: ContributionBatch | Mapping[str, Any]) -> ContributionBatch:
     if isinstance(value, ContributionBatch):
         return value
@@ -324,12 +340,10 @@ def validate_contribution_batch(
                 f"{name} must have shape {shape}, got {arrays[name].shape}"
             )
 
-    decoded_expert = bf16_bits_to_float32(expert_output)
     decoded_weights = bf16_bits_to_float32(arrays["router_weights"])
-    decoded_shared = bf16_bits_to_float32(arrays["shared_output"])
-    if not np.isfinite(decoded_expert).all():
+    if not _bf16_bits_all_finite(expert_output):
         raise ContributionSchemaError("expert_output contains non-finite values")
-    if not np.isfinite(decoded_shared).all():
+    if not _bf16_bits_all_finite(arrays["shared_output"]):
         raise ContributionSchemaError("shared_output contains non-finite values")
     if not np.isfinite(decoded_weights).all() or np.any(decoded_weights < 0):
         raise ContributionSchemaError("router_weights must be finite and nonnegative")

@@ -44,7 +44,9 @@ model:
   use_random_routing: false
   float32_gate_logits: false
   capacity_factor: -1.0
-  attention: dot_product
+  # Explicitly bind MaxText's TPU-native selection (Splash/Flash at length
+  # 1024) instead of inheriting a mutable default or forcing dense attention.
+  attention: autoselected
   sparse_matmul: true
   use_ring_of_experts: false
   ragged_buffer_factor: -1.0
