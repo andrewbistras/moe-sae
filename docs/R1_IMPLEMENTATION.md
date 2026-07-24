@@ -397,7 +397,9 @@ non-sealable contract. It derives all 510 unscanned checkpoint destinations
 from the canonical inventory and groups them into 44 performance leaves: one
 embedding, 12 leaves across three scanned dense blocks, 17 leaves across 27
 scanned completed MoE blocks, and 14 unscanned target-routed-only leaves. The
-candidate order is EP16/FSDP4, EP32/FSDP2, then EP8/FSDP8. Its device ABI has
+accepted layouts are EP16/FSDP4, EP32/FSDP2, and EP8/FSDP8. Qualification
+starts with EP8/FSDP8 because it has the smallest worst-case dropless routing
+buffer. Its device ABI has
 exactly three outputs—BF16 routed activation, global int32 expert IDs, and FP32
 scaled router weights. Host-created int64 sequence IDs and uint16 positions are
 durable metadata, not model outputs. After durable casts the complete row is
@@ -417,9 +419,11 @@ supersedes legacy batch-split execution with a thin NNX scan over native
 `DeepSeekMoELayer` calls, maps native expert compute to the existing
 `expert_only` storage axis, overlays exactly 14 target leaves on one isolated
 17-leaf template, executes packed target attention, and stops after the routed
-aggregate plus exact router metadata. Patch application is commit-, hash-, and
-post-image-bound. Real v6e qualification, parity, sealing, and production
-admission remain hard false.
+aggregate plus exact router metadata. The metadata comes from the same native
+sparse invocation that dispatches the experts; the target contains one gate
+and one top-k path and never recomputes the router. Patch application is
+commit-, hash-, and post-image-bound. Real v6e qualification, parity, sealing,
+and production admission remain hard false.
 
 The checkpoint side now has a matching framework-neutral restore authority.
 Given one exact generation-pinned V2 envelope receipt and an independently
@@ -437,9 +441,12 @@ requested global shard slices, binds 30 arrays into the pruned NNX graph, passes
 dynamic `nnx.jit` argument. An exact-receipt VM-local read-through cache ensures
 that many shard callbacks do not redownload the same at-most-64-MiB GCS object.
 Randomized rectangular-slice tests, an eight-device scan-axis test, and
-64-device emulation pass. No released payload has been observed and no real
-v6e restore or compile has completed, so qualification, sealing, and production
-admission remain hard false.
+64-device emulation pass. The exact full-prefix abstract lower contains native
+ragged all-to-all, 47 `dot_general` operations, and no shared-expert or legacy
+batch-split program; the discarded two-router version lowered 48 dots. No
+released payload has been observed and no real v6e restore or compile has
+completed, so qualification, sealing, and production admission remain hard
+false.
 
 The first real-hardware benchmark no longer depends on the 649.674 GB
 checkpoint conversion. A synthetic allocator creates the same 44-leaf logical
@@ -475,10 +482,13 @@ Static BF16 prefix state alone is approximately 26.24, 17.72, 13.45, and
 11.32 GiB per chip for EP64/FSDP1, EP32/FSDP2, EP16/FSDP4, and EP8/FSDP8,
 respectively. These numbers exclude gathered layer weights, executables,
 attention, routing expansion, and capture buffers. Qualification therefore
-starts with EP16/FSDP4, then EP32/FSDP2 and EP8/FSDP8; EP64/FSDP1 is an HBM and
-communication boundary, not the presumed winner. The superseded legacy
-batch-split implementation remains useful as a parity reference, not a
-production performance candidate.
+starts with EP8/FSDP8. At B128×1024, the nonpositive ragged bound alone can
+reserve about 1.75 GiB/chip at EP8, 3.50 GiB/chip at EP16, and 7.00 GiB/chip
+at EP32 before GMM outputs and other live buffers. EP16 is attempted only
+after EP8 evidence; EP32 is the highest-HBM-risk candidate and is not presumed
+to fit. EP64/FSDP1 is an HBM and communication boundary, not the presumed
+winner. The superseded legacy batch-split implementation remains useful as a
+parity reference, not a production performance candidate.
 
 At 65,536 valid tokens, one-copy BF16 dispatch plus combine across the 28
 routed invocations moves about 6.577 GB/chip. Even the optimistic 800 GB/s
@@ -488,7 +498,11 @@ or synchronization. If routed communication costs twice that lower bound and
 other overhead consumes 10%, the counted BF16 kernels must average about 73%
 of peak. Qualification therefore requires weight-stationary pipelining of
 `dispatch(k+1)`, `expert GEMM(k)`, and `combine(k-1)`; serialized routing is
-not a viable candidate.
+not a viable final candidate. The currently pinned
+`use_ring_of_experts=false`, `num_moe_token_chunks=1` program is an exact
+serialized baseline for first hardware qualification, not evidence that the
+51% target has been met. Its result must drive the next overlap/pipelining
+change rather than being promoted as the final performance architecture.
 
 Required kernel properties:
 

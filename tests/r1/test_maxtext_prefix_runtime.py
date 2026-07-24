@@ -55,6 +55,9 @@ def _config(mesh: PrefixMeshCandidate) -> SimpleNamespace:
         routed_bias=True,
         float32_gate_logits=True,
         sparse_matmul=True,
+        megablox=True,
+        use_tokamax_gmm=False,
+        use_gmm_v2=False,
         mlp_bias=False,
         prefuse_moe_weights=False,
         shard_exp_on_fsdp=False,
@@ -117,6 +120,9 @@ def test_overrides_define_one_forward_only_b128_program(tmp_path: Path) -> None:
     assert values["enable_dropout"] is False
     assert values["float32_gate_logits"] is True
     assert values["sparse_matmul"] is True
+    assert values["megablox"] is True
+    assert values["use_tokamax_gmm"] is False
+    assert values["use_gmm_v2"] is False
     assert values["mlp_bias"] is False
     assert values["prefuse_moe_weights"] is False
     assert values["shard_exp_on_fsdp"] is False
@@ -164,6 +170,9 @@ def test_initialized_config_accepts_each_fixed_mesh(
         ("routed_bias_update_rate", 0.001, "routed_bias_update_rate"),
         ("float32_gate_logits", False, "float32_gate_logits"),
         ("sparse_matmul", False, "sparse_matmul"),
+        ("megablox", False, "megablox"),
+        ("use_tokamax_gmm", True, "use_tokamax_gmm"),
+        ("use_gmm_v2", True, "use_gmm_v2"),
         ("mlp_bias", True, "mlp_bias"),
         ("prefuse_moe_weights", True, "prefuse_moe_weights"),
         ("shard_exp_on_fsdp", True, "shard_exp_on_fsdp"),

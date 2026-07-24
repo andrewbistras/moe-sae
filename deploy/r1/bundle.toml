@@ -76,7 +76,7 @@ sha256 = "552e8a3f52dcd76d16606ac8171683ad274b6b49f25342699598ea40acb0010a"
 name = "image-measurer"
 path = "deploy/r1/image/measure_image.py"
 mode = "0755"
-sha256 = "1876296fef8948478f731ea809925801ba80366896f594b2dca3046ad72be78e"
+sha256 = "87de6c87e5263c7499fe9864da56aae0b537dc71446a418e1202e472e3cb79cf"
 
 [[files]]
 name = "service-unit"

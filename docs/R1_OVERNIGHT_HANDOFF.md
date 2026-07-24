@@ -91,7 +91,10 @@ python -m moe_sae.r1.prefix_benchmark_runner \
 
 Run `EP8/FSDP8` first because it has the smallest static dropless-routing
 buffer, then `EP16/FSDP4`; treat `EP32/FSDP2` as the highest-HBM-risk
-candidate. Each run compiles once, validates the output/router ABI, completes
+candidate. The worst-case BF16 dispatch allocation alone is approximately
+1.75, 3.50, and 7.00 GiB/chip for EP8, EP16, and EP32, before GMM outputs,
+gathered weights, attention, and other live buffers; none is HBM-qualified
+until measured. Each run compiles once, validates the output/router ABI, completes
 five warmups, and measures 500 device-synchronized steps. For the frozen full
 B128×1024 workload, 51% MFU requires an aggregate step time no greater than
 163.551 ms. Allocation, compile, output validation, and warmups are reported

@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import importlib.util
 import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
+import textwrap
 
 import pytest
 
@@ -273,8 +276,35 @@ def test_native_moe_guard_is_on_moe_only_and_target_returns_three_arrays(
     target_source = ast.get_source_segment(source, target)
     assert target_source is not None
     assert ".routed_moe" in target_source
+    assert "capture_router_metadata = True" in target_source
+    assert "r1_direct_router_metadata" not in target_source
+    assert ".gate(" not in target_source
+    assert ".get_topk(" not in target_source
     assert "shared_experts" not in target_source
     assert "decoder_segment_ids" in target_source
+    for prerequisite in (
+        "float32_gate_logits",
+        "sparse_matmul",
+        "megablox",
+        "use_tokamax_gmm",
+        "use_gmm_v2",
+        "use_ring_of_experts",
+        "use_ragged_sort",
+        "ragged_buffer_factor",
+        "num_moe_emb_chunks",
+        "num_moe_token_chunks",
+        "use_random_routing",
+        "self.quant is not None",
+    ):
+        assert prerequisite in target_source
+    routed_calls = [
+        node
+        for node in ast.walk(target)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "routed_moe"
+    ]
+    assert len(routed_calls) == 1
     returns = [node for node in ast.walk(target) if isinstance(node, ast.Return)]
     assert len(returns) == 1
     assert isinstance(returns[0].value, ast.Tuple)
@@ -333,6 +363,169 @@ def test_native_sparse_compute_preserves_batchsplit_expert_storage_axis(
         'self._logical_to_mesh_axes((expert_axis, None, "mlp_no_fsdp"))'
         in source
     )
-    assert "def r1_direct_router_metadata(" in source
-    assert "top_k_indices.astype(jnp.int32)" in source
-    assert "top_k_weights.astype(jnp.float32)" in source
+    assert (
+        "logical_rules = None if self.config.using_pipeline_parallelism "
+        "else self.config.logical_axis_rules"
+    ) in source
+    assert "rules=logical_rules" in source
+    assert "def r1_direct_router_metadata(" not in source
+    tree = ast.parse(source)
+    routed_call = _class_method(tree, "RoutedMoE", "__call__")
+    permute = _class_method(tree, "RoutedMoE", "permute")
+    routed_source = ast.get_source_segment(source, routed_call)
+    permute_source = ast.get_source_segment(source, permute)
+    assert routed_source is not None
+    assert permute_source is not None
+    assert routed_source.count("self.gate(") == 1
+    assert permute_source.count("self.get_topk(") == 1
+    assert "top_k_indices.astype(jnp.int32)" in routed_source
+    assert "top_k_weights.astype(jnp.float32)" in routed_source
+
+
+def test_exact_64_device_full_prefix_abstract_lower(
+    applied_checkout: Path,
+    tmp_path: Path,
+) -> None:
+    if importlib.util.find_spec("flax") is None:
+        pytest.skip("Flax is absent; install the TPU/MaxText test extra")
+    repository = Path(__file__).resolve().parents[2]
+    script = tmp_path / "lower_full_prefix.py"
+    script.write_text(
+        textwrap.dedent(
+            """
+            from pathlib import Path
+            import sys
+
+            import jax
+            import jax.numpy as jnp
+            from flax import nnx
+
+            from moe_sae.r1.maxtext_prefix_runtime import (
+                PrefixRuntimeSettings,
+                bind_pruned_model_parameters,
+                create_abstract_pruned_model,
+                create_prefix_mesh,
+                create_prefix_restore_shardings,
+                initialize_maxtext_config,
+                materialize_rng_state,
+                split_restored_prefix_leaves,
+            )
+            from moe_sae.r1.prefix_batchsplit_contract import (
+                build_pinned_prefix_performance_tree_plan,
+            )
+
+            maxtext = Path(sys.argv[1])
+            output = Path(sys.argv[2])
+            settings = PrefixRuntimeSettings(
+                maxtext / "src/maxtext/configs/base.yml",
+                output,
+            )
+            config = initialize_maxtext_config(settings)
+            # CPU emulation cannot lower the selected GPU-Pallas MLA. This
+            # override leaves the native MoE and its sharding rules unchanged.
+            object.__getattribute__(config, "_flat_config")["attention"] = (
+                "dot_product"
+            )
+            mesh = create_prefix_mesh(config)
+            abstract = create_abstract_pruned_model(config, mesh)
+            bindings = create_prefix_restore_shardings(abstract, config, mesh)
+            shardings = {item.leaf_key: item.sharding for item in bindings}
+            dtypes = {"bfloat16": jnp.bfloat16, "float32": jnp.float32}
+            leaves = {
+                item.leaf_key: jax.ShapeDtypeStruct(
+                    item.logical_shape,
+                    dtypes[item.dtype],
+                    sharding=shardings[item.leaf_key],
+                )
+                for item in build_pinned_prefix_performance_tree_plan().leaves
+            }
+            model_parameters, target = split_restored_prefix_leaves(leaves)
+            graphdef, parameters, nonparameters = bind_pruned_model_parameters(
+                abstract,
+                model_parameters,
+            )
+            model = nnx.merge(
+                graphdef,
+                parameters,
+                materialize_rng_state(nonparameters),
+            )
+            input_sharding = jax.sharding.NamedSharding(
+                mesh,
+                jax.sharding.PartitionSpec(
+                    ("data", "fsdp", "expert"),
+                    None,
+                ),
+            )
+            batch = [
+                jax.ShapeDtypeStruct(
+                    (128, 1024),
+                    jnp.int32,
+                    sharding=input_sharding,
+                )
+                for _ in range(3)
+            ]
+
+            def forward(
+                runtime_model,
+                target_parameters,
+                tokens,
+                positions,
+                segments,
+            ):
+                return runtime_model.decoder.r1_forward_routed_prefix(
+                    runtime_model.token_embedder,
+                    tokens,
+                    positions,
+                    segments,
+                    target_parameters,
+                )
+
+            lowered = nnx.jit(forward, graph_updates=False).lower(
+                model,
+                target,
+                *batch,
+            )
+            stablehlo = lowered.as_text()
+            assert "ragged_all_to_all" in stablehlo
+            assert "shared_experts" not in stablehlo
+            assert "batch_split" not in stablehlo
+            # The superseded metadata recomputation produced 48 dots. The
+            # same-invocation native tap lowers exactly 47.
+            assert stablehlo.count("dot_general") == 47
+            print("r1-full-prefix-lower-ok")
+            """
+        ).lstrip(),
+        encoding="utf-8",
+    )
+    environment = dict(os.environ)
+    environment.update(
+        {
+            "JAX_PLATFORMS": "cpu",
+            "XLA_FLAGS": "--xla_force_host_platform_device_count=64",
+            "PYTHONPATH": os.pathsep.join(
+                (
+                    str(repository / "src"),
+                    str(applied_checkout / "src"),
+                    environment.get("PYTHONPATH", ""),
+                )
+            ),
+        }
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            str(applied_checkout),
+            str(tmp_path / "output"),
+        ],
+        capture_output=True,
+        check=False,
+        env=environment,
+        text=True,
+        timeout=300,
+    )
+    assert result.returncode == 0, (
+        f"full prefix lower failed\nstdout:\n{result.stdout[-8000:]}"
+        f"\nstderr:\n{result.stderr[-8000:]}"
+    )
+    assert "r1-full-prefix-lower-ok" in result.stdout

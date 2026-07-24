@@ -26,21 +26,21 @@ PATCH_SERIES = (
     ),
     (
         "0003-native-ragged-r1-prefix.patch",
-        "d4db9f2930583a494d36da89551d5086a64aa1bb7ad7d298d7ab1bc3453dca9c",
+        "c1df8ec6717d15a6341d5363c26a50cbdf5672c713d489bb0109707cf4102af0",
     ),
 )
 POST_APPLY_SHA256: Mapping[str, str] = {
     "src/maxtext/layers/moe.py": (
-        "572b25d80997ce308a3b25484dbbbc42649ad388ebca2a00c23fd6030f7a699d"
+        "0988c166b728415994db1fa8bfc204ccb6515723f31882904ca0e5446412f91d"
     ),
     "src/maxtext/layers/nnx_decoders.py": (
         "22fe037c890afdfcd6b80fc07b7b3f8a9333315e103ab0b701b2a986341ced85"
     ),
     "src/maxtext/models/deepseek.py": (
-        "ef7a9ec151b523116d17831b460031ef2db176002eeac2ba4f91a3a897555d7b"
+        "46e01da9ddf7f59fb5734ca7bd14dc34cad568376fa4dea122b44f5a30e62e9e"
     ),
     "src/maxtext/models/deepseek_prefix.py": (
-        "48d256d1a234bfd70b0b1e49433dfbae98700b5d497a16c196de13696fdcf067"
+        "8cbf46d1370e4a429ebd3902b65e6cd988e39410463434ee15b49d20ac545050"
     ),
 }
 EXPECTED_STATUS = (

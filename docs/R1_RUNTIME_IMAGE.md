@@ -15,7 +15,7 @@ pins:
 | Python | `3.12.11` |
 | uv | `0.11.14` |
 | MaxText base | `c03f8bd307d18049fa814fc8c104bd9ec8c292aa` |
-| MaxText patches | `f5b4f810…`, `d78349f8…`, then `d4db9f29…` |
+| MaxText patches | `f5b4f810…`, `d78349f8…`, then `c1df8ec6…` |
 | JAX / JAXLIB | `0.10.2` / `0.10.2` |
 | libtpu | `0.0.43` |
 | Packer / Google Compute plugin | `1.15.4` / `1.2.7` |

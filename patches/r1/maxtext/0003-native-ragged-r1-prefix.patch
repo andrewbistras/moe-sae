@@ -1,67 +1,20 @@
 diff --git a/src/maxtext/layers/moe.py b/src/maxtext/layers/moe.py
-index c84c56b28bdd31b2e16001d5028db47de2b274ae..8f1d4ce90da6f9ca609a7804656256f1d63f1be0 100644
+index c84c56b28bdd31b2e16001d5028db47de2b274ae..d844f32bfa4986f36c483bd7c82d1750a58355af 100644
 --- a/src/maxtext/layers/moe.py
 +++ b/src/maxtext/layers/moe.py
-@@ -778,6 +778,58 @@ class RoutedMoE(nnx.Module):
- 
-     return top_k_weights, top_k_indices
- 
-+  def r1_direct_router_metadata(
-+      self,
-+      inputs: jax.Array,
-+      gate_inputs: jax.Array | None = None,
-+  ) -> tuple[jax.Array, jax.Array]:
-+    """Return DeepSeek-R1's global IDs and scaled weights without dispatch.
-+
-+    The B128 prefix runtime keeps ``use_batch_split_schedule`` enabled only to
-+    preserve the released checkpoint/storage layout.  Its execution path uses
-+    this ordinary ``RoutedMoE`` module directly.  Router metadata is therefore
-+    recomputed through the same gate and ``get_topk`` implementation, before
-+    any expert-parallel remapping performed by sparse dispatch.
-+    """
-+
-+    unsupported = []
-+    if not self.config.model_name.startswith("deepseek3"):
-+      unsupported.append("model_name")
-+    if not self.config.float32_gate_logits:
-+      unsupported.append("float32_gate_logits=False")
-+    if not self.config.sparse_matmul:
-+      unsupported.append("sparse_matmul=False")
-+    if self.config.use_ring_of_experts:
-+      unsupported.append("use_ring_of_experts=True")
-+    if not self.config.use_ragged_sort:
-+      unsupported.append("use_ragged_sort=False")
-+    if self.config.ragged_buffer_factor > 0.0:
-+      unsupported.append("ragged_buffer_factor>0")
-+    if self.config.use_random_routing:
-+      unsupported.append("use_random_routing=True")
-+    if self.config.num_moe_emb_chunks > 0:
-+      unsupported.append("num_moe_emb_chunks>0")
-+    if self.config.num_moe_token_chunks != 1:
-+      unsupported.append("num_moe_token_chunks!=1")
-+    if self.quant is not None:
-+      unsupported.append("quantization")
-+    if unsupported:
-+      raise ValueError(
-+          "R1 direct router metadata does not support " + ", ".join(unsupported)
-+      )
-+
-+    inputs = inputs.astype(self.config.dtype)
-+    routing_inputs = inputs if gate_inputs is None else gate_inputs.astype(jnp.float32)
-+    gate_logits, pre_bias_logits = self.gate(routing_inputs)
-+    top_k_weights, top_k_indices = self.get_topk(
-+        gate_logits,
-+        pre_bias_logits,
-+    )
-+    return (
-+        top_k_indices.astype(jnp.int32),
-+        top_k_weights.astype(jnp.float32),
-+    )
-+
-   def deepseek_scale_weights(self, weights):
-     """Scales weights according to DeepSeek's v3 reference implementation."""
-     # https://github.com/deepseek-ai/DeepSeek-V3/blob/2f7b80eecebf3d1c84da5a0d465f6639ea175012/inference/model.py#L592-L594.
-@@ -1661,9 +1713,15 @@ class RoutedMoE(nnx.Module):
+@@ -677,9 +677,11 @@ class RoutedMoE(nnx.Module):
+   def _maybe_shard_with_logical(self, inputs, logical_name):
++    logical_rules = None if self.config.using_pipeline_parallelism else self.config.logical_axis_rules
+     return maybe_shard_with_logical(
+         inputs,
+         logical_name,
+         mesh=self.mesh,
+         shard_mode=self.config.shard_mode,
+         debug_sharding=self.config.debug_sharding,
++        rules=logical_rules,
+         extra_stack_level=1,
+     )
+@@ -1661,9 +1661,15 @@ class RoutedMoE(nnx.Module):
          wo_pspec = self._logical_to_mesh_axes((None, "mlp_no_fsdp", None))
        else:
          # These are the main shardings used by default - they use funky rules to AG over FSDP.
@@ -97,7 +50,7 @@ index 42b8a4464d5682e21053f82329486f7a378ccb02..8680038b97110b9812ac783aa0cf92c3
          decoder_positions,
          decoder_segment_ids,
 diff --git a/src/maxtext/models/deepseek.py b/src/maxtext/models/deepseek.py
-index 3ec5c32f1f51d687be72e906a33d1ce3a0d7599a..5cc49037f5b232429e1ddb451c655b9b3d9b716e 100644
+index 3ec5c32f1f51d687be72e906a33d1ce3a0d7599a..37070633c8c2647ca3d4d1c592996cd8ac90d503 100644
 --- a/src/maxtext/models/deepseek.py
 +++ b/src/maxtext/models/deepseek.py
 @@ -433,6 +433,7 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
@@ -119,7 +72,7 @@ index 3ec5c32f1f51d687be72e906a33d1ce3a0d7599a..5cc49037f5b232429e1ddb451c655b9b
        # The older version of batch-split that fully uses qwix quantization.
        if self.config.use_qwix_quantization and not self.config.use_manual_quantization:
          activation_pspec = jax.sharding.PartitionSpec(
-@@ -600,6 +603,43 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
+@@ -600,6 +603,76 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
  
      return self.post_process(layer_output, load_balance_loss, moe_bias_updates, kv_cache)
  
@@ -137,6 +90,29 @@ index 3ec5c32f1f51d687be72e906a33d1ce3a0d7599a..5cc49037f5b232429e1ddb451c655b9b
 +      raise ValueError("R1 target does not support MHC or Engram")
 +    if self.config.dropout_rate != 0.0:
 +      raise ValueError("R1 target requires dropout_rate=0")
++    capture_requirements = {
++        "float32_gate_logits": True,
++        "sparse_matmul": True,
++        "megablox": True,
++        "use_tokamax_gmm": False,
++        "use_gmm_v2": False,
++        "use_ring_of_experts": False,
++        "use_ragged_sort": True,
++        "ragged_buffer_factor": -1.0,
++        "num_moe_emb_chunks": 0,
++        "num_moe_token_chunks": 1,
++        "use_random_routing": False,
++    }
++    drift = [
++        name
++        for name, expected in capture_requirements.items()
++        if getattr(self.config, name, None) != expected
++    ]
++    if drift or self.quant is not None:
++      raise ValueError(
++          "R1 target native metadata prerequisites drifted: "
++          + ", ".join(drift or ("quantization",))
++      )
 +
 +    x = self.with_logical_constraint(inputs)
 +    x = checkpoint_name(x, "decoder_layer_input")
@@ -147,12 +123,22 @@ index 3ec5c32f1f51d687be72e906a33d1ce3a0d7599a..5cc49037f5b232429e1ddb451c655b9b
 +        True,
 +    )
 +    routed_moe = self.DeepSeekMoeBlock_0.routed_moe
-+    routed_aggregate, _, _ = routed_moe(
++    if routed_moe.capture_router_metadata:
++      raise ValueError("R1 target requires metadata capture to start disabled")
++    # This target layer is a throwaway merge whose graph updates are discarded
++    # by deepseek_prefix._target_layer.  Enabling the static native tap here
++    # makes dispatch return the exact IDs and weights produced by its one gate
++    # and top-k invocation; no second router evaluation is permitted.
++    routed_moe.capture_router_metadata = True
++    (
++        routed_aggregate,
++        _,
++        _,
++        expert_ids,
++        router_weights,
++    ) = routed_moe(
 +        hidden_states,
 +        out_sharding=self.out_sharding,
-+    )
-+    expert_ids, router_weights = routed_moe.r1_direct_router_metadata(
-+        hidden_states
 +    )
 +    return (
 +        self.with_logical_constraint(routed_aggregate),
@@ -164,10 +150,10 @@ index 3ec5c32f1f51d687be72e906a33d1ce3a0d7599a..5cc49037f5b232429e1ddb451c655b9b
      mlp_lnx, load_balance_loss, moe_bias_updates = self.DeepSeekMoeBlock_0(
          x, intermediate_sharding=self.mlp_intermediate_sharding, out_sharding=self.out_sharding
 diff --git a/src/maxtext/models/deepseek_prefix.py b/src/maxtext/models/deepseek_prefix.py
-index f6daa2b184721b55443e47eae82cb94909d4b460..5c379dc7b976809c1d89bcdef65d27bf03077d04 100644
+index f6daa2b184721b55443e47eae82cb94909d4b460..5225d630800001d097e5ad00545381b220dd72cc 100644
 --- a/src/maxtext/models/deepseek_prefix.py
 +++ b/src/maxtext/models/deepseek_prefix.py
-@@ -12,72 +12,92 @@
+@@ -12,72 +12,95 @@
  # See the License for the specific language governing permissions and
  # limitations under the License.
  
@@ -249,6 +235,9 @@ index f6daa2b184721b55443e47eae82cb94909d4b460..5c379dc7b976809c1d89bcdef65d27bf
 +_NATIVE_CONFIG = {
 +    "float32_gate_logits": True,
 +    "sparse_matmul": True,
++    "megablox": True,
++    "use_tokamax_gmm": False,
++    "use_gmm_v2": False,
 +    "mlp_bias": False,
 +    "prefuse_moe_weights": False,
 +    "shard_exp_on_fsdp": False,
