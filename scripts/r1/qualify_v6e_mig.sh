@@ -12,12 +12,12 @@ set -Eeuo pipefail
 umask 077
 
 readonly PROJECT="${PROJECT:-neural-dragnet}"
-readonly ZONE="${ZONE:-us-east1-d}"
-readonly MIG="${MIG:-r1-v6e-bench-27e25e5-ue1d-a1}"
-readonly EXPECTED_TEMPLATE="${EXPECTED_TEMPLATE:-r1-v6e-spot-stop-27e25e5-us-east1-v1}"
-readonly ATTEMPT="${ATTEMPT:-ue1d-a1-ep16-fsdp4}"
-readonly MESH="${MESH:-EP16/FSDP4}"
-readonly FORMATION_TIMEOUT_SECONDS="${FORMATION_TIMEOUT_SECONDS:-21600}"
+readonly ZONE="${ZONE:-europe-west4-a}"
+readonly MIG="${MIG:-r1-v6e-bench-53ee3b2f-euw4a-a2}"
+readonly EXPECTED_TEMPLATE="${EXPECTED_TEMPLATE:-r1-v6e-spot-stop-53ee3b2f-europe-west4-v1}"
+readonly ATTEMPT="${ATTEMPT:-euw4a-a2-ep8-fsdp8}"
+readonly MESH="${MESH:-EP8/FSDP8}"
+readonly FORMATION_TIMEOUT_SECONDS="${FORMATION_TIMEOUT_SECONDS:-28800}"
 readonly WORKER_READINESS_TIMEOUT_SECONDS="${WORKER_READINESS_TIMEOUT_SECONDS:-900}"
 readonly BENCHMARK_TIMEOUT_SECONDS="${BENCHMARK_TIMEOUT_SECONDS:-3600}"
 readonly POLL_SECONDS="${POLL_SECONDS:-30}"
@@ -26,7 +26,7 @@ readonly UNIT="moe-sae-r1-qual-${ATTEMPT}"
 readonly RESULT_ROOT="/var/lib/moe-sae-r1/qualification/${ATTEMPT}"
 readonly RESULT_PATH="${RESULT_ROOT}/result.json"
 readonly SUCCESS_PATH="${RESULT_ROOT}/worker.success"
-readonly IMAGE_OBSERVATION_SHA256="629b8baf0e80f694be537df504fa7214eff283e00af97ced23b910a17d05c47f"
+readonly IMAGE_OBSERVATION_SHA256="f145fe3a539b7b0771e1483f16508b1cec99b12449e758cd5ed8fb99c0ab7cda"
 readonly SSH_KEY_FILE="/home/abistras/.ssh/moe_sae_r1_controller"
 readonly SSH_KEY_EXPIRATION="$(
   date -u --date='+12 hours' '+%Y-%m-%dT%H:%M:%SZ'

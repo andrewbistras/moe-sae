@@ -80,16 +80,18 @@ writes only one small local JSON result:
 python -m moe_sae.r1.prefix_benchmark_runner \
   --maxtext-base-yml /opt/moe-sae-r1/runtime/lib/python3.12/site-packages/maxtext/configs/base.yml \
   --output-directory /var/lib/moe-sae-r1/qualification/manual \
-  --mesh EP16/FSDP4 \
+  --mesh EP8/FSDP8 \
   --seed 0 \
-  --result-json /var/lib/moe-sae-r1/qualification/manual/ep16-fsdp4.json
+  --result-json /var/lib/moe-sae-r1/qualification/manual/ep8-fsdp8.json
 ```
 
-Repeat with `EP32/FSDP2` and `EP8/FSDP8`. Each run compiles once, validates the
-output/router ABI, completes five warmups, and measures 500 device-synchronized
-steps. For the frozen full B128×1024 workload, 51% MFU requires an aggregate
-step time no greater than 163.551 ms. Allocation, compile, output validation,
-and warmups are reported separately.
+Run `EP8/FSDP8` first because it has the smallest static dropless-routing
+buffer, then `EP16/FSDP4`; treat `EP32/FSDP2` as the highest-HBM-risk
+candidate. Each run compiles once, validates the output/router ABI, completes
+five warmups, and measures 500 device-synchronized steps. For the frozen full
+B128×1024 workload, 51% MFU requires an aggregate step time no greater than
+163.551 ms. Allocation, compile, output validation, and warmups are reported
+separately.
 
 For the first image qualification, run
 `scripts/r1/qualify_v6e_mig.sh` on the persistent controller. The script is
@@ -108,11 +110,11 @@ mesh:
 ```zsh
 sudo env \
   PROJECT=neural-dragnet \
-  ZONE=us-east1-d \
-  MIG=r1-v6e-bench-27e25e5-ue1d-a1 \
-  EXPECTED_TEMPLATE=r1-v6e-spot-stop-27e25e5-us-east1-v1 \
-  ATTEMPT=ue1d-a1-ep16-fsdp4 \
-  MESH=EP16/FSDP4 \
+  ZONE=europe-west4-a \
+  MIG=r1-v6e-bench-53ee3b2f-euw4a-a2 \
+  EXPECTED_TEMPLATE=r1-v6e-spot-stop-53ee3b2f-europe-west4-v1 \
+  ATTEMPT=euw4a-a2-ep8-fsdp8 \
+  MESH=EP8/FSDP8 \
   /usr/local/sbin/qualify_v6e_mig.sh
 ```
 
