@@ -1,0 +1,78 @@
+{
+  "copy": {
+    "completed_at": "2026-07-24T06:51:13.887Z",
+    "create_only": true,
+    "daisy_chain": false,
+    "destination": {
+      "generation": 1784875873875824,
+      "uri": "gs://neural-dragnet-r1-use1-655343590563/runtime/872720d5a668c05350ad86a0cf92b1ff5767146dd08861b969a95cf9f871da31.tar.gz"
+    },
+    "inter_region_bytes": 1362071085,
+    "observed_throughput_mib_per_second": 31.1,
+    "operation": "gcloud-storage-server-side-copy",
+    "source": {
+      "generation": 1784875720559397,
+      "uri": "gs://neural-dragnet-r1-euw4-655343590563/runtime/872720d5a668c05350ad86a0cf92b1ff5767146dd08861b969a95cf9f871da31.tar.gz"
+    }
+  },
+  "destination_observation": {
+    "bucket": "neural-dragnet-r1-use1-655343590563",
+    "component_count": null,
+    "content_encoding": null,
+    "content_type": "application/gzip",
+    "crc32c": "3ae64g==",
+    "generation": 1784875873875824,
+    "md5": "13t2yqTNJkMSjh75f0z/FA==",
+    "metadata": {
+      "moe-sae-r1-derived-runtime-attestation-sha256": "0a168050565ca369e66f29ac5c3d5c7af7a1367ce0e30e5c4b1349f0a39651ad",
+      "moe-sae-r1-derived-runtime-member-count": "69558",
+      "moe-sae-r1-derived-runtime-repository-commit": "68a9547b6e46e56b3afdbd74ad43d3daa7809a24",
+      "moe-sae-r1-derived-runtime-result-sha256": "f5e6b8507cf6845b2de863fb0735bde46dca363ba0e086b786dffc12f947bc82",
+      "moe-sae-r1-derived-runtime-schema": "v1",
+      "moe-sae-r1-derived-runtime-sha256": "872720d5a668c05350ad86a0cf92b1ff5767146dd08861b969a95cf9f871da31",
+      "moe-sae-r1-derived-runtime-size-bytes": "1362071085"
+    },
+    "metageneration": 1,
+    "name": "runtime/872720d5a668c05350ad86a0cf92b1ff5767146dd08861b969a95cf9f871da31.tar.gz",
+    "raw_api_observation_sha256": "940af4f3548d9c1277520ff3fbe734bce71617b9a7b415d95901220c677129da",
+    "size_bytes": 1362071085,
+    "storage_class": "STANDARD",
+    "time_created": "2026-07-24T06:51:13.887Z"
+  },
+  "gates": {
+    "component_count_absent": true,
+    "content_identity_equal": true,
+    "custom_metadata_equal": true,
+    "destination_exact_generation_reread": true,
+    "destination_was_absent_before_copy": true,
+    "source_exact_generation_reread": true
+  },
+  "production_qualified": false,
+  "publication_receipt_sha256": "68835dd5e80f48d910d522a41b69eb23939fb70a565cbafab9dcd30c900c6aa8",
+  "repository_commit": "68a9547b6e46e56b3afdbd74ad43d3daa7809a24",
+  "schema": "moe-sae.r1.derived-runtime-regional-copy-evidence.v1",
+  "source_observation": {
+    "bucket": "neural-dragnet-r1-euw4-655343590563",
+    "component_count": null,
+    "content_encoding": null,
+    "content_type": "application/gzip",
+    "crc32c": "3ae64g==",
+    "generation": 1784875720559397,
+    "md5": "13t2yqTNJkMSjh75f0z/FA==",
+    "metadata": {
+      "moe-sae-r1-derived-runtime-attestation-sha256": "0a168050565ca369e66f29ac5c3d5c7af7a1367ce0e30e5c4b1349f0a39651ad",
+      "moe-sae-r1-derived-runtime-member-count": "69558",
+      "moe-sae-r1-derived-runtime-repository-commit": "68a9547b6e46e56b3afdbd74ad43d3daa7809a24",
+      "moe-sae-r1-derived-runtime-result-sha256": "f5e6b8507cf6845b2de863fb0735bde46dca363ba0e086b786dffc12f947bc82",
+      "moe-sae-r1-derived-runtime-schema": "v1",
+      "moe-sae-r1-derived-runtime-sha256": "872720d5a668c05350ad86a0cf92b1ff5767146dd08861b969a95cf9f871da31",
+      "moe-sae-r1-derived-runtime-size-bytes": "1362071085"
+    },
+    "metageneration": 1,
+    "name": "runtime/872720d5a668c05350ad86a0cf92b1ff5767146dd08861b969a95cf9f871da31.tar.gz",
+    "raw_api_observation_sha256": "4375ae665992b05028d296e4f259901c58af6efff5609019bc23d555e964fd78",
+    "size_bytes": 1362071085,
+    "storage_class": "STANDARD",
+    "time_created": "2026-07-24T06:48:40.566Z"
+  }
+}

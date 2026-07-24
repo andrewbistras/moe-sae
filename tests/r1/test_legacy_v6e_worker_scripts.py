@@ -56,34 +56,53 @@ def test_worker_bootstrap_is_generation_pinned_and_has_no_discovery_read() -> No
     source = _source(BOOTSTRAP)
     assert (
         'readonly EUW4_RUNTIME_URI="gs://neural-dragnet-r1-euw4-655343590563/'
-        "runtime/6129738baad8d2bb4060c6e19b8a9227341afe9c795304f70fdf3206155f45c9"
+        "runtime/872720d5a668c05350ad86a0cf92b1ff5767146dd08861b969a95cf9f871da31"
         '.tar.gz"'
     ) in source
-    assert 'readonly EUW4_RUNTIME_GENERATION="1784862130885035"' in source
+    assert 'readonly EUW4_RUNTIME_GENERATION="1784875720559397"' in source
     assert (
         'readonly USE1_RUNTIME_URI="gs://neural-dragnet-r1-use1-655343590563/'
-        "runtime/6129738baad8d2bb4060c6e19b8a9227341afe9c795304f70fdf3206155f45c9"
+        "runtime/872720d5a668c05350ad86a0cf92b1ff5767146dd08861b969a95cf9f871da31"
         '.tar.gz"'
     ) in source
-    assert 'readonly USE1_RUNTIME_GENERATION="1784865436897245"' in source
+    assert 'readonly USE1_RUNTIME_GENERATION="1784875873875824"' in source
     assert "europe-west4-a)" in source
     assert "us-east1-d)" in source
     assert (
         'readonly RUNTIME_SHA256="'
-        "6129738baad8d2bb4060c6e19b8a9227341afe9c795304f70fdf3206155f45c9"
+        "872720d5a668c05350ad86a0cf92b1ff5767146dd08861b969a95cf9f871da31"
         '"'
     ) in source
-    assert 'readonly RUNTIME_SIZE_BYTES="1378895492"' in source
-    assert 'readonly RUNTIME_MEMBER_COUNT="69566"' in source
+    assert 'readonly RUNTIME_SIZE_BYTES="1362071085"' in source
+    assert 'readonly RUNTIME_MEMBER_COUNT="69558"' in source
     assert (
         'readonly RUNTIME_COMMIT="'
-        "0b01bc2b76e375271249eb6f7e0499d5b016a1da"
+        "68a9547b6e46e56b3afdbd74ad43d3daa7809a24"
         '"'
     ) in source
     assert '"${RUNTIME_URI}#${RUNTIME_GENERATION}"' in source
     assert "gcloud storage ls" not in source
     assert "gcloud storage objects list" not in source
     assert "gcloud storage cp" in source
+
+
+def test_controller_and_bootstrap_bind_the_same_derived_runtime_commit() -> None:
+    bootstrap = _source(BOOTSTRAP)
+    controller = _source(CONTROLLER)
+    runtime_commit = re.search(
+        r'^readonly RUNTIME_COMMIT="([0-9a-f]{40})"$',
+        bootstrap,
+        re.MULTILINE,
+    )
+    expected_commit = re.search(
+        r'^readonly EXPECTED_RUNTIME_COMMIT="([0-9a-f]{40})"$',
+        controller,
+        re.MULTILINE,
+    )
+    assert runtime_commit is not None
+    assert expected_commit is not None
+    assert expected_commit.group(1) == runtime_commit.group(1)
+    assert runtime_commit.group(1) == "68a9547b6e46e56b3afdbd74ad43d3daa7809a24"
 
 
 def test_worker_fast_path_precedes_the_only_gcs_get() -> None:

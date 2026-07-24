@@ -1,0 +1,83 @@
+{
+  "artifact": {
+    "archive": {
+      "expanded_regular_bytes": 4515398549,
+      "format": "GNU-tar+gzip",
+      "member_count": 69558,
+      "sha256": "872720d5a668c05350ad86a0cf92b1ff5767146dd08861b969a95cf9f871da31",
+      "size_bytes": 1362071085
+    },
+    "derived_attestation_sha256": "0a168050565ca369e66f29ac5c3d5c7af7a1367ce0e30e5c4b1349f0a39651ad",
+    "repacker_result_sha256": "f5e6b8507cf6845b2de863fb0735bde46dca363ba0e086b786dffc12f947bc82",
+    "result_schema": "moe-sae.r1.derived-runtime-result.v1"
+  },
+  "base": {
+    "base_runtime_archive_sha256": "6129738baad8d2bb4060c6e19b8a9227341afe9c795304f70fdf3206155f45c9",
+    "boot_image": "projects/neural-dragnet/global/images/moe-sae-r1-v6e-native-0b01bc2-20260724",
+    "boot_image_id": 9023833988234439751,
+    "image_observation_sha256": "0582a9a5d5c1ff11c44cbe713a82124680fa9f67a311927ed883b1105cc3a143",
+    "image_recipe_sha256": "3e3e82e0c43b5312711a9ff51617c0e6c9aeeb2b3339761fd258cc7867c9d164",
+    "repository_commit": "0b01bc2b76e375271249eb6f7e0499d5b016a1da"
+  },
+  "cleanup": {
+    "boot_disk_deleted": true,
+    "instance_deleted": true,
+    "observed_at": "2026-07-24T06:54:15Z"
+  },
+  "context": {
+    "archive_sha256": "a3b61078375bc881941945903040731aa3f0daefceaaa6291cf6b3758daf69af",
+    "file_count": 39,
+    "manifest_sha256": "f391c5616f47fe9c65fd5e8dcb3420d4e703b2e25fbcf1cc3bd6c39e7fb26c69",
+    "repository_commit": "68a9547b6e46e56b3afdbd74ad43d3daa7809a24",
+    "total_payload_bytes": 1840681
+  },
+  "project": "neural-dragnet",
+  "publication": {
+    "eu_generation": 1784875720559397,
+    "eu_publication_receipt": "derived-runtime-publication-euw4-68a9547-20260724.json",
+    "regional_copy_evidence": "derived-runtime-copy-euw4-use1-68a9547-20260724.json",
+    "us_generation": 1784875873875824
+  },
+  "repacker_sha256": "c0089c8f644678976eec4d21129effe2b6c56c9c6b9cfa06026fa2c55607cfd7",
+  "resource": {
+    "boot_disk": {
+      "id": 3808276173579794472,
+      "name": "r1-repack-68a9547-20260724t0625z",
+      "size_gb": 100,
+      "type": "pd-balanced"
+    },
+    "instance": {
+      "created_at": "2026-07-23T23:31:35.260-07:00",
+      "external_ip": false,
+      "id": 469000467432519720,
+      "machine_type": "e2-standard-2",
+      "name": "r1-repack-68a9547-20260724t0625z"
+    }
+  },
+  "schema": "moe-sae.r1.derived-runtime-repack-success-evidence.v1",
+  "systemd": {
+    "completed_at": "2026-07-24T06:41:18Z",
+    "exec_main_status": 0,
+    "result": "success",
+    "started_at": "2026-07-24T06:34:24Z",
+    "unit": "moe-sae-r1-repack-68a9547.service"
+  },
+  "validation": {
+    "archive_sha256_match": true,
+    "gzip_test_passed": true,
+    "maxtext_import_passed": true,
+    "runtime_user": {
+      "gid": 20001,
+      "groups": [
+        20001
+      ],
+      "uid": 20001
+    },
+    "runtime_user_imports_passed": true,
+    "tar_member_count_match": true,
+    "worker_files_mode": "0644",
+    "worker_package_directories_mode": "0755",
+    "worker_package_owner": "root:root"
+  },
+  "zone": "europe-west4-a"
+}
