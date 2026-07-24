@@ -210,12 +210,15 @@ The service is one-shot (`Restart=no`). Once any host enters distributed JAX,
 a failed/preempted attempt is replaced by a fresh whole MIG and launch fence;
 systemd never replays one worker under a stale launch.
 
-`DeploymentEnvelopeV1` remains immutable and retains its obsolete Spot
-termination action `STOP`. The additive `placement_v2` protocol instead
-requires `DELETE`, a fresh whole 16-VM MIG and launch reference for every
-replacement attempt, and controller-side Compute API evidence. It permits a
-successor attempt to move regions without changing the image, runtime, or
-scientific identity. The V2 records are still a protocol oracle: the cloud API
-adapter and a documented live create/preempt/recreate test remain required
-before production admission. See the
+Both deployment protocols now require the Compute MIG-compatible Spot
+termination action `STOP`. Compute rejects `DELETE` for Spot VMs in a managed
+instance group even though the standalone Spot guide recommends it. A stopped
+member is never restarted or reused: `DO_NOTHING` prevents per-VM repair, and
+the controller requires a fresh whole 16-VM MIG, launch reference, and fence
+for every replacement attempt. This preserves terminal whole-slice semantics
+without encoding an API-invalid template. A successor attempt may move regions
+without changing the image, runtime, or scientific identity. The V2 records
+are still a protocol oracle: the cloud API adapter and a documented live
+create/preempt/recreate test remain required before production admission. See
+the
 [official TPU Spot VM guide](https://docs.cloud.google.com/tpu/docs/spot-compute).

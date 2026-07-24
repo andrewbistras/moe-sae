@@ -583,8 +583,8 @@ class DeploymentEnvelopeV2(CanonicalRecord):
             raise ProtocolError("replacement_policy must be FRESH_WHOLE_MIG")
         if self.provisioning_model != "SPOT":
             raise ProtocolError("provisioning_model must be SPOT")
-        if self.termination_action != "DELETE":
-            raise ProtocolError("termination_action must be DELETE")
+        if self.termination_action != "STOP":
+            raise ProtocolError("termination_action must be STOP")
         if self.maintenance_policy != "TERMINATE":
             raise ProtocolError("maintenance_policy must be TERMINATE")
         _service_account_email(self.service_account_email, "service_account_email")
@@ -888,8 +888,8 @@ class InstanceTemplateObservationV2(CanonicalRecord):
             raise ProtocolError("template image selfLink does not match project/name")
         if self.provisioning_model != "SPOT":
             raise ProtocolError("template provisioning_model must be SPOT")
-        if self.termination_action != "DELETE":
-            raise ProtocolError("template termination_action must be DELETE")
+        if self.termination_action != "STOP":
+            raise ProtocolError("template termination_action must be STOP")
         if self.maintenance_policy != "TERMINATE":
             raise ProtocolError("template maintenance_policy must be TERMINATE")
         if _boolean(self.automatic_restart, "automatic_restart"):

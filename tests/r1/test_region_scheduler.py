@@ -285,7 +285,7 @@ def _authority(
         default_action_on_failure="DO_NOTHING",
         replacement_policy="FRESH_WHOLE_MIG",
         provisioning_model="SPOT",
-        termination_action="DELETE",
+        termination_action="STOP",
         maintenance_policy="TERMINATE",
         service_account_email="r1-worker@neural-dragnet.iam.gserviceaccount.com",
         service_account_unique_id="123456789012345678901",

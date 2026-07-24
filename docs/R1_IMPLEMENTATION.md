@@ -771,7 +771,8 @@ campaign from its accepted event head.
 ### Phase 1: immutable image and data identities
 
 **Implementation status, 2026-07-23:** additive placement V2 records now
-require a certified dated Ubuntu 22.04 base-image resolution, Spot `DELETE`, a
+require a certified dated Ubuntu 22.04 base-image resolution, MIG-compatible
+Spot `STOP` with controller-enforced whole-MIG replacement, a
 full 16-VM v6e-64 MIG, a fresh generation-pinned launch reference/template/MIG
 per attempt, and controller-side API evidence. They permit cross-region
 successors while holding image/runtime/shape policy fixed. The cloud response

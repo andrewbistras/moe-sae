@@ -111,7 +111,7 @@ def _deployment(attempt: int = 1) -> DeploymentEnvelopeV2:
         default_action_on_failure="DO_NOTHING",
         replacement_policy="FRESH_WHOLE_MIG",
         provisioning_model="SPOT",
-        termination_action="DELETE",
+        termination_action="STOP",
         maintenance_policy="TERMINATE",
         service_account_email=WORKER_EMAIL,
         service_account_unique_id=WORKER_ID,
@@ -296,7 +296,7 @@ def test_attempt_authority_binds_lease_identity_and_v2_envelope() -> None:
     ("field", "value", "message"),
     [
         ("guaranteed_notice_ms", 1, "must be zero"),
-        ("termination_action", "STOP", "DELETE"),
+        ("termination_action", "DELETE", "STOP"),
         ("loss_scope", "ONE_VM", "WHOLE_SLICE"),
         ("lost_vm_count", 1, "16 TPU VMs"),
         ("lost_chip_count", 4, "64 TPU chips"),

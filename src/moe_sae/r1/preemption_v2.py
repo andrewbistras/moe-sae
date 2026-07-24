@@ -475,8 +475,8 @@ class ZeroNoticeSliceIncidentV2(CanonicalRecord):
             != 0
         ):
             raise ProtocolError("guaranteed_notice_ms must be zero")
-        if self.termination_action != "DELETE":
-            raise ProtocolError("termination_action must be DELETE")
+        if self.termination_action != "STOP":
+            raise ProtocolError("termination_action must be STOP")
         if self.loss_scope != "WHOLE_SLICE":
             raise ProtocolError("loss_scope must be WHOLE_SLICE")
         if require_integer(self.lost_vm_count, "lost_vm_count", minimum=1) != 16:
@@ -944,7 +944,7 @@ class ZeroNoticeStepLatchV2:
             authority=self._authority,
             trigger_kind=trigger_kind,
             guaranteed_notice_ms=0,
-            termination_action="DELETE",
+            termination_action="STOP",
             loss_scope="WHOLE_SLICE",
             lost_vm_count=16,
             lost_chip_count=64,

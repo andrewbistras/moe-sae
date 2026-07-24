@@ -201,7 +201,7 @@ def _deployment(attempt: int = 1) -> DeploymentEnvelopeV2:
         default_action_on_failure="DO_NOTHING",
         replacement_policy="FRESH_WHOLE_MIG",
         provisioning_model="SPOT",
-        termination_action="DELETE",
+        termination_action="STOP",
         maintenance_policy="TERMINATE",
         service_account_email=WORKER_EMAIL,
         service_account_unique_id=WORKER_ID,
@@ -224,7 +224,7 @@ def _template(attempt: int = 1) -> InstanceTemplateObservationV2:
         image_id=IMAGE_ID,
         image_self_link=IMAGE_LINK,
         provisioning_model="SPOT",
-        termination_action="DELETE",
+        termination_action="STOP",
         maintenance_policy="TERMINATE",
         automatic_restart=False,
         service_account_email=WORKER_EMAIL,
@@ -446,7 +446,7 @@ def test_base_image_authority_is_not_self_asserted() -> None:
         ("default_action_on_failure", "RECREATE", "DO_NOTHING"),
         ("replacement_policy", "REUSE_MIG", "FRESH_WHOLE_MIG"),
         ("provisioning_model", "STANDARD", "SPOT"),
-        ("termination_action", "STOP", "DELETE"),
+        ("termination_action", "DELETE", "STOP"),
         ("maintenance_policy", "MIGRATE", "TERMINATE"),
     ],
 )
@@ -551,7 +551,7 @@ def test_observations_require_quiescent_full_slice() -> None:
     with pytest.raises(ProtocolError, match="boolean"):
         replace(template, automatic_restart=0)
     with pytest.raises(ProtocolError, match="termination_action"):
-        replace(template, termination_action="STOP")
+        replace(template, termination_action="DELETE")
     with pytest.raises(ProtocolError, match="only moe-sae-r1-launch-ref"):
         replace(template, metadata_keys=("operator-command",))
     with pytest.raises(ProtocolError, match="startup scripts"):
