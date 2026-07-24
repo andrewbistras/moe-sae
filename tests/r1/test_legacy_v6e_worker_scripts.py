@@ -14,6 +14,9 @@ ROOT = Path(__file__).resolve().parents[2]
 BOOTSTRAP = ROOT / "scripts/r1/bootstrap_legacy_v6e_worker.sh"
 CONTROLLER = ROOT / "scripts/r1/qualify_legacy_v6e.sh"
 VALIDATOR = ROOT / "scripts/r1/validate_legacy_v6e_result.py"
+QUALIFIER_TEMPLATE = (
+    ROOT / "ops/r1/systemd/moe-sae-r1-legacy-qualifier@.service"
+)
 
 
 def _source(path: Path) -> str:
@@ -34,6 +37,19 @@ def test_legacy_scripts_are_executable_bash_with_valid_syntax() -> None:
         assert path.stat().st_mode & 0o111
         assert _source(path).startswith("#!/usr/bin/env bash\n")
         subprocess.run(["bash", "-n", str(path)], check=True)
+
+
+def test_qualifier_template_binds_each_persistent_attempt_environment() -> None:
+    source = _source(QUALIFIER_TEMPLATE)
+    assert (
+        "EnvironmentFile=/etc/moe-sae-r1/legacy-qualifier/%i.env"
+        in source
+    )
+    assert "ExecStart=/usr/local/sbin/qualify_legacy_v6e.sh" in source
+    assert "Restart=on-abnormal" in source
+    assert "WantedBy=multi-user.target" in source
+    assert "DEPLOYMENT_PROFILE=" not in source
+    assert "ATTEMPT_SEQUENCE=" not in source
 
 
 def test_worker_bootstrap_is_generation_pinned_and_has_no_discovery_read() -> None:

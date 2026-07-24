@@ -1,0 +1,18 @@
+[Unit]
+Description=Bounded DeepSeek-R1 legacy v6e-64 qualifier (%i)
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+EnvironmentFile=/etc/moe-sae-r1/legacy-qualifier/%i.env
+ExecStart=/usr/local/sbin/qualify_legacy_v6e.sh
+Restart=on-abnormal
+RestartSec=30s
+TimeoutStopSec=900s
+KillMode=mixed
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
