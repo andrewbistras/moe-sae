@@ -772,9 +772,15 @@ optimizer, MFU formula, acceptance threshold, or report contract.
 thread-safe local step latch now bind the exact lease, deployment identity, and
 placement V2 envelope; freeze the first zero-notice whole-slice incident; and
 derive recovery only from a prepublished CAS checkpoint pointer under a fresh
-fence/MIG. Lease renewal is allowed only while the gate is open. The metadata
-poller, slice-wide fanout, durable incident sink, checkpoint-pointer adapter,
-and live preempt/recreate chaos test remain unimplemented, so this is not yet
+fence/MIG. Lease renewal is allowed only while the gate is open. The additive
+`runtime_supervisor` now executes the metadata poller, fixed-key launch
+resolution, controller lease/renewal, bounded immutable incident sink,
+publish-last checkpoint-pointer CAS, and a deterministic local
+preempt/recreate/resume test. It resolves the placement/hash cycle with one
+pre-template immutable token and one token-derived post-placement admission
+snapshot; neither path lists objects or accepts executable metadata. The
+qualified 16-host collective fanout, fixed MaxText workload bridge, and live
+GCS/v6e preempt/recreate chaos test remain unimplemented, so this is not yet
 production authority.
 
 1. Finish Gemma and export the complete Filestore control/evidence bundle to

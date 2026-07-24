@@ -279,6 +279,7 @@ def main() -> None:
         "maxtext_prefix_runtime",
         "prefix_benchmark",
         "prefix_benchmark_runner",
+        "runtime_supervisor",
     ):
         module = import_module(f"moe_sae.r1.{module_name}")
         module_file = getattr(module, "__file__", None)

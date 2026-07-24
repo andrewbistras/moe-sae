@@ -160,7 +160,7 @@ installed distribution file after verifying its RECORD entry. It imports the
 runtime entrypoint, proves its resolved path remains inside the sealed venv,
 and requires its bytes to equal the committed source. It also binds the local
 wheel `direct_url.json`, retained wheel and patch attestations, installed
-hashes for the four patched MaxText files, packaged `base.yml`, five critical
+hashes for the four patched MaxText files, packaged `base.yml`, six critical
 benchmark/restore modules, context/recipe/project/lock/unit identities, and
 `production_qualified=false`. This observation is input to the existing
 `ImageManifestV1`; it is not itself that manifest.
@@ -201,6 +201,19 @@ The managed-Python download artifact and the Packer executable/plugin binaries
 are pinned by version but not yet by committed artifact digests. Their observed
 bytes and a trusted builder-toolchain authority remain image-qualification
 requirements; static bundle validation does not close that gap.
+
+The baked context now also contains `runtime_supervisor.py`. It implements the
+generation/SHA-pinned metadata client, token-derived admission snapshot,
+controller placement/evidence checks, region-exact prefix-envelope open,
+monotonic lease renewal, zero-notice SIGTERM/preemption latch, publish-last
+checkpoint CAS, and sealed-pointer-only resume. Its local end-to-end test loses
+an attempt after one published unit and proves the successor starts at the next
+unit under fence 2. The systemd entrypoint deliberately does not invoke it yet:
+there is still no qualified `WholeSliceRuntime` that constructs and fans out
+the exact 16-process device inventory, and no fixed MaxText workload adapter
+that calls the supervisor gate before every accelerator step. Those are
+executable adapter gaps, not authorization to fall back to a command from
+metadata.
 
 No build should be labeled qualified until all six pass.
 

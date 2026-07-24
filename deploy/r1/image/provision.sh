@@ -153,7 +153,15 @@ EXPECTED = {
         0o644,
     ),
     "src/moe_sae/r1/mfu_v2.py": ("src/moe_sae/r1/mfu_v2.py", 0o644),
+    "src/moe_sae/r1/placement_v2.py": (
+        "src/moe_sae/r1/placement_v2.py",
+        0o644,
+    ),
     "src/moe_sae/r1/preemption.py": ("src/moe_sae/r1/preemption.py", 0o644),
+    "src/moe_sae/r1/preemption_v2.py": (
+        "src/moe_sae/r1/preemption_v2.py",
+        0o644,
+    ),
     "src/moe_sae/r1/prefix_batchsplit_contract.py": (
         "src/moe_sae/r1/prefix_batchsplit_contract.py",
         0o644,
@@ -179,6 +187,10 @@ EXPECTED = {
         0o644,
     ),
     "src/moe_sae/r1/protocol.py": ("src/moe_sae/r1/protocol.py", 0o644),
+    "src/moe_sae/r1/runtime_supervisor.py": (
+        "src/moe_sae/r1/runtime_supervisor.py",
+        0o644,
+    ),
     "src/moe_sae/r1/runtime_entrypoint.py": (
         "src/moe_sae/r1/runtime_entrypoint.py",
         0o644,

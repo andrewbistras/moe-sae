@@ -35,6 +35,9 @@
     {"source": "src/moe_sae/r1/mfu.py", "archive": "src/moe_sae/r1/mfu.py", "mode": "0644"},
     {"source": "src/moe_sae/r1/mfu_v2.py", "archive": "src/moe_sae/r1/mfu_v2.py", "mode": "0644"},
     {"source": "src/moe_sae/r1/mfu_authority.py", "archive": "src/moe_sae/r1/mfu_authority.py", "mode": "0644"},
+    {"source": "src/moe_sae/r1/placement_v2.py", "archive": "src/moe_sae/r1/placement_v2.py", "mode": "0644"},
+    {"source": "src/moe_sae/r1/preemption_v2.py", "archive": "src/moe_sae/r1/preemption_v2.py", "mode": "0644"},
+    {"source": "src/moe_sae/r1/runtime_supervisor.py", "archive": "src/moe_sae/r1/runtime_supervisor.py", "mode": "0644"},
     {"source": "src/moe_sae/r1/runtime_entrypoint.py", "archive": "src/moe_sae/r1/runtime_entrypoint.py", "mode": "0644"}
   ]
 }

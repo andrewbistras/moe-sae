@@ -316,8 +316,11 @@ def test_real_context_contains_the_patched_prefix_benchmark_closure() -> None:
         "src/moe_sae/r1/prefix_benchmark.py",
         "src/moe_sae/r1/prefix_benchmark_runner.py",
         "src/moe_sae/r1/prefix_restore_authority.py",
+        "src/moe_sae/r1/placement_v2.py",
+        "src/moe_sae/r1/preemption_v2.py",
+        "src/moe_sae/r1/runtime_supervisor.py",
     }
-    assert len(spec["files"]) == 35
+    assert len(spec["files"]) == 38
     assert required <= sources
 
     provisioner = (REPOSITORY / "deploy/r1/image/provision.sh").read_text(

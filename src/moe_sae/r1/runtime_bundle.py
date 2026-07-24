@@ -243,6 +243,21 @@ _EXPECTED_CONTEXT_FILES = frozenset(
             "0644",
         ),
         (
+            "src/moe_sae/r1/placement_v2.py",
+            "src/moe_sae/r1/placement_v2.py",
+            "0644",
+        ),
+        (
+            "src/moe_sae/r1/preemption_v2.py",
+            "src/moe_sae/r1/preemption_v2.py",
+            "0644",
+        ),
+        (
+            "src/moe_sae/r1/runtime_supervisor.py",
+            "src/moe_sae/r1/runtime_supervisor.py",
+            "0644",
+        ),
+        (
             "src/moe_sae/r1/runtime_entrypoint.py",
             "src/moe_sae/r1/runtime_entrypoint.py",
             "0644",
