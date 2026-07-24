@@ -166,8 +166,21 @@ def test_legacy_controller_never_creates_and_deletes_only_bound_slice() -> None:
     assert "EXPECTED_ACCELERATOR=\"v6e-64\"" in source
     assert "EXPECTED_RUNTIME_VERSION=\"v6e-ubuntu-2404\"" in source
     assert "EXPECTED_SERVICE_ACCOUNT=" in source
-    assert "enableExternalIps == false" in source
+    assert "(.networkConfig.enableExternalIps // false) == false" in source
     assert "(.networkEndpoints | length) == 16" in source
+    assert "all(.networkEndpoints[]; ((.accessConfig? // {}) == {}))" in source
+
+
+def test_controller_seals_every_confirmed_release_atomically() -> None:
+    source = _source(CONTROLLER)
+    publish = _function(source, "publish_release_marker")
+    seal = _function(source, "seal_evidence_best_effort")
+    assert "seal_evidence_best_effort" in publish
+    assert 'local temporary="SHA256SUMS.$$.tmp"' in seal
+    write = seal.index('xargs -0 -r sha256sum >"$temporary"')
+    durable = seal.index('sync -f "$temporary"', write)
+    publish_last = seal.index('mv "$temporary" SHA256SUMS', durable)
+    assert write < durable < publish_last
 
 
 def test_controller_binds_incarnation_and_isolates_reaper_snapshots() -> None:

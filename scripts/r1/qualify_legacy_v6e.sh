@@ -258,13 +258,13 @@ validate_ready_node() {
       .serviceAccount.email == $service_account and
       .serviceAccount.scope ==
         ["https://www.googleapis.com/auth/cloud-platform"] and
-      .networkConfig.enableExternalIps == false and
+      (.networkConfig.enableExternalIps // false) == false and
       .networkConfig.network == $network and
       .networkConfig.subnetwork == $subnetwork and
       (.queuedResource | split("/") | last) == $queued_resource and
       (.networkEndpoints | length) == 16 and
       ([.networkEndpoints[].ipAddress] | unique | length) == 16 and
-      ([.networkEndpoints[] | has("accessConfig")] | any) == false and
+      all(.networkEndpoints[]; ((.accessConfig? // {}) == {})) and
       ((.health // "HEALTHY") == "HEALTHY")
     ' "$snapshot" >/dev/null ||
     die "READY TPU node identity/topology changed"
@@ -393,6 +393,7 @@ copy_bootstrap_to_all_workers() {
 seal_evidence_best_effort() {
   (
     cd "$STATE_ROOT"
+    local temporary="SHA256SUMS.$$.tmp"
     find . \
       -type f \
       ! -name SHA256SUMS \
@@ -401,7 +402,10 @@ seal_evidence_best_effort() {
       ! -name '*.tmp' \
       -print0 |
       sort -z |
-      xargs -0 -r sha256sum >SHA256SUMS
+      xargs -0 -r sha256sum >"$temporary"
+    sync -f "$temporary"
+    mv "$temporary" SHA256SUMS
+    sync -f .
   )
 }
 
@@ -541,6 +545,9 @@ publish_release_marker() {
   sync -f "$temporary"
   mv "$temporary" "$REAPER_RELEASED_PATH"
   sync -f "$(dirname "$REAPER_RELEASED_PATH")"
+  if ! seal_evidence_best_effort; then
+    log "release marker is durable but evidence checksum sealing failed"
+  fi
 }
 
 initialize_formation_deadline() {
@@ -641,7 +648,8 @@ reap_exact_resource() {
   [[ "$#" == 0 ]] || die "reaper accepts no additional arguments"
   [[ "$EUID" == 0 ]] || die "reaper must run as root"
   for command in \
-    chmod date dirname gcloud grep jq mkdir mv rm seq sleep sync timeout; do
+    chmod date dirname find gcloud grep jq mkdir mv rm seq sha256sum sleep sort \
+    sync timeout xargs; do
     command -v "$command" >/dev/null 2>&1 ||
       die "reaper command is unavailable: $command"
   done
