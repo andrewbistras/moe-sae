@@ -174,6 +174,23 @@ def test_controller_binds_incarnation_and_isolates_reaper_snapshots() -> None:
     assert "attempt identity is already sealed released" in source
 
 
+def test_controller_derives_every_retry_identity_from_one_sequence() -> None:
+    source = _source(CONTROLLER)
+    assert 'readonly ATTEMPT_SEQUENCE="${ATTEMPT_SEQUENCE:-3}"' in source
+    assert (
+        'readonly QUEUED_RESOURCE="r1-v6e64-spot-euw4a-a${ATTEMPT_SEQUENCE}"'
+        in source
+    )
+    assert 'readonly TPU_NAME="${QUEUED_RESOURCE}-node"' in source
+    assert (
+        'readonly ATTEMPT="euw4a-legacy-a${ATTEMPT_SEQUENCE}-ep8-fsdp8"'
+        in source
+    )
+    assert "fsdp8-euw4a-a${ATTEMPT_SEQUENCE}" in source
+    assert "Environment=ATTEMPT_SEQUENCE=${ATTEMPT_SEQUENCE}" in source
+    assert "require_positive_integer \"$ATTEMPT_SEQUENCE\"" in source
+
+
 def test_legacy_controller_fans_out_fixed_systemd_benchmark() -> None:
     source = _source(CONTROLLER)
     assert "for worker in $(seq 0 15)" in source

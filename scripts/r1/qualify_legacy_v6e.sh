@@ -15,18 +15,19 @@ umask 077
 
 readonly PROJECT="${PROJECT:-neural-dragnet}"
 readonly ZONE="${ZONE:-europe-west4-a}"
-readonly QUEUED_RESOURCE="${QUEUED_RESOURCE:-r1-v6e64-spot-euw4a-a3}"
-readonly TPU_NAME="${TPU_NAME:-r1-v6e64-spot-euw4a-a3-node}"
+readonly ATTEMPT_SEQUENCE="${ATTEMPT_SEQUENCE:-3}"
+readonly QUEUED_RESOURCE="r1-v6e64-spot-euw4a-a${ATTEMPT_SEQUENCE}"
+readonly TPU_NAME="${QUEUED_RESOURCE}-node"
 readonly EXPECTED_ACCELERATOR="v6e-64"
 readonly EXPECTED_RUNTIME_VERSION="v6e-ubuntu-2404"
 readonly EXPECTED_SERVICE_ACCOUNT="655343590563-compute@developer.gserviceaccount.com"
 readonly EXPECTED_NETWORK="projects/neural-dragnet/global/networks/default"
 readonly EXPECTED_SUBNETWORK="projects/neural-dragnet/regions/europe-west4/subnetworks/default"
-readonly EXPECTED_LAUNCH_REF="qualification-legacy-native-ep8-fsdp8-euw4a-a3"
+readonly EXPECTED_LAUNCH_REF="qualification-legacy-native-ep8-fsdp8-euw4a-a${ATTEMPT_SEQUENCE}"
 readonly EXPECTED_RUNTIME_COMMIT="0b01bc2b76e375271249eb6f7e0499d5b016a1da"
 readonly EXPECTED_BOOTSTRAP_SHA256="db8066c56b276db7c759aa045de7bc29046adbb3e5254bec6400dc213f27710e"
 readonly EXPECTED_VALIDATOR_SHA256="0f30113726e878cfaf544c86e98d8b81edd80d4a08dea7c05462d63e187b5c07"
-readonly ATTEMPT="${ATTEMPT:-euw4a-legacy-a3-ep8-fsdp8}"
+readonly ATTEMPT="euw4a-legacy-a${ATTEMPT_SEQUENCE}-ep8-fsdp8"
 readonly MESH="EP8/FSDP8"
 readonly FORMATION_TIMEOUT_SECONDS="${FORMATION_TIMEOUT_SECONDS:-28800}"
 readonly WORKER_BOOTSTRAP_TIMEOUT_SECONDS="${WORKER_BOOTSTRAP_TIMEOUT_SECONDS:-2400}"
@@ -580,9 +581,7 @@ install_persistent_reaper() {
       'Type=exec' \
       "Environment=PROJECT=${PROJECT}" \
       "Environment=ZONE=${ZONE}" \
-      "Environment=QUEUED_RESOURCE=${QUEUED_RESOURCE}" \
-      "Environment=TPU_NAME=${TPU_NAME}" \
-      "Environment=ATTEMPT=${ATTEMPT}" \
+      "Environment=ATTEMPT_SEQUENCE=${ATTEMPT_SEQUENCE}" \
       "Environment=STATE_ROOT=${STATE_ROOT}" \
       "ExecStart=${REAPER_CONTROLLER} --reap" \
       'Restart=on-failure' \
@@ -631,6 +630,10 @@ reap_exact_resource() {
     command -v "$command" >/dev/null 2>&1 ||
       die "reaper command is unavailable: $command"
   done
+  require_positive_integer "$ATTEMPT_SEQUENCE" ATTEMPT_SEQUENCE
+  require_name "$QUEUED_RESOURCE" QUEUED_RESOURCE
+  require_name "$TPU_NAME" TPU_NAME
+  require_name "$ATTEMPT" ATTEMPT
   snapshot_suffix='.reaper'
   mkdir -p "$STATE_ROOT"/{formation,cleanup}
   while true; do
@@ -789,6 +792,7 @@ main() {
   done
   require_name "$PROJECT" PROJECT
   require_name "$ZONE" ZONE
+  require_positive_integer "$ATTEMPT_SEQUENCE" ATTEMPT_SEQUENCE
   require_name "$QUEUED_RESOURCE" QUEUED_RESOURCE
   require_name "$TPU_NAME" TPU_NAME
   require_name "$ATTEMPT" ATTEMPT

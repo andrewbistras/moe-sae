@@ -6,6 +6,7 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=exec
+Environment=ATTEMPT_SEQUENCE=3
 ExecStart=/usr/local/sbin/qualify_legacy_v6e.sh
 Restart=on-abnormal
 RestartSec=30s
