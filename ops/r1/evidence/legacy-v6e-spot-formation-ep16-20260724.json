@@ -89,15 +89,33 @@
       "runtime_downloads": 0,
       "service_state_initiator": "SERVICE",
       "zone": "europe-west4-a"
+    },
+    {
+      "benchmark_started": false,
+      "controller_log_sha256": "e35e0601ab76dad68d636caad80216955a592566a3ef6962cf1411f85c7d409f",
+      "controller_sha256": "86ede1c2ff3538eabc01bcf7a044b28c7764858561696f145356776dc80f98d8",
+      "create_time": "2026-07-24T07:53:32.641544414Z",
+      "evidence_manifest_sha256": "03c8a6f852f4d4463ccacba55b3995cdb8e7789877e706b79330ffc75f24273c",
+      "first_observed_provisioning": "2026-07-24T07:56:27Z",
+      "first_observed_suspending": "2026-07-24T07:59:04Z",
+      "layout": "EP16/FSDP4",
+      "name": "r1-v6e64-spot-euw4a-a11",
+      "queued_resource_snapshot_sha256": "57fc108815cd72e84a83572d33e4975e9c01fd7ccee3e9ee1f707c772ca075af",
+      "reached_ready": false,
+      "release_confirmed": "2026-07-24T07:59:25Z",
+      "release_marker_epoch": 1784879949,
+      "runtime_downloads": 0,
+      "service_state_initiator": "SERVICE",
+      "zone": "europe-west4-a"
     }
   ],
   "conclusion": {
     "adapter_or_benchmark_failure_observed": false,
-    "cumulative_attempt_count": 10,
-    "cumulative_provider_suspension_count": 10,
+    "cumulative_attempt_count": 11,
+    "cumulative_provider_suspension_count": 11,
     "cumulative_ready_slice_count": 0,
-    "ep16_attempt_count": 5,
-    "ep16_provider_suspension_count": 5
+    "ep16_attempt_count": 6,
+    "ep16_provider_suspension_count": 6
   },
   "controller_commit": "f91d207d7e8514d73869fee56d01e76a42af223b",
   "predecessor_evidence": {
