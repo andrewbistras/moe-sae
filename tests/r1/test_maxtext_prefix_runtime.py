@@ -54,6 +54,7 @@ def _config(mesh: PrefixMeshCandidate) -> SimpleNamespace:
         use_pathways=False,
         using_pipeline_parallelism=False,
         logits_via_embedding=True,
+        allow_split_physical_axes=mesh.allow_split_physical_axes,
         dtype=SimpleNamespace(name="bfloat16"),
         weight_dtype=SimpleNamespace(name="bfloat16"),
         quantization="",
@@ -78,6 +79,11 @@ def test_mesh_ladder_is_exact_and_ordered() -> None:
     ]
     with pytest.raises(MaxTextPrefixRuntimeError, match="64"):
         PrefixMeshCandidate("EP8/FSDP4", fsdp=4, expert=8)
+    assert [item.allow_split_physical_axes for item in PREFIX_MESH_CANDIDATES] == [
+        True,
+        True,
+        False,
+    ]
 
 
 def test_overrides_define_one_forward_only_b128_program(tmp_path: Path) -> None:
@@ -96,6 +102,16 @@ def test_overrides_define_one_forward_only_b128_program(tmp_path: Path) -> None:
     assert values["ici_fsdp_parallelism"] == 4
     assert values["pipeline_parallel_layers"] == 0
     assert values["enable_checkpointing"] is False
+    assert values["allow_split_physical_axes"] is True
+
+
+def test_ep8_keeps_physical_axes_unsplit(tmp_path: Path) -> None:
+    settings = PrefixRuntimeSettings(
+        maxtext_base_yml=tmp_path / "base.yml",
+        output_directory=tmp_path / "out",
+        mesh=PREFIX_MESH_CANDIDATES[2],
+    )
+    assert settings.maxtext_overrides()["allow_split_physical_axes"] is False
 
 
 @pytest.mark.parametrize("mesh", PREFIX_MESH_CANDIDATES)
@@ -114,6 +130,7 @@ def test_initialized_config_accepts_each_fixed_mesh(
         ("routed_bias_update_rate", 0.001, "routed_bias_update_rate"),
         ("weight_dtype", SimpleNamespace(name="float32"), "weight dtype"),
         ("use_pathways", True, "use_pathways"),
+        ("allow_split_physical_axes", False, "allow_split_physical_axes"),
     ],
 )
 def test_initialized_config_rejects_execution_drift(

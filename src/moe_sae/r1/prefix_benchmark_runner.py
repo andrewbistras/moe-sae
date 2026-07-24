@@ -119,6 +119,61 @@ def _validate_output(output: Any) -> dict[str, Any]:
     }
 
 
+def _physical_mesh_evidence(mesh: Any, config: Any) -> dict[str, Any]:
+    """Describe the exact logical-to-physical assignment used by MaxText."""
+
+    try:
+        import numpy as np
+    except (ImportError, ModuleNotFoundError) as error:  # pragma: no cover - image
+        raise PrefixBenchmarkRunnerError("NumPy is unavailable") from error
+    axis_names = tuple(getattr(mesh, "axis_names", ()))
+    if axis_names != ("data", "fsdp", "expert", "context"):
+        raise PrefixBenchmarkRunnerError("prefix mesh axis order changed")
+    devices = np.asarray(getattr(mesh, "devices", ()), dtype=object)
+    expected_shape = (
+        1,
+        int(getattr(config, "ici_fsdp_parallelism", 0)),
+        int(getattr(config, "ici_expert_parallelism", 0)),
+        1,
+    )
+    if tuple(devices.shape) != expected_shape or devices.size != 64:
+        raise PrefixBenchmarkRunnerError("prefix mesh device assignment changed")
+
+    records: list[dict[str, Any]] = []
+    device_ids: set[int] = set()
+    for logical_index in np.ndindex(devices.shape):
+        device = devices[logical_index]
+        try:
+            device_id = int(device.id)
+            process_index = int(device.process_index)
+            coordinates = [int(value) for value in device.coords]
+        except (AttributeError, TypeError, ValueError) as error:
+            raise PrefixBenchmarkRunnerError(
+                "v6e device physical identity is unavailable"
+            ) from error
+        if not coordinates or device_id in device_ids:
+            raise PrefixBenchmarkRunnerError(
+                "v6e device physical identity is not one-to-one"
+            )
+        device_ids.add(device_id)
+        records.append(
+            {
+                "logical_index": [int(value) for value in logical_index],
+                "device_id": device_id,
+                "process_index": process_index,
+                "physical_coordinates": coordinates,
+            }
+        )
+    return {
+        "axis_names": list(axis_names),
+        "logical_shape": list(expected_shape),
+        "allow_split_physical_axes": bool(
+            getattr(config, "allow_split_physical_axes", False)
+        ),
+        "devices": records,
+    }
+
+
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
     path = path.absolute()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -170,6 +225,7 @@ def run(argv: Sequence[str] | None = None) -> dict[str, Any] | None:
     )
     config = initialize_maxtext_config(settings)
     mesh = create_prefix_mesh(config)
+    mesh_evidence = _physical_mesh_evidence(mesh, config)
     batch = create_synthetic_prefix_batch(mesh)
 
     compile_started = time.monotonic_ns()
@@ -197,6 +253,7 @@ def run(argv: Sequence[str] | None = None) -> dict[str, Any] | None:
         "seed": args.seed,
         "process_count": 16,
         "device_count": 64,
+        "physical_mesh": mesh_evidence,
         "prepare_seconds": prepare_ns / 1_000_000_000,
         "output_validation": validation,
         "benchmark": result.as_dict(),

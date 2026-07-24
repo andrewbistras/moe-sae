@@ -103,6 +103,12 @@ class PrefixMeshCandidate:
                 "mesh candidate must consume exactly 64 devices"
             )
 
+    @property
+    def allow_split_physical_axes(self) -> bool:
+        """Whether this logical mesh must split one v6e 8x8 physical axis."""
+
+        return self.expert > 8
+
 
 PREFIX_MESH_CANDIDATES = tuple(
     PrefixMeshCandidate(
@@ -179,6 +185,7 @@ class PrefixRuntimeSettings:
             "dataset_type": "synthetic",
             "hardware": "tpu",
             "skip_jax_distributed_system": False,
+            "allow_split_physical_axes": self.mesh.allow_split_physical_axes,
             "ici_data_parallelism": 1,
             "ici_fsdp_parallelism": self.mesh.fsdp,
             "ici_expert_parallelism": self.mesh.expert,
@@ -411,6 +418,7 @@ def validate_initialized_config(config: Any, mesh: PrefixMeshCandidate) -> None:
         "use_pathways": False,
         "using_pipeline_parallelism": False,
         "logits_via_embedding": True,
+        "allow_split_physical_axes": mesh.allow_split_physical_axes,
     }
     for name, wanted in expected.items():
         actual = getattr(config, name, None)
