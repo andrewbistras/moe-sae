@@ -53,15 +53,51 @@
       "runtime_downloads": 0,
       "service_state_initiator": "SERVICE",
       "zone": "europe-west4-a"
+    },
+    {
+      "benchmark_started": false,
+      "controller_log_sha256": "b5b92a9205495c6eb47716bc17bcbec3b3548a5b1c39568b34231795e2fff031",
+      "controller_sha256": "86ede1c2ff3538eabc01bcf7a044b28c7764858561696f145356776dc80f98d8",
+      "create_time": "2026-07-24T07:24:44.948664350Z",
+      "evidence_manifest_sha256": "9ca6674279aab5bf28455963b929f7c4313b02a8c4a9ae1b4e50233ea7cde8a0",
+      "first_observed_provisioning": "2026-07-24T07:27:27Z",
+      "first_observed_suspending": "2026-07-24T07:29:34Z",
+      "layout": "EP16/FSDP4",
+      "name": "r1-v6e64-spot-euw4a-a9",
+      "queued_resource_snapshot_sha256": "c3b60b4a2146a7497298f00e7cc9ccd03ce73f96cf71cb46032efb179f9cac7f",
+      "reached_ready": false,
+      "release_confirmed": "2026-07-24T07:30:01Z",
+      "release_marker_epoch": 1784878180,
+      "runtime_downloads": 0,
+      "service_state_initiator": "SERVICE",
+      "zone": "europe-west4-a"
+    },
+    {
+      "benchmark_started": false,
+      "controller_log_sha256": "d7bfd8c941dff6b98f064543e3ca48115f251fa8d19477c81cc7d20f0154f0c4",
+      "controller_sha256": "86ede1c2ff3538eabc01bcf7a044b28c7764858561696f145356776dc80f98d8",
+      "create_time": "2026-07-24T07:31:08.204135466Z",
+      "evidence_manifest_sha256": "c5ed21be13b1c7582a417025eebdef0cbba80b1f8c990309ec3fc527f1cface3",
+      "first_observed_provisioning": "2026-07-24T07:33:43Z",
+      "first_observed_suspending": "2026-07-24T07:36:54Z",
+      "layout": "EP16/FSDP4",
+      "name": "r1-v6e64-spot-euw4a-a10",
+      "queued_resource_snapshot_sha256": "c1c8a564f9c3b362c2ac137527b1e612a46f76f5264307c5d5fa16d5f4413fa7",
+      "reached_ready": false,
+      "release_confirmed": "2026-07-24T07:37:20Z",
+      "release_marker_epoch": 1784878619,
+      "runtime_downloads": 0,
+      "service_state_initiator": "SERVICE",
+      "zone": "europe-west4-a"
     }
   ],
   "conclusion": {
     "adapter_or_benchmark_failure_observed": false,
-    "cumulative_attempt_count": 8,
-    "cumulative_provider_suspension_count": 8,
+    "cumulative_attempt_count": 10,
+    "cumulative_provider_suspension_count": 10,
     "cumulative_ready_slice_count": 0,
-    "ep16_attempt_count": 3,
-    "ep16_provider_suspension_count": 3
+    "ep16_attempt_count": 5,
+    "ep16_provider_suspension_count": 5
   },
   "controller_commit": "f91d207d7e8514d73869fee56d01e76a42af223b",
   "predecessor_evidence": {
