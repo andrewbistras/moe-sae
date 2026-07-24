@@ -39,6 +39,30 @@ def _canonical(value: object) -> bytes:
     )
 
 
+def test_canonical_json_respects_the_baked_record_framing() -> None:
+    value = {"schema": "example.v1", "value": 1}
+    line = _canonical(value)
+    wire = line.removesuffix(b"\n")
+
+    assert repacker._canonical_json(line, name="line") == value
+    assert (
+        repacker._canonical_json(
+            wire,
+            name="wire",
+            trailing_newline=False,
+        )
+        == value
+    )
+    with pytest.raises(repacker.RepackError, match="not canonical JSON"):
+        repacker._canonical_json(wire, name="line")
+    with pytest.raises(repacker.RepackError, match="not canonical JSON"):
+        repacker._canonical_json(
+            line,
+            name="wire",
+            trailing_newline=False,
+        )
+
+
 def _context_archive(
     path: Path,
     *,

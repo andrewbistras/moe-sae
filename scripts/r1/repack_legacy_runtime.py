@@ -233,14 +233,22 @@ def _strict_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return value
 
 
-def _canonical_json(raw: bytes, *, name: str) -> dict[str, object]:
+def _canonical_json(
+    raw: bytes,
+    *,
+    name: str,
+    trailing_newline: bool = True,
+) -> dict[str, object]:
     try:
         value = json.loads(raw, object_pairs_hook=_strict_pairs)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise RepackError(f"{name} is not strict JSON") from error
     if not isinstance(value, dict):
         raise RepackError(f"{name} must be a JSON object")
-    if _canonical_bytes(value) != raw:
+    canonical = _canonical_bytes(value)
+    if not trailing_newline:
+        canonical = canonical.removesuffix(b"\n")
+    if canonical != raw:
         raise RepackError(f"{name} is not canonical JSON")
     return value
 
@@ -1595,7 +1603,14 @@ def repack(
         raise RepackError("base image recipe hash mismatch")
     if _sha256_bytes(observation_raw) != request.expected_image_observation_sha256:
         raise RepackError("base image observation hash mismatch")
-    recipe = _canonical_json(recipe_raw, name="base image recipe")
+    # ImageRecipeV1 uses the protocol's canonical wire form, which deliberately
+    # has no record-separating newline.  The diagnostic observation is emitted
+    # as a canonical JSON line and therefore retains the default newline.
+    recipe = _canonical_json(
+        recipe_raw,
+        name="base image recipe",
+        trailing_newline=False,
+    )
     observation = _canonical_json(observation_raw, name="base image observation")
     if (
         recipe.get("schema") != "moe-sae.r1.image-recipe.v1"
