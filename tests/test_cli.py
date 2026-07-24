@@ -759,6 +759,8 @@ def test_single_cli_exposes_exact_subcommands():
         "sae-status",
         "sae-abort",
         "sae-phase",
+        "gate1-audit",
+        "gate1-report",
         "train",
         "eval",
         "report",
@@ -803,6 +805,14 @@ def test_single_cli_exposes_exact_subcommands():
             ],
             cli_module._command_sae_phase,
         ),
+        (
+            ["gate1-audit", "--all", "--cache-root", "/dev/shm/gate1"],
+            cli_module._command_gate1_audit,
+        ),
+        (
+            ["gate1-report"],
+            cli_module._command_gate1_report,
+        ),
     ],
 )
 def test_sae_control_commands_dispatch_to_exact_handlers(argv, handler):
@@ -826,6 +836,100 @@ def test_sae_farm_cli_defaults_to_nfs_safe_polling_and_timeouts() -> None:
                 "--poll-seconds",
                 str(CONTROL_POLL_SECONDS / 10.0),
             ]
+        )
+
+
+def test_gate1_cli_matrix_is_decisive_first_complete_and_duplicate_free() -> None:
+    from moe_sae.gate1_protocol import load_gate1_protocol
+
+    protocol = load_gate1_protocol("configs/gemma4_gate1_audit.yaml")
+    cells = cli_module._gate1_cells(protocol)
+
+    assert len(cells) == 22
+    assert len(set(cells)) == len(cells)
+    assert cells[:6] == (
+        ("A_seed1_50m", "heldout", "true"),
+        ("B_seed1_50m", "heldout", "true"),
+        ("A_seed1_50m", "train_stratified", "true"),
+        ("B_seed1_50m", "train_stratified", "true"),
+        ("A_seed1_50m", "heldout", "shuffled"),
+        ("A_seed1_50m", "heldout", "all_banks"),
+    )
+
+
+def test_gate1_cli_rejects_partial_or_conflicting_cell_selection() -> None:
+    with pytest.raises(SystemExit):
+        main(["gate1-audit", "--cache-root", "/dev/shm/gate1"])
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "gate1-audit",
+                "--all",
+                "--cache-root",
+                "/dev/shm/gate1",
+                "--split",
+                "heldout",
+            ]
+        )
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "gate1-audit",
+                "--all",
+                "--cache-root",
+                "/dev/shm/gate1",
+                "--cache-max-bytes",
+                "0",
+            ]
+        )
+
+
+def test_gate1_report_discovers_identity_named_merged_cells(tmp_path: Path) -> None:
+    protocol_id = "gemma4-mechanism-gate1-20260724"
+    protocol_sha256 = "a" * 64
+    cell_directory = tmp_path / protocol_id / protocol_sha256 / ("b" * 64)
+    cell_directory.mkdir(parents=True)
+    cell = {
+        "cell_identity_sha256": "b" * 64,
+        "checkpoint_label": "A_seed1_50m",
+        "split": "heldout",
+        "route_mode": "true",
+    }
+    (cell_directory / "cell.json").write_text(
+        json.dumps(cell), encoding="utf-8"
+    )
+
+    assert cli_module._discover_gate1_cell_records(
+        tmp_path,
+        protocol_id=protocol_id,
+        protocol_sha256=protocol_sha256,
+    ) == {("A_seed1_50m", "heldout", "true"): cell}
+
+
+def test_gate1_report_discovery_rejects_duplicate_matrix_cells(
+    tmp_path: Path,
+) -> None:
+    protocol_id = "gemma4-mechanism-gate1-20260724"
+    protocol_sha256 = "a" * 64
+    base = tmp_path / protocol_id / protocol_sha256
+    cell = {
+        "checkpoint_label": "A_seed1_50m",
+        "split": "heldout",
+        "route_mode": "true",
+    }
+    for digest in ("b" * 64, "c" * 64):
+        directory = base / digest
+        directory.mkdir(parents=True)
+        cell["cell_identity_sha256"] = digest
+        (directory / "cell.json").write_text(
+            json.dumps(cell), encoding="utf-8"
+        )
+
+    with pytest.raises(RuntimeError, match="duplicate"):
+        cli_module._discover_gate1_cell_records(
+            tmp_path,
+            protocol_id=protocol_id,
+            protocol_sha256=protocol_sha256,
         )
 
 

@@ -7595,6 +7595,264 @@ def _command_activation_abort(args: argparse.Namespace) -> int:
     return 0
 
 
+def _gate1_cells(protocol: Any) -> tuple[tuple[str, str, str], ...]:
+    """Return the decisive-first, duplicate-free frozen audit matrix."""
+
+    cells: list[tuple[str, str, str]] = []
+    final = protocol.matrix.final_baselines
+    ablation = protocol.matrix.router_ablation
+    # Produce the mechanistic answer for each seed before spending time on the
+    # secondary historical learning curve.  True A/heldout is shared by two
+    # protocol sections and is evaluated exactly once.
+    for seed in (1, 2, 3):
+        a_label = f"A_seed{seed}_50m"
+        b_label = f"B_seed{seed}_50m"
+        cells.extend(
+            (
+                (a_label, "heldout", "true"),
+                (b_label, "heldout", "true"),
+                (a_label, "train_stratified", "true"),
+                (b_label, "train_stratified", "true"),
+                (a_label, ablation.split, "shuffled"),
+                (a_label, ablation.split, "all_banks"),
+            )
+        )
+    learning = protocol.matrix.learning_curve
+    cells.extend(
+        (label, learning.split, learning.route_mode)
+        for label in learning.checkpoints
+    )
+
+    declared = {
+        (label, learning.split, learning.route_mode)
+        for label in learning.checkpoints
+    }
+    declared.update(
+        (label, split, final.route_mode)
+        for label in final.checkpoints
+        for split in final.splits
+    )
+    declared.update(
+        (label, ablation.split, mode)
+        for label in ablation.checkpoints
+        for mode in ablation.route_modes
+    )
+    unique = tuple(dict.fromkeys(cells))
+    if set(unique) != declared:
+        raise RuntimeError("internal Gate-1 matrix ordering does not cover the protocol")
+    return unique
+
+
+def _command_gate1_audit(args: argparse.Namespace) -> int:
+    """Execute one or every frozen retrospective cell on an exact v4-32."""
+
+    from moe_sae.gate1_audit import run_gate1_audit_cell
+    from moe_sae.gate1_protocol import load_gate1_protocol
+
+    config = _config(args)
+    config.validate_production()
+    root = _artifact_root(config, args.artifact_root).resolve()
+    _require_production_artifact_root(root)
+    require_v4_32_runtime()
+    protocol = load_gate1_protocol(args.protocol)
+    if protocol.capture.config_sha256 != config.config_hash:
+        raise RuntimeError("Gate-1 protocol and production Gemma config disagree")
+
+    cache_root = _require_lingering_sae_cache_runtime(args.cache_root)
+    output_root = Path(
+        args.output_root or root / "diagnostics" / "gate1"
+    ).expanduser().resolve()
+    train = _sealed_dataset(
+        _capture_root(root, "train"),
+        cache_root=cache_root,
+        cache_max_bytes=args.cache_max_bytes,
+        require_resident_cache=False,
+    )
+    heldout = _sealed_dataset(
+        _capture_root(root, "eval"),
+        cache_root=cache_root,
+        cache_max_bytes=args.cache_max_bytes,
+        require_resident_cache=False,
+    )
+
+    if args.all:
+        cells = _gate1_cells(protocol)
+    else:
+        cells = ((args.checkpoint_label, args.split, args.route_mode),)
+    summaries: list[dict[str, Any]] = []
+    for cell_index, (checkpoint_label, split, route_mode) in enumerate(
+        cells, start=1
+    ):
+        result = run_gate1_audit_cell(
+            protocol,
+            train,
+            heldout,
+            output_root,
+            checkpoint_label=checkpoint_label,
+            split_name=split,
+            route_mode=route_mode,
+        )
+        summaries.append(
+            {
+                "checkpoint_label": checkpoint_label,
+                "split": split,
+                "route_mode": route_mode,
+                "tokens": int(result["tokens"]),
+                "ev": float(result["sequence_sse"]["ev"]),
+                "nmse": float(result["sequence_sse"]["nmse"]),
+                "dead_rate": (
+                    float(result["dead_features"]) / int(result["total_features"])
+                ),
+            }
+        )
+        if _process_context()[0] == 0:
+            print(
+                json.dumps(
+                    {
+                        "schema_version": "gemma4-gate1-cell-complete-v1",
+                        "protocol_sha256": protocol.sha256,
+                        "cell_index": cell_index,
+                        "cell_count": len(cells),
+                        **summaries[-1],
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+        if cell_index != len(cells):
+            _release_accelerator_state(f"gate1-cell-{cell_index:02d}")
+    if _process_context()[0] == 0 and args.all:
+        print(
+            json.dumps(
+                {
+                    "schema_version": "gemma4-gate1-matrix-run-v1",
+                    "protocol_sha256": protocol.sha256,
+                    "output_root": str(output_root),
+                    "completed_cells": summaries,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+    return 0
+
+
+def _discover_gate1_cell_records(
+    cell_root: Path,
+    *,
+    protocol_id: str,
+    protocol_sha256: str,
+) -> dict[tuple[str, str, str], dict[str, Any]]:
+    """Read the immutable merged cells beneath one exact protocol directory."""
+
+    protocol_directory = (
+        cell_root.expanduser().resolve() / protocol_id / protocol_sha256
+    )
+    if (
+        not protocol_directory.is_dir()
+        or protocol_directory.is_symlink()
+    ):
+        raise RuntimeError(
+            f"missing regular Gate-1 protocol directory: {protocol_directory}"
+        )
+    records: dict[tuple[str, str, str], dict[str, Any]] = {}
+    sha256_pattern = re.compile(r"[0-9a-f]{64}")
+    for entry in sorted(protocol_directory.iterdir(), key=lambda item: item.name):
+        if entry.name == "report.json":
+            continue
+        if entry.is_symlink() or not entry.is_dir():
+            raise RuntimeError(
+                f"unexpected Gate-1 protocol-directory entry: {entry}"
+            )
+        if sha256_pattern.fullmatch(entry.name) is None:
+            raise RuntimeError(f"Gate-1 cell directory is not identity-named: {entry}")
+        cell_path = entry / "cell.json"
+        if (
+            not cell_path.is_file()
+            or cell_path.is_symlink()
+            or cell_path.stat().st_size > 64 * 1024 * 1024
+        ):
+            raise RuntimeError(f"missing or invalid merged Gate-1 cell: {cell_path}")
+        cell = _read_json_object(
+            cell_path, description="merged Gate-1 cell result"
+        )
+        if cell.get("cell_identity_sha256") != entry.name:
+            raise RuntimeError(
+                f"Gate-1 cell identity disagrees with its directory: {cell_path}"
+            )
+        key_values = (
+            cell.get("checkpoint_label"),
+            cell.get("split"),
+            cell.get("route_mode"),
+        )
+        if any(not isinstance(value, str) or not value for value in key_values):
+            raise RuntimeError(f"Gate-1 cell has no canonical matrix key: {cell_path}")
+        key = (str(key_values[0]), str(key_values[1]), str(key_values[2]))
+        if key in records:
+            raise RuntimeError(f"duplicate merged Gate-1 matrix cell: {key!r}")
+        records[key] = cell
+    return records
+
+
+def _command_gate1_report(args: argparse.Namespace) -> int:
+    """Reduce all immutable Gate-1 cells into one deterministic report."""
+
+    from moe_sae.gate1_protocol import load_gate1_protocol
+    from moe_sae.gate1_report import build_gate1_report, validate_gate1_report
+
+    config = _config(args)
+    config.validate_production()
+    root = _artifact_root(config, args.artifact_root).resolve()
+    _require_production_artifact_root(root)
+    protocol = load_gate1_protocol(args.protocol)
+    if protocol.capture.config_sha256 != config.config_hash:
+        raise RuntimeError("Gate-1 protocol and production Gemma config disagree")
+    cell_root = Path(
+        args.cell_root or root / "diagnostics" / "gate1"
+    ).expanduser().resolve()
+    protocol_directory = cell_root / protocol.protocol_id / protocol.sha256
+    records = _discover_gate1_cell_records(
+        cell_root,
+        protocol_id=protocol.protocol_id,
+        protocol_sha256=protocol.sha256,
+    )
+    report = build_gate1_report(protocol, records)
+    destination = protocol_directory / "report.json"
+    if destination.is_symlink():
+        raise RuntimeError("Gate-1 report destination may not be a symlink")
+    if destination.exists():
+        existing = _read_json_object(
+            destination, description="existing immutable Gate-1 report"
+        )
+        validated_existing = validate_gate1_report(existing, protocol)
+        if validated_existing != report:
+            raise RuntimeError(
+                "existing immutable Gate-1 report differs from deterministic rebuild"
+            )
+    else:
+        atomic_write_json(destination, report)
+    persisted = _read_json_object(
+        destination, description="persisted immutable Gate-1 report"
+    )
+    if validate_gate1_report(persisted, protocol) != report:
+        raise RuntimeError("persisted Gate-1 report failed read-after-write")
+    print(
+        json.dumps(
+            {
+                "schema_version": report["schema_version"],
+                "protocol_sha256": protocol.sha256,
+                "cell_count": report["cell_count"],
+                "report_sha256": report["report_sha256"],
+                "report_path": str(destination),
+                "mechanism_decision": report["mechanism_decision"],
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
 def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
     parser.add_argument("--artifact-root")
@@ -7890,6 +8148,51 @@ def build_parser() -> argparse.ArgumentParser:
     sae_phase.add_argument("--attempt-number", type=int, required=True)
     sae_phase.set_defaults(handler=_command_sae_phase)
 
+    gate1 = subparsers.add_parser(
+        "gate1-audit",
+        help="run the frozen retrospective mechanism audit on exact checkpoints",
+    )
+    _add_common(gate1)
+    gate1.add_argument(
+        "--protocol",
+        default=str(REPO_ROOT / "configs" / "gemma4_gate1_audit.yaml"),
+    )
+    gate1.add_argument(
+        "--cache-root",
+        required=True,
+        help="host-private /dev/shm cache path (same pathname on every worker)",
+    )
+    gate1.add_argument(
+        "--cache-max-bytes",
+        type=int,
+        default=24 * 1024**3,
+    )
+    gate1.add_argument("--output-root")
+    gate1.add_argument(
+        "--all",
+        action="store_true",
+        help="run every unique protocol cell in decisive-first order",
+    )
+    gate1.add_argument("--checkpoint-label")
+    gate1.add_argument("--split", choices=("heldout", "train_stratified"))
+    gate1.add_argument("--route-mode", choices=("true", "shuffled", "all_banks"))
+    gate1.set_defaults(handler=_command_gate1_audit)
+
+    gate1_report = subparsers.add_parser(
+        "gate1-report",
+        help="reduce the complete frozen Gate-1 audit into one immutable report",
+    )
+    _add_common(gate1_report)
+    gate1_report.add_argument(
+        "--protocol",
+        default=str(REPO_ROOT / "configs" / "gemma4_gate1_audit.yaml"),
+    )
+    gate1_report.add_argument(
+        "--cell-root",
+        help="shared Gate-1 output root (defaults below the artifact root)",
+    )
+    gate1_report.set_defaults(handler=_command_gate1_report)
+
     train_parser = subparsers.add_parser("train", help="train or resume one A/B/F seed")
     _add_common(train_parser)
     train_parser.add_argument("--condition", choices=("A", "B", "F"), required=True)
@@ -7958,6 +8261,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "eval" and not args.all and args.seed is None:
         parser.error("eval --condition requires --seed")
+    if args.command == "gate1-audit":
+        selected = (args.checkpoint_label, args.split, args.route_mode)
+        if args.all and any(value is not None for value in selected):
+            parser.error(
+                "gate1-audit --all cannot be combined with an individual cell"
+            )
+        if not args.all and any(value is None for value in selected):
+            parser.error(
+                "gate1-audit requires --all or all of "
+                "--checkpoint-label, --split, and --route-mode"
+            )
+        if args.cache_max_bytes <= 0:
+            parser.error("gate1-audit --cache-max-bytes must be positive")
     try:
         return int(args.handler(args))
     except (PreflightError, RuntimeError, ValueError, FileNotFoundError) as error:

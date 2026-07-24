@@ -1,0 +1,227 @@
+schema_version: gemma4-gate1-audit-v1
+protocol_id: gemma4-mechanism-gate1-20260724
+
+capture:
+  config_sha256: 337e5e127c106772ba3606e640d51e6309fd4ddc5c96647e0455bfacc548bd95
+  checkpoint_sha256: fbb5e2fe394d8ca03a30e15247b7a4171461b913406b63005a29dc47c3ed8281
+  train_manifest_sha256: ed2ba84582a489f83209c2ce0756139f93f30e3370e54960fcfc56c82c331357
+  eval_manifest_sha256: d407cfc541cb249cf71156c91ec82545a480d12edde10abbf18be30d96d8302b
+  train_tokens: 50000000
+  eval_tokens: 2000000
+
+route_permutation:
+  mode: keyed_sequence_permutation
+  domain: gemma4-gate1-router-permutation-v1
+  key: 20260724
+
+statistics:
+  cluster: sequence_id
+  bootstrap_replicates: 20000
+  bootstrap_key: 20260724
+  old_f_minus_b_ev: 0.033926403809130146
+  material_effect_ev: 0.0033926403809130147
+
+splits:
+  heldout:
+    source: eval
+    ranges:
+      - [0, 2000000]
+  train_stratified:
+    source: train
+    ranges:
+      - [0, 500000]
+      - [16500000, 17000000]
+      - [33000000, 33500000]
+      - [49500000, 50000000]
+
+checkpoints:
+  A_seed1_5m:
+    schema_version: gemma4-audit-checkpoint-expectation-v1
+    condition: A
+    seed: 1
+    tokens_seen: 5013504
+    steps: 306
+    checkpoint_uri: gs://moe-sae-bucket/moe-sae/gemma4_v1/sae-checkpoints/runs/a699b5300e483dee8c902ecaf55018950c6de18afd317225c4517931bbdf6718/step-00000306-tokens-000005013504-attempt-9bb6879aedc939a1ee9a40551043f8fe
+    training_config_sha256: fbbdadb1acad7ba801375507dcd7038d0a9f15fffe7f8b57379655cf7a5e0583
+    mesh_shape: {data: 4, feature: 4}
+    checkpoint_identity:
+      operation_sha256: 61db8deb0eaf6c5dbf182d867723cc995f2e6cf2986da320071c03b31cef446f
+      config_sha256: 337e5e127c106772ba3606e640d51e6309fd4ddc5c96647e0455bfacc548bd95
+      capture_manifest_sha256: ed2ba84582a489f83209c2ce0756139f93f30e3370e54960fcfc56c82c331357
+      capture_checkpoint_sha256: fbb5e2fe394d8ca03a30e15247b7a4171461b913406b63005a29dc47c3ed8281
+      condition: A
+      seed: 1
+      run_instance_id: 7a729f84627edc2e629cc60e80b181e5
+  B_seed1_5m:
+    schema_version: gemma4-audit-checkpoint-expectation-v1
+    condition: B
+    seed: 1
+    tokens_seen: 5013504
+    steps: 306
+    checkpoint_uri: gs://moe-sae-bucket/moe-sae/gemma4_v1/sae-checkpoints/runs/49e6ff88ceb6c3a356375fe81ab800f3dd1ec146d99fe000691f5cb9edffb3df/step-00000306-tokens-000005013504-attempt-f87948f8306991800016378cbb737316
+    training_config_sha256: 167aa1b6fbf9fe4a1e55c922c9eac2b26cf957d4bd9f91fe3e938a3ddaf6dec0
+    mesh_shape: {data: 4, feature: 4}
+    checkpoint_identity:
+      operation_sha256: 24ed753b0d7b642075b5d48389f0c5a80869e6d8a2200f8d9351bf72ae818fcb
+      config_sha256: 337e5e127c106772ba3606e640d51e6309fd4ddc5c96647e0455bfacc548bd95
+      capture_manifest_sha256: ed2ba84582a489f83209c2ce0756139f93f30e3370e54960fcfc56c82c331357
+      capture_checkpoint_sha256: fbb5e2fe394d8ca03a30e15247b7a4171461b913406b63005a29dc47c3ed8281
+      condition: B
+      seed: 1
+      run_instance_id: f4bf6f42851760fa7a8faf438ac48649
+  F_seed1_5m:
+    schema_version: gemma4-audit-checkpoint-expectation-v1
+    condition: F
+    seed: 1
+    tokens_seen: 5013504
+    steps: 306
+    checkpoint_uri: gs://moe-sae-bucket/moe-sae/gemma4_v1/sae-checkpoints/runs/3bab5dbeb1bcfc6f87c9e7c111c378fc16590f6f5e54dd407c27309a9b6cbd40/step-00000306-tokens-000005013504-attempt-48a6254e7c95a487599983e48903b6ad
+    training_config_sha256: a3233f299a86c359e2388ba4b4ce281ec330b9dd26a4886e66f912b8eebfe79a
+    mesh_shape: {data: 4, feature: 4}
+    checkpoint_identity:
+      operation_sha256: 24ed753b0d7b642075b5d48389f0c5a80869e6d8a2200f8d9351bf72ae818fcb
+      config_sha256: 337e5e127c106772ba3606e640d51e6309fd4ddc5c96647e0455bfacc548bd95
+      capture_manifest_sha256: ed2ba84582a489f83209c2ce0756139f93f30e3370e54960fcfc56c82c331357
+      capture_checkpoint_sha256: fbb5e2fe394d8ca03a30e15247b7a4171461b913406b63005a29dc47c3ed8281
+      condition: F
+      seed: 1
+      run_instance_id: 0c48b7da7515c606a1510fa5cb963249
+  A_seed1_40m:
+    schema_version: gemma4-audit-checkpoint-expectation-v1
+    condition: A
+    seed: 1
+    tokens_seen: 40009728
+    steps: 2442
+    checkpoint_uri: gs://moe-sae-bucket/moe-sae/gemma4_v1/sae-checkpoints/runs/9a573e40053101884304939b8a443a8912cb0e5fabd8c83b74fa4f4398092649/step-00002442-tokens-000040009728-attempt-14d7bd7b2930ce38e7431401767c14b0
+    training_config_sha256: fbbdadb1acad7ba801375507dcd7038d0a9f15fffe7f8b57379655cf7a5e0583
+    mesh_shape: {data: 4, feature: 4}
+    checkpoint_identity:
+      operation_sha256: 24ed753b0d7b642075b5d48389f0c5a80869e6d8a2200f8d9351bf72ae818fcb
+      config_sha256: 337e5e127c106772ba3606e640d51e6309fd4ddc5c96647e0455bfacc548bd95
+      capture_manifest_sha256: ed2ba84582a489f83209c2ce0756139f93f30e3370e54960fcfc56c82c331357
+      capture_checkpoint_sha256: fbb5e2fe394d8ca03a30e15247b7a4171461b913406b63005a29dc47c3ed8281
+      condition: A
+      seed: 1
+      run_instance_id: f68f71bb5f4e99c76f618fa7a78d34dd
+  A_seed1_50m:
+    schema_version: gemma4-audit-checkpoint-expectation-v1
+    condition: A
+    seed: 1
+    tokens_seen: 50000000
+    steps: 3052
+    checkpoint_uri: gs://moe-sae-bucket/moe-sae/gemma4_v1/sae-checkpoints/runs/2ff7f77f0a33757340c45941a7c7c626262508a06bc5b7e39135989bb6b4ce34/step-00003052-tokens-000050000000-attempt-8f753a2d8e9b6bab5090e64590212cbd
+    training_config_sha256: fbbdadb1acad7ba801375507dcd7038d0a9f15fffe7f8b57379655cf7a5e0583
+    mesh_shape: {data: 4, feature: 4}
+    checkpoint_identity:
+      operation_sha256: 505c31615813d570ec7703fc0afada66e000a746254af09196933c82a822187d
+      config_sha256: 337e5e127c106772ba3606e640d51e6309fd4ddc5c96647e0455bfacc548bd95
+      capture_manifest_sha256: ed2ba84582a489f83209c2ce0756139f93f30e3370e54960fcfc56c82c331357
+      capture_checkpoint_sha256: fbb5e2fe394d8ca03a30e15247b7a4171461b913406b63005a29dc47c3ed8281
+      condition: A
+      seed: 1
+      run_instance_id: 87dee0e3fbbba237ae04d8c972e65a4b
+  A_seed2_50m:
+    schema_version: gemma4-audit-checkpoint-expectation-v1
+    condition: A
+    seed: 2
+    tokens_seen: 50000000
+    steps: 3052
+    checkpoint_uri: gs://moe-sae-bucket/moe-sae/gemma4_v1/sae-checkpoints/runs/d26b9acf7c739361c6224d218ac8b9ba3706c40fb969c209eb19bc2777531dc4/step-00003052-tokens-000050000000-attempt-320200ad98e6a23b932e70ebbf490778
+    training_config_sha256: 0b30e7d354bf634f4d625407af483b48ed6776b76d38c29d8bf94b8c51695936
+    mesh_shape: {data: 4, feature: 4}
+    checkpoint_identity:
+      operation_sha256: 505c31615813d570ec7703fc0afada66e000a746254af09196933c82a822187d
+      config_sha256: 337e5e127c106772ba3606e640d51e6309fd4ddc5c96647e0455bfacc548bd95
+      capture_manifest_sha256: ed2ba84582a489f83209c2ce0756139f93f30e3370e54960fcfc56c82c331357
+      capture_checkpoint_sha256: fbb5e2fe394d8ca03a30e15247b7a4171461b913406b63005a29dc47c3ed8281
+      condition: A
+      seed: 2
+      run_instance_id: 2b7bddabfe217c37bf6092363a64ee44
+  A_seed3_50m:
+    schema_version: gemma4-audit-checkpoint-expectation-v1
+    condition: A
+    seed: 3
+    tokens_seen: 50000000
+    steps: 3052
+    checkpoint_uri: gs://moe-sae-bucket/moe-sae/gemma4_v1/sae-checkpoints/runs/5a40776b4ca4de4fcb036eba1a443a10f705b1c907640287bcc55a8f0ca41886/step-00003052-tokens-000050000000-attempt-53197c009e708a2b8e60d2b878e11fe6
+    training_config_sha256: e23af3ca6c42daefc04ee569bf3c4cdf8685a48349bb224311e70f0d8c4cf893
+    mesh_shape: {data: 4, feature: 4}
+    checkpoint_identity:
+      operation_sha256: 505c31615813d570ec7703fc0afada66e000a746254af09196933c82a822187d
+      config_sha256: 337e5e127c106772ba3606e640d51e6309fd4ddc5c96647e0455bfacc548bd95
+      capture_manifest_sha256: ed2ba84582a489f83209c2ce0756139f93f30e3370e54960fcfc56c82c331357
+      capture_checkpoint_sha256: fbb5e2fe394d8ca03a30e15247b7a4171461b913406b63005a29dc47c3ed8281
+      condition: A
+      seed: 3
+      run_instance_id: ecf09688ef43581e6a77fc2c1cf60a87
+  B_seed1_50m:
+    schema_version: gemma4-audit-checkpoint-expectation-v1
+    condition: B
+    seed: 1
+    tokens_seen: 50000000
+    steps: 3052
+    checkpoint_uri: gs://moe-sae-bucket/moe-sae/gemma4_v1/sae-checkpoints/runs/0e43929b830b6c36bc7b2f23c5b7354d0d6845995df21b63dab195feefe7365b/step-00003052-tokens-000050000000-attempt-8bfacbc38787353a7f9873519210fa52
+    training_config_sha256: 167aa1b6fbf9fe4a1e55c922c9eac2b26cf957d4bd9f91fe3e938a3ddaf6dec0
+    mesh_shape: {data: 4, feature: 4}
+    checkpoint_identity:
+      operation_sha256: 505c31615813d570ec7703fc0afada66e000a746254af09196933c82a822187d
+      config_sha256: 337e5e127c106772ba3606e640d51e6309fd4ddc5c96647e0455bfacc548bd95
+      capture_manifest_sha256: ed2ba84582a489f83209c2ce0756139f93f30e3370e54960fcfc56c82c331357
+      capture_checkpoint_sha256: fbb5e2fe394d8ca03a30e15247b7a4171461b913406b63005a29dc47c3ed8281
+      condition: B
+      seed: 1
+      run_instance_id: 07f391cc8b00f1dbb6b5ff0e0e3856c8
+  B_seed2_50m:
+    schema_version: gemma4-audit-checkpoint-expectation-v1
+    condition: B
+    seed: 2
+    tokens_seen: 50000000
+    steps: 3052
+    checkpoint_uri: gs://moe-sae-bucket/moe-sae/gemma4_v1/sae-checkpoints/runs/e5685b6024f0bc907998452ccd14afc911aa251c0a47985118351d3e541335da/step-00003052-tokens-000050000000-attempt-bc49e489739d8a232891514221ead187
+    training_config_sha256: 51b7902d4952535db0f23d8250f9ccb215b9f7b6887f04d3ad6e6647011f1bd0
+    mesh_shape: {data: 4, feature: 4}
+    checkpoint_identity:
+      operation_sha256: 505c31615813d570ec7703fc0afada66e000a746254af09196933c82a822187d
+      config_sha256: 337e5e127c106772ba3606e640d51e6309fd4ddc5c96647e0455bfacc548bd95
+      capture_manifest_sha256: ed2ba84582a489f83209c2ce0756139f93f30e3370e54960fcfc56c82c331357
+      capture_checkpoint_sha256: fbb5e2fe394d8ca03a30e15247b7a4171461b913406b63005a29dc47c3ed8281
+      condition: B
+      seed: 2
+      run_instance_id: 85289d862f6c4e0ac2f51334539689f2
+  B_seed3_50m:
+    schema_version: gemma4-audit-checkpoint-expectation-v1
+    condition: B
+    seed: 3
+    tokens_seen: 50000000
+    steps: 3052
+    checkpoint_uri: gs://moe-sae-bucket/moe-sae/gemma4_v1/sae-checkpoints/runs/4bb0d9e54d3c98e81a0be544bfa1a0f9d9b9a61ec5395a742ba43b8d99c064d4/step-00003052-tokens-000050000000-attempt-29574b752b1c37009f6246889e8f1287
+    training_config_sha256: aa6a8fd53a4f73dc5fe9dce5a01978a8a4dae70d0b8fa6334bcf677353e35ba9
+    mesh_shape: {data: 4, feature: 4}
+    checkpoint_identity:
+      operation_sha256: 505c31615813d570ec7703fc0afada66e000a746254af09196933c82a822187d
+      config_sha256: 337e5e127c106772ba3606e640d51e6309fd4ddc5c96647e0455bfacc548bd95
+      capture_manifest_sha256: ed2ba84582a489f83209c2ce0756139f93f30e3370e54960fcfc56c82c331357
+      capture_checkpoint_sha256: fbb5e2fe394d8ca03a30e15247b7a4171461b913406b63005a29dc47c3ed8281
+      condition: B
+      seed: 3
+      run_instance_id: 007cb2f9618c5429ea5ab20e831f07ab
+
+matrix:
+  learning_curve:
+    split: heldout
+    route_mode: "true"
+    checkpoints: [A_seed1_5m, B_seed1_5m, F_seed1_5m, A_seed1_40m]
+  final_baselines:
+    splits: [heldout, train_stratified]
+    route_mode: "true"
+    checkpoints:
+      - A_seed1_50m
+      - A_seed2_50m
+      - A_seed3_50m
+      - B_seed1_50m
+      - B_seed2_50m
+      - B_seed3_50m
+  router_ablation:
+    split: heldout
+    route_modes: ["true", shuffled, all_banks]
+    checkpoints: [A_seed1_50m, A_seed2_50m, A_seed3_50m]
