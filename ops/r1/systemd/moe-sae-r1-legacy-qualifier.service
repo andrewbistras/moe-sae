@@ -6,6 +6,7 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=exec
+Environment=DEPLOYMENT_PROFILE=euw4a
 Environment=ATTEMPT_SEQUENCE=3
 ExecStart=/usr/local/sbin/qualify_legacy_v6e.sh
 Restart=on-abnormal

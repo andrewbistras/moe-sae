@@ -1,0 +1,33 @@
+{
+  "archive": {
+    "generation": 1784865436897245,
+    "member_count": 69566,
+    "sha256": "6129738baad8d2bb4060c6e19b8a9227341afe9c795304f70fdf3206155f45c9",
+    "size_bytes": 1378895492,
+    "uri": "gs://neural-dragnet-r1-use1-655343590563/runtime/6129738baad8d2bb4060c6e19b8a9227341afe9c795304f70fdf3206155f45c9.tar.gz"
+  },
+  "bootstrap_script_sha256": "482d5c2e00740e6638986b439bedf9cbe693e7f942ce3afedf73441c40b5ed5e",
+  "cold_install": {
+    "finished_at": "2026-07-24T04:02:51Z",
+    "result": "success",
+    "started_at": "2026-07-24T04:00:53Z",
+    "systemd_exec_main_status": 0
+  },
+  "fast_path": {
+    "elapsed_seconds": 22.79,
+    "gcloud_executable": "/bin/false",
+    "result": "success",
+    "storage_read_possible": false
+  },
+  "host": {
+    "image_family": "ubuntu-2404-lts-amd64",
+    "kernel_release": "6.17.0-1021-gcp",
+    "name": "r1-legacy-bootstrap-test-use1",
+    "os_release_sha256": "01af466feb100306498c86aa6bad1815e33036019aa34d4362c20f374ea5c829",
+    "project": "neural-dragnet",
+    "temporary_vm_deleted": true,
+    "zone": "us-east1-d"
+  },
+  "repository_commit": "0b01bc2b76e375271249eb6f7e0499d5b016a1da",
+  "schema": "moe-sae.r1.legacy-bootstrap-live-evidence.v1"
+}

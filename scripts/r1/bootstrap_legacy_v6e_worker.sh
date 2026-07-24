@@ -13,8 +13,10 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly RUNTIME_URI="gs://neural-dragnet-r1-euw4-655343590563/runtime/6129738baad8d2bb4060c6e19b8a9227341afe9c795304f70fdf3206155f45c9.tar.gz"
-readonly RUNTIME_GENERATION="1784862130885035"
+readonly EUW4_RUNTIME_URI="gs://neural-dragnet-r1-euw4-655343590563/runtime/6129738baad8d2bb4060c6e19b8a9227341afe9c795304f70fdf3206155f45c9.tar.gz"
+readonly EUW4_RUNTIME_GENERATION="1784862130885035"
+readonly USE1_RUNTIME_URI="gs://neural-dragnet-r1-use1-655343590563/runtime/6129738baad8d2bb4060c6e19b8a9227341afe9c795304f70fdf3206155f45c9.tar.gz"
+readonly USE1_RUNTIME_GENERATION="1784865436897245"
 readonly RUNTIME_SHA256="6129738baad8d2bb4060c6e19b8a9227341afe9c795304f70fdf3206155f45c9"
 readonly RUNTIME_SIZE_BYTES="1378895492"
 readonly RUNTIME_MEMBER_COUNT="69566"
@@ -33,6 +35,8 @@ readonly MAX_EXPANDED_BYTES="$((12 * 1024 * 1024 * 1024))"
 
 archive_path=''
 staging_root=''
+RUNTIME_URI=''
+RUNTIME_GENERATION=''
 
 log() {
   printf '%s [legacy-v6e-bootstrap] %s\n' \
@@ -120,6 +124,7 @@ ensure_runtime_identity() {
 
 verify_metadata_identity() {
   local actual_service_account
+  local actual_zone
   local scopes
 
   actual_service_account="$(
@@ -146,6 +151,27 @@ verify_metadata_identity() {
   )"
   grep -Fxq 'https://www.googleapis.com/auth/cloud-platform' <<<"$scopes" ||
     die "worker does not have the required cloud-platform OAuth scope"
+  actual_zone="$(
+    curl \
+      --fail \
+      --silent \
+      --show-error \
+      --connect-timeout 3 \
+      --max-time 10 \
+      -H 'Metadata-Flavor: Google' \
+      "$METADATA_ROOT/instance/zone"
+  )"
+  case "${actual_zone##*/}" in
+    europe-west4-a)
+      RUNTIME_URI="$EUW4_RUNTIME_URI"
+      RUNTIME_GENERATION="$EUW4_RUNTIME_GENERATION"
+      ;;
+    us-east1-d)
+      RUNTIME_URI="$USE1_RUNTIME_URI"
+      RUNTIME_GENERATION="$USE1_RUNTIME_GENERATION"
+      ;;
+    *) die "worker zone has no exact regional runtime replica" ;;
+  esac
 }
 
 verify_runtime_tree() {

@@ -39,11 +39,19 @@ def test_legacy_scripts_are_executable_bash_with_valid_syntax() -> None:
 def test_worker_bootstrap_is_generation_pinned_and_has_no_discovery_read() -> None:
     source = _source(BOOTSTRAP)
     assert (
-        'readonly RUNTIME_URI="gs://neural-dragnet-r1-euw4-655343590563/'
+        'readonly EUW4_RUNTIME_URI="gs://neural-dragnet-r1-euw4-655343590563/'
         "runtime/6129738baad8d2bb4060c6e19b8a9227341afe9c795304f70fdf3206155f45c9"
         '.tar.gz"'
     ) in source
-    assert 'readonly RUNTIME_GENERATION="1784862130885035"' in source
+    assert 'readonly EUW4_RUNTIME_GENERATION="1784862130885035"' in source
+    assert (
+        'readonly USE1_RUNTIME_URI="gs://neural-dragnet-r1-use1-655343590563/'
+        "runtime/6129738baad8d2bb4060c6e19b8a9227341afe9c795304f70fdf3206155f45c9"
+        '.tar.gz"'
+    ) in source
+    assert 'readonly USE1_RUNTIME_GENERATION="1784865436897245"' in source
+    assert "europe-west4-a)" in source
+    assert "us-east1-d)" in source
     assert (
         'readonly RUNTIME_SHA256="'
         "6129738baad8d2bb4060c6e19b8a9227341afe9c795304f70fdf3206155f45c9"
@@ -135,8 +143,8 @@ def test_worker_accepts_no_remote_command_or_credential_input() -> None:
     assert "bash -c" not in source
     assert "Authorization:" not in source
     assert "token" not in source.lower()
-    assert source.count("curl \\\n") == 2
-    assert source.count("$METADATA_ROOT/") == 2
+    assert source.count("curl \\\n") == 3
+    assert source.count("$METADATA_ROOT/") == 3
 
 
 def test_legacy_controller_never_creates_and_deletes_only_bound_slice() -> None:
@@ -178,16 +186,20 @@ def test_controller_derives_every_retry_identity_from_one_sequence() -> None:
     source = _source(CONTROLLER)
     assert 'readonly ATTEMPT_SEQUENCE="${ATTEMPT_SEQUENCE:-3}"' in source
     assert (
-        'readonly QUEUED_RESOURCE="r1-v6e64-spot-euw4a-a${ATTEMPT_SEQUENCE}"'
+        'readonly QUEUED_RESOURCE="r1-v6e64-spot-${REGION_CODE}-a${ATTEMPT_SEQUENCE}"'
         in source
     )
     assert 'readonly TPU_NAME="${QUEUED_RESOURCE}-node"' in source
     assert (
-        'readonly ATTEMPT="euw4a-legacy-a${ATTEMPT_SEQUENCE}-ep8-fsdp8"'
+        'readonly ATTEMPT="${REGION_CODE}-legacy-a${ATTEMPT_SEQUENCE}-ep8-fsdp8"'
         in source
     )
-    assert "fsdp8-euw4a-a${ATTEMPT_SEQUENCE}" in source
+    assert "fsdp8-${REGION_CODE}-a${ATTEMPT_SEQUENCE}" in source
+    assert 'readonly DEPLOYMENT_PROFILE="${DEPLOYMENT_PROFILE:-euw4a}"' in source
+    assert 'readonly ZONE="us-east1-d"' in source
+    assert 'readonly REGION_CODE="use1d"' in source
     assert "Environment=ATTEMPT_SEQUENCE=${ATTEMPT_SEQUENCE}" in source
+    assert "Environment=DEPLOYMENT_PROFILE=${DEPLOYMENT_PROFILE}" in source
     assert "require_positive_integer \"$ATTEMPT_SEQUENCE\"" in source
 
 

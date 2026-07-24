@@ -14,20 +14,35 @@ IFS=$'\n\t'
 umask 077
 
 readonly PROJECT="${PROJECT:-neural-dragnet}"
-readonly ZONE="${ZONE:-europe-west4-a}"
+readonly DEPLOYMENT_PROFILE="${DEPLOYMENT_PROFILE:-euw4a}"
+case "$DEPLOYMENT_PROFILE" in
+  euw4a)
+    readonly ZONE="europe-west4-a"
+    readonly REGION_CODE="euw4a"
+    readonly EXPECTED_SUBNETWORK="projects/neural-dragnet/regions/europe-west4/subnetworks/default"
+    ;;
+  use1d)
+    readonly ZONE="us-east1-d"
+    readonly REGION_CODE="use1d"
+    readonly EXPECTED_SUBNETWORK="projects/neural-dragnet/regions/us-east1/subnetworks/default"
+    ;;
+  *)
+    printf 'unsupported DEPLOYMENT_PROFILE=%s\n' "$DEPLOYMENT_PROFILE" >&2
+    exit 64
+    ;;
+esac
 readonly ATTEMPT_SEQUENCE="${ATTEMPT_SEQUENCE:-3}"
-readonly QUEUED_RESOURCE="r1-v6e64-spot-euw4a-a${ATTEMPT_SEQUENCE}"
+readonly QUEUED_RESOURCE="r1-v6e64-spot-${REGION_CODE}-a${ATTEMPT_SEQUENCE}"
 readonly TPU_NAME="${QUEUED_RESOURCE}-node"
 readonly EXPECTED_ACCELERATOR="v6e-64"
 readonly EXPECTED_RUNTIME_VERSION="v6e-ubuntu-2404"
 readonly EXPECTED_SERVICE_ACCOUNT="655343590563-compute@developer.gserviceaccount.com"
 readonly EXPECTED_NETWORK="projects/neural-dragnet/global/networks/default"
-readonly EXPECTED_SUBNETWORK="projects/neural-dragnet/regions/europe-west4/subnetworks/default"
-readonly EXPECTED_LAUNCH_REF="qualification-legacy-native-ep8-fsdp8-euw4a-a${ATTEMPT_SEQUENCE}"
+readonly EXPECTED_LAUNCH_REF="qualification-legacy-native-ep8-fsdp8-${REGION_CODE}-a${ATTEMPT_SEQUENCE}"
 readonly EXPECTED_RUNTIME_COMMIT="0b01bc2b76e375271249eb6f7e0499d5b016a1da"
-readonly EXPECTED_BOOTSTRAP_SHA256="db8066c56b276db7c759aa045de7bc29046adbb3e5254bec6400dc213f27710e"
+readonly EXPECTED_BOOTSTRAP_SHA256="482d5c2e00740e6638986b439bedf9cbe693e7f942ce3afedf73441c40b5ed5e"
 readonly EXPECTED_VALIDATOR_SHA256="0f30113726e878cfaf544c86e98d8b81edd80d4a08dea7c05462d63e187b5c07"
-readonly ATTEMPT="euw4a-legacy-a${ATTEMPT_SEQUENCE}-ep8-fsdp8"
+readonly ATTEMPT="${REGION_CODE}-legacy-a${ATTEMPT_SEQUENCE}-ep8-fsdp8"
 readonly MESH="EP8/FSDP8"
 readonly FORMATION_TIMEOUT_SECONDS="${FORMATION_TIMEOUT_SECONDS:-28800}"
 readonly WORKER_BOOTSTRAP_TIMEOUT_SECONDS="${WORKER_BOOTSTRAP_TIMEOUT_SECONDS:-2400}"
@@ -580,7 +595,7 @@ install_persistent_reaper() {
       '[Service]' \
       'Type=exec' \
       "Environment=PROJECT=${PROJECT}" \
-      "Environment=ZONE=${ZONE}" \
+      "Environment=DEPLOYMENT_PROFILE=${DEPLOYMENT_PROFILE}" \
       "Environment=ATTEMPT_SEQUENCE=${ATTEMPT_SEQUENCE}" \
       "Environment=STATE_ROOT=${STATE_ROOT}" \
       "ExecStart=${REAPER_CONTROLLER} --reap" \

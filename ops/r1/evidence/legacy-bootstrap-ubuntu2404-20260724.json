@@ -6,6 +6,7 @@
     "size_bytes": 1378895492,
     "uri": "gs://neural-dragnet-r1-euw4-655343590563/runtime/6129738baad8d2bb4060c6e19b8a9227341afe9c795304f70fdf3206155f45c9.tar.gz"
   },
+  "bootstrap_script_sha256": "db8066c56b276db7c759aa045de7bc29046adbb3e5254bec6400dc213f27710e",
   "cold_install": {
     "finished_at": "2026-07-24T03:09:33Z",
     "result": "success",
