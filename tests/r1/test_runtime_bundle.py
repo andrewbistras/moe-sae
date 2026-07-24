@@ -309,6 +309,7 @@ def test_real_context_contains_the_patched_prefix_benchmark_closure() -> None:
     required = {
         "patches/r1/maxtext/0001-routed-moe-prefix-tap.patch",
         "patches/r1/maxtext/0002-b128-routed-prefix.patch",
+        "patches/r1/maxtext/0003-native-ragged-r1-prefix.patch",
         "src/moe_sae/r1/jax_prefix_restore.py",
         "src/moe_sae/r1/maxtext_patch_series.py",
         "src/moe_sae/r1/maxtext_prefix_runtime.py",
@@ -316,7 +317,7 @@ def test_real_context_contains_the_patched_prefix_benchmark_closure() -> None:
         "src/moe_sae/r1/prefix_benchmark_runner.py",
         "src/moe_sae/r1/prefix_restore_authority.py",
     }
-    assert len(spec["files"]) == 34
+    assert len(spec["files"]) == 35
     assert required <= sources
 
     provisioner = (REPOSITORY / "deploy/r1/image/provision.sh").read_text(

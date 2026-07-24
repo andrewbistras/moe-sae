@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,6 +18,7 @@ from moe_sae.r1.maxtext_prefix_runtime import (
     PrefixRuntimeSettings,
     _expected_partition_specs,
     assert_real_v6e64_runtime,
+    compile_prefix,
     create_device_synthetic_prefix_leaves,
     create_synthetic_prefix_batch,
     initialize_v6e_distributed_runtime,
@@ -51,6 +53,22 @@ def _config(mesh: PrefixMeshCandidate) -> SimpleNamespace:
         routed_scaling_factor=2.5,
         routed_score_func="sigmoid",
         routed_bias=True,
+        float32_gate_logits=True,
+        sparse_matmul=True,
+        mlp_bias=False,
+        prefuse_moe_weights=False,
+        shard_exp_on_fsdp=False,
+        use_2d_fsdp_sharding=False,
+        use_ring_of_experts=False,
+        use_ragged_sort=True,
+        ragged_buffer_factor=-1.0,
+        num_moe_emb_chunks=0,
+        num_moe_token_chunks=1,
+        use_random_routing=False,
+        float32_weight_sum=True,
+        record_internal_nn_metrics=0,
+        check_vma=False,
+        capacity_factor=-1.0,
         use_pathways=False,
         using_pipeline_parallelism=False,
         logits_via_embedding=True,
@@ -97,6 +115,22 @@ def test_overrides_define_one_forward_only_b128_program(tmp_path: Path) -> None:
     assert values["batch_split_factor"] == 2
     assert values["weight_dtype"] == "bfloat16"
     assert values["enable_dropout"] is False
+    assert values["float32_gate_logits"] is True
+    assert values["sparse_matmul"] is True
+    assert values["mlp_bias"] is False
+    assert values["prefuse_moe_weights"] is False
+    assert values["shard_exp_on_fsdp"] is False
+    assert values["use_2d_fsdp_sharding"] is False
+    assert values["use_ring_of_experts"] is False
+    assert values["use_ragged_sort"] is True
+    assert values["ragged_buffer_factor"] == -1.0
+    assert values["num_moe_emb_chunks"] == 0
+    assert values["num_moe_token_chunks"] == 1
+    assert values["use_random_routing"] is False
+    assert values["float32_weight_sum"] is True
+    assert values["record_internal_nn_metrics"] == 0
+    assert values["check_vma"] is False
+    assert values["capacity_factor"] == -1.0
     assert values["use_pathways"] is False
     assert values["ici_expert_parallelism"] == 16
     assert values["ici_fsdp_parallelism"] == 4
@@ -128,6 +162,22 @@ def test_initialized_config_accepts_each_fixed_mesh(
         ("global_batch_size_to_load", 64, "global batch"),
         ("dropout_rate", 0.1, "dropout_rate"),
         ("routed_bias_update_rate", 0.001, "routed_bias_update_rate"),
+        ("float32_gate_logits", False, "float32_gate_logits"),
+        ("sparse_matmul", False, "sparse_matmul"),
+        ("mlp_bias", True, "mlp_bias"),
+        ("prefuse_moe_weights", True, "prefuse_moe_weights"),
+        ("shard_exp_on_fsdp", True, "shard_exp_on_fsdp"),
+        ("use_2d_fsdp_sharding", True, "use_2d_fsdp_sharding"),
+        ("use_ring_of_experts", True, "use_ring_of_experts"),
+        ("use_ragged_sort", False, "use_ragged_sort"),
+        ("ragged_buffer_factor", 1.1, "ragged_buffer_factor"),
+        ("num_moe_emb_chunks", 2, "num_moe_emb_chunks"),
+        ("num_moe_token_chunks", 2, "num_moe_token_chunks"),
+        ("use_random_routing", True, "use_random_routing"),
+        ("float32_weight_sum", False, "float32_weight_sum"),
+        ("record_internal_nn_metrics", 1, "record_internal_nn_metrics"),
+        ("check_vma", True, "check_vma"),
+        ("capacity_factor", 1.25, "capacity_factor"),
         ("weight_dtype", SimpleNamespace(name="float32"), "weight dtype"),
         ("use_pathways", True, "use_pathways"),
         ("allow_split_physical_axes", False, "allow_split_physical_axes"),
@@ -293,6 +343,11 @@ def test_compiled_prefix_keeps_parameters_dynamic() -> None:
     ]
     with pytest.raises(MaxTextPrefixRuntimeError, match="wrong type"):
         compiled(("tokens", "positions", "segments"))  # type: ignore[arg-type]
+
+
+def test_prefix_compile_disables_nnx_graph_updates() -> None:
+    source = inspect.getsource(compile_prefix)
+    assert "nnx.jit(forward, graph_updates=False)" in source
 
 
 def test_real_topology_and_synthetic_batch_fail_closed_on_cpu() -> None:

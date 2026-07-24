@@ -109,6 +109,10 @@ EXPECTED = {
         "patches/r1/maxtext/0002-b128-routed-prefix.patch",
         0o644,
     ),
+    "patches/r1/maxtext/0003-native-ragged-r1-prefix.patch": (
+        "patches/r1/maxtext/0003-native-ragged-r1-prefix.patch",
+        0o644,
+    ),
     "src/moe_sae/__init__.py": ("src/moe_sae/__init__.py", 0o644),
     "src/moe_sae/r1/__init__.py": ("src/moe_sae/r1/__init__.py", 0o644),
     "src/moe_sae/r1/checkpoint_conversion.py": (

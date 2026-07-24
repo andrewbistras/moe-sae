@@ -1,0 +1,2 @@
+# Unified-diff context lines may consist of one required leading space.
+patches/r1/maxtext/*.patch -whitespace

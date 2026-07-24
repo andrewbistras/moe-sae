@@ -10,6 +10,7 @@
     {"source": "deploy/r1/systemd/moe-sae-r1.service", "archive": "systemd/moe-sae-r1.service", "mode": "0644"},
     {"source": "patches/r1/maxtext/0001-routed-moe-prefix-tap.patch", "archive": "patches/r1/maxtext/0001-routed-moe-prefix-tap.patch", "mode": "0644"},
     {"source": "patches/r1/maxtext/0002-b128-routed-prefix.patch", "archive": "patches/r1/maxtext/0002-b128-routed-prefix.patch", "mode": "0644"},
+    {"source": "patches/r1/maxtext/0003-native-ragged-r1-prefix.patch", "archive": "patches/r1/maxtext/0003-native-ragged-r1-prefix.patch", "mode": "0644"},
     {"source": "src/moe_sae/__init__.py", "archive": "src/moe_sae/__init__.py", "mode": "0644"},
     {"source": "src/moe_sae/r1/__init__.py", "archive": "src/moe_sae/r1/__init__.py", "mode": "0644"},
     {"source": "src/moe_sae/r1/checkpoint_conversion.py", "archive": "src/moe_sae/r1/checkpoint_conversion.py", "mode": "0644"},

@@ -375,10 +375,11 @@ ideal-bandwidth lower bound.
 
 There are 27 completed routed blocks before the target. Each creates a
 dispatch/compute/combine dependency, and a forward-only prefix lacks the
-backward pipeline that helps hide communication in training. MaxText's batch
-split/ring-of-experts schedule is therefore the leading starting point:
-double-buffer token chunks and prove attention/dispatch/expert/combine overlap
-in Xprof instead of assuming raw expert GEMMs dominate.
+backward pipeline that helps hide communication in training. The active
+candidate therefore uses MaxText's ordinary sparse MoE with ragged all-to-all
+dispatch and ragged local sorting. The batch-split flag remains true only to
+preserve the released 44-leaf checkpoint/storage ABI; the legacy batch-split
+route/MoE/unroute program is not executed.
 
 The pinned MaxText audit found that its batch-split implementation is a useful
 kernel source, not an executable harvesting path. The checked-in YAML inherits
@@ -410,12 +411,13 @@ configuration. It records seven required source repairs: thread packed segment
 metadata, build a block-diagonal causal mask, stop the scan after 27 complete
 MoE blocks plus one partial target, omit the target shared expert and residual,
 keep router math in FP32, capture global IDs before remap, and remove custom-VJP
-backward/host-offload work. The two ordered source patches now implement this
-B128×1024 candidate against the pinned MaxText commit. They reuse native
-batch-split MoE execution, overlap the next completed-layer gather with the
-pending second microbatch, gather the target while the final completed layer
-finishes, execute packed target attention, and stop after the routed aggregate
-and native router metadata. Patch application is commit-, hash-, and
+backward/host-offload work. Three ordered source patches now implement this
+B128×1024 candidate against the pinned MaxText commit. The third patch
+supersedes legacy batch-split execution with a thin NNX scan over native
+`DeepSeekMoELayer` calls, maps native expert compute to the existing
+`expert_only` storage axis, overlays exactly 14 target leaves on one isolated
+17-leaf template, executes packed target attention, and stops after the routed
+aggregate plus exact router metadata. Patch application is commit-, hash-, and
 post-image-bound. Real v6e qualification, parity, sealing, and production
 admission remain hard false.
 
@@ -450,7 +452,7 @@ steps; reduces the slowest host duration after the timed window; and requires a
 step at or below 163.551 ms for 51% of the official 64-chip BF16 peak under the
 frozen useful-prefix numerator.
 
-The ordinary MoE path is the independent performance candidate, but it has two
+The active native MoE path has two
 separate drop controls. Positive `capacity_factor` masks assignments, and
 positive `ragged_buffer_factor` truncates the sparse routing buffer. Setting
 only `capacity_factor=-1` is therefore not a dropless proof. A practical
@@ -465,16 +467,18 @@ scans the 27 completed MoE blocks, then executes one separate routed-only
 target; it removes custom VJP/backward state, preserves FP32 routing and global
 IDs, and adds exact packed-segment masking. HLO and restored-parameter
 inventories must prove that target shared weights, suffix layers, final norm,
-logits, backward computation, and host residual transfers are absent.
+logits, backward computation, and host residual transfers are absent. The
+performance compile disables NNX graph updates and returns only the routed
+aggregate, int32 expert IDs, and FP32 scaled weights.
 
 Static BF16 prefix state alone is approximately 26.24, 17.72, 13.45, and
 11.32 GiB per chip for EP64/FSDP1, EP32/FSDP2, EP16/FSDP4, and EP8/FSDP8,
 respectively. These numbers exclude gathered layer weights, executables,
 attention, routing expansion, and capture buffers. Qualification therefore
 starts with EP16/FSDP4, then EP32/FSDP2 and EP8/FSDP8; EP64/FSDP1 is an HBM and
-communication boundary, not the presumed winner. Both the repaired
-forward-only batch split and the instrumented ordinary ring/ragged path must
-be benchmarked before one becomes production.
+communication boundary, not the presumed winner. The superseded legacy
+batch-split implementation remains useful as a parity reference, not a
+production performance candidate.
 
 At 65,536 valid tokens, one-copy BF16 dispatch plus combine across the 28
 routed invocations moves about 6.577 GB/chip. Even the optimistic 800 GB/s
@@ -491,7 +495,8 @@ Required kernel properties:
 - ragged or grouped expert GEMMs with no token dropping;
 - no worst-case dense `[tokens, experts, ...]` materialization;
 - no host synchronization in the captured forward path;
-- capture IDs/weights in the same native router invocation;
+- capture IDs/weights with the same native gate and `get_topk`
+  implementation, never an approximate router;
 - bounded asynchronous device-to-host buffers and direct regional GCS upload;
 - prefix-only weights so post-target layers do not consume HBM or load time.
 
@@ -797,7 +802,7 @@ statically checked transform-array limits, a one-shard source/sink protocol,
 and exact crash/resume receipts. Its evidence is synthetic only. The shared
 project lock still points MaxText at the Gemma commit and remains intentionally
 separate; `deploy/r1/runtime/` is the only accepted static R1 lock. Its Packer
-context now bakes both R1 patches as a twice-built deterministic MaxText wheel
+context now bakes all three R1 patches as a twice-built deterministic MaxText wheel
 and includes the 44-leaf restore plus synthetic v6e benchmark closure. The
 systemd entrypoint still stops before launch admission, and the image remains
 explicitly `UNBUILT` and `production_qualified=false`. Production sealing

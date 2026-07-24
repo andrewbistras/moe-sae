@@ -15,7 +15,7 @@ pins:
 | Python | `3.12.11` |
 | uv | `0.11.14` |
 | MaxText base | `c03f8bd307d18049fa814fc8c104bd9ec8c292aa` |
-| MaxText patches | `f5b4f810…` then `d78349f8…` |
+| MaxText patches | `f5b4f810…`, `d78349f8…`, then `d4db9f29…` |
 | JAX / JAXLIB | `0.10.2` / `0.10.2` |
 | libtpu | `0.0.43` |
 | Packer / Google Compute plugin | `1.15.4` / `1.2.7` |
@@ -23,11 +23,11 @@ pins:
 | base resolver input | `projects/ubuntu-os-accelerator-images/global/images/family/ubuntu-accel-2204-amd64-tpu-v5e-v5p-v6e` |
 
 The lock contains the complete upstream MaxText TPU extra. The bake then
-applies both content-bound R1 patches to a separate clean checkout and replaces
+applies all three content-bound R1 patches to a separate clean checkout and replaces
 the pristine install with a deterministic, non-editable wheel. It builds that
 wheel twice on the Linux baker with the base commit time as
 `SOURCE_DATE_EPOCH`; unequal bytes abort the bake. The retained wheel,
-canonical patch attestation, installed RECORD, and three patched source hashes
+canonical patch attestation, installed RECORD, and four patched source hashes
 are measured together. Torch is absent. Every PyPI artifact in the lock has a
 SHA-256, MaxText is an exact 40-character Git revision, and the lock has no
 alternate index.
@@ -67,8 +67,8 @@ attest_r1_runtime_lock(".")                  # rejects Gemma pin
 
 ## Deterministic context
 
-`context-files.json` is an exact 34-file allowlist. It includes the isolated
-runtime project, both MaxText patches, the patch/restore/benchmark closure, the
+`context-files.json` is an exact 35-file allowlist. It includes the isolated
+runtime project, all three MaxText patches, the patch/restore/benchmark closure, the
 R1 protocol/control/MFU modules needed by the worker, the fixed entrypoint,
 service, and image measurement inputs. It excludes the root project and lock,
 Gemma configuration/modules/CLI, old TPU bootstrap scripts, tests, docs, Git
@@ -124,7 +124,7 @@ The provisioner runs through `sudo env -i` with a fixed PATH and an enumerated
 environment. It refuses a base image without its bounded shell/tool/CA surface;
 it does not consult a moving apt repository. uv resolves only the frozen,
 hashed lock while baking. The provisioner fetches only the exact MaxText
-commit, applies both hash-bound patches, builds twice without build isolation
+commit, applies all three hash-bound patches, builds twice without build isolation
 using pinned Hatch tools, and installs from a permanent root-owned wheel. The
 bake runs native `systemd-analyze verify` on the
 installed unit; the Python substring/line scans are supplementary guardrails,
@@ -160,7 +160,7 @@ installed distribution file after verifying its RECORD entry. It imports the
 runtime entrypoint, proves its resolved path remains inside the sealed venv,
 and requires its bytes to equal the committed source. It also binds the local
 wheel `direct_url.json`, retained wheel and patch attestations, installed
-hashes for the three patched MaxText files, packaged `base.yml`, five critical
+hashes for the four patched MaxText files, packaged `base.yml`, five critical
 benchmark/restore modules, context/recipe/project/lock/unit identities, and
 `production_qualified=false`. This observation is input to the existing
 `ImageManifestV1`; it is not itself that manifest.

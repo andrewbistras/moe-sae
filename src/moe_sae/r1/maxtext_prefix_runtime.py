@@ -164,6 +164,24 @@ class PrefixRuntimeSettings:
             "dropout_rate": 0.0,
             "load_balance_loss_weight": 0.0,
             "routed_bias_update_rate": 0.0,
+            # Batch split remains enabled only for the released checkpoint
+            # layout. Execution uses MaxText's ordinary sparse/ragged MoE.
+            "float32_gate_logits": True,
+            "sparse_matmul": True,
+            "mlp_bias": False,
+            "prefuse_moe_weights": False,
+            "shard_exp_on_fsdp": False,
+            "use_2d_fsdp_sharding": False,
+            "use_ring_of_experts": False,
+            "use_ragged_sort": True,
+            "ragged_buffer_factor": -1.0,
+            "num_moe_emb_chunks": 0,
+            "num_moe_token_chunks": 1,
+            "use_random_routing": False,
+            "float32_weight_sum": True,
+            "record_internal_nn_metrics": 0,
+            "check_vma": False,
+            "capacity_factor": -1.0,
             "scan_layers": True,
             "pure_nnx": True,
             "pure_nnx_decoder": True,
@@ -415,6 +433,22 @@ def validate_initialized_config(config: Any, mesh: PrefixMeshCandidate) -> None:
         "routed_scaling_factor": 2.5,
         "routed_score_func": "sigmoid",
         "routed_bias": True,
+        "float32_gate_logits": True,
+        "sparse_matmul": True,
+        "mlp_bias": False,
+        "prefuse_moe_weights": False,
+        "shard_exp_on_fsdp": False,
+        "use_2d_fsdp_sharding": False,
+        "use_ring_of_experts": False,
+        "use_ragged_sort": True,
+        "ragged_buffer_factor": -1.0,
+        "num_moe_emb_chunks": 0,
+        "num_moe_token_chunks": 1,
+        "use_random_routing": False,
+        "float32_weight_sum": True,
+        "record_internal_nn_metrics": 0,
+        "check_vma": False,
+        "capacity_factor": -1.0,
         "use_pathways": False,
         "using_pipeline_parallelism": False,
         "logits_via_embedding": True,
@@ -957,7 +991,9 @@ def compile_prefix(
             target,
         )
 
-    lowered = nnx.jit(forward).lower(
+    # This is a forward-only executable. Do not propagate NNX graph/state
+    # updates from qualification invocations.
+    lowered = nnx.jit(forward, graph_updates=False).lower(
         model,
         target_parameters,
         example_batch.decoder_input_tokens,

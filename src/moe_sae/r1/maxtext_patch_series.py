@@ -1,4 +1,4 @@
-"""Fail-closed application of the two pinned R1 MaxText source patches."""
+"""Fail-closed application of the three pinned R1 MaxText source patches."""
 
 from __future__ import annotations
 
@@ -10,7 +10,8 @@ import os
 from pathlib import Path
 import stat
 import subprocess
-from typing import Iterator, Mapping
+import tempfile
+from typing import Iterator, Mapping, Sequence
 
 
 MAXTEXT_BASE_COMMIT = "c03f8bd307d18049fa814fc8c104bd9ec8c292aa"
@@ -23,21 +24,29 @@ PATCH_SERIES = (
         "0002-b128-routed-prefix.patch",
         "d78349f83d08993afbaa1b2b346a9ac34f1b034b5015fa02572f71b79b6859fe",
     ),
+    (
+        "0003-native-ragged-r1-prefix.patch",
+        "d4db9f2930583a494d36da89551d5086a64aa1bb7ad7d298d7ab1bc3453dca9c",
+    ),
 )
 POST_APPLY_SHA256: Mapping[str, str] = {
     "src/maxtext/layers/moe.py": (
-        "f6fe4ace7538f542747d20b3167e3424219aed4562552bd5a51b178d4f0cf527"
+        "572b25d80997ce308a3b25484dbbbc42649ad388ebca2a00c23fd6030f7a699d"
     ),
     "src/maxtext/layers/nnx_decoders.py": (
-        "e51522f3249fb7d1bcf8e39ca6f55b3c51c5471fc5adf0ac7b1a5de94e3c90f5"
+        "22fe037c890afdfcd6b80fc07b7b3f8a9333315e103ab0b701b2a986341ced85"
+    ),
+    "src/maxtext/models/deepseek.py": (
+        "ef7a9ec151b523116d17831b460031ef2db176002eeac2ba4f91a3a897555d7b"
     ),
     "src/maxtext/models/deepseek_prefix.py": (
-        "11fdb7bb64797822c336759df42dafa9524a1c1af50f82b72dc7af8edc8048c0"
+        "48d256d1a234bfd70b0b1e49433dfbae98700b5d497a16c196de13696fdcf067"
     ),
 }
 EXPECTED_STATUS = (
     " M src/maxtext/layers/moe.py",
     " M src/maxtext/layers/nnx_decoders.py",
+    " M src/maxtext/models/deepseek.py",
     "?? src/maxtext/models/deepseek_prefix.py",
 )
 _MAX_PATCH_BYTES = 1024 * 1024
@@ -135,6 +144,7 @@ def _git(
     *arguments: str,
     input_bytes: bytes | None = None,
     check: bool = True,
+    environment_overrides: Mapping[str, str] | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     environment = {
         key: value
@@ -149,6 +159,8 @@ def _git(
             "GIT_TERMINAL_PROMPT": "0",
         }
     )
+    if environment_overrides is not None:
+        environment.update(environment_overrides)
     result = subprocess.run(
         ("git", "-C", str(root), *arguments),
         input=input_bytes,
@@ -162,6 +174,47 @@ def _git(
             f"git {' '.join(arguments)} failed: {detail or 'no diagnostic'}"
         )
     return result
+
+
+def _preflight_ordered_patches(
+    root: Path,
+    payloads: Sequence[bytes],
+) -> None:
+    """Validate dependent patches in order without changing the worktree.
+
+    A disposable Git index starts at ``HEAD`` and receives every patch with
+    ``--cached``. Later patches can therefore depend on files created or
+    changed by earlier patches, while any failure leaves the real index and
+    worktree untouched.
+    """
+
+    with tempfile.TemporaryDirectory(
+        prefix="moe-sae-r1-patch-index-",
+        dir=root / ".git",
+    ) as temporary:
+        environment = {
+            "GIT_INDEX_FILE": str(Path(temporary) / "index"),
+        }
+        _git(
+            root,
+            "read-tree",
+            "HEAD",
+            environment_overrides=environment,
+        )
+        for index, payload in enumerate(payloads, start=1):
+            try:
+                _git(
+                    root,
+                    "apply",
+                    "--cached",
+                    "--whitespace=error-all",
+                    input_bytes=payload,
+                    environment_overrides=environment,
+                )
+            except MaxTextPatchSeriesError as error:
+                raise MaxTextPatchSeriesError(
+                    f"git apply --check failed at ordered patch {index}: {error}"
+                ) from error
 
 
 def _stdout(root: Path, *arguments: str) -> str:
@@ -224,18 +277,17 @@ def apply_pinned_maxtext_patch_series(
         )
         for name, expected_sha256 in PATCH_SERIES
     )
-    series = b"".join(payloads)
     with _exclusive_checkout(root):
         _require_clean_base(root)
-        _git(
-            root,
-            "apply",
-            "--check",
-            "--whitespace=error-all",
-            input_bytes=series,
-        )
+        _preflight_ordered_patches(root, payloads)
         _require_clean_base(root)
-        _git(root, "apply", "--whitespace=error-all", input_bytes=series)
+        for payload in payloads:
+            _git(
+                root,
+                "apply",
+                "--whitespace=error-all",
+                input_bytes=payload,
+            )
         if (
             _stdout(root, "rev-parse", "--verify", "HEAD^{commit}")
             != MAXTEXT_BASE_COMMIT

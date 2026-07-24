@@ -58,7 +58,7 @@ sha256 = "1631b7beed109f3873f49045f6717e165eaa13bc5fa4b78bec9f597c453d2f2d"
 name = "context-spec"
 path = "deploy/r1/context-files.json"
 mode = "0644"
-sha256 = "4849858fb1f9af53f7d075bc37a0bf8b0189fe0db1a65db8ba8718ff88e346fa"
+sha256 = "90c75daba6f80f3683ff8619e76f89d5e9b2c245f58cf7b9057d66d9effaf9d1"
 
 [[files]]
 name = "packer-template"
@@ -70,13 +70,13 @@ sha256 = "81ede4f04f76290b4e3a53c8b7f541953d193d26e540df814edf8b39f929a9ea"
 name = "provisioner"
 path = "deploy/r1/image/provision.sh"
 mode = "0755"
-sha256 = "ece710b60e958901df9f519d7596a38a67f4d30192599de27e8ccd1ab1c033d3"
+sha256 = "552e8a3f52dcd76d16606ac8171683ad274b6b49f25342699598ea40acb0010a"
 
 [[files]]
 name = "image-measurer"
 path = "deploy/r1/image/measure_image.py"
 mode = "0755"
-sha256 = "63bd2650db51072b8aa9534a47f233651d26ea1a8eec9308fe9d82c2fc3a4e75"
+sha256 = "1876296fef8948478f731ea809925801ba80366896f594b2dca3046ad72be78e"
 
 [[files]]
 name = "service-unit"
@@ -100,4 +100,4 @@ sha256 = "ac41942f43bd1a8a32ac107b7cf6189722f737ca3da3a3c8330024f1c030814a"
 name = "bundle-validator"
 path = "src/moe_sae/r1/runtime_bundle.py"
 mode = "0644"
-sha256 = "8698a583c0b58a3272a13409ebdd54d929428f24ab14cecd82641e46f4f436fd"
+sha256 = "be86059b3f4ab0562113bad58e6c8b777605833b43ded64d91db36e968e8bb0f"

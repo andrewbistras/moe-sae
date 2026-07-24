@@ -22,19 +22,24 @@ MAXTEXT_REVISION = "c03f8bd307d18049fa814fc8c104bd9ec8c292aa"
 MAXTEXT_PATCH_SHA256 = (
     "f5b4f810dd981add4f13baad91d5811cf632ec32d17266b67b84644783ae850b",
     "d78349f83d08993afbaa1b2b346a9ac34f1b034b5015fa02572f71b79b6859fe",
+    "d4db9f2930583a494d36da89551d5086a64aa1bb7ad7d298d7ab1bc3453dca9c",
 )
 MAXTEXT_POST_APPLY_SHA256 = (
     (
         "src/maxtext/layers/moe.py",
-        "f6fe4ace7538f542747d20b3167e3424219aed4562552bd5a51b178d4f0cf527",
+        "572b25d80997ce308a3b25484dbbbc42649ad388ebca2a00c23fd6030f7a699d",
     ),
     (
         "src/maxtext/layers/nnx_decoders.py",
-        "e51522f3249fb7d1bcf8e39ca6f55b3c51c5471fc5adf0ac7b1a5de94e3c90f5",
+        "22fe037c890afdfcd6b80fc07b7b3f8a9333315e103ab0b701b2a986341ced85",
+    ),
+    (
+        "src/maxtext/models/deepseek.py",
+        "ef7a9ec151b523116d17831b460031ef2db176002eeac2ba4f91a3a897555d7b",
     ),
     (
         "src/maxtext/models/deepseek_prefix.py",
-        "11fdb7bb64797822c336759df42dafa9524a1c1af50f82b72dc7af8edc8048c0",
+        "48d256d1a234bfd70b0b1e49433dfbae98700b5d497a16c196de13696fdcf067",
     ),
 )
 MAXTEXT_WHEEL = (

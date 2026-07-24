@@ -53,8 +53,8 @@ print(
 PY
 ```
 
-The series binds both patch hashes and the final hashes of `moe.py`,
-`nnx_decoders.py`, and `deepseek_prefix.py`. The runtime then:
+The series binds all three patch hashes and the final hashes of `moe.py`,
+`nnx_decoders.py`, `deepseek.py`, and `deepseek_prefix.py`. The runtime then:
 
 1. constructs an explicit EP/FSDP mesh;
 2. creates and prunes the abstract NNX prefix graph;
@@ -62,8 +62,12 @@ The series binds both patch hashes and the final hashes of `moe.py`,
 4. restores exact callback-backed arrays, or creates benchmark-only device
    arrays;
 5. binds 30 model leaves and passes 14 target leaves separately;
-6. compiles the dynamic model with `nnx.jit`; and
-7. returns BF16 routed activations, int32 global top-8 IDs, and FP32 scaled
+6. scans completed layers through MaxText's native sparse/ragged MoE while
+   retaining the batch-split checkpoint layout;
+7. overlays exactly 14 target leaves on an independent 17-leaf layer template,
+   leaving only three unread shared-expert fillers;
+8. compiles the dynamic model with `nnx.jit(graph_updates=False)`; and
+9. returns BF16 routed activations, int32 global top-8 IDs, and FP32 scaled
    weights.
 
 CPU tracing passes through the complete adapter and stops only when it reaches
