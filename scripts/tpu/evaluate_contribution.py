@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -16,6 +17,8 @@ from pathlib import Path
 
 PROCESS_COUNT = 4
 _SHA = re.compile(r"^[0-9a-f]{40}$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+RESULT_SCHEMA_VERSION = "gemma4-contribution-phase2-scientific-result-v1"
 
 
 class OperatorError(RuntimeError):
@@ -167,7 +170,24 @@ def _command(settings: Settings, controller: int, process: int) -> list[str]:
             f"cd {shlex.quote(settings.root)}",
             f'test "$(git rev-parse HEAD)" = {shlex.quote(settings.commit)}',
             'test -z "$(git status --porcelain=v1 --untracked-files=all)"',
+            "set +e",
             shlex.join(worker),
+            "evaluation_status=$?",
+            "set -e",
+            (
+                'if test "$evaluation_status" -ne 0; then '
+                'exit "$evaluation_status"; fi'
+            ),
+            (
+                "test -s "
+                f"{shlex.quote(settings.result_root.rstrip('/') + '/scientific-result.json')}"
+            ),
+            (
+                'printf "terminal action=evaluate controller=%s process=%s '
+                'status=%s\\n" '
+                f"{controller} {process} \"$evaluation_status\""
+            ),
+            'exit "$evaluation_status"',
         )
     )
     command = [
@@ -212,29 +232,118 @@ def _run(command: list[str], log: Path) -> int:
             return 124
 
 
+def _terminal_evaluation_status(
+    log: Path,
+    *,
+    controller: int,
+    process: int,
+) -> int:
+    try:
+        lines = log.read_bytes().splitlines()
+    except OSError as error:
+        raise OperatorError(f"cannot read evaluation SSH log: {log}") from error
+    markers = [
+        line for line in lines if line.startswith(b"terminal action=evaluate ")
+    ]
+    if len(markers) != 1:
+        raise OperatorError(
+            f"controller {controller} evaluation log has {len(markers)} "
+            "terminal markers; exactly one is required"
+        )
+    prefix = (
+        f"terminal action=evaluate controller={controller} "
+        f"process={process} status="
+    ).encode("ascii")
+    marker = markers[0]
+    if not marker.startswith(prefix):
+        raise OperatorError(
+            f"controller {controller} evaluation terminal marker is not "
+            "bound to the expected controller/process"
+        )
+    raw_status = marker[len(prefix) :]
+    if re.fullmatch(rb"(?:0|[1-9][0-9]{0,2})", raw_status) is None:
+        raise OperatorError("evaluation terminal marker has an invalid status")
+    status = int(raw_status)
+    if status > 255:
+        raise OperatorError(
+            "evaluation terminal marker status is outside the shell range"
+        )
+    return status
+
+
+def _canonical_sha256(value: object) -> str:
+    try:
+        payload = json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("ascii")
+    except (TypeError, ValueError, UnicodeEncodeError) as error:
+        raise OperatorError("scientific result is not canonical JSON") from error
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _validate_scientific_result(path: Path) -> dict[str, object]:
+    try:
+        value = json.loads(path.read_text(encoding="ascii"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise OperatorError(f"cannot read scientific result: {path}") from error
+    if not isinstance(value, dict):
+        raise OperatorError("scientific result must be a JSON object")
+    body = dict(value)
+    claimed = body.pop("result_sha256", None)
+    if (
+        body.get("schema_version") != RESULT_SCHEMA_VERSION
+        or not isinstance(claimed, str)
+        or _SHA256.fullmatch(claimed) is None
+        or _canonical_sha256(body) != claimed
+    ):
+        raise OperatorError("scientific result identity or self-hash is invalid")
+    return value
+
+
 def main() -> int:
     settings = Settings.from_environment()
     mapping = _mapping(settings.bundle)
     settings.log_root.mkdir(parents=True, exist_ok=False, mode=0o700)
+    logs = {
+        controller: settings.log_root
+        / f"evaluation-c{controller:05d}-p{process:05d}.log"
+        for controller, process in mapping.items()
+    }
     with ThreadPoolExecutor(max_workers=PROCESS_COUNT) as pool:
         futures = {
             controller: pool.submit(
                 _run,
                 _command(settings, controller, process),
-                settings.log_root
-                / f"evaluation-c{controller:05d}-p{process:05d}.log",
+                logs[controller],
             )
             for controller, process in mapping.items()
         }
         codes = {controller: future.result() for controller, future in futures.items()}
+    statuses = {
+        controller: _terminal_evaluation_status(
+            logs[controller],
+            controller=controller,
+            process=process,
+        )
+        for controller, process in mapping.items()
+    }
     if any(code != 0 for code in codes.values()):
+        print(
+            "local gcloud transports returned nonzero after all four exact "
+            f"evaluation terminal markers: {codes}",
+            flush=True,
+        )
+    if any(status != 0 for status in statuses.values()):
         raise OperatorError(
-            f"one or more evaluation workers failed: {codes}; "
+            f"one or more evaluation workers failed: {statuses}; "
             f"inspect {settings.log_root}"
         )
     result = Path(settings.result_root) / "scientific-result.json"
-    if not result.is_file():
-        raise OperatorError(f"evaluation completed without {result}")
+    _validate_scientific_result(result)
     print(result)
     return 0
 
