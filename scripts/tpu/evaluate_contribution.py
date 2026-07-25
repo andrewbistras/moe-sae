@@ -12,7 +12,7 @@ import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 PROCESS_COUNT = 4
@@ -64,7 +64,7 @@ class Settings:
             raise OperatorError("CONTRIBUTION_SAE_CACHE_MAX_BYTES must be positive")
         artifact_root = _required("ARTIFACT_ROOT")
         bulk_root = _required("BULK_GCS_ROOT").rstrip("/")
-        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         return cls(
             project=_required("GCP_PROJECT"),
             tpu=_required("TPU_NAME"),

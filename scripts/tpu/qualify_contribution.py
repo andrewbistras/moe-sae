@@ -22,7 +22,7 @@ import sys
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
 QUALIFICATION_SECONDS = 600
@@ -129,7 +129,7 @@ def _settings(environment: Mapping[str, str]) -> Settings:
         raise OperatorError("CHECKPOINT_SHA256 must be lowercase hexadecimal")
 
     run_id = environment.get("QUALIFICATION_RUN_ID") or (
-        datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         + "-"
         + commit[:12]
     )
