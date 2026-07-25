@@ -445,6 +445,33 @@ def test_production_runtime_replays_the_sealed_v1_compile_prefix(
     ]
 
 
+def test_lowering_batch_replay_does_not_restart_maxtext_iterator() -> None:
+    class RestartingIterator:
+        def __init__(self) -> None:
+            self.values = (0, 1, 2)
+            self.index = 0
+            self.iter_calls = 0
+
+        def __iter__(self):
+            self.iter_calls += 1
+            self.index = 0
+            return self
+
+        def __next__(self):
+            if self.index == len(self.values):
+                raise StopIteration
+            value = self.values[self.index]
+            self.index += 1
+            return value
+
+    source = RestartingIterator()
+    opened = iter(source)
+    first = next(opened)
+
+    assert list(worker._replay_first_without_reiterating(first, opened)) == [0, 1, 2]
+    assert source.iter_calls == 1
+
+
 def test_controller_ordinal_does_not_override_observed_jax_process_ownership(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

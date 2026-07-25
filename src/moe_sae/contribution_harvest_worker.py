@@ -21,7 +21,6 @@ distributed JAX.
 from __future__ import annotations
 
 import argparse
-import itertools
 import json
 import os
 import re
@@ -1208,7 +1207,7 @@ def run_harvest_child(
                     sidecar,
                 )
             result = deps.harvest(
-                itertools.chain((first_raw,), iterator),
+                _replay_first_without_reiterating(first_raw, iterator),
                 authorized,
                 writer=writer,
                 source_v1_dataset=source,
@@ -1885,6 +1884,27 @@ def _default_create_source_dataset(
         cache_max_bytes=invocation.source_cache_max_bytes,
         object_store=object_store,
     )
+
+
+def _replay_first_without_reiterating(
+    first: Any,
+    source: Any,
+) -> Iterable[Any]:
+    """Replay ``first`` while advancing the already-open iterator in place.
+
+    MaxText's multihost loader restarts its local source when ``iter(source)``
+    is called.  Making that loader a later member of ``itertools.chain`` thus
+    replays an entire B128 batch.  V1's B16 prefix replay is already reproduced
+    explicitly by the packed lane; another batch-size-dependent replay would
+    change the scientific inventory.
+    """
+
+    yield first
+    while True:
+        try:
+            yield next(source)
+        except StopIteration:
+            return
 
 
 def _default_create_runtime(argv: Sequence[str], files: Sequence[str]) -> Any:
