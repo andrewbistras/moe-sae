@@ -681,3 +681,107 @@ do not satisfy the objective-matched A/R/B/F contract.
 DeepSeek-R1 work consumes no production slice for this experiment until the
 Gemma full-width seed-0 gate establishes that the representation boundary,
 not merely the systems implementation, is worth scaling.
+
+## Phase-2 mechanism-pilot execution record
+
+The operator explicitly bypassed the staged qualification and escalation gates
+on 2026-07-25 in order to obtain the direct 2M-train/250k-eval mechanism result.
+This execution is therefore a single-seed pilot, not the frozen protocol's
+multi-seed confirmatory result.
+
+The sealed execution identity is:
+
+```text
+training namespace:
+  phase2-direct-986193a60ad3
+training code:
+  986193a60ad310bba60aa4f5cd1c65b2247aeac5
+evaluation/finalization code:
+  67c2c75c3fa2acc4b65f9c67fd6660da7655a6c6
+training capture:
+  a2f23aef6b9121e81a5bfea473c64039ca5bf6b073e4f70f4703938a1d8a6903
+held-out capture:
+  31454e5ce8693521c41a2a95f2ef88d40c5d26c726a0efac5c26d882ed341f5e
+scientific result:
+  67d0e913537fa414ff23193ee3c9ca99e3ab9ea4bbdff9cccf240ccc1e04f7b0
+common-SST receipt:
+  cb96cb78957c8801cae67e2f50d541085099047c2c1af4dce19739080291d7cc
+result file SHA-256:
+  b7e39a29e510725e70835eb0dd88a1af7b159d505f97d6471e01acbd7d5b3011
+```
+
+All five checkpoints completed exactly 2,000,000 scientific training tokens.
+A/R/B/F evaluated with total L0 16 and Q with L0 64 on the same 250,000
+held-out tokens in 625 packed-sequence clusters. The four evaluator processes
+exited zero, every checkpoint pointer and score-manifest object resolved, and
+the result and denominator-receipt hashes independently recomputed.
+
+The held-out component endpoint was:
+
+| Condition | EV |
+|---|---:|
+| A | 0.3195047562 |
+| R | 0.1000750821 |
+| B | 0.2978687594 |
+| F | 0.3109305831 |
+
+The paired packed-sequence effects were:
+
+| Contrast | EV effect | Paired 95% interval |
+|---|---:|---:|
+| A - R | +0.2194296741 | [+0.2143140416, +0.2243696004] |
+| A - B | +0.0216359968 | [+0.0207357018, +0.0225976964] |
+| F - B | +0.0130618237 | [+0.0125458622, +0.0135587845] |
+
+Thus the F-over-B denominator is positive and stable, and:
+
+```text
+G2 = 165.64300097%
+```
+
+A also beats B at the recomposed routed endpoint by +0.1409539863 EV, with a
+paired 95% interval of [+0.1357821629, +0.1459360019]. Q reaches held-out
+EV 0.5912710448. Together with the large A-over-R effect, this is strong
+evidence for the mechanism: route identity carries causally useful
+factorization information, and the expert-aligned component objective turns
+that information into reconstruction quality which neither a random alignment
+nor the candidate-matched global baseline recovers.
+
+The measured marginal cost result does **not** pass:
+
+```text
+A training chip-seconds = 37,015.638
+F training chip-seconds = 19,434.918
+C2 = 190.45945033%
+```
+
+The excess is explained by the legacy A capacity scan: 1,095.854 wall-seconds,
+versus 1,217.624 seconds in A's optimizer interval. F's optimizer interval was
+1,214.682 seconds. Removing the scan after the fact would give an optimizer-only
+A/F ratio of about 100.24%, but that is diagnostic, not a replacement for the
+sealed measured C2. Commit `f1536d0d62ba3bec504e753e273c3c3755d6f313`
+accelerates future routed-capacity scans; it cannot retroactively change this
+run's timing evidence.
+
+Final aggregation initially rejected tiny target-only component-SST differences
+between the grouped A/R graph and global B/F graph. The scientific token
+inventory, routed SST, centering identity, and all hashes were exact; the
+component difference was at most two binary32 ULPs after rounding. Commit
+`67c2c75c3fa2acc4b65f9c67fd6660da7655a6c6` selects A's per-sequence
+target-only SST as the deterministic common denominator, records a self-hashed
+canonicalization receipt, and still fails closed outside a four-binary32-epsilon
+tolerance.
+
+The complete 936,208-byte evidence tree and operator logs are redundantly
+retained under:
+
+```text
+gs://moe-sae-bucket/moe-sae/gemma4_v1/experiment2/evaluation/evidence/phase2-direct-986193a60ad3-seed0/
+```
+
+This pilot therefore establishes the representation mechanism but not the
+efficiency headline. The decisive next measurement is a fresh, optimized A/F
+timing run on the same sealed captures, with the accelerated scan in the timed
+binary and no protocol expansion. If optimizer time remains at parity, the
+next systems target is the A grouped encode/decode path itself rather than
+additional scientific controls.
