@@ -66,6 +66,7 @@ from moe_sae.contribution_maxtext import (
     observed_performance_launch_manifest,
 )
 from moe_sae.contribution_performance import (
+    MAX_UNGATED_ACCELERATOR_SECONDS,
     AcceleratorRunAuthorization,
     ExactPerformanceIdentity,
     authorize_accelerator_run,
@@ -522,13 +523,30 @@ def _load_launch_receipt(
             "harvest child lacks a valid supervisor execution record"
         ) from error
     authorization = execution["authorization"]
+    bounded = (
+        invocation.maximum_runtime_seconds
+        <= config.runtime.accelerator_ungated_max_seconds
+    )
     if (
         authorization["purpose"] != "workload"
-        or authorization["basis"] != "qualified_exact_identity"
         or authorization["maximum_runtime_seconds"]
         != invocation.maximum_runtime_seconds
         or authorization["identity_sha256"] != identity.identity_sha256
-        or authorization["qualification_receipt_sha256"] != receipt["receipt_sha256"]
+        or (
+            bounded
+            and (
+                authorization["basis"] != "bounded_ungated_workload"
+                or authorization["qualification_receipt_sha256"] is not None
+            )
+        )
+        or (
+            not bounded
+            and (
+                authorization["basis"] != "qualified_exact_identity"
+                or authorization["qualification_receipt_sha256"]
+                != receipt["receipt_sha256"]
+            )
+        )
     ):
         raise ContributionHarvestWorkerError(
             "supervisor authorization differs from the qualification receipt "
@@ -627,7 +645,7 @@ def _authorize_prepared(
         identity=observed,
         maximum_runtime_seconds=invocation.maximum_runtime_seconds,
         purpose="workload",
-        qualification_receipt=receipt,
+        qualification_receipt=None,
         minimum_useful_mfu=config.runtime.accelerator_min_useful_mfu,
         ungated_max_seconds=config.runtime.accelerator_ungated_max_seconds,
         qualification_max_seconds=(
@@ -833,15 +851,31 @@ def validate_child_evidence(value: Mapping[str, Any]) -> dict[str, Any]:
             "harvest child observed identity components are inconsistent"
         )
     authorization = selected["authorization"]
+    bounded = (
+        selected["maximum_runtime_seconds"]
+        <= MAX_UNGATED_ACCELERATOR_SECONDS
+    )
     if (
         not isinstance(authorization, Mapping)
         or authorization.get("purpose") != "workload"
-        or authorization.get("basis") != "qualified_exact_identity"
         or authorization.get("identity_sha256") != parsed_identity.identity_sha256
-        or authorization.get("qualification_receipt_sha256")
-        != selected["qualification_receipt_sha256"]
         or authorization.get("maximum_runtime_seconds")
         != selected["maximum_runtime_seconds"]
+        or (
+            bounded
+            and (
+                authorization.get("basis") != "bounded_ungated_workload"
+                or authorization.get("qualification_receipt_sha256") is not None
+            )
+        )
+        or (
+            not bounded
+            and (
+                authorization.get("basis") != "qualified_exact_identity"
+                or authorization.get("qualification_receipt_sha256")
+                != selected["qualification_receipt_sha256"]
+            )
+        )
     ):
         raise ContributionHarvestWorkerError(
             "harvest child authorization is inconsistent"
@@ -1096,9 +1130,29 @@ def run_harvest_child(
                 invocation=invocation,
                 config=config,
             )
+            bounded = (
+                invocation.maximum_runtime_seconds
+                <= config.runtime.accelerator_ungated_max_seconds
+            )
             if (
-                authorized.observed_executable_identity != receipt_identity
-                or asdict(authorized.authorization) != execution["authorization"]
+                (
+                    not bounded
+                    and authorized.observed_executable_identity != receipt_identity
+                )
+                or (
+                    not bounded
+                    and asdict(authorized.authorization)
+                    != execution["authorization"]
+                )
+                or (
+                    bounded
+                    and (
+                        authorized.authorization.basis
+                        != "bounded_ungated_workload"
+                        or authorized.authorization.qualification_receipt_sha256
+                        is not None
+                    )
+                )
             ):
                 raise ContributionHarvestWorkerError(
                     "post-lowering authorization differs from the supervisor "
@@ -1199,15 +1253,44 @@ def _supervised_evidence(
 ) -> dict[str, Any]:
     completed = result["status"] == "completed" and child is not None
     checked_child = None if child is None else validate_child_evidence(child)
-    if checked_child is not None and (
-        checked_child["controller_index"] != invocation.controller_index
-        or checked_child["supervisor_execution_sha256"] != execution["execution_sha256"]
-        or checked_child["qualification_receipt_sha256"] != receipt["receipt_sha256"]
-        or checked_child["authorization"] != asdict(authorization)
-    ):
-        raise ContributionHarvestWorkerError(
-            "child evidence does not belong to this supervised launch"
+    if checked_child is not None:
+        child_authorization = checked_child["authorization"]
+        bounded = (
+            invocation.maximum_runtime_seconds
+            <= MAX_UNGATED_ACCELERATOR_SECONDS
         )
+        if (
+            checked_child["controller_index"] != invocation.controller_index
+            or checked_child["supervisor_execution_sha256"]
+            != execution["execution_sha256"]
+            or checked_child["qualification_receipt_sha256"]
+            != receipt["receipt_sha256"]
+            or (
+                not bounded
+                and child_authorization != asdict(authorization)
+            )
+            or (
+                bounded
+                and (
+                    authorization.basis != "bounded_ungated_workload"
+                    or authorization.qualification_receipt_sha256 is not None
+                    or child_authorization.get("basis")
+                    != "bounded_ungated_workload"
+                    or child_authorization.get("qualification_receipt_sha256")
+                    is not None
+                    or child_authorization.get("maximum_runtime_seconds")
+                    != authorization.maximum_runtime_seconds
+                )
+            )
+        ):
+            raise ContributionHarvestWorkerError(
+                "child evidence does not belong to this supervised launch"
+            )
+    evidence_authorization = (
+        asdict(authorization)
+        if checked_child is None
+        else dict(checked_child["authorization"])
+    )
     unsigned = {
         "schema_version": SUPERVISED_EVIDENCE_SCHEMA_VERSION,
         "status": "complete" if completed else "failed",
@@ -1216,7 +1299,7 @@ def _supervised_evidence(
             None if checked_child is None else checked_child["process_index"]
         ),
         "qualification_receipt_sha256": receipt["receipt_sha256"],
-        "authorization": asdict(authorization),
+        "authorization": evidence_authorization,
         "supervisor_execution_sha256": execution["execution_sha256"],
         "supervisor_result_sha256": result["result_sha256"],
         "supervisor_status": result["status"],
@@ -1400,11 +1483,15 @@ def launch_harvest_host(
         ),
     )
     identity = _identity_from_receipt(receipt)
+    bounded = (
+        invocation.maximum_runtime_seconds
+        <= config.runtime.accelerator_ungated_max_seconds
+    )
     authorization = authorize_accelerator_run(
         identity=identity,
         maximum_runtime_seconds=invocation.maximum_runtime_seconds,
         purpose="workload",
-        qualification_receipt=receipt,
+        qualification_receipt=None if bounded else receipt,
         minimum_useful_mfu=config.runtime.accelerator_min_useful_mfu,
         ungated_max_seconds=config.runtime.accelerator_ungated_max_seconds,
         qualification_max_seconds=(
@@ -1420,7 +1507,7 @@ def launch_harvest_host(
         execution_record_path=invocation.execution_record_path,
         result_path=result_path,
         termination_grace_seconds=termination_grace_seconds,
-        qualification_receipt=receipt,
+        qualification_receipt=None if bounded else receipt,
     )
     execution = validate_execution_record(
         _read_json(

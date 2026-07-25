@@ -194,6 +194,7 @@ def _case(
     receipt_graph: dict | None = None,
     controller_index: int = 0,
     observed_process_index: int = 0,
+    maximum_runtime_seconds: int = 3_600,
 ) -> SimpleNamespace:
     config = load_contribution_config(CONFIG_PATH)
     source_manifest = _source_manifest(config)
@@ -234,12 +235,13 @@ def _case(
     receipt = _receipt(identity)
     receipt_path = tmp_path / "qualification-receipt.json"
     _write_json(receipt_path, receipt)
-    maximum_runtime = 3_600
+    maximum_runtime = maximum_runtime_seconds
+    bounded = maximum_runtime <= config.runtime.accelerator_ungated_max_seconds
     authorization = authorize_accelerator_run(
         identity=identity,
         maximum_runtime_seconds=maximum_runtime,
         purpose="workload",
-        qualification_receipt=receipt,
+        qualification_receipt=None if bounded else receipt,
     )
     execution_path = tmp_path / "execution.json"
     execution = build_execution_record(
@@ -251,7 +253,7 @@ def _case(
         execution_record_path=execution_path,
         result_path=tmp_path / "result.json",
         termination_grace_seconds=10.0,
-        qualification_receipt=receipt,
+        qualification_receipt=None if bounded else receipt,
     )
     _write_json(execution_path, execution)
 
@@ -470,6 +472,38 @@ def test_identity_mismatch_fails_before_writer_or_harvest_side_effect(
 
     assert case.writer_state["created"] is False
     assert not case.invocation.child_evidence_path.exists()
+
+
+def test_bounded_real_data_harvest_records_its_observed_identity_without_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    actual_graph = {
+        "schema_version": "test-graph-v1",
+        "stablehlo_sha256": "f" * 64,
+    }
+    case = _case(
+        tmp_path,
+        monkeypatch,
+        prepared_graph=actual_graph,
+        receipt_graph={
+            "schema_version": "test-graph-v1",
+            "stablehlo_sha256": "e" * 64,
+        },
+        maximum_runtime_seconds=600,
+    )
+
+    evidence = worker.run_harvest_child(
+        case.invocation,
+        dependencies=case.dependencies,
+    )
+
+    checked = worker.validate_child_evidence(evidence)
+    assert checked["authorization"]["basis"] == "bounded_ungated_workload"
+    assert checked["authorization"]["qualification_receipt_sha256"] is None
+    assert checked["observed_identity_sha256"] != case.identity.identity_sha256
+    assert checked["prepared_graph"] == actual_graph
+    assert case.writer_state["created"] is True
 
 
 def test_phase2_adopts_exact_phase1_parent_before_appending(
