@@ -589,6 +589,36 @@ def test_nonzero_gcloud_transport_accepts_exact_bound_worker_markers(
     ) == [0, 0, 0, 0]
 
 
+def test_zero_gcloud_transport_still_requires_every_terminal_marker(
+    operator,
+    tmp_path: Path,
+) -> None:
+    settings = _settings(operator, tmp_path, action="train")
+    mapping = {0: 2, 1: 0, 2: 3, 3: 1}
+    logs = []
+    for controller, process in mapping.items():
+        log = tmp_path / f"prefetch-{controller}.log"
+        log.write_text(
+            (
+                f"terminal prefetch controller={controller} "
+                f"process={process} status=0\n"
+                if controller != 3
+                else "gcloud transport exited zero without remote marker\n"
+            ),
+            encoding="utf-8",
+        )
+        logs.append(log)
+
+    with pytest.raises(operator.OperatorError, match="exactly one"):
+        operator._validated_fanout_completion(
+            settings=settings,
+            mapping=mapping,
+            stage="prefetch",
+            returncodes=[0, 0, 0, 0],
+            log_paths=logs,
+        )
+
+
 def test_worker_terminal_marker_is_exactly_bound_and_unique(
     operator,
     tmp_path: Path,
@@ -645,10 +675,19 @@ def test_worker_terminal_marker_rejects_noncanonical_status(
         )
 
 
+@pytest.mark.parametrize(
+    ("action_statuses", "failure"),
+    [
+        ([0, 0, 0, 0], None),
+        ([0, 7, 0, 0], "train workers failed"),
+    ],
+)
 def test_run_uses_exact_remote_status_after_transport_teardown(
     operator,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    action_statuses: list[int],
+    failure: str | None,
 ) -> None:
     settings = _settings(
         operator,
@@ -694,18 +733,24 @@ def test_run_uses_exact_remote_status_after_transport_teardown(
         del maximum_wait_seconds
         stages.append(stage)
         marker_stage = "prefetch" if stage == "prefetch" else "action=train"
-        for log, (controller, process) in zip(
+        statuses = [0, 0, 0, 0] if stage == "prefetch" else action_statuses
+        for log, (controller, process), status in zip(
             logs,
             mapping.items(),
+            statuses,
             strict=True,
         ):
             log.write_text(
                 f"terminal {marker_stage} controller={controller} "
-                f"process={process} status=0\n",
+                f"process={process} status={status}\n",
                 encoding="utf-8",
             )
         return [1, 1, 1, 1]
 
     monkeypatch.setattr(operator, "_fanout", fanout)
-    assert operator.run(settings) == 0
+    if failure is None:
+        assert operator.run(settings) == 0
+    else:
+        with pytest.raises(operator.OperatorError, match=failure):
+            operator.run(settings)
     assert stages == ["prefetch", "train"]
