@@ -363,16 +363,30 @@ class ContributionProcessInput:
             raise ContributionInputError(
                 "capacity margin must be a finite fraction in [0,1]"
             )
-        observed = 0
-        for update in self.iter_updates():
-            for microbatch in update:
-                selected = microbatch.bank_ids[microbatch.valid_mask]
-                if selected.size:
-                    counts = np.bincount(
-                        selected.reshape(-1),
-                        minlength=self.layout.bank_count,
-                    )
-                    observed = max(observed, int(counts.max(initial=0)))
+        selective_reader = getattr(
+            self.dataset,
+            "iter_capacity_token_range",
+            None,
+        )
+        if callable(selective_reader):
+            observed = self._scan_selective_capacity(selective_reader)
+        else:
+            # Lightweight in-memory test datasets and external adapters can
+            # retain the generic full-batch seam.  The production
+            # ContributionDataset implements the selective path below.
+            observed = 0
+            for update in self.iter_updates():
+                for microbatch in update:
+                    selected = microbatch.bank_ids[microbatch.valid_mask]
+                    if selected.size:
+                        counts = np.bincount(
+                            selected.reshape(-1),
+                            minlength=self.layout.bank_count,
+                        )
+                        observed = max(
+                            observed,
+                            int(counts.max(initial=0)),
+                        )
         if observed <= 0:
             raise ContributionInputError(
                 "capacity scan observed no scientific A/R components"
@@ -391,6 +405,119 @@ class ContributionProcessInput:
             **unsigned,
             receipt_sha256=canonical_sha256(unsigned),
         )
+
+    def _scan_selective_capacity(self, reader: Any) -> int:
+        """Scan exact local microbatches from route-only safetensors slices."""
+
+        include_sequence_id = self.layout.condition == "R"
+        expert_buffer = np.empty(
+            (self.local_rows, self.layout.top_routed),
+            dtype=np.uint8,
+        )
+        sequence_buffer = (
+            np.empty((self.local_rows,), dtype=np.int64)
+            if include_sequence_id
+            else None
+        )
+        filled = 0
+        yielded = 0
+        observed = 0
+
+        def observe(rows: int) -> None:
+            nonlocal observed
+            sequences = (
+                sequence_buffer[:rows]
+                if sequence_buffer is not None
+                else np.zeros((rows,), dtype=np.int64)
+            )
+            selected = condition_bank_ids(
+                expert_buffer[:rows],
+                sequences,
+                self.layout,
+            )
+            counts = np.bincount(
+                selected.reshape(-1),
+                minlength=self.layout.bank_count,
+            )
+            observed = max(observed, int(counts.max(initial=0)))
+
+        try:
+            pieces = reader(
+                self.process_range_start,
+                self.process_range_end,
+                include_sequence_id=include_sequence_id,
+            )
+            for piece in pieces:
+                ids = np.asarray(getattr(piece, "expert_ids", None))
+                if (
+                    ids.dtype != np.uint8
+                    or ids.ndim != 2
+                    or ids.shape[1] != self.layout.top_routed
+                    or ids.shape[0] <= 0
+                ):
+                    raise ContributionInputError(
+                        "selective capacity expert_ids must be nonempty "
+                        "uint8 [N,top_routed]"
+                    )
+                if np.any(ids >= self.layout.num_experts):
+                    raise ContributionInputError(
+                        "selective capacity expert_ids are outside the layout"
+                    )
+                sorted_ids = np.sort(ids, axis=1)
+                if np.any(sorted_ids[:, 1:] == sorted_ids[:, :-1]):
+                    raise ContributionInputError(
+                        "selective capacity expert_ids are not unique per token"
+                    )
+
+                sequence_id: np.ndarray | None = None
+                raw_sequence = getattr(piece, "sequence_id", None)
+                if include_sequence_id:
+                    sequence_id = np.asarray(raw_sequence)
+                    if (
+                        sequence_id.dtype != np.int64
+                        or sequence_id.shape != (ids.shape[0],)
+                        or np.any(sequence_id < 0)
+                    ):
+                        raise ContributionInputError(
+                            "selective R capacity sequence_id must be "
+                            "nonnegative int64 [N]"
+                        )
+                elif raw_sequence is not None:
+                    raise ContributionInputError(
+                        "selective A capacity reads must omit sequence_id"
+                    )
+
+                offset = 0
+                while offset < ids.shape[0]:
+                    take = min(self.local_rows - filled, ids.shape[0] - offset)
+                    expert_buffer[filled : filled + take] = ids[offset : offset + take]
+                    if sequence_buffer is not None and sequence_id is not None:
+                        sequence_buffer[filled : filled + take] = sequence_id[
+                            offset : offset + take
+                        ]
+                    filled += take
+                    yielded += take
+                    offset += take
+                    if filled == self.local_rows:
+                        observe(filled)
+                        filled = 0
+        except ContributionInputError:
+            raise
+        except Exception as error:
+            raise ContributionInputError(
+                "cannot read selective contribution capacity range "
+                f"[{self.process_range_start},{self.process_range_end})"
+            ) from error
+
+        expected = self.process_range_end - self.process_range_start
+        if yielded != expected:
+            raise ContributionInputError(
+                f"selective capacity reader yielded {yielded} rows, "
+                f"expected {expected}"
+            )
+        if filled:
+            observe(filled)
+        return observed
 
 
 def merge_capacity_receipts(

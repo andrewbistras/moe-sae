@@ -23,6 +23,7 @@ from moe_sae.contribution_input import (
     merge_capacity_receipts,
 )
 from moe_sae.contribution_sae import ContributionSAEConfig
+from moe_sae.contribution_storage import ContributionCapacityBatch
 
 
 def wire_batch(tokens: int) -> ContributionBatch:
@@ -79,6 +80,35 @@ class FakeDataset:
                 for name in ContributionBatch.__dataclass_fields__
             }
         )
+
+
+class SelectiveFakeDataset(FakeDataset):
+    def __init__(self, value: ContributionBatch):
+        super().__init__(value)
+        self.capacity_reads: list[tuple[int, int, bool]] = []
+
+    def iter_capacity_token_range(
+        self,
+        start: int,
+        end: int,
+        *,
+        include_sequence_id: bool,
+    ):
+        self.capacity_reads.append((start, end, include_sequence_id))
+        # Deliberately split at boundaries unrelated to the fixed microbatch
+        # size.  The adapter must re-form exactly the legacy windows.
+        boundaries = sorted({start, min(start + 3, end), min(start + 7, end), end})
+        for left, right in zip(boundaries, boundaries[1:]):
+            if left == right:
+                continue
+            yield ContributionCapacityBatch(
+                expert_ids=np.ascontiguousarray(self.value.expert_ids[left:right]),
+                sequence_id=(
+                    np.ascontiguousarray(self.value.sequence_id[left:right])
+                    if include_sequence_id
+                    else None
+                ),
+            )
 
 
 def input_for(
@@ -233,6 +263,68 @@ def test_capacity_scan_binds_condition_key_partition_and_margin():
     assert merged.capacity == receipt_a.capacity
     with pytest.raises(ContributionInputError, match="different conditions"):
         merge_capacity_receipts((receipt_a, receipt_r))
+
+
+@pytest.mark.parametrize(
+    ("condition", "include_sequence_id"),
+    [("A", False), ("R", True)],
+)
+def test_selective_capacity_scan_is_receipt_identical_to_legacy(
+    condition: str,
+    include_sequence_id: bool,
+) -> None:
+    value = wire_batch(23)
+    layout = ContributionSAEConfig(
+        condition=condition,
+        bank_width=16,
+        k_per_contribution=2,
+        randomization_key=17,
+    )
+    legacy_dataset = FakeDataset(value)
+    selective_dataset = SelectiveFakeDataset(value)
+    kwargs = {
+        "total_tokens": 23,
+        "global_microbatch_tokens": 8,
+        "microbatches_per_update": 2,
+        "process_count": 2,
+        "process_index": 1,
+    }
+    legacy = ContributionProcessInput(legacy_dataset, layout, **kwargs)
+    selective = ContributionProcessInput(selective_dataset, layout, **kwargs)
+
+    expected = legacy.scan_local_capacity(margin_fraction=0.10)
+    observed = selective.scan_local_capacity(margin_fraction=0.10)
+
+    assert observed == expected
+    assert selective_dataset.reads == []
+    assert selective_dataset.capacity_reads == [
+        (
+            selective.process_range_start,
+            selective.process_range_end,
+            include_sequence_id,
+        )
+    ]
+
+
+def test_selective_capacity_scan_rejects_duplicate_routes() -> None:
+    value = wire_batch(8)
+    dataset = SelectiveFakeDataset(value)
+    duplicated = np.asarray(value.expert_ids).copy()
+    duplicated[0, 1] = duplicated[0, 0]
+    dataset.value = replace(value, expert_ids=duplicated)
+    source = ContributionProcessInput(
+        dataset,
+        ContributionSAEConfig(
+            condition="A",
+            bank_width=16,
+            k_per_contribution=2,
+        ),
+        total_tokens=8,
+        global_microbatch_tokens=8,
+    )
+
+    with pytest.raises(ContributionInputError, match="not unique"):
+        source.scan_local_capacity(margin_fraction=0.10)
 
 
 def test_input_fails_closed_on_schema_range_and_partition_mismatch():

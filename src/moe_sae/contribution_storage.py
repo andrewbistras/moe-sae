@@ -43,8 +43,10 @@ from moe_sae.artifacts import (
 from moe_sae.contribution_artifacts import (
     LEGACY_AGGREGATE_SCHEMA_VERSION,
     MAX_SHARD_TOKENS,
+    NUM_EXPERTS,
     PROTOCOL_ID,
     SCHEMA_VERSION,
+    TOP_K_EXPERTS,
     ContributionBatch,
     ContributionIntegrityError,
     ContributionLegacySchemaError,
@@ -239,6 +241,73 @@ class ContributionSharedShard:
     sha256: str
     object: ObjectIdentity
     batch: ContributionSharedBatch
+
+
+@dataclass(frozen=True, slots=True)
+class ContributionCapacityBatch:
+    """Minimal routed fields needed by the A/R grouped-GEMM capacity scan.
+
+    ``sequence_id`` is absent for A because true expert IDs already are its
+    bank IDs.  R requests it because its bank permutation is keyed by packed
+    sequence.  The enclosing immutable safetensors object and its metadata are
+    still hash-verified before either tensor is exposed.
+    """
+
+    expert_ids: np.ndarray
+    sequence_id: np.ndarray | None
+
+    @property
+    def tokens(self) -> int:
+        return int(self.expert_ids.shape[0])
+
+
+def _validate_capacity_batch(
+    value: ContributionCapacityBatch,
+    *,
+    expected_tokens: int,
+    include_sequence_id: bool,
+) -> ContributionCapacityBatch:
+    expert_ids = np.asarray(value.expert_ids)
+    if expert_ids.dtype != np.uint8 or expert_ids.shape != (
+        expected_tokens,
+        TOP_K_EXPERTS,
+    ):
+        raise ContributionIntegrityError(
+            "selective expert_ids must be uint8 [tokens,8]"
+        )
+    if np.any(expert_ids >= NUM_EXPERTS):
+        raise ContributionIntegrityError(
+            f"selective expert_ids must be in [0,{NUM_EXPERTS - 1}]"
+        )
+    sorted_ids = np.sort(expert_ids, axis=1)
+    if np.any(sorted_ids[:, 1:] == sorted_ids[:, :-1]):
+        raise ContributionIntegrityError(
+            "selective expert_ids must be unique within each token"
+        )
+
+    sequence_id = value.sequence_id
+    if include_sequence_id:
+        sequence = np.asarray(sequence_id)
+        if sequence.dtype != np.int64 or sequence.shape != (expected_tokens,):
+            raise ContributionIntegrityError(
+                "selective sequence_id must be int64 [tokens]"
+            )
+        if np.any(sequence < 0):
+            raise ContributionIntegrityError(
+                "selective sequence_id must be nonnegative"
+            )
+        checked_sequence: np.ndarray | None = np.ascontiguousarray(sequence)
+    else:
+        if sequence_id is not None:
+            raise ContributionIntegrityError(
+                "A-only capacity reads must not load sequence_id"
+            )
+        checked_sequence = None
+
+    return ContributionCapacityBatch(
+        expert_ids=np.ascontiguousarray(expert_ids),
+        sequence_id=checked_sequence,
+    )
 
 
 def _validate_shared_batch(
@@ -1691,6 +1760,16 @@ class ContributionDataset:
             raise ContributionStorageError(
                 "materialized contribution object failed SHA-256/size verification"
             )
+        expected_metadata = self._inspect_materialized_shard(entry, path)
+        return identity, path, expected_metadata
+
+    def _inspect_materialized_shard(
+        self,
+        entry: Mapping[str, Any],
+        path: Path,
+    ) -> dict[str, str]:
+        """Validate the exact v2 tensor set and scientific file metadata."""
+
         try:
             with safe_open(path, framework="numpy") as handle:
                 keys = frozenset(handle.keys())
@@ -1719,7 +1798,79 @@ class ContributionDataset:
             raise ContributionStorageError(
                 "contribution safetensors keys or metadata differ from v2"
             )
-        return identity, path, expected_metadata
+        return expected_metadata
+
+    def _materialized_capacity_shards(
+        self,
+        entries: tuple[Mapping[str, Any], ...],
+    ) -> tuple[tuple[Mapping[str, Any], Path], ...]:
+        """Verify each immutable capacity-scan object exactly once.
+
+        The ordinary training reader deliberately validates one requested
+        shard at a time.  A capacity scan knows its complete process-local
+        range up front, so batching the cache proof avoids re-hashing the same
+        ~0.8 GB object for every 1,024-row microbatch.  ``materialize_many``
+        provides the SHA-256/size proof; this method then independently checks
+        the exact v2 tensor set and scientific file metadata.
+        """
+
+        if not entries:
+            return ()
+        identities: list[ObjectIdentity] = []
+        for entry in entries:
+            receipt = self._receipt(entry)
+            identities.append(object_identity_from_mapping(receipt["object"]))
+        try:
+            paths = self.cache.materialize_many(tuple(identities), max_workers=4)
+        except Exception as error:
+            raise ContributionStorageError(
+                "cannot materialize contribution capacity-scan objects"
+            ) from error
+
+        verified: list[tuple[Mapping[str, Any], Path]] = []
+        for entry, path in zip(entries, paths, strict=True):
+            self._inspect_materialized_shard(entry, path)
+            verified.append((entry, path))
+        return tuple(verified)
+
+    def _load_capacity_slice(
+        self,
+        entry: Mapping[str, Any],
+        path: Path,
+        *,
+        local_start: int,
+        local_end: int,
+        include_sequence_id: bool,
+    ) -> ContributionCapacityBatch:
+        """Memory-map only route IDs and, for R, packed-sequence IDs."""
+
+        tokens = int(entry["tokens"])
+        if not 0 <= local_start < local_end <= tokens:
+            raise ContributionRangeError(
+                "selective capacity shard slice is outside its sealed range"
+            )
+        try:
+            with safe_open(path, framework="numpy") as handle:
+                expert_ids = np.asarray(
+                    handle.get_slice("expert_ids")[local_start:local_end]
+                )
+                sequence_id = (
+                    np.asarray(handle.get_slice("sequence_id")[local_start:local_end])
+                    if include_sequence_id
+                    else None
+                )
+        except Exception as error:
+            raise ContributionStorageError(
+                f"cannot selectively load contribution safetensors object: {path}"
+            ) from error
+        return _validate_capacity_batch(
+            ContributionCapacityBatch(
+                expert_ids=expert_ids,
+                sequence_id=sequence_id,
+            ),
+            expected_tokens=local_end - local_start,
+            include_sequence_id=include_sequence_id,
+        )
 
     def _load_shard(self, entry: Mapping[str, Any]) -> ContributionShard:
         identity, path, _metadata = self._materialized_shard(entry)
@@ -1919,6 +2070,44 @@ class ContributionDataset:
                 f"manifest yielded {yielded} contribution tokens for [{start},{end})"
             )
 
+    def iter_capacity_token_range(
+        self,
+        start: int,
+        end: int,
+        *,
+        include_sequence_id: bool,
+    ) -> Iterator[ContributionCapacityBatch]:
+        """Yield an exact range without touching dense contribution tensors.
+
+        Safetensors offsets make ``expert_ids`` and ``sequence_id`` independently
+        addressable.  Whole-object SHA-256 verification still binds these
+        slices to the sealed contribution payload, so ``position`` is not
+        needed merely to re-prove token identity during this derived scan.
+        """
+
+        if not isinstance(include_sequence_id, bool):
+            raise ContributionRangeError("include_sequence_id must be an exact boolean")
+        entries = tuple(self._entries_for_range(start, end))
+        yielded = 0
+        for entry, path in self._materialized_capacity_shards(entries):
+            range_start = int(entry["range_start"])
+            range_end = int(entry["range_end"])
+            local_start = max(start, range_start) - range_start
+            local_end = min(end, range_end) - range_start
+            selected = self._load_capacity_slice(
+                entry,
+                path,
+                local_start=local_start,
+                local_end=local_end,
+                include_sequence_id=include_sequence_id,
+            )
+            yielded += selected.tokens
+            yield selected
+        if yielded != end - start:
+            raise ContributionRangeError(
+                f"manifest yielded {yielded} capacity tokens for [{start},{end})"
+            )
+
     def iter_shared_token_range(
         self,
         start: int,
@@ -1954,6 +2143,7 @@ ContributionArtifactWriter = ContributionShardWriter
 __all__ = [
     "ContributionAdoptionResult",
     "ContributionArtifactWriter",
+    "ContributionCapacityBatch",
     "ContributionDataset",
     "ContributionSharedBatch",
     "ContributionSharedShard",

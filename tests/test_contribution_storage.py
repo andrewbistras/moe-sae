@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,7 @@ from moe_sae.contribution_artifacts import (
 )
 from moe_sae.contribution_storage import (
     ContributionAdoptionResult,
+    ContributionCapacityBatch,
     ContributionDataset,
     ContributionShardWriter,
     ContributionStorageError,
@@ -321,6 +323,80 @@ def test_shared_reader_does_not_load_expert_payload_tensors(
         np.concatenate([piece.position for piece in pieces]),
         np.concatenate([expected[0].position[1:], expected[1].position[:2]]),
     )
+
+
+def test_capacity_reader_loads_only_route_fields(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset, _store, _control, expected = sealed_dataset(tmp_path)
+
+    def reject_full_load(_path):
+        raise AssertionError("capacity reads must not call safetensors.load_file")
+
+    real_safe_open = contribution_storage_module.safe_open
+    sliced_fields: list[str] = []
+
+    @contextmanager
+    def recording_safe_open(*args, **kwargs):
+        with real_safe_open(*args, **kwargs) as handle:
+
+            class RecordingHandle:
+                def keys(self):
+                    return handle.keys()
+
+                def metadata(self):
+                    return handle.metadata()
+
+                def get_slice(self, name):
+                    sliced_fields.append(name)
+                    return handle.get_slice(name)
+
+            yield RecordingHandle()
+
+    monkeypatch.setattr(contribution_storage_module, "load_file", reject_full_load)
+    monkeypatch.setattr(
+        contribution_storage_module,
+        "safe_open",
+        recording_safe_open,
+    )
+
+    a_pieces = tuple(
+        dataset.iter_capacity_token_range(
+            1,
+            4,
+            include_sequence_id=False,
+        )
+    )
+    r_pieces = tuple(
+        dataset.iter_capacity_token_range(
+            1,
+            4,
+            include_sequence_id=True,
+        )
+    )
+
+    assert all(isinstance(piece, ContributionCapacityBatch) for piece in a_pieces)
+    assert [piece.tokens for piece in a_pieces] == [1, 2]
+    assert all(piece.sequence_id is None for piece in a_pieces)
+    np.testing.assert_array_equal(
+        np.concatenate([piece.expert_ids for piece in a_pieces]),
+        np.concatenate([expected[0].expert_ids[1:], expected[1].expert_ids[:2]]),
+    )
+    np.testing.assert_array_equal(
+        np.concatenate(
+            [piece.sequence_id for piece in r_pieces if piece.sequence_id is not None]
+        ),
+        np.concatenate([expected[0].sequence_id[1:], expected[1].sequence_id[:2]]),
+    )
+    assert sliced_fields.count("expert_ids") == 4
+    assert sliced_fields.count("sequence_id") == 2
+    assert not {
+        "expert_output",
+        "router_weights",
+        "shared_output",
+        "position",
+    }.intersection(sliced_fields)
 
 
 def test_publication_derives_source_identity_from_a_sealed_v1_root(
