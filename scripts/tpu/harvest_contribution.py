@@ -1162,11 +1162,21 @@ def run(settings: Settings) -> int:
         log_paths,
         maximum_runtime_seconds=settings.maximum_runtime_seconds,
     )
-    _validated_transport_completion(
+    harvest_statuses = _validated_transport_completion(
         settings=settings,
         returncodes=returncodes,
         log_paths=log_paths,
     )
+    failed_harvests = [
+        f"controller={controller_index} status={status}"
+        for controller_index, status in enumerate(harvest_statuses)
+        if status != 0
+    ]
+    if failed_harvests:
+        raise OperatorError(
+            "remote harvest failed before publication: "
+            f"{', '.join(failed_harvests)}; publication was not attempted"
+        )
 
     publish_log = settings.local_log_root / "publish.ssh.log"
     published = _run_logged(

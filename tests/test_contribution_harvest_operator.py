@@ -443,6 +443,47 @@ def test_run_reaches_publish_after_nonzero_transports_with_exact_markers(
     ]
 
 
+def test_run_rejects_nonzero_remote_harvest_status_before_publish(
+    operator,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(operator, tmp_path)
+    monkeypatch.setattr(operator.shutil, "which", lambda _name: "/usr/bin/gcloud")
+    monkeypatch.setattr(operator, "_verify_local_checkout", lambda _settings: None)
+    harvest_statuses = [0, 7, 0, 23]
+
+    def fanout(_commands, log_paths, **_kwargs):
+        for controller_index, (log_path, status) in enumerate(
+            zip(log_paths, harvest_statuses, strict=True)
+        ):
+            log_path.write_text(
+                f"terminal phase={settings.phase} split={settings.split} "
+                f"controller={controller_index} status={status}\n",
+                encoding="utf-8",
+            )
+        return [0, 0, 0, 0]
+
+    logged: list[Path] = []
+
+    def run_logged(command, log_path):
+        logged.append(log_path)
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(operator, "_fanout", fanout)
+    monkeypatch.setattr(operator, "_run_logged", run_logged)
+
+    with pytest.raises(
+        operator.OperatorError,
+        match=(
+            r"controller=1 status=7, controller=3 status=23; "
+            r"publication was not attempted"
+        ),
+    ):
+        operator.run(settings)
+    assert [path.name for path in logged] == ["init-attempt.ssh.log"]
+
+
 @pytest.mark.parametrize(
     "marker",
     [
