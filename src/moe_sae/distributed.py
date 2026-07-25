@@ -2288,8 +2288,15 @@ def restore_distributed_checkpoint(
     *,
     checkpoint_payload_root: str | Path | None = None,
     checkpoint_identity: Mapping[str, Any] | None = None,
+    checkpoint_metadata_identity: Mapping[str, Any] | None = None,
 ) -> tuple[TrainState, dict[str, Any]]:
-    """Restore only through a validated ``latest.json`` or ``final.json`` pointer."""
+    """Restore only through a validated ``latest.json`` or ``final.json`` pointer.
+
+    ``checkpoint_identity`` always binds the complete control pointer and its
+    payload namespace.  Payload metadata defaults to that same identity.
+    Callers whose immutable payload stores a canonical identity digest instead
+    may supply that nonempty exact subset via ``checkpoint_metadata_identity``.
+    """
 
     if "://" in str(path):
         raise ValueError("checkpoint control pointer must be a POSIX path")
@@ -2300,6 +2307,25 @@ def restore_distributed_checkpoint(
         )
     kind = "latest" if pointer_file.name == "latest.json" else "final"
     identity = dict(checkpoint_identity or {})
+    if checkpoint_metadata_identity is None:
+        metadata_identity = identity
+    else:
+        metadata_identity = dict(checkpoint_metadata_identity)
+        if not metadata_identity:
+            raise ValueError(
+                "explicit checkpoint metadata identity must be nonempty"
+            )
+        invalid_metadata_identity = {
+            name: (expected, identity.get(name))
+            for name, expected in metadata_identity.items()
+            if name not in identity or identity[name] != expected
+        }
+        if invalid_metadata_identity:
+            raise ValueError(
+                "explicit checkpoint metadata identity must be an exact "
+                "subset of checkpoint identity: "
+                + ", ".join(sorted(invalid_metadata_identity))
+            )
     payload_root = _effective_checkpoint_payload_root(
         pointer_file.parent, checkpoint_payload_root
     )
@@ -2338,7 +2364,7 @@ def restore_distributed_checkpoint(
             )
         mismatches = {
             name: (metadata.get(name), expected)
-            for name, expected in identity.items()
+            for name, expected in metadata_identity.items()
             if metadata.get(name) != expected
         }
         if mismatches:

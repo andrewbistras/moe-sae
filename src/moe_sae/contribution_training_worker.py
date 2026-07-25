@@ -2075,6 +2075,9 @@ class _OrbaxCheckpointBackend:
             self.training_config,
             checkpoint_payload_root=self.payload_root,
             checkpoint_identity=run_identity,
+            checkpoint_metadata_identity={
+                "run_identity_sha256": run_identity["run_identity_sha256"]
+            },
         )
         return RestoredTrainingState(restored, metadata)
 

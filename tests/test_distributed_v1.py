@@ -476,6 +476,193 @@ def test_checkpoint_timing_resume_uses_coordinator_value_without_exists_branch(
     assert reads == [tmp_path / "checkpoint_timing.json"]
 
 
+def _stub_distributed_checkpoint_restore(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    metadata: dict[str, object],
+) -> tuple[SimpleNamespace, list[dict[str, object]]]:
+    payload_uri = "gs://bucket/checkpoints/payload"
+    state = SimpleNamespace(
+        tokens_seen=jnp.asarray(8),
+        step=jnp.asarray(2),
+    )
+    pointer_identities: list[dict[str, object]] = []
+
+    def load_pointer(
+        _root,
+        *,
+        kind,
+        payload_root,
+        run_identity,
+    ):
+        assert kind == "latest"
+        assert payload_root == "gs://bucket/checkpoints"
+        pointer_identities.append(dict(run_identity))
+        return {
+            "payload_uri": payload_uri,
+            "tokens_seen": 8,
+            "step": 2,
+        }
+
+    def decide(_operation: str, error: Exception | None) -> None:
+        if error is not None:
+            raise error
+
+    monkeypatch.setattr(
+        distributed_module,
+        "_collective_load_pointer",
+        load_pointer,
+    )
+    monkeypatch.setattr(
+        distributed_module,
+        "_collectively_require_finalized_checkpoint",
+        lambda _uri: None,
+    )
+    monkeypatch.setattr(
+        distributed_module,
+        "_restore_distributed_payload",
+        lambda *_args: (state, dict(metadata)),
+    )
+    monkeypatch.setattr(
+        distributed_module,
+        "_checkpoint_phase_decision",
+        decide,
+    )
+    return state, pointer_identities
+
+
+def test_restore_uses_full_pointer_identity_and_explicit_payload_subset(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    run_identity = {
+        "condition": "A",
+        "seed": 0,
+        "run_identity_sha256": "a" * 64,
+    }
+    metadata_identity = {"run_identity_sha256": "a" * 64}
+    expected, pointer_identities = _stub_distributed_checkpoint_restore(
+        monkeypatch,
+        metadata={
+            **metadata_identity,
+            "checkpoint_payload_uri": "gs://bucket/checkpoints/payload",
+            "tokens_seen": 8,
+            "steps": 2,
+        },
+    )
+
+    restored, _ = restore_distributed_checkpoint(
+        tmp_path / "latest.json",
+        object(),  # type: ignore[arg-type]
+        object(),  # type: ignore[arg-type]
+        object(),  # type: ignore[arg-type]
+        checkpoint_payload_root="gs://bucket/checkpoints",
+        checkpoint_identity=run_identity,
+        checkpoint_metadata_identity=metadata_identity,
+    )
+
+    assert restored is expected
+    assert pointer_identities == [run_identity]
+
+
+def test_restore_rejects_wrong_payload_identity_hash(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    run_identity = {
+        "condition": "A",
+        "run_identity_sha256": "a" * 64,
+    }
+    _stub_distributed_checkpoint_restore(
+        monkeypatch,
+        metadata={
+            "run_identity_sha256": "b" * 64,
+            "checkpoint_payload_uri": "gs://bucket/checkpoints/payload",
+            "tokens_seen": 8,
+            "steps": 2,
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="different run"):
+        restore_distributed_checkpoint(
+            tmp_path / "latest.json",
+            object(),  # type: ignore[arg-type]
+            object(),  # type: ignore[arg-type]
+            object(),  # type: ignore[arg-type]
+            checkpoint_payload_root="gs://bucket/checkpoints",
+            checkpoint_identity=run_identity,
+            checkpoint_metadata_identity={"run_identity_sha256": "a" * 64},
+        )
+
+
+def test_restore_defaults_payload_validation_to_full_pointer_identity(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    run_identity = {
+        "condition": "A",
+        "run_identity_sha256": "a" * 64,
+    }
+    _stub_distributed_checkpoint_restore(
+        monkeypatch,
+        metadata={
+            **run_identity,
+            "checkpoint_payload_uri": "gs://bucket/checkpoints/payload",
+            "tokens_seen": 8,
+            "steps": 2,
+        },
+    )
+
+    restore_distributed_checkpoint(
+        tmp_path / "latest.json",
+        object(),  # type: ignore[arg-type]
+        object(),  # type: ignore[arg-type]
+        object(),  # type: ignore[arg-type]
+        checkpoint_payload_root="gs://bucket/checkpoints",
+        checkpoint_identity=run_identity,
+    )
+
+    _stub_distributed_checkpoint_restore(
+        monkeypatch,
+        metadata={
+            "run_identity_sha256": "a" * 64,
+            "checkpoint_payload_uri": "gs://bucket/checkpoints/payload",
+            "tokens_seen": 8,
+            "steps": 2,
+        },
+    )
+    with pytest.raises(RuntimeError, match="different run"):
+        restore_distributed_checkpoint(
+            tmp_path / "latest.json",
+            object(),  # type: ignore[arg-type]
+            object(),  # type: ignore[arg-type]
+            object(),  # type: ignore[arg-type]
+            checkpoint_payload_root="gs://bucket/checkpoints",
+            checkpoint_identity=run_identity,
+        )
+
+
+@pytest.mark.parametrize(
+    "metadata_identity",
+    [
+        {},
+        {"missing": "value"},
+        {"run_identity_sha256": "b" * 64},
+    ],
+)
+def test_restore_rejects_invalid_explicit_payload_identity_subset(
+    metadata_identity: dict[str, object],
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="metadata identity"):
+        restore_distributed_checkpoint(
+            tmp_path / "latest.json",
+            object(),  # type: ignore[arg-type]
+            object(),  # type: ignore[arg-type]
+            object(),  # type: ignore[arg-type]
+            checkpoint_payload_root="gs://bucket/checkpoints",
+            checkpoint_identity={"run_identity_sha256": "a" * 64},
+            checkpoint_metadata_identity=metadata_identity,
+        )
+
+
 def test_evaluation_restores_training_capacity_then_uses_eval_capacity(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

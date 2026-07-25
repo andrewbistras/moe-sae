@@ -589,6 +589,11 @@ def run(args: argparse.Namespace) -> int:
         q_training_config,
         checkpoint_payload_root=args.checkpoint_payload_root,
         checkpoint_identity=runs["Q"][0]["run_identity"],
+        checkpoint_metadata_identity={
+            "run_identity_sha256": runs["Q"][0]["run_identity"][
+                "run_identity_sha256"
+            ]
+        },
     )
     q_result = evaluate_shared_q_input(
         q_state.params,
@@ -683,6 +688,11 @@ def run(args: argparse.Namespace) -> int:
             train_config,
             checkpoint_payload_root=args.checkpoint_payload_root,
             checkpoint_identity=runs[condition][0]["run_identity"],
+            checkpoint_metadata_identity={
+                "run_identity_sha256": runs[condition][0]["run_identity"][
+                    "run_identity_sha256"
+                ]
+            },
         )
         row_refs: list[ScoreArtifactRef] = []
 

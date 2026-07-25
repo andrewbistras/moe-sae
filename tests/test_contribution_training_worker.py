@@ -849,6 +849,54 @@ def test_checkpoint_receipt_paths_are_identical_on_every_process(
     )
 
 
+def test_orbax_restore_binds_full_pointer_and_hash_only_payload_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import moe_sae.distributed as distributed_module
+
+    control_root = tmp_path / "control"
+    control_root.mkdir()
+    (control_root / "latest.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        training_worker_module,
+        "_collective_records",
+        lambda record: [record],
+    )
+    observed: dict[str, Any] = {}
+    restored_state = object()
+
+    def restore(*args, **kwargs):
+        observed["args"] = args
+        observed["kwargs"] = kwargs
+        return restored_state, {"timing": {}}
+
+    monkeypatch.setattr(
+        distributed_module,
+        "restore_distributed_checkpoint",
+        restore,
+    )
+    backend = training_worker_module._OrbaxCheckpointBackend(
+        control_root=control_root,
+        payload_root=str(tmp_path / "payloads"),
+        mesh=object(),
+        training_config=object(),
+    )
+    run_identity = {
+        "condition": "A",
+        "run_identity_sha256": "a" * 64,
+    }
+
+    restored = backend.restore(object(), run_identity)
+
+    assert restored is not None
+    assert restored.state is restored_state
+    assert observed["kwargs"]["checkpoint_identity"] == run_identity
+    assert observed["kwargs"]["checkpoint_metadata_identity"] == {
+        "run_identity_sha256": "a" * 64
+    }
+
+
 def test_bounded_direct_training_rejects_more_than_one_hour() -> None:
     with pytest.raises(
         ContributionTrainingWorkerError,
