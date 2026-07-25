@@ -423,7 +423,7 @@ def _qualification_metrics(
     batch_sequences: int,
     sequence_length: int,
 ) -> dict[str, Any]:
-    """Recover the exact measured scalars after a clean admission rejection."""
+    """Recompute exact measured scalars before applying admission ordering."""
 
     observations = [host["observation"] for _, host in checked]
     if len(observations) != 4 or not all(
@@ -507,7 +507,7 @@ def _qualification_metrics(
         "synchronized_measurement_steps": measured_steps,
     }
     if (
-        not 0.0 < useful_mfu < 0.10
+        not 0.0 < useful_mfu <= 1.0
         or any(
             not math.isfinite(float(value))
             for value in metrics.values()
@@ -515,7 +515,7 @@ def _qualification_metrics(
         )
     ):
         raise QualificationDecisionError(
-            "low-MFU admission error is inconsistent with measured metrics"
+            "qualification observations produce invalid measured metrics"
         )
     return metrics
 
@@ -548,6 +548,11 @@ def decide_candidate(args: argparse.Namespace) -> int:
         exit_code = FALLBACK_EXIT
     else:
         sidecar = _identical_recomposition_sidecar(checked)
+        measured_metrics = _qualification_metrics(
+            checked,
+            batch_sequences=args.batch_sequences,
+            sequence_length=args.sequence_length,
+        )
         try:
             bundle = aggregate_supervised_host_evidence(
                 [host for _, host in checked],
@@ -555,26 +560,43 @@ def decide_candidate(args: argparse.Namespace) -> int:
                 sequence_length=args.sequence_length,
             )
         except ContributionPerformanceError as error:
-            reason = str(error)
-            if reason == _LOW_MFU_ADMISSION_MESSAGE:
+            admission_reason = str(error)
+            admission_reason_code = _FALLBACK_ADMISSION_MESSAGES.get(
+                admission_reason,
+                "",
+            )
+            low_mfu_has_precedence = (
+                admission_reason == _LOW_MFU_ADMISSION_MESSAGE
+                or admission_reason_code == "persistence_headroom"
+            )
+            if (
+                measured_metrics["useful_prefix_mfu"] < 0.10
+                and low_mfu_has_precedence
+            ):
+                reason = _LOW_MFU_ADMISSION_MESSAGE
                 reason_code = "useful_mfu_below_hard_gate"
                 outcome = "aborted"
                 exit_code = ABORT_EXIT
-                qualification_metrics = _qualification_metrics(
-                    checked,
-                    batch_sequences=args.batch_sequences,
-                    sequence_length=args.sequence_length,
-                )
+                qualification_metrics = measured_metrics
             else:
-                reason_code = _FALLBACK_ADMISSION_MESSAGES.get(reason, "")
+                reason = admission_reason
+                reason_code = admission_reason_code
             if not reason_code:
                 raise QualificationDecisionError(
                     "qualification admission failed for a non-headroom reason: "
                     f"{reason}"
                 ) from error
-            if reason != _LOW_MFU_ADMISSION_MESSAGE:
+            if outcome != "aborted":
                 outcome = "fallback_allowed"
                 exit_code = FALLBACK_EXIT
+        else:
+            if measured_metrics["useful_prefix_mfu"] < 0.10:
+                bundle = None
+                reason = _LOW_MFU_ADMISSION_MESSAGE
+                reason_code = "useful_mfu_below_hard_gate"
+                outcome = "aborted"
+                exit_code = ABORT_EXIT
+                qualification_metrics = measured_metrics
 
     bundle_sha256: str | None = None
     if bundle is not None:

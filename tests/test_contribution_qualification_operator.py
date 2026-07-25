@@ -334,7 +334,7 @@ def test_only_explicit_admission_messages_allow_fallback(decider) -> None:
     )
 
 
-def test_low_mfu_seals_abort_decision_with_measured_metrics(
+def test_low_mfu_preempts_persistence_fallback_and_seals_measured_abort(
     decider,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -382,15 +382,15 @@ def test_low_mfu_seals_abort_decision_with_measured_metrics(
         lambda _checked: sidecar,
     )
 
-    def reject_low_mfu(*_args, **_kwargs):
+    def reject_persistence_headroom(*_args, **_kwargs):
         raise decider.ContributionPerformanceError(
-            decider._LOW_MFU_ADMISSION_MESSAGE
+            "persisted goodput is below 85% of device output goodput"
         )
 
     monkeypatch.setattr(
         decider,
         "aggregate_supervised_host_evidence",
-        reject_low_mfu,
+        reject_persistence_headroom,
     )
     args = argparse.Namespace(
         candidate_id="b128-ep8-fsdp2",
