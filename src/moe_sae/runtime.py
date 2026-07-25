@@ -7,22 +7,22 @@ the CPU test/training environment while leaving the production path explicit.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor
 import contextlib
-from dataclasses import asdict, dataclass
+import glob
 import hashlib
-from importlib import metadata, resources
 import json
 import math
 import os
-from pathlib import Path
 import platform
 import re
-import glob
 import subprocess
 import sys
 import time
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import asdict, dataclass
+from importlib import metadata, resources
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -493,6 +493,7 @@ def build_maxtext_argv(
         "grain_file_type": "arrayrecord",
         "enable_data_shuffling": "false",
         "per_device_batch_size": per_device_sequence_batch,
+        "eval_per_device_batch_size": per_device_sequence_batch,
         "ici_expert_parallelism": mesh.expert_parallelism,
         "ici_fsdp_parallelism": mesh.fsdp_parallelism,
         "ici_tensor_parallelism": mesh.tensor_parallelism,
@@ -546,11 +547,17 @@ def create_maxtext_runtime(
 
         if not packed_train_files or not packed_eval_files:
             raise ValueError("packed runtime requires exact train and eval file inventories")
+        per_device_sequence_batch = int(config.per_device_batch_size)
+        if per_device_sequence_batch not in PER_DEVICE_SEQUENCE_BATCHES:
+            raise ValueError(
+                "packed runtime per-device sequence batch was not qualified"
+            )
         train_iterator = build_maxtext_packed_iterator(
             packed_train_files,
             config=config,
             mesh=mesh,
             global_batch_size=int(config.global_batch_size_to_load),
+            qualified_per_device_sequence_batch=per_device_sequence_batch,
         )
         eval_batch = int(
             getattr(config, "global_batch_size_to_load_eval", 0)
@@ -561,6 +568,7 @@ def create_maxtext_runtime(
             config=config,
             mesh=mesh,
             global_batch_size=eval_batch,
+            qualified_per_device_sequence_batch=per_device_sequence_batch,
         )
     return MaxTextRuntime(config, mesh, model, train_iterator, eval_iterator)
 

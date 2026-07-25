@@ -716,6 +716,7 @@ def test_qualifier_and_real_harvest_share_one_performance_launch_identity(
         "attention": config.model.attention,
         "max_target_length": 1_024,
         "per_device_batch_size": 8,
+        "eval_per_device_batch_size": 8,
         "ici_expert_parallelism": 8,
         "ici_fsdp_parallelism": 2,
         "ici_tensor_parallelism": 1,

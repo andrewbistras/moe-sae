@@ -232,6 +232,7 @@ def _runtime() -> SimpleNamespace:
         "weight_dtype": "bfloat16",
         "max_target_length": 1_024,
         "per_device_batch_size": 1,
+        "eval_per_device_batch_size": 1,
         "ici_expert_parallelism": 16,
         "ici_fsdp_parallelism": 1,
         "ici_tensor_parallelism": 1,

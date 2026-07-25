@@ -1,20 +1,24 @@
+import sys
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
 
 import numpy as np
 import pytest
 
+import moe_sae.data as data_module
 from moe_sae.runtime import (
-    BenchmarkObservation,
     HARVEST_MESHES,
+    BenchmarkObservation,
     _staged_path_accessible,
     build_maxtext_argv,
     choose_harvest_benchmark,
     compact_capture,
+    create_maxtext_runtime,
     environment_fingerprint,
     estimate_useful_prefix_flops,
     immutable_range_id,
-    scientific_token_mask,
     scan_token_shaped_secrets,
+    scientific_token_mask,
     token_quota,
     updates_for_tokens,
 )
@@ -89,7 +93,73 @@ def test_maxtext_argv_locks_scientific_capture_settings():
     assert "use_multimodal=false" in joined
     assert "load_balance_loss_weight=0" in joined
     assert "use_ragged_sort=true" in joined
+    assert "eval_per_device_batch_size=2" in joined
     assert "ici_expert_parallelism=16" in joined
+
+
+def test_packed_runtime_forwards_exact_qualified_b128_contract(
+    monkeypatch,
+) -> None:
+    config = SimpleNamespace(
+        mesh_axes=("expert", "fsdp", "tensor"),
+        per_device_batch_size=8,
+        eval_per_device_batch_size=8,
+        global_batch_size_to_load=128,
+        global_batch_size_to_load_eval=128,
+    )
+    mesh = object()
+    model = object()
+
+    jax = ModuleType("jax")
+    jax.sharding = SimpleNamespace(Mesh=lambda _devices, _axes: mesh)
+    common_types = ModuleType("maxtext.common.common_types")
+    common_types.MODEL_MODE_TRAIN = "train"
+    pyconfig = SimpleNamespace(initialize=lambda _argv: config)
+    configs = ModuleType("maxtext.configs")
+    configs.pyconfig = pyconfig
+    input_interface = SimpleNamespace(
+        create_data_iterator=lambda _config, _mesh: (None, None)
+    )
+    input_pipeline = ModuleType("maxtext.input_pipeline")
+    input_pipeline.input_pipeline_interface = input_interface
+    maxtext_utils = SimpleNamespace(create_device_mesh=lambda _config: object())
+    model_creation_utils = SimpleNamespace(
+        from_pretrained=lambda _config, **_kwargs: model
+    )
+    utils = ModuleType("maxtext.utils")
+    utils.maxtext_utils = maxtext_utils
+    utils.model_creation_utils = model_creation_utils
+    packages = {
+        "jax": jax,
+        "maxtext": ModuleType("maxtext"),
+        "maxtext.common": ModuleType("maxtext.common"),
+        "maxtext.common.common_types": common_types,
+        "maxtext.configs": configs,
+        "maxtext.input_pipeline": input_pipeline,
+        "maxtext.utils": utils,
+    }
+    for name, value in packages.items():
+        monkeypatch.setitem(sys.modules, name, value)
+
+    calls = []
+
+    def build(files, **kwargs):
+        calls.append((tuple(files), kwargs))
+        return object()
+
+    monkeypatch.setattr(data_module, "build_maxtext_packed_iterator", build)
+    runtime = create_maxtext_runtime(
+        ("base.yml",),
+        packed_train_files=("train-0",),
+        packed_eval_files=("eval-0",),
+    )
+
+    assert runtime.model is model
+    assert [call[0] for call in calls] == [("train-0",), ("eval-0",)]
+    assert [call[1]["global_batch_size"] for call in calls] == [128, 128]
+    assert [
+        call[1]["qualified_per_device_sequence_batch"] for call in calls
+    ] == [8, 8]
 
 
 def test_exact_host_quota_and_immutable_ids():

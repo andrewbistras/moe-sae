@@ -82,6 +82,7 @@ def test_contribution_argv_accepts_b128_and_keeps_route_optimizations(
     )
     assert "use_ragged_sort=true" in argv
     assert "per_device_batch_size=8" in argv
+    assert "eval_per_device_batch_size=8" in argv
     assert f"attention={config.model.attention}" in argv
     assert "run_name=gemma4-contribution-v1" in argv
     assert f"jax_cache_dir={tmp_path / 'jax-cache'}" in argv
@@ -104,6 +105,7 @@ def test_effective_runtime_rejects_attention_drift() -> None:
         matmul_precision="default",
         max_target_length=config.model.sequence_length,
         per_device_batch_size=8,
+        eval_per_device_batch_size=8,
         ici_expert_parallelism=_MESH.expert_parallelism,
         ici_fsdp_parallelism=_MESH.fsdp_parallelism,
         ici_tensor_parallelism=_MESH.tensor_parallelism,
@@ -120,7 +122,18 @@ def test_effective_runtime_rejects_attention_drift() -> None:
         per_device_sequence_batch=8,
     )
     assert manifest["attention"] == config.model.attention
+    assert manifest["eval_per_device_batch_size"] == 8
 
+    runtime_config.eval_per_device_batch_size = 4
+    with pytest.raises(ContributionMaxTextError, match="eval_per_device_batch_size"):
+        effective_performance_runtime_manifest(
+            runtime_config,
+            runtime_mesh,
+            config=config,
+            mesh=_MESH,
+            per_device_sequence_batch=8,
+        )
+    runtime_config.eval_per_device_batch_size = 8
     runtime_config.attention = "dot_product"
     with pytest.raises(ContributionMaxTextError, match="attention"):
         effective_performance_runtime_manifest(

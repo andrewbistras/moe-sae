@@ -1,15 +1,16 @@
 import gzip
 import hashlib
 import json
-from pathlib import Path
 import struct
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 import moe_sae.data as data_module
+from moe_sae.config import MODEL_ID, MODEL_REVISION
 from moe_sae.data import (
     ALLENAI_C4_REPO_ID,
     ALLENAI_C4_REVISION,
@@ -20,10 +21,11 @@ from moe_sae.data import (
     GEMMA4_TOKENIZER_SOURCE_FILES,
     PACKED_DATASET_SCHEMA,
     PACKED_RECORD_FORMAT,
+    STAGED_PER_DEVICE_SEQUENCE_BATCHES,
     OrderedPacker,
     PackedBatchIterable,
-    StagingError,
     SourceFile,
+    StagingError,
     allenai_c4_stream,
     decode_packed_record,
     encode_packed_record,
@@ -33,10 +35,8 @@ from moe_sae.data import (
     stage_c4_split,
     verify_packed_source,
 )
-from moe_sae.object_store import LocalObjectStore, parse_gcs_uri
 from moe_sae.model import HuggingFaceRepoFile
-from moe_sae.config import MODEL_ID, MODEL_REVISION
-
+from moe_sae.object_store import LocalObjectStore, parse_gcs_uri
 
 TOKENIZER_ID = "google/gemma-4-26B-A4B"
 TOKENIZER_REVISION = "a" * 40
@@ -537,6 +537,7 @@ def test_sealed_stage_rejects_aggregate_or_shard_corruption(tmp_path):
 def test_fixed_host_reader_order_is_independent_of_candidate_batch_size(tmp_path):
     result = _stage(tmp_path, target=220)
     files = _files(result)
+    candidate_batches = []
     leading_rows = []
     for global_batch_size in (16, 32, 64):
         batch = next(
@@ -555,10 +556,37 @@ def test_fixed_host_reader_order_is_independent_of_candidate_batch_size(tmp_path
             "inputs_position",
             "inputs_segmentation",
         }
+        candidate_batches.append(batch)
         leading_rows.append(batch["inputs"][:4])
+    qualified = list(
+        PackedBatchIterable(
+            files,
+            global_batch_size=128,
+            process_index=2,
+            process_count=4,
+            sequence_length=16,
+            qualified_per_device_sequence_batch=8,
+        )
+    )
+    assert len(qualified) == 1
+    assert qualified[0]["inputs"].shape == (32, 16)
+    assert qualified[0]["inputs_position"].shape == (32, 16)
+    assert qualified[0]["inputs_segmentation"].shape == (32, 16)
+    for name in ("inputs", "inputs_position", "inputs_segmentation"):
+        np.testing.assert_array_equal(
+            qualified[0][name][:16],
+            candidate_batches[-1][name],
+        )
+    leading_rows.append(qualified[0]["inputs"][:4])
     for rows in leading_rows[1:]:
         np.testing.assert_array_equal(rows, leading_rows[0])
     assert leading_rows[0][:, 1].tolist() == [12, 16, 20, 24]
+    assert not np.any(qualified[0]["inputs"][16:])
+    assert not np.any(qualified[0]["inputs_position"][16:])
+    assert not np.any(qualified[0]["inputs_segmentation"][16:])
+    assert _manifest(result)["consumer"]["per_device_sequence_batches"] == list(
+        STAGED_PER_DEVICE_SEQUENCE_BATCHES
+    )
 
     with pytest.raises(ValueError, match="qualified per-device"):
         PackedBatchIterable(
@@ -567,6 +595,50 @@ def test_fixed_host_reader_order_is_independent_of_candidate_batch_size(tmp_path
             process_index=0,
             process_count=4,
             sequence_length=16,
+        )
+    with pytest.raises(ValueError, match="qualified per-device"):
+        PackedBatchIterable(
+            files,
+            global_batch_size=128,
+            process_index=0,
+            process_count=4,
+            sequence_length=16,
+        )
+
+
+def test_qualified_b128_reader_keeps_a_full_immutable_lane(tmp_path):
+    result = _stage(
+        tmp_path,
+        target=900,
+        document_count=128,
+    )
+    assert _manifest(result)["record_count"] == 128
+    qualified = list(
+        PackedBatchIterable(
+            _files(result),
+            global_batch_size=128,
+            process_index=3,
+            process_count=4,
+            sequence_length=16,
+            qualified_per_device_sequence_batch=8,
+        )
+    )
+    staged = list(
+        PackedBatchIterable(
+            _files(result),
+            global_batch_size=64,
+            process_index=3,
+            process_count=4,
+            sequence_length=16,
+        )
+    )
+    assert len(qualified) == 1
+    assert qualified[0]["inputs"].shape == (32, 16)
+    assert len(staged) == 2
+    for name in ("inputs", "inputs_position", "inputs_segmentation"):
+        np.testing.assert_array_equal(
+            qualified[0][name],
+            np.concatenate([batch[name] for batch in staged]),
         )
 
 
