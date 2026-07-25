@@ -891,6 +891,11 @@ def initialize_attempt(args: argparse.Namespace) -> int:
         raise OperatorError(
             f"immutable attempt ID already exists: {args.attempt_id}"
         ) from error
+    for controller_index in range(PROCESS_COUNT):
+        (attempt_root / f"controller-c{controller_index:05d}").mkdir(
+            mode=0o700,
+            exist_ok=False,
+        )
     _atomic_create(attempt_root / "operator-plan.json", plan)
     print(plan["operator_plan_sha256"], flush=True)
     return 0

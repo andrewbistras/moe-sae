@@ -267,8 +267,23 @@ def test_four_host_commands_share_identity_but_use_private_paths(
 def test_attempt_plan_binds_qualification_and_is_create_only(
     operator,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     args = _attempt_args(operator, tmp_path)
+    controller_roots = [
+        Path(args.attempt_root) / f"controller-c{controller_index:05d}"
+        for controller_index in range(4)
+    ]
+    atomic_create = operator._atomic_create
+
+    def observe_plan_publication(path, value):
+        assert path == Path(args.attempt_root) / "operator-plan.json"
+        assert all(
+            root.is_dir() and not root.is_symlink() for root in controller_roots
+        )
+        atomic_create(path, value)
+
+    monkeypatch.setattr(operator, "_atomic_create", observe_plan_publication)
     assert operator.initialize_attempt(args) == 0
     plan_path = Path(args.attempt_root) / "operator-plan.json"
     plan = json.loads(plan_path.read_text(encoding="utf-8"))
@@ -279,6 +294,15 @@ def test_attempt_plan_binds_qualification_and_is_create_only(
     assert plan["global_sequence_batch"] == 128
     assert plan["process_count"] == 4
     assert plan["progress_authority"].endswith("never_bucket_listing")
+    assert all(
+        root.is_dir() and not root.is_symlink() for root in controller_roots
+    )
+    assert [path.name for path in controller_roots] == [
+        "controller-c00000",
+        "controller-c00001",
+        "controller-c00002",
+        "controller-c00003",
+    ]
     with pytest.raises(operator.OperatorError, match="already exists"):
         operator.initialize_attempt(args)
 
