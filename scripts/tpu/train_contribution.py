@@ -1153,6 +1153,116 @@ def _fanout(
             handle.close()
 
 
+def _terminal_worker_status(
+    log_path: Path,
+    *,
+    settings: Settings,
+    stage: str,
+    controller_index: int,
+    process_index: int,
+) -> int:
+    """Read one exact remote worker terminal marker from an SSH log.
+
+    ``gcloud ... ssh`` can return nonzero after the remote shell has already
+    completed successfully.  The remote command prints its marker only after
+    the stage's required immutable evidence exists, so the marker—not the
+    later local transport teardown—is the workload completion authority.
+    """
+
+    if stage == "prefetch":
+        marker_start = b"terminal prefetch "
+        expected_prefix = (
+            f"terminal prefetch controller={controller_index} "
+            f"process={process_index} status="
+        ).encode("ascii")
+    elif stage == "action":
+        marker_start = b"terminal action="
+        expected_prefix = (
+            f"terminal action={settings.action} "
+            f"controller={controller_index} process={process_index} status="
+        ).encode("ascii")
+    else:
+        raise OperatorError(f"unknown terminal-marker stage {stage!r}")
+
+    try:
+        lines = log_path.read_bytes().splitlines()
+    except OSError as error:
+        raise OperatorError(
+            f"cannot read controller {controller_index} {stage} SSH log: "
+            f"{log_path}"
+        ) from error
+    marker_lines = [line for line in lines if line.startswith(marker_start)]
+    if len(marker_lines) != 1:
+        raise OperatorError(
+            f"controller {controller_index} {stage} SSH log has "
+            f"{len(marker_lines)} terminal markers; exactly one is required"
+        )
+    marker = marker_lines[0]
+    if not marker.startswith(expected_prefix):
+        raise OperatorError(
+            f"controller {controller_index} {stage} SSH terminal marker "
+            "does not match the exact action/controller/process"
+        )
+    raw_status = marker[len(expected_prefix) :]
+    if re.fullmatch(rb"(?:0|[1-9][0-9]{0,2})", raw_status) is None:
+        raise OperatorError(
+            f"controller {controller_index} {stage} SSH terminal marker "
+            "has an invalid worker status"
+        )
+    status = int(raw_status)
+    if status > 255:
+        raise OperatorError(
+            f"controller {controller_index} {stage} SSH terminal marker "
+            "status is outside the shell exit-code range"
+        )
+    return status
+
+
+def _validated_fanout_completion(
+    *,
+    settings: Settings,
+    mapping: Mapping[int, int],
+    stage: str,
+    returncodes: Sequence[int],
+    log_paths: Sequence[Path],
+) -> list[int]:
+    """Require four exact remote completions before advancing a stage."""
+
+    if (
+        len(mapping) != PROCESS_COUNT
+        or len(returncodes) != PROCESS_COUNT
+        or len(log_paths) != PROCESS_COUNT
+        or set(mapping) != set(range(PROCESS_COUNT))
+        or set(mapping.values()) != set(range(PROCESS_COUNT))
+    ):
+        raise OperatorError(
+            f"{stage} completion requires one exact four-controller/process "
+            "permutation and exactly four codes and logs"
+        )
+    statuses = [
+        _terminal_worker_status(
+            log_path,
+            settings=settings,
+            stage=stage,
+            controller_index=controller_index,
+            process_index=process_index,
+        )
+        for (controller_index, process_index), log_path in zip(
+            mapping.items(),
+            log_paths,
+            strict=True,
+        )
+    ]
+    if any(int(code) != 0 for code in returncodes):
+        print(
+            "[exp2-sae] local gcloud transport returned nonzero codes "
+            f"{list(returncodes)} after all four exact {stage} terminal "
+            "markers; using the bound remote worker statuses",
+            flush=True,
+        )
+    return statuses
+
+
 def _dry_run(settings: Settings) -> int:
     payload = {
         "action": settings.action,
@@ -1218,6 +1328,11 @@ def run(settings: Settings) -> int:
         ),
         flush=True,
     )
+    prefetch_logs = [
+        settings.local_log_root
+        / f"prefetch-c{controller:05d}-p{process:05d}.ssh.log"
+        for controller, process in mapping.items()
+    ]
     prefetch_codes = _fanout(
         [
             _prefetch_command(
@@ -1227,18 +1342,22 @@ def run(settings: Settings) -> int:
             )
             for controller, process in mapping.items()
         ],
-        [
-            settings.local_log_root
-            / f"prefetch-c{controller:05d}-p{process:05d}.ssh.log"
-            for controller, process in mapping.items()
-        ],
+        prefetch_logs,
         maximum_wait_seconds=PREFETCH_TRANSPORT_WAIT_SECONDS,
         stage="prefetch",
     )
-    if any(code != 0 for code in prefetch_codes):
+    prefetch_statuses = _validated_fanout_completion(
+        settings=settings,
+        mapping=mapping,
+        stage="prefetch",
+        returncodes=prefetch_codes,
+        log_paths=prefetch_logs,
+    )
+    if any(status != 0 for status in prefetch_statuses):
         raise OperatorError(
             "one or more mapped lane prefetches failed "
-            f"(codes={prefetch_codes}); accelerator work was not launched; "
+            f"(statuses={prefetch_statuses}); accelerator work was not "
+            "launched; "
             f"inspect {settings.local_log_root}"
         )
 
@@ -1251,6 +1370,14 @@ def run(settings: Settings) -> int:
         f"[exp2-sae] launching four mapped {settings.action} workers concurrently",
         flush=True,
     )
+    action_logs = [
+        settings.local_log_root
+        / (
+            f"{settings.action}-c{controller:05d}-"
+            f"p{process:05d}.ssh.log"
+        )
+        for controller, process in mapping.items()
+    ]
     action_codes = _fanout(
         [
             _action_command(
@@ -1260,22 +1387,22 @@ def run(settings: Settings) -> int:
             )
             for controller, process in mapping.items()
         ],
-        [
-            settings.local_log_root
-            / (
-                f"{settings.action}-c{controller:05d}-"
-                f"p{process:05d}.ssh.log"
-            )
-            for controller, process in mapping.items()
-        ],
+        action_logs,
         maximum_wait_seconds=action_wait,
         stage=settings.action,
     )
-    if any(code != 0 for code in action_codes):
+    action_statuses = _validated_fanout_completion(
+        settings=settings,
+        mapping=mapping,
+        stage="action",
+        returncodes=action_codes,
+        log_paths=action_logs,
+    )
+    if any(status != 0 for status in action_statuses):
         raise OperatorError(
             f"one or more mapped {settings.action} workers failed "
-            f"(codes={action_codes}); inspect {settings.local_log_root} "
-            f"and {settings.attempt_root}"
+            f"(statuses={action_statuses}); inspect "
+            f"{settings.local_log_root} and {settings.attempt_root}"
         )
     terminal = (
         settings.selection_path

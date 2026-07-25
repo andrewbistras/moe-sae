@@ -524,12 +524,188 @@ def test_prefetch_failure_never_launches_accelerator_action(
     monkeypatch.setattr(operator, "_run_capture", lambda *_args: completed)
     stages: list[str] = []
 
-    def fanout(_commands, _logs, *, maximum_wait_seconds, stage):
+    def fanout(_commands, logs, *, maximum_wait_seconds, stage):
         del maximum_wait_seconds
         stages.append(stage)
-        return [0, 1, 0, 0]
+        assert stage == "prefetch"
+        statuses = [0, 1, 0, 0]
+        mapping = [(0, 2), (1, 0), (2, 3), (3, 1)]
+        for log, (controller, process), status in zip(
+            logs,
+            mapping,
+            statuses,
+            strict=True,
+        ):
+            log.write_text(
+                f"terminal prefetch controller={controller} "
+                f"process={process} status={status}\n",
+                encoding="utf-8",
+            )
+        return [1, 1, 1, 1]
 
     monkeypatch.setattr(operator, "_fanout", fanout)
     with pytest.raises(operator.OperatorError, match="prefetches failed"):
         operator.run(settings)
     assert stages == ["prefetch"]
+
+
+def test_nonzero_gcloud_transport_accepts_exact_bound_worker_markers(
+    operator,
+    tmp_path: Path,
+) -> None:
+    settings = _settings(operator, tmp_path, action="train")
+    mapping = {0: 2, 1: 0, 2: 3, 3: 1}
+    prefetch_logs = []
+    action_logs = []
+    for controller, process in mapping.items():
+        prefetch = tmp_path / f"prefetch-{controller}.log"
+        prefetch.write_text(
+            f"transport diagnostic\nterminal prefetch "
+            f"controller={controller} process={process} status=0\n",
+            encoding="utf-8",
+        )
+        prefetch_logs.append(prefetch)
+        action = tmp_path / f"action-{controller}.log"
+        action.write_text(
+            f"terminal action=train controller={controller} "
+            f"process={process} status=0\n",
+            encoding="utf-8",
+        )
+        action_logs.append(action)
+
+    assert operator._validated_fanout_completion(
+        settings=settings,
+        mapping=mapping,
+        stage="prefetch",
+        returncodes=[1, 1, 1, 1],
+        log_paths=prefetch_logs,
+    ) == [0, 0, 0, 0]
+    assert operator._validated_fanout_completion(
+        settings=settings,
+        mapping=mapping,
+        stage="action",
+        returncodes=[1, 1, 1, 1],
+        log_paths=action_logs,
+    ) == [0, 0, 0, 0]
+
+
+def test_worker_terminal_marker_is_exactly_bound_and_unique(
+    operator,
+    tmp_path: Path,
+) -> None:
+    settings = _settings(operator, tmp_path, action="train")
+    log = tmp_path / "worker.log"
+    log.write_text(
+        "terminal prefetch controller=0 process=2 status=0\n"
+        "terminal prefetch controller=0 process=2 status=0\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(operator.OperatorError, match="exactly one"):
+        operator._terminal_worker_status(
+            log,
+            settings=settings,
+            stage="prefetch",
+            controller_index=0,
+            process_index=2,
+        )
+
+    log.write_text(
+        "terminal action=train controller=0 process=3 status=0\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(operator.OperatorError, match="does not match"):
+        operator._terminal_worker_status(
+            log,
+            settings=settings,
+            stage="action",
+            controller_index=0,
+            process_index=2,
+        )
+
+
+@pytest.mark.parametrize("status", ["", "-1", "00", "256", "0 trailing"])
+def test_worker_terminal_marker_rejects_noncanonical_status(
+    operator,
+    tmp_path: Path,
+    status: str,
+) -> None:
+    settings = _settings(operator, tmp_path, action="train")
+    log = tmp_path / "worker.log"
+    log.write_text(
+        f"terminal action=train controller=0 process=2 status={status}\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(operator.OperatorError, match="worker status|range"):
+        operator._terminal_worker_status(
+            log,
+            settings=settings,
+            stage="action",
+            controller_index=0,
+            process_index=2,
+        )
+
+
+def test_run_uses_exact_remote_status_after_transport_teardown(
+    operator,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(
+        operator,
+        tmp_path,
+        action="train",
+        maximum_runtime_seconds=600,
+    )
+    mapping = {0: 2, 1: 0, 2: 3, 3: 1}
+    plan_body = {
+        "schema_version": operator.ATTEMPT_PLAN_SCHEMA_VERSION,
+        "action": settings.action,
+        "attempt_id": settings.attempt_id,
+        "attempt_root": settings.attempt_root,
+        "run_root": settings.run_root,
+        "run_contract_sha256": "a" * 64,
+        "admission_mode": operator.DIRECT_BOUNDED_ADMISSION,
+        "controller_to_jax_process_index": [
+            {"controller_index": controller, "process_index": process}
+            for controller, process in mapping.items()
+        ],
+        "maximum_runtime_seconds": 600,
+        "qualification_hard_deadline_seconds": 600,
+        "prefetch_hard_deadline_seconds": 600,
+        "terminal_policy": (
+            "four_mapped_prefetches_then_four_concurrent_supervised_workers"
+        ),
+    }
+    plan = {
+        **plan_body,
+        "attempt_plan_sha256": canonical_sha256(plan_body),
+    }
+    completed = subprocess.CompletedProcess(
+        args=["gcloud"],
+        returncode=0,
+        stdout=(json.dumps(plan) + "\n").encode("utf-8"),
+    )
+    monkeypatch.setattr(operator.shutil, "which", lambda _name: "/bin/gcloud")
+    monkeypatch.setattr(operator, "_verify_local_checkout", lambda _settings: None)
+    monkeypatch.setattr(operator, "_run_capture", lambda *_args: completed)
+    stages = []
+
+    def fanout(_commands, logs, *, maximum_wait_seconds, stage):
+        del maximum_wait_seconds
+        stages.append(stage)
+        marker_stage = "prefetch" if stage == "prefetch" else "action=train"
+        for log, (controller, process) in zip(
+            logs,
+            mapping.items(),
+            strict=True,
+        ):
+            log.write_text(
+                f"terminal {marker_stage} controller={controller} "
+                f"process={process} status=0\n",
+                encoding="utf-8",
+            )
+        return [1, 1, 1, 1]
+
+    monkeypatch.setattr(operator, "_fanout", fanout)
+    assert operator.run(settings) == 0
+    assert stages == ["prefetch", "train"]
