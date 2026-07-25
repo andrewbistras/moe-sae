@@ -1,9 +1,10 @@
-"""Standalone qualified training worker for Experiment-2 SAEs.
+"""Standalone bounded or qualified training worker for Experiment-2 SAEs.
 
 This module is intentionally independent of :mod:`moe_sae.cli`.  It owns the
 small operational boundary which the scientific trainers do not:
 
-* qualify both resident-forward and rematerialized-microbatch executables;
+* run the fixed resident executable directly under a <=600-second deadline;
+* optionally qualify resident and rematerialized executables for longer runs;
 * bind the faster passing executable to an exact graph/hardware/config receipt;
 * refuse accelerator work beyond 600 seconds without that >=3% receipt; and
 * advance a sealed v2 input stream and immutable checkpoint pointers in exact
@@ -57,7 +58,7 @@ TRAINING_MODE_SELECTION_SCHEMA_VERSION = (
     "gemma4-contribution-sae-mode-selection-v1"
 )
 TRAINING_RUN_IDENTITY_SCHEMA_VERSION = (
-    "gemma4-contribution-sae-run-identity-v1"
+    "gemma4-contribution-sae-run-identity-v2"
 )
 TRAINING_RESULT_SCHEMA_VERSION = "gemma4-contribution-sae-training-result-v1"
 TRAINING_EXECUTION_CONFIG_SCHEMA_VERSION = (
@@ -678,10 +679,29 @@ def _metric_record(value: Mapping[str, Any], *, expected_l0: int) -> dict[str, A
 def _run_identity(
     plan: TrainingWorkerPlan,
     *,
-    selection_sha256: str,
     identity: ExactPerformanceIdentity,
     mode: InputMode,
+    admission_basis: str,
+    admission_evidence_sha256: str | None,
 ) -> dict[str, Any]:
+    if admission_basis not in {
+        "qualified_exact_identity",
+        "bounded_ungated_resident",
+    }:
+        raise ContributionTrainingWorkerError(
+            "training run admission basis is invalid"
+        )
+    if admission_evidence_sha256 is not None:
+        _sha256(
+            "admission evidence SHA-256",
+            admission_evidence_sha256,
+        )
+    if (
+        admission_basis == "qualified_exact_identity"
+    ) != (admission_evidence_sha256 is not None):
+        raise ContributionTrainingWorkerError(
+            "training run admission evidence is inconsistent"
+        )
     unsigned = {
         "schema_version": TRAINING_RUN_IDENTITY_SCHEMA_VERSION,
         "plan": {
@@ -691,10 +711,10 @@ def _run_identity(
         "input_mode": mode,
         "performance_identity": identity.to_dict(),
         "performance_identity_sha256": identity.identity_sha256,
-        "mode_selection_sha256": _sha256(
-            "mode selection SHA-256",
-            selection_sha256,
-        ),
+        "admission": {
+            "basis": admission_basis,
+            "evidence_sha256": admission_evidence_sha256,
+        },
     }
     return {
         **unsigned,
@@ -706,18 +726,24 @@ def run_qualified_training(
     plan: TrainingWorkerPlan,
     source: TrainingSource,
     mean: Any,
-    selection: Mapping[str, Any],
+    selection: Mapping[str, Any] | None,
     dependencies: TrainingLoopDependencies,
     *,
     expected_l0: int,
     maximum_runtime_seconds: int,
     metric_sink: Callable[[Mapping[str, Any]], None] | None = None,
+    direct_bounded_resident: bool = False,
 ) -> dict[str, Any]:
-    """Run or resume one exact fixed-order condition after admission.
+    """Run or resume one exact fixed-order condition.
 
     Checkpoint callbacks receive the complete run identity and cumulative
     timing.  They must publish immutable payloads before changing a mutable
     ``latest`` pointer.  The core never infers progress from payload listings.
+
+    ``direct_bounded_resident`` deliberately bypasses mode benchmarking and
+    receipt admission only while the complete child is hard-limited to at
+    most 600 seconds.  It still derives the checkpoint identity from the
+    actually lowered resident StableHLO/hardware/config tuple.
     """
 
     if source.total_tokens != plan.total_tokens:
@@ -730,18 +756,64 @@ def run_qualified_training(
         )
     _positive_int("expected_l0", expected_l0)
     maximum = _positive_int("maximum_runtime_seconds", maximum_runtime_seconds)
-    mode, receipt_identity, receipt = chosen_mode_evidence(selection)
-    checked_selection = validate_training_mode_selection(selection)
+    if direct_bounded_resident:
+        if maximum > MAX_QUALIFICATION_SECONDS:
+            raise ContributionTrainingWorkerError(
+                "direct resident training cannot exceed 600 seconds"
+            )
+        if selection is not None:
+            raise ContributionTrainingWorkerError(
+                "direct resident training must not receive a mode selection"
+            )
+        mode: InputMode = "resident"
+        receipt_identity: ExactPerformanceIdentity | None = None
+        receipt: dict[str, Any] | None = None
+        admission_basis = "bounded_ungated_resident"
+        admission_evidence_sha256 = None
+    else:
+        if selection is None:
+            raise ContributionTrainingWorkerError(
+                "qualified training requires a mode selection"
+            )
+        mode, receipt_identity, receipt = chosen_mode_evidence(selection)
+        checked_selection = validate_training_mode_selection(selection)
+        admission_basis = "qualified_exact_identity"
+        admission_evidence_sha256 = checked_selection["selection_sha256"]
 
     initial = dependencies.initialize_state()
-    # The immutable checkpoint namespace can be known before lowering because
-    # its exact performance identity comes from the chosen passing receipt.
-    provisional_identity = _run_identity(
-        plan,
-        selection_sha256=checked_selection["selection_sha256"],
-        identity=receipt_identity,
-        mode=mode,
-    )
+    prepared: PreparedTrainingExecutable | None = None
+    lowering_seconds = 0.0
+    if direct_bounded_resident:
+        # Lower once from the deterministic first fixed-order batch so the
+        # direct run obtains an exact identity before looking up a resumable
+        # checkpoint namespace.  Values do not affect StableHLO identity.
+        try:
+            identity_batch = next(iter(source.iter_updates()))
+        except StopIteration as error:
+            raise ContributionTrainingWorkerError(
+                "training source contains no updates"
+            ) from error
+        lowered_started = dependencies.clock()
+        prepared = dependencies.lower(mode, initial, identity_batch, mean)
+        lowering_seconds = dependencies.clock() - lowered_started
+        provisional_identity = _run_identity(
+            plan,
+            identity=prepared.identity,
+            mode=mode,
+            admission_basis=admission_basis,
+            admission_evidence_sha256=admission_evidence_sha256,
+        )
+    else:
+        assert receipt_identity is not None
+        # A qualified run can identify its checkpoint namespace before
+        # lowering because the chosen receipt already binds that identity.
+        provisional_identity = _run_identity(
+            plan,
+            identity=receipt_identity,
+            mode=mode,
+            admission_basis=admission_basis,
+            admission_evidence_sha256=admission_evidence_sha256,
+        )
     restored = dependencies.restore(initial, provisional_identity)
     state = initial if restored is None else restored.state
     if restored is not None and dict(restored.metadata).get(
@@ -797,18 +869,25 @@ def run_qualified_training(
     if first_input_seconds < 0:
         raise ContributionTrainingWorkerError("training clock moved backwards")
 
-    lowered_started = dependencies.clock()
-    prepared = dependencies.lower(mode, state, first, mean)
-    lowering_seconds = dependencies.clock() - lowered_started
-    if prepared.identity != receipt_identity:
-        raise ContributionTrainingWorkerError(
-            "lowered graph/hardware/config differs from the chosen qualification"
-        )
+    if prepared is None:
+        lowered_started = dependencies.clock()
+        prepared = dependencies.lower(mode, state, first, mean)
+        lowering_seconds = dependencies.clock() - lowered_started
+        if prepared.identity != receipt_identity:
+            raise ContributionTrainingWorkerError(
+                "lowered graph/hardware/config differs from the chosen "
+                "qualification"
+            )
     authorization = authorize_accelerator_run(
         identity=prepared.identity,
         maximum_runtime_seconds=maximum,
         purpose="workload",
-        qualification_receipt=receipt if maximum > MAX_QUALIFICATION_SECONDS else None,
+        qualification_receipt=(
+            receipt
+            if not direct_bounded_resident
+            and maximum > MAX_QUALIFICATION_SECONDS
+            else None
+        ),
     )
     compile_seconds = _finite_nonnegative(
         "compile_seconds",
@@ -2365,7 +2444,7 @@ def _run_production_training(
     config: Experiment2Config,
     plan: TrainingWorkerPlan,
     workload: _ProductionWorkload,
-    selection: Mapping[str, Any],
+    selection: Mapping[str, Any] | None,
     *,
     source_revision: str,
     peak_flops_per_second: int,
@@ -2373,6 +2452,7 @@ def _run_production_training(
     checkpoint_payload_root: str,
     maximum_runtime_seconds: int,
     metric_path: str | Path | None,
+    direct_bounded_resident: bool = False,
 ) -> dict[str, Any]:
     engine = _ProductionEngine(
         config,
@@ -2424,6 +2504,7 @@ def _run_production_training(
         expected_l0=workload.expected_l0,
         maximum_runtime_seconds=maximum_runtime_seconds,
         metric_sink=metric_sink,
+        direct_bounded_resident=direct_bounded_resident,
     )
 
 
@@ -2656,6 +2737,14 @@ def _parser() -> argparse.ArgumentParser:
     train.add_argument("--maximum-runtime-seconds", required=True, type=int)
     train.add_argument("--result-path", required=True, type=_absolute_path)
     train.add_argument("--metric-path", type=_absolute_path)
+    train.add_argument(
+        "--direct-bounded-resident",
+        action="store_true",
+        help=(
+            "run the resident graph directly under the <=600-second hard "
+            "deadline without a mode-selection receipt"
+        ),
+    )
 
     train_child = commands.add_parser(
         "train-child",
@@ -2676,6 +2765,10 @@ def _parser() -> argparse.ArgumentParser:
     train_child.add_argument("--maximum-runtime-seconds", required=True, type=int)
     train_child.add_argument("--result-path", required=True, type=_absolute_path)
     train_child.add_argument("--metric-path", type=_absolute_path)
+    train_child.add_argument(
+        "--direct-bounded-resident",
+        action="store_true",
+    )
     return parser
 
 
@@ -3042,10 +3135,21 @@ def _qualify_child_command(args: argparse.Namespace) -> int:
 
 
 def _train_command(args: argparse.Namespace) -> int:
-    selection = validate_training_mode_selection(
-        _read_json(args.selection_path, name="mode selection")
-    )
-    _mode, identity, receipt = chosen_mode_evidence(selection)
+    if (
+        args.direct_bounded_resident
+        and args.maximum_runtime_seconds > MAX_QUALIFICATION_SECONDS
+    ):
+        raise ContributionTrainingWorkerError(
+            "direct resident training cannot exceed 600 seconds"
+        )
+    if args.direct_bounded_resident:
+        selection = None
+        receipt = None
+    else:
+        selection = validate_training_mode_selection(
+            _read_json(args.selection_path, name="mode selection")
+        )
+        _mode, _selected_identity, receipt = chosen_mode_evidence(selection)
     child = [
         sys.executable,
         "-m",
@@ -3063,8 +3167,15 @@ def _train_command(args: argparse.Namespace) -> int:
         "--result-path",
         args.result_path,
     ]
+    if args.direct_bounded_resident:
+        child.append("--direct-bounded-resident")
     if args.metric_path is not None:
         child.extend(["--metric-path", args.metric_path])
+    identity = (
+        _prelaunch_identity(args, child_command=child)
+        if args.direct_bounded_resident
+        else _selected_identity
+    )
     result = _supervise(
         args,
         child_command=child,
@@ -3072,7 +3183,8 @@ def _train_command(args: argparse.Namespace) -> int:
         maximum_seconds=args.maximum_runtime_seconds,
         qualification_receipt=(
             receipt
-            if args.maximum_runtime_seconds > MAX_QUALIFICATION_SECONDS
+            if not args.direct_bounded_resident
+            and args.maximum_runtime_seconds > MAX_QUALIFICATION_SECONDS
             else None
         ),
         operation="train",
@@ -3096,10 +3208,21 @@ def _train_child_command(args: argparse.Namespace) -> int:
     from moe_sae.runtime import initialize_jax_distributed, require_v4_32_runtime
 
     _verify_repository_revision(args.source_revision)
-    selection = validate_training_mode_selection(
-        _read_json(args.selection_path, name="mode selection")
-    )
-    context = selection["workload_context"]
+    if (
+        args.direct_bounded_resident
+        and args.maximum_runtime_seconds > MAX_QUALIFICATION_SECONDS
+    ):
+        raise ContributionTrainingWorkerError(
+            "direct resident training cannot exceed 600 seconds"
+        )
+    if args.direct_bounded_resident:
+        selection = None
+        context = None
+    else:
+        selection = validate_training_mode_selection(
+            _read_json(args.selection_path, name="mode selection")
+        )
+        context = selection["workload_context"]
     config = load_contribution_config(args.config)
     plan = TrainingWorkerPlan.from_config(
         config,
@@ -3143,6 +3266,7 @@ def _train_child_command(args: argparse.Namespace) -> int:
         checkpoint_payload_root=args.checkpoint_payload_root,
         maximum_runtime_seconds=args.maximum_runtime_seconds,
         metric_path=args.metric_path,
+        direct_bounded_resident=args.direct_bounded_resident,
     )
     import jax
 

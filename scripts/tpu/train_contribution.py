@@ -7,8 +7,8 @@ bundle's physical-controller -> observed-JAX-process permutation to:
 
 1. prefetch and hash-prove exactly one contiguous contribution lane on each
    mapped controller; and
-2. fan out either the hard-600-second SAE qualifier or an exactly
-   receipt-authorized training run.
+2. fan out a bounded direct resident run, a hard-600-second two-mode
+   qualifier, or a longer exactly receipt-authorized training run.
 
 The operator never assumes that ``--worker=N`` implies ``jax.process_index=N``.
 """
@@ -63,6 +63,8 @@ _COORDINATOR_BUNDLE_FIELDS = {
 
 CONDITIONS = ("A", "R", "B", "F", "Q")
 ACTIONS = ("qualify", "train")
+DIRECT_BOUNDED_ADMISSION = "bounded_direct_resident"
+QUALIFIED_ADMISSION = "qualified_mode_selection"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
@@ -326,6 +328,19 @@ def _settings(
     )
 
 
+def _admission_mode(action: str, maximum_runtime_seconds: int) -> str:
+    """Select the explicit training admission path.
+
+    A bounded train is itself the at-most-600-second experiment and therefore
+    lowers the fixed resident graph directly.  Longer runs preserve the
+    existing two-mode qualification contract.
+    """
+
+    if action == "train" and maximum_runtime_seconds <= QUALIFICATION_SECONDS:
+        return DIRECT_BOUNDED_ADMISSION
+    return QUALIFIED_ADMISSION
+
+
 def _read_json(path: Path, *, name: str) -> dict[str, object]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -557,6 +572,11 @@ def initialize_attempt(args: argparse.Namespace) -> dict[str, object]:
     if sae_control_root.is_symlink() or run_root.is_symlink():
         raise OperatorError("SAE control paths must not be symbolic links")
     lineage = _qualification_lineage(bundle, sidecar)
+    admission_mode = _admission_mode(
+        args.action,
+        args.maximum_runtime_seconds,
+    )
+    direct_bounded = admission_mode == DIRECT_BOUNDED_ADMISSION
     mapping = {
         int(item["controller_index"]): int(item["process_index"])
         for item in lineage["controller_to_jax_process_index"]
@@ -580,13 +600,18 @@ def initialize_attempt(args: argparse.Namespace) -> dict[str, object]:
         "cache_root": args.cache_root,
         "cache_max_bytes": args.cache_max_bytes,
         "checkpoint_payload_root": args.checkpoint_payload_root.rstrip("/"),
+        "admission_mode": admission_mode,
     }
     contract = {
         **contract_body,
         "run_contract_sha256": _canonical_sha256(contract_body),
     }
     contract_path = run_root / "run-contract.json"
-    if args.action == "train" and not contract_path.is_file():
+    if (
+        args.action == "train"
+        and not direct_bounded
+        and not contract_path.is_file()
+    ):
         raise OperatorError("training requires a prior qualified run contract")
     sae_control_root.mkdir(parents=True, exist_ok=True, mode=0o700)
     run_root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -596,20 +621,26 @@ def initialize_attempt(args: argparse.Namespace) -> dict[str, object]:
     if args.action == "qualify" and selection.exists():
         raise OperatorError("run already has a completed mode selection")
     if args.action == "train":
-        if not selection.is_file():
+        if direct_bounded and selection.exists():
+            raise OperatorError(
+                "bounded direct training must not inherit a mode selection"
+            )
+        if not direct_bounded and not selection.is_file():
             raise OperatorError("training requires mode-selection.json")
         if result.exists():
             raise OperatorError("run already has a final training result")
-        for controller, process in mapping.items():
-            receipt = (
-                run_root
-                / "qualified-prefetch"
-                / f"controller-c{controller:05d}-p{process:05d}.json"
-            )
-            if not receipt.is_file():
-                raise OperatorError(
-                    "training requires every qualification-bound prefetch receipt"
+        if not direct_bounded:
+            for controller, process in mapping.items():
+                receipt = (
+                    run_root
+                    / "qualified-prefetch"
+                    / f"controller-c{controller:05d}-p{process:05d}.json"
                 )
+                if not receipt.is_file():
+                    raise OperatorError(
+                        "training requires every qualification-bound prefetch "
+                        "receipt"
+                    )
     try:
         attempt_root.mkdir(parents=True, exist_ok=False, mode=0o700)
     except FileExistsError as error:
@@ -623,6 +654,7 @@ def initialize_attempt(args: argparse.Namespace) -> dict[str, object]:
         "attempt_root": str(attempt_root),
         "run_root": str(run_root),
         "run_contract_sha256": contract["run_contract_sha256"],
+        "admission_mode": admission_mode,
         "controller_to_jax_process_index": (
             lineage["controller_to_jax_process_index"]
         ),
@@ -658,6 +690,11 @@ def _validate_attempt_plan(
         or unsigned.get("run_root") != settings.run_root
         or unsigned.get("maximum_runtime_seconds")
         != settings.maximum_runtime_seconds
+        or unsigned.get("admission_mode")
+        != _admission_mode(
+            settings.action,
+            settings.maximum_runtime_seconds,
+        )
         or unsigned.get("qualification_hard_deadline_seconds")
         != QUALIFICATION_SECONDS
         or unsigned.get("prefetch_hard_deadline_seconds")
@@ -944,6 +981,14 @@ def _action_command(
                 settings.metric_path,
             )
         )
+        if (
+            _admission_mode(
+                settings.action,
+                settings.maximum_runtime_seconds,
+            )
+            == DIRECT_BOUNDED_ADMISSION
+        ):
+            command.append("--direct-bounded-resident")
         terminal_path = settings.result_path
     lines = [
         "set -eu",
@@ -1117,6 +1162,10 @@ def _dry_run(settings: Settings) -> int:
         "condition": settings.condition,
         "seed": settings.seed,
         "qualification_hard_deadline_seconds": QUALIFICATION_SECONDS,
+        "admission_mode": _admission_mode(
+            settings.action,
+            settings.maximum_runtime_seconds,
+        ),
         "prefetch_hard_deadline_seconds": PREFETCH_SECONDS,
         "mapping_source": settings.qualification_bundle,
         "mapping_policy": (

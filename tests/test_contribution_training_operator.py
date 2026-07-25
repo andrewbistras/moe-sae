@@ -170,7 +170,13 @@ def _write_inputs(operator, root: Path) -> dict[str, Path]:
     }
 
 
-def _settings(operator, tmp_path: Path, *, action: str = "qualify"):
+def _settings(
+    operator,
+    tmp_path: Path,
+    *,
+    action: str = "qualify",
+    maximum_runtime_seconds: int | None = None,
+):
     return operator.Settings(
         gcp_project="neural-dragnet",
         tpu_name="gemma4-v4-32",
@@ -194,7 +200,9 @@ def _settings(operator, tmp_path: Path, *, action: str = "qualify"):
         run_id="phase2-A-seed0",
         attempt_id=f"{action}-001",
         maximum_runtime_seconds=(
-            600 if action == "qualify" else 7_200
+            maximum_runtime_seconds
+            if maximum_runtime_seconds is not None
+            else (600 if action == "qualify" else 7_200)
         ),
         local_log_root=tmp_path / f"{action}-logs",
     )
@@ -207,6 +215,7 @@ def _init_args(
     *,
     action: str,
     attempt_id: str,
+    maximum_runtime_seconds: int | None = None,
 ) -> argparse.Namespace:
     run_root = tmp_path / "sae" / "runs" / "phase2-A-seed0"
     attempt_root = (
@@ -231,7 +240,11 @@ def _init_args(
         run_root=str(run_root),
         attempt_root=str(attempt_root),
         checkpoint_payload_root="gs://bucket/sae-checkpoints",
-        maximum_runtime_seconds=600 if action == "qualify" else 7_200,
+        maximum_runtime_seconds=(
+            maximum_runtime_seconds
+            if maximum_runtime_seconds is not None
+            else (600 if action == "qualify" else 7_200)
+        ),
     )
 
 
@@ -322,6 +335,31 @@ def test_attempt_contract_is_create_only_and_train_requires_qualification(
     assert trained["maximum_runtime_seconds"] == 7_200
 
 
+def test_bounded_train_creates_direct_resident_contract_without_selection(
+    operator,
+    tmp_path: Path,
+) -> None:
+    inputs = _write_inputs(operator, tmp_path)
+    train_args = _init_args(
+        operator,
+        tmp_path,
+        inputs,
+        action="train",
+        attempt_id="direct001",
+        maximum_runtime_seconds=600,
+    )
+    plan = operator.initialize_attempt(train_args)
+    assert plan["action"] == "train"
+    assert plan["maximum_runtime_seconds"] == 600
+    assert plan["admission_mode"] == operator.DIRECT_BOUNDED_ADMISSION
+    run_root = Path(train_args.run_root)
+    assert not (run_root / "mode-selection.json").exists()
+    contract = json.loads(
+        (run_root / "run-contract.json").read_text(encoding="utf-8")
+    )
+    assert contract["admission_mode"] == operator.DIRECT_BOUNDED_ADMISSION
+
+
 def test_commands_keep_controller_transport_and_jax_lane_distinct(
     operator,
     tmp_path: Path,
@@ -362,6 +400,21 @@ def test_commands_keep_controller_transport_and_jax_lane_distinct(
     assert "--maximum-runtime-seconds 7200" in joined
     assert "--checkpoint-control-root" in joined
     assert "--metric-path" in joined
+    assert "--direct-bounded-resident" not in joined
+
+    direct = operator._action_command(
+        _settings(
+            operator,
+            tmp_path,
+            action="train",
+            maximum_runtime_seconds=600,
+        ),
+        controller_index=1,
+        process_index=3,
+    )
+    joined = " ".join(direct)
+    assert "--maximum-runtime-seconds 600" in joined
+    assert "--direct-bounded-resident" in joined
 
 
 def test_qualification_runtime_is_exactly_600(operator, tmp_path: Path) -> None:
@@ -443,6 +496,7 @@ def test_prefetch_failure_never_launches_accelerator_action(
         "attempt_root": settings.attempt_root,
         "run_root": settings.run_root,
         "run_contract_sha256": "a" * 64,
+        "admission_mode": operator.QUALIFIED_ADMISSION,
         "controller_to_jax_process_index": [
             {"controller_index": 0, "process_index": 2},
             {"controller_index": 1, "process_index": 0},

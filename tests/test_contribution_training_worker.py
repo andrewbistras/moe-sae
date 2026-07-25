@@ -667,6 +667,79 @@ def test_extended_training_requires_and_uses_exact_passing_receipt() -> None:
     assert checkpoints.saves[-1][1] is True
 
 
+def test_bounded_direct_training_uses_resident_graph_without_selection() -> None:
+    checkpoints = Checkpoints()
+    result = run_qualified_training(
+        plan(),
+        Source(),
+        mean=None,
+        selection=None,
+        dependencies=dependencies(checkpoints),
+        expected_l0=2,
+        maximum_runtime_seconds=600,
+        direct_bounded_resident=True,
+    )
+    assert result["status"] == "completed"
+    assert result["input_mode"] == "resident"
+    assert result["steps"] == 3
+    assert result["tokens"] == 10
+    assert result["authorization_basis"] == "bounded_ungated_workload"
+    assert result["qualification_receipt_sha256"] is None
+    assert result["run_identity"]["admission"] == {
+        "basis": "bounded_ungated_resident",
+        "evidence_sha256": None,
+    }
+    assert checkpoints.saves[-1][1] is True
+
+
+def test_bounded_direct_training_rejects_an_extended_deadline() -> None:
+    with pytest.raises(
+        ContributionTrainingWorkerError,
+        match="cannot exceed 600 seconds",
+    ):
+        run_qualified_training(
+            plan(),
+            Source(),
+            mean=None,
+            selection=None,
+            dependencies=dependencies(Checkpoints()),
+            expected_l0=2,
+            maximum_runtime_seconds=601,
+            direct_bounded_resident=True,
+        )
+
+
+def test_bounded_direct_training_resumes_from_exact_lowered_identity() -> None:
+    store = Checkpoints()
+    with pytest.raises(RuntimeError, match="simulated preemption"):
+        run_qualified_training(
+            plan(),
+            Source(),
+            mean=None,
+            selection=None,
+            dependencies=dependencies(store, fail_at_step=1),
+            expected_l0=2,
+            maximum_runtime_seconds=600,
+            direct_bounded_resident=True,
+        )
+    assert store.restored is not None
+    assert store.restored[0].step == 1
+
+    result = run_qualified_training(
+        plan(),
+        Source(),
+        mean=None,
+        selection=None,
+        dependencies=dependencies(store),
+        expected_l0=2,
+        maximum_runtime_seconds=600,
+        direct_bounded_resident=True,
+    )
+    assert result["status"] == "completed"
+    assert result["tokens"] == 10
+    assert store.restored[0] == State(3, 10, 77)
+
+
 def test_lowered_identity_drift_is_rejected_before_compile_or_steps() -> None:
     with pytest.raises(
         ContributionTrainingWorkerError,
