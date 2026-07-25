@@ -642,6 +642,72 @@ def test_qualified_b128_reader_keeps_a_full_immutable_lane(tmp_path):
         )
 
 
+def test_qualified_reader_can_reproduce_a_sealed_compile_batch_replay(tmp_path):
+    result = _stage(
+        tmp_path,
+        target=900,
+        document_count=128,
+    )
+    baseline = list(
+        PackedBatchIterable(
+            _files(result),
+            global_batch_size=16,
+            process_index=0,
+            process_count=4,
+            sequence_length=16,
+        )
+    )
+    replayed = list(
+        PackedBatchIterable(
+            _files(result),
+            global_batch_size=128,
+            process_index=0,
+            process_count=4,
+            sequence_length=16,
+            qualified_per_device_sequence_batch=8,
+            replay_lane_prefix_records=4,
+        )
+    )
+
+    assert len(baseline) == 8
+    assert len(replayed) == 2
+    for name in ("inputs", "inputs_position", "inputs_segmentation"):
+        expected = np.concatenate(
+            [
+                baseline[0][name],
+                baseline[0][name],
+                *[batch[name] for batch in baseline[1:]],
+            ]
+        )
+        actual = np.concatenate([batch[name] for batch in replayed])
+        np.testing.assert_array_equal(actual[: expected.shape[0]], expected)
+        assert not np.any(actual[expected.shape[0] :])
+
+
+def test_replayed_lane_prefix_is_strictly_validated(tmp_path):
+    result = _stage(tmp_path, target=40)
+    files = _files(result)
+    with pytest.raises(ValueError, match="nonnegative integer"):
+        PackedBatchIterable(
+            files,
+            global_batch_size=16,
+            process_index=0,
+            process_count=4,
+            sequence_length=16,
+            replay_lane_prefix_records=True,
+        )
+    reader = PackedBatchIterable(
+        files,
+        global_batch_size=16,
+        process_index=0,
+        process_count=4,
+        sequence_length=16,
+        replay_lane_prefix_records=10_000,
+    )
+    with pytest.raises(StagingError, match="longer than"):
+        next(iter(reader))
+
+
 def test_staged_publication_is_conditional_content_addressed_and_manifest_last(
     tmp_path,
 ):

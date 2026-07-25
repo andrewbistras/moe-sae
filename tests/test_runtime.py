@@ -152,6 +152,7 @@ def test_packed_runtime_forwards_exact_qualified_b128_contract(
         ("base.yml",),
         packed_train_files=("train-0",),
         packed_eval_files=("eval-0",),
+        packed_lane_prefix_replay_records=4,
     )
 
     assert runtime.model is model
@@ -160,6 +161,7 @@ def test_packed_runtime_forwards_exact_qualified_b128_contract(
     assert [
         call[1]["qualified_per_device_sequence_batch"] for call in calls
     ] == [8, 8]
+    assert [call[1]["replay_lane_prefix_records"] for call in calls] == [4, 4]
 
 
 def test_exact_host_quota_and_immutable_ids():

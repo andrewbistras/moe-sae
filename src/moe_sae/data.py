@@ -1279,6 +1279,12 @@ class PackedBatchIterable:
     short, this reader fills the remainder with all-zero padding records so no
     scientific source record is dropped and the accelerator shape stays
     static.
+
+    ``replay_lane_prefix_records`` exists only to reproduce an already sealed
+    scientific inventory whose producer replayed a compile batch. It inserts
+    the named prefix before the complete immutable lane, then rebatches that
+    exact record stream at the requested static shape. The source-key validator
+    remains authoritative; this option must never be used to relax identity.
     """
 
     def __init__(
@@ -1290,6 +1296,7 @@ class PackedBatchIterable:
         process_count: int,
         sequence_length: int = DEFAULT_SEQUENCE_LENGTH,
         qualified_per_device_sequence_batch: int | None = None,
+        replay_lane_prefix_records: int = 0,
     ):
         if not files:
             raise ValueError("packed ArrayRecord file inventory cannot be empty")
@@ -1319,11 +1326,20 @@ class PackedBatchIterable:
             raise ValueError(
                 "global batch size must match a qualified per-device sequence batch"
             )
+        if (
+            isinstance(replay_lane_prefix_records, bool)
+            or not isinstance(replay_lane_prefix_records, int)
+            or replay_lane_prefix_records < 0
+        ):
+            raise ValueError(
+                "replayed lane-prefix records must be a nonnegative integer"
+            )
         self.files = tuple(files)
         self.global_batch_size = global_batch_size
         self.process_index = process_index
         self.process_count = process_count
         self.sequence_length = sequence_length
+        self.replay_lane_prefix_records = replay_lane_prefix_records
 
     def __iter__(self) -> Iterator[dict[str, np.ndarray]]:
         source = _array_record_source(self.files)
@@ -1331,15 +1347,27 @@ class PackedBatchIterable:
         lane_records = (
             len(source) - self.process_index + self.process_count - 1
         ) // self.process_count
-        steps = (lane_records + local_batch - 1) // local_batch
+        replay = self.replay_lane_prefix_records
+        if replay > lane_records:
+            raise StagingError(
+                "replayed lane prefix is longer than the immutable source lane"
+            )
+        consumer_records = lane_records + replay
+        steps = (consumer_records + local_batch - 1) // local_batch
         padding_i32 = np.zeros(self.sequence_length, dtype=np.int32)
         padding_u16 = np.zeros(self.sequence_length, dtype=np.uint16)
         for step in range(steps):
             records = []
             lane_start = step * local_batch
-            records_in_step = min(local_batch, lane_records - lane_start)
+            records_in_step = min(local_batch, consumer_records - lane_start)
             for offset in range(records_in_step):
-                index = self.process_index + (lane_start + offset) * self.process_count
+                consumer_index = lane_start + offset
+                lane_index = (
+                    consumer_index
+                    if consumer_index < replay
+                    else consumer_index - replay
+                )
+                index = self.process_index + lane_index * self.process_count
                 records.append(
                     decode_packed_record(
                         bytes(source[index]),
@@ -1371,6 +1399,7 @@ def build_maxtext_packed_iterator(
     mesh: Any,
     global_batch_size: int | None = None,
     qualified_per_device_sequence_batch: int | None = None,
+    replay_lane_prefix_records: int = 0,
 ) -> Any:
     """Wrap the offline reader in MaxText's native global-array adapter."""
 
@@ -1390,6 +1419,7 @@ def build_maxtext_packed_iterator(
         qualified_per_device_sequence_batch=(
             qualified_per_device_sequence_batch
         ),
+        replay_lane_prefix_records=replay_lane_prefix_records,
     )
     return MultiHostDataLoadIterator(local, mesh, generate_padding_batch=False)
 

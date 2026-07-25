@@ -517,6 +517,7 @@ def create_maxtext_runtime(
     *,
     packed_train_files: Sequence[str] | None = None,
     packed_eval_files: Sequence[str] | None = None,
+    packed_lane_prefix_replay_records: int = 0,
 ) -> MaxTextRuntime:
     """Load the pinned MaxText model and iterators without importing Torch."""
 
@@ -558,6 +559,7 @@ def create_maxtext_runtime(
             mesh=mesh,
             global_batch_size=int(config.global_batch_size_to_load),
             qualified_per_device_sequence_batch=per_device_sequence_batch,
+            replay_lane_prefix_records=packed_lane_prefix_replay_records,
         )
         eval_batch = int(
             getattr(config, "global_batch_size_to_load_eval", 0)
@@ -569,6 +571,7 @@ def create_maxtext_runtime(
             mesh=mesh,
             global_batch_size=eval_batch,
             qualified_per_device_sequence_batch=per_device_sequence_batch,
+            replay_lane_prefix_records=packed_lane_prefix_replay_records,
         )
     return MaxTextRuntime(config, mesh, model, train_iterator, eval_iterator)
 

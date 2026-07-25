@@ -420,6 +420,31 @@ def test_long_harvest_reuses_qualified_prepared_executable_and_seals_evidence(
     )
 
 
+def test_production_runtime_replays_the_sealed_v1_compile_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[tuple[str, ...], dict[str, object]]] = []
+
+    def create(argv, **kwargs):
+        calls.append((tuple(argv), kwargs))
+        return object()
+
+    monkeypatch.setattr(worker, "create_maxtext_runtime", create)
+
+    worker._default_create_runtime(("base.yml",), ("shard-0", "shard-1"))
+
+    assert calls == [
+        (
+            ("base.yml",),
+            {
+                "packed_train_files": ("shard-0", "shard-1"),
+                "packed_eval_files": ("shard-0", "shard-1"),
+                "packed_lane_prefix_replay_records": 4,
+            },
+        )
+    ]
+
+
 def test_controller_ordinal_does_not_override_observed_jax_process_ownership(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -1888,10 +1888,14 @@ def _default_create_source_dataset(
 
 
 def _default_create_runtime(argv: Sequence[str], files: Sequence[str]) -> Any:
+    # Experiment 1's sealed v1 producer persisted its first four-record host
+    # batch twice. Reproduce that scientific inventory before B128 rebatching
+    # so every contribution row aligns with its aggregate activation row.
     return create_maxtext_runtime(
         argv,
         packed_train_files=tuple(files),
         packed_eval_files=tuple(files),
+        packed_lane_prefix_replay_records=4,
     )
 
 
@@ -1906,13 +1910,17 @@ def _default_effective_runtime(
         raise ContributionHarvestWorkerError(
             "production harvest requires the real Grain data path"
         )
-    return effective_performance_runtime_manifest(
-        runtime.config,
-        runtime.mesh,
-        config=config,
-        mesh=mesh,
-        per_device_sequence_batch=per_device_sequence_batch,
+    result = dict(
+        effective_performance_runtime_manifest(
+            runtime.config,
+            runtime.mesh,
+            config=config,
+            mesh=mesh,
+            per_device_sequence_batch=per_device_sequence_batch,
+        )
     )
+    result["source_v1_prefix_replay_lane_records"] = 4
+    return result
 
 
 def _default_performance_launch(
