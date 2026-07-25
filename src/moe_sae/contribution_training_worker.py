@@ -72,6 +72,18 @@ TRAINING_SUPERVISION_SCHEMA_VERSION = (
 PREFETCH_RECEIPT_SCHEMA_VERSION = (
     "gemma4-contribution-sae-process-lane-prefetch-v1"
 )
+CHIP_SECONDS_SCOPE = (
+    "fixed_capacity_scan_in_training_invocation_plus_synchronized_"
+    "optimizer_loop_including_input_wait"
+)
+CHIP_SECONDS_EXCLUDES = (
+    "prefetch",
+    "qualification",
+    "lowering",
+    "compilation",
+    "checkpoint_serialization",
+    "evaluation",
+)
 
 InputMode = Literal["resident", "rematerialized"]
 INPUT_MODES: tuple[InputMode, ...] = ("resident", "rematerialized")
@@ -315,6 +327,7 @@ class TrainingLoopDependencies:
         [Any, Mapping[str, Any], Mapping[str, Any], bool],
         Mapping[str, Any],
     ]
+    canonicalize_seconds: Callable[[float], float] = float
     clock: Callable[[], float] = time.perf_counter
 
 
@@ -722,6 +735,91 @@ def _run_identity(
     }
 
 
+def _canonical_elapsed_seconds(
+    dependencies: TrainingLoopDependencies,
+    *,
+    name: str,
+    local_seconds: float,
+) -> float:
+    """Return one timing value shared by every process in the training job."""
+
+    local = _finite_nonnegative(name, local_seconds)
+    try:
+        canonical = dependencies.canonicalize_seconds(local)
+    except Exception as error:
+        raise ContributionTrainingWorkerError(
+            f"could not canonicalize {name} across training processes"
+        ) from error
+    return _finite_nonnegative(f"canonical {name}", canonical)
+
+
+def _restored_timing(
+    restored: RestoredTrainingState | None,
+) -> dict[str, float | int]:
+    """Validate cumulative cost evidence embedded in a restored checkpoint."""
+
+    if restored is None:
+        return {}
+    raw = dict(restored.metadata).get("timing")
+    if raw is None:
+        return {}
+    if not isinstance(raw, Mapping):
+        raise ContributionTrainingWorkerError(
+            "restored checkpoint timing must be a mapping"
+        )
+    result: dict[str, float | int] = {}
+    for name in (
+        "compile_seconds",
+        "lowering_seconds",
+        "preprocessing_wall_seconds",
+        "optimizer_wall_seconds",
+        "checkpoint_seconds_before_save",
+    ):
+        if name in raw:
+            result[name] = _finite_nonnegative(
+                f"restored {name}",
+                raw[name],
+            )
+    if "global_chip_count" in raw:
+        result["global_chip_count"] = _positive_int(
+            "restored global_chip_count",
+            raw["global_chip_count"],
+        )
+    return result
+
+
+def _training_chip_count(
+    prepared: PreparedTrainingExecutable | None,
+    *,
+    supplied: int | None,
+    restored_timing: Mapping[str, float | int],
+) -> int:
+    """Resolve and cross-check the one global chip count used by the ledger."""
+
+    candidates: list[int] = []
+    if supplied is not None:
+        candidates.append(_positive_int("global_chip_count", supplied))
+    if prepared is not None:
+        candidates.append(
+            _positive_int(
+                "prepared global_chip_count",
+                prepared.hardware_manifest.get("global_chip_count"),
+            )
+        )
+    restored = restored_timing.get("global_chip_count")
+    if restored is not None:
+        candidates.append(_positive_int("restored global_chip_count", restored))
+    if not candidates:
+        raise ContributionTrainingWorkerError(
+            "training cost ledger has no global chip count"
+        )
+    if len(set(candidates)) != 1:
+        raise ContributionTrainingWorkerError(
+            "training cost ledger global chip counts disagree"
+        )
+    return candidates[0]
+
+
 def run_qualified_training(
     plan: TrainingWorkerPlan,
     source: TrainingSource,
@@ -733,6 +831,8 @@ def run_qualified_training(
     maximum_runtime_seconds: int,
     metric_sink: Callable[[Mapping[str, Any]], None] | None = None,
     direct_bounded_resident: bool = False,
+    preprocessing_wall_seconds: float = 0.0,
+    global_chip_count: int | None = None,
 ) -> dict[str, Any]:
     """Run or resume one exact fixed-order condition.
 
@@ -780,9 +880,14 @@ def run_qualified_training(
         admission_basis = "qualified_exact_identity"
         admission_evidence_sha256 = checked_selection["selection_sha256"]
 
+    current_preprocessing_seconds = _canonical_elapsed_seconds(
+        dependencies,
+        name="preprocessing_wall_seconds",
+        local_seconds=preprocessing_wall_seconds,
+    )
     initial = dependencies.initialize_state()
     prepared: PreparedTrainingExecutable | None = None
-    lowering_seconds = 0.0
+    current_lowering_seconds = 0.0
     if direct_bounded_resident:
         # Lower once from the deterministic first fixed-order batch so the
         # direct run obtains an exact identity before looking up a resumable
@@ -795,7 +900,11 @@ def run_qualified_training(
             ) from error
         lowered_started = dependencies.clock()
         prepared = dependencies.lower(mode, initial, identity_batch, mean)
-        lowering_seconds = dependencies.clock() - lowered_started
+        current_lowering_seconds = _canonical_elapsed_seconds(
+            dependencies,
+            name="lowering_seconds",
+            local_seconds=dependencies.clock() - lowered_started,
+        )
         provisional_identity = _run_identity(
             plan,
             identity=prepared.identity,
@@ -815,6 +924,7 @@ def run_qualified_training(
             admission_evidence_sha256=admission_evidence_sha256,
         )
     restored = dependencies.restore(initial, provisional_identity)
+    prior_timing = _restored_timing(restored)
     state = initial if restored is None else restored.state
     if restored is not None and dict(restored.metadata).get(
         "run_identity_sha256"
@@ -835,8 +945,30 @@ def run_qualified_training(
             "restored state exceeds the phase update plan"
         )
 
+    preprocessing_seconds = float(
+        prior_timing.get("preprocessing_wall_seconds", 0.0)
+    ) + current_preprocessing_seconds
+    lowering_seconds = float(
+        prior_timing.get("lowering_seconds", 0.0)
+    ) + current_lowering_seconds
+    compile_seconds = float(prior_timing.get("compile_seconds", 0.0))
+    optimizer_seconds = float(prior_timing.get("optimizer_wall_seconds", 0.0))
+    checkpoint_seconds = float(
+        prior_timing.get("checkpoint_seconds_before_save", 0.0)
+    )
+
     iterator = itertools.islice(source.iter_updates(), start_step, None)
     if start_step == plan.planned_updates:
+        if optimizer_seconds <= 0.0:
+            raise ContributionTrainingWorkerError(
+                "completed checkpoint lacks cumulative optimizer timing"
+            )
+        chip_count = _training_chip_count(
+            prepared,
+            supplied=global_chip_count,
+            restored_timing=prior_timing,
+        )
+        marginal_seconds = preprocessing_seconds + optimizer_seconds
         unsigned = {
             "schema_version": TRAINING_RESULT_SCHEMA_VERSION,
             "status": "already_complete",
@@ -844,13 +976,20 @@ def run_qualified_training(
             "input_mode": mode,
             "steps": start_step,
             "tokens": start_tokens,
-            "compile_seconds": 0.0,
-            "optimizer_wall_seconds": 0.0,
-            "checkpoint_seconds": 0.0,
-            "chip_seconds": 0.0,
+            "compile_seconds": compile_seconds,
+            "lowering_seconds": lowering_seconds,
+            "preprocessing_wall_seconds": preprocessing_seconds,
+            "optimizer_wall_seconds": optimizer_seconds,
+            "marginal_wall_seconds": marginal_seconds,
+            "checkpoint_seconds": checkpoint_seconds,
+            "chip_seconds": marginal_seconds * chip_count,
+            "chip_seconds_scope": CHIP_SECONDS_SCOPE,
+            "chip_seconds_excludes": list(CHIP_SECONDS_EXCLUDES),
+            "tokens_per_second": start_tokens / marginal_seconds,
             "metric_count": 0,
             "last_metric": None,
             "authorization_basis": "existing_complete_checkpoint",
+            "qualification_receipt_sha256": None,
             "checkpoint_receipts": [],
         }
         return {
@@ -872,7 +1011,11 @@ def run_qualified_training(
     if prepared is None:
         lowered_started = dependencies.clock()
         prepared = dependencies.lower(mode, state, first, mean)
-        lowering_seconds = dependencies.clock() - lowered_started
+        lowering_seconds += _canonical_elapsed_seconds(
+            dependencies,
+            name="lowering_seconds",
+            local_seconds=dependencies.clock() - lowered_started,
+        )
         if prepared.identity != receipt_identity:
             raise ContributionTrainingWorkerError(
                 "lowered graph/hardware/config differs from the chosen "
@@ -889,15 +1032,14 @@ def run_qualified_training(
             else None
         ),
     )
-    compile_seconds = _finite_nonnegative(
-        "compile_seconds",
-        dependencies.compile(prepared),
+    compile_seconds += _canonical_elapsed_seconds(
+        dependencies,
+        name="compile_seconds",
+        local_seconds=dependencies.compile(prepared),
     )
 
     metrics: list[dict[str, Any]] = []
     checkpoints: list[dict[str, Any]] = []
-    optimizer_seconds = 0.0
-    checkpoint_seconds = 0.0
     next_checkpoints = iter(plan.checkpoint_tokens)
     checkpoint_target = next(next_checkpoints, None)
     while checkpoint_target is not None and checkpoint_target <= start_tokens:
@@ -922,11 +1064,11 @@ def run_qualified_training(
             input_seconds = first_input_seconds
         state, raw_metric = dependencies.step(prepared, state, group, mean)
         dependencies.synchronize(state)
-        elapsed = input_seconds + (dependencies.clock() - step_started)
-        if not math.isfinite(elapsed) or elapsed < 0:
-            raise ContributionTrainingWorkerError(
-                "optimizer timing is invalid"
-            )
+        elapsed = _canonical_elapsed_seconds(
+            dependencies,
+            name="optimizer update seconds",
+            local_seconds=input_seconds + (dependencies.clock() - step_started),
+        )
         optimizer_seconds += elapsed
         metric = _metric_record(raw_metric, expected_l0=expected_l0)
         step, tokens = dependencies.progress(state)
@@ -962,8 +1104,14 @@ def run_qualified_training(
             timing = {
                 "compile_seconds": compile_seconds,
                 "lowering_seconds": lowering_seconds,
+                "preprocessing_wall_seconds": preprocessing_seconds,
                 "optimizer_wall_seconds": optimizer_seconds,
                 "checkpoint_seconds_before_save": checkpoint_seconds,
+                "global_chip_count": _training_chip_count(
+                    prepared,
+                    supplied=global_chip_count,
+                    restored_timing=prior_timing,
+                ),
             }
             record = dict(
                 dependencies.save(
@@ -974,7 +1122,11 @@ def run_qualified_training(
                 )
             )
             checkpoints.append(record)
-            checkpoint_seconds += dependencies.clock() - checkpoint_started
+            checkpoint_seconds += _canonical_elapsed_seconds(
+                dependencies,
+                name="checkpoint serialization seconds",
+                local_seconds=dependencies.clock() - checkpoint_started,
+            )
             while checkpoint_target is not None and checkpoint_target <= tokens:
                 checkpoint_target = next(next_checkpoints, None)
 
@@ -991,12 +1143,16 @@ def run_qualified_training(
             "training finished without consuming the exact token count"
         )
 
-    # MFU remains diagnostic during production training; chip-seconds and
-    # tokens/s are authoritative.  The actual global chip count is sealed into
-    # the hardware manifest used by the passing receipt.
-    hardware = prepared.hardware_manifest
-    chip_count = hardware.get("global_chip_count")
-    _positive_int("global_chip_count", chip_count)
+    # MFU remains diagnostic during production training.  The primary measured
+    # ledger includes the fixed A/R capacity scan performed by this training
+    # invocation plus synchronized optimizer work and its input waits.  The
+    # explicitly named exclusions remain separately visible.
+    chip_count = _training_chip_count(
+        prepared,
+        supplied=global_chip_count,
+        restored_timing=prior_timing,
+    )
+    marginal_seconds = preprocessing_seconds + optimizer_seconds
     unsigned = {
         "schema_version": TRAINING_RESULT_SCHEMA_VERSION,
         "status": "completed",
@@ -1006,10 +1162,14 @@ def run_qualified_training(
         "tokens": previous_tokens,
         "compile_seconds": compile_seconds,
         "lowering_seconds": lowering_seconds,
+        "preprocessing_wall_seconds": preprocessing_seconds,
         "optimizer_wall_seconds": optimizer_seconds,
+        "marginal_wall_seconds": marginal_seconds,
         "checkpoint_seconds": checkpoint_seconds,
-        "chip_seconds": optimizer_seconds * chip_count,
-        "tokens_per_second": previous_tokens / optimizer_seconds,
+        "chip_seconds": marginal_seconds * chip_count,
+        "chip_seconds_scope": CHIP_SECONDS_SCOPE,
+        "chip_seconds_excludes": list(CHIP_SECONDS_EXCLUDES),
+        "tokens_per_second": previous_tokens / marginal_seconds,
         "metric_count": len(metrics),
         "last_metric": metrics[-1],
         "authorization_basis": authorization.basis,
@@ -1400,6 +1560,7 @@ class _ProductionWorkload:
     arithmetic: SAEArithmetic
     workload_context: Mapping[str, Any]
     checkpoint_training_config: Any
+    preprocessing_wall_seconds: float
 
     @property
     def expected_l0(self) -> int:
@@ -1792,7 +1953,7 @@ class _ProductionEngine:
         handle: _PreparedHandle = prepared.handle
         started = time.perf_counter()
         handle.trainer._executable = handle.lowered.compile()
-        return _collective_max_seconds(time.perf_counter() - started)
+        return time.perf_counter() - started
 
     @staticmethod
     def step(
@@ -1931,6 +2092,7 @@ class _OrbaxCheckpointBackend:
             final_pointer_from_latest,
             make_pointer,
             new_attempt_id,
+            pointer_path,
             publish_pointer,
         )
         from moe_sae.distributed import save_distributed_checkpoint
@@ -1981,18 +2143,22 @@ class _OrbaxCheckpointBackend:
             attempt_id=attempt_id,
             run_identity=run_identity,
         )
-        latest_path: str | None = None
-        final_path: str | None = None
         if jax.process_index() == 0:
-            latest_path = str(publish_pointer(self.control_root, latest))
+            publish_pointer(self.control_root, latest)
             if final:
-                final_path = str(
-                    publish_pointer(
-                        self.control_root,
-                        final_pointer_from_latest(latest),
-                    )
+                publish_pointer(
+                    self.control_root,
+                    final_pointer_from_latest(latest),
                 )
         _collective_barrier(f"contribution-sae-pointer-{step}-{tokens}")
+        # Every process derives the same canonical control paths only after
+        # process zero has published them and the global visibility barrier
+        # has completed.  Returning process-local ``None`` values here used to
+        # make otherwise successful multi-host results hash differently.
+        latest_path = str(pointer_path(self.control_root, "latest"))
+        final_path = (
+            str(pointer_path(self.control_root, "final")) if final else None
+        )
         return {
             "payload_uri": payload_uri,
             "step": step,
@@ -2241,8 +2407,10 @@ def _build_production_workload(
             "collective prefetch receipts contain duplicates"
         )
 
+    preprocessing_wall_seconds = 0.0
     if plan.condition in {"A", "R"}:
         if expected_context is None:
+            preprocessing_started = time.perf_counter()
             local_capacity = source.scan_local_capacity(
                 margin_fraction=config.runtime.capacity_margin_fraction,
             )
@@ -2253,6 +2421,9 @@ def _build_production_workload(
             merged = merge_capacity_receipts(capacity_receipts)
             bank_capacity = int(merged.capacity)
             merged_capacity = merged.to_dict()
+            preprocessing_wall_seconds = (
+                time.perf_counter() - preprocessing_started
+            )
         else:
             raw_capacity = expected_context.get("capacity_receipts")
             if not isinstance(raw_capacity, list):
@@ -2308,6 +2479,7 @@ def _build_production_workload(
         arithmetic=arithmetic,
         workload_context=workload_context,
         checkpoint_training_config=training_config,
+        preprocessing_wall_seconds=preprocessing_wall_seconds,
     )
 
 
@@ -2494,6 +2666,7 @@ def _run_production_training(
         progress=engine.progress,
         restore=checkpoint.restore,
         save=checkpoint.save,
+        canonicalize_seconds=_collective_max_seconds,
     )
     return run_qualified_training(
         plan,
@@ -2505,6 +2678,10 @@ def _run_production_training(
         maximum_runtime_seconds=maximum_runtime_seconds,
         metric_sink=metric_sink,
         direct_bounded_resident=direct_bounded_resident,
+        preprocessing_wall_seconds=workload.preprocessing_wall_seconds,
+        global_chip_count=int(
+            np.asarray(workload.mesh.devices, dtype=object).size
+        ),
     )
 
 

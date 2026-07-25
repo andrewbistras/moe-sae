@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pytest
 
 from moe_sae import contribution_training_worker as training_worker_module
@@ -580,8 +581,11 @@ class Checkpoints:
         state, metadata = self.restored
         return RestoredTrainingState(state, metadata)
 
-    def save(self, state, run_identity, _timing, final):
-        metadata = {"run_identity_sha256": run_identity["run_identity_sha256"]}
+    def save(self, state, run_identity, timing, final):
+        metadata = {
+            "run_identity_sha256": run_identity["run_identity_sha256"],
+            "timing": dict(timing),
+        }
         self.restored = (state, metadata)
         self.saves.append((state, final))
         return {"step": state.step, "tokens": state.tokens, "final": final}
@@ -607,6 +611,8 @@ def dependencies(
     *,
     fail_at_step: int | None = None,
     lowered_identity: ExactPerformanceIdentity | None = None,
+    step_seconds: float = 0.25,
+    canonicalize_seconds=float,
 ):
     clock = FakeClock()
 
@@ -622,7 +628,7 @@ def dependencies(
     def step(_prepared, state, batch, _mean):
         if fail_at_step is not None and state.step == fail_at_step:
             raise RuntimeError("simulated preemption")
-        clock.advance(0.25)
+        clock.advance(step_seconds)
         new = State(state.step + 1, state.tokens + batch, state.value * 3 + batch)
         return new, {
             "loss": 1.0 / new.step,
@@ -644,6 +650,7 @@ def dependencies(
         progress=lambda state: (state.step, state.tokens),
         restore=checkpoints.restore,
         save=checkpoints.save,
+        canonicalize_seconds=canonicalize_seconds,
         clock=clock,
     )
 
@@ -690,6 +697,156 @@ def test_bounded_direct_training_uses_resident_graph_without_selection() -> None
         "evidence_sha256": None,
     }
     assert checkpoints.saves[-1][1] is True
+
+
+def test_capacity_scan_time_is_included_and_scope_is_explicit() -> None:
+    result = run_qualified_training(
+        plan(),
+        Source(),
+        mean=None,
+        selection=None,
+        dependencies=dependencies(Checkpoints()),
+        expected_l0=2,
+        maximum_runtime_seconds=600,
+        direct_bounded_resident=True,
+        preprocessing_wall_seconds=2.0,
+    )
+    assert result["preprocessing_wall_seconds"] == 2.0
+    assert result["optimizer_wall_seconds"] == 0.75
+    assert result["marginal_wall_seconds"] == 2.75
+    assert result["chip_seconds"] == 44.0
+    assert result["chip_seconds_scope"] == (
+        training_worker_module.CHIP_SECONDS_SCOPE
+    )
+    assert result["chip_seconds_excludes"] == list(
+        training_worker_module.CHIP_SECONDS_EXCLUDES
+    )
+
+
+def test_completed_checkpoint_replay_preserves_cumulative_cost() -> None:
+    store = Checkpoints()
+    first = run_qualified_training(
+        plan(),
+        Source(),
+        mean=None,
+        selection=None,
+        dependencies=dependencies(store),
+        expected_l0=2,
+        maximum_runtime_seconds=600,
+        direct_bounded_resident=True,
+    )
+    replay = run_qualified_training(
+        plan(),
+        Source(),
+        mean=None,
+        selection=None,
+        dependencies=dependencies(store),
+        expected_l0=2,
+        maximum_runtime_seconds=600,
+        direct_bounded_resident=True,
+    )
+    assert replay["status"] == "already_complete"
+    assert replay["optimizer_wall_seconds"] == first["optimizer_wall_seconds"]
+    assert replay["marginal_wall_seconds"] == first["marginal_wall_seconds"]
+    assert replay["chip_seconds"] == first["chip_seconds"]
+    assert replay["chip_seconds"] > 0.0
+
+
+def test_collectively_canonical_timings_produce_identical_results() -> None:
+    def collective_max(_local_seconds: float) -> float:
+        return 1.0
+
+    left = run_qualified_training(
+        plan(),
+        Source(),
+        mean=None,
+        selection=None,
+        dependencies=dependencies(
+            Checkpoints(),
+            step_seconds=0.1,
+            canonicalize_seconds=collective_max,
+        ),
+        expected_l0=2,
+        maximum_runtime_seconds=600,
+        direct_bounded_resident=True,
+    )
+    right = run_qualified_training(
+        plan(),
+        Source(),
+        mean=None,
+        selection=None,
+        dependencies=dependencies(
+            Checkpoints(),
+            step_seconds=0.9,
+            canonicalize_seconds=collective_max,
+        ),
+        expected_l0=2,
+        maximum_runtime_seconds=600,
+        direct_bounded_resident=True,
+    )
+    assert left == right
+    assert left["result_sha256"] == right["result_sha256"]
+
+
+def test_checkpoint_receipt_paths_are_identical_on_every_process(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import jax
+    from jax.experimental import multihost_utils
+
+    process_index = 0
+    attempt = np.frombuffer(bytes.fromhex("12" * 16), dtype=np.uint8)
+    monkeypatch.setattr(jax, "process_index", lambda: process_index)
+    monkeypatch.setattr(
+        multihost_utils,
+        "broadcast_one_to_all",
+        lambda _value, **_kwargs: attempt,
+    )
+    monkeypatch.setattr(
+        training_worker_module,
+        "_collective_barrier",
+        lambda _label: None,
+    )
+    import moe_sae.distributed as distributed_module
+
+    monkeypatch.setattr(
+        distributed_module,
+        "save_distributed_checkpoint",
+        lambda *_args, **_kwargs: None,
+    )
+    backend = training_worker_module._OrbaxCheckpointBackend(
+        control_root=tmp_path / "control",
+        payload_root=str(tmp_path / "payloads"),
+        mesh=object(),
+        training_config=object(),
+    )
+    state = type("CheckpointState", (), {"step": 3, "tokens_seen": 10})()
+    run_identity_body = {"run": "same-on-every-process"}
+    run_identity = {
+        **run_identity_body,
+        "run_identity_sha256": training_worker_module.canonical_sha256(
+            run_identity_body
+        ),
+    }
+    timing = {
+        "compile_seconds": 1.0,
+        "lowering_seconds": 1.0,
+        "preprocessing_wall_seconds": 2.0,
+        "optimizer_wall_seconds": 3.0,
+        "checkpoint_seconds_before_save": 0.0,
+        "global_chip_count": 16,
+    }
+    coordinator = dict(backend.save(state, run_identity, timing, True))
+    process_index = 1
+    follower = dict(backend.save(state, run_identity, timing, True))
+    assert follower == coordinator
+    assert coordinator["latest_pointer"] == str(
+        tmp_path / "control" / "latest.json"
+    )
+    assert coordinator["final_pointer"] == str(
+        tmp_path / "control" / "final.json"
+    )
 
 
 def test_bounded_direct_training_rejects_an_extended_deadline() -> None:
@@ -796,6 +953,11 @@ def test_interrupted_resume_matches_uninterrupted_fixed_order() -> None:
     )
     assert resumed["tokens"] == uninterrupted["tokens"] == 10
     assert resumed_store.restored[0] == expected_state
+    assert (
+        resumed["optimizer_wall_seconds"]
+        == uninterrupted["optimizer_wall_seconds"]
+    )
+    assert resumed["chip_seconds"] == uninterrupted["chip_seconds"]
 
 
 def test_resume_rejects_state_off_the_exact_token_boundary() -> None:
