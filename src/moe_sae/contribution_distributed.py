@@ -34,6 +34,7 @@ from moe_sae.distributed import (
     _param_specs,
     _validate_exact_distributed_l0,
     init_distributed_state,
+    replicate_process_local_array,
     shard_train_state,
     state_shardings,
 )
@@ -1036,9 +1037,9 @@ class ContributionDistributedTrainer:
                 self.distributed,
             )
         )
-        mean_array = jax.device_put(
+        mean_array = replicate_process_local_array(
             jnp.asarray(mean, jnp.float32),
-            NamedSharding(self.mesh, P()),
+            self.mesh,
         )
         if mean_array.shape != (self.layout.hidden_dim,):
             raise ValueError(f"mean must have shape [{self.layout.hidden_dim}]")

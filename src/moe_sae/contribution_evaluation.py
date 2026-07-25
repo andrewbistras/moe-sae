@@ -68,7 +68,11 @@ from moe_sae.contribution_recomposition import (
 )
 from moe_sae.contribution_sae import ContributionSAEConfig
 from moe_sae.contribution_training import forward_contributions
-from moe_sae.distributed import DistributedConfig, _param_specs
+from moe_sae.distributed import (
+    DistributedConfig,
+    _param_specs,
+    replicate_process_local_array,
+)
 from moe_sae.sae import SAEParams
 
 EVALUATION_SCHEMA_VERSION = "gemma4-contribution-evaluation-v1"
@@ -887,9 +891,9 @@ class ContributionDistributedEvaluator:
             raise ValueError(
                 f"mean must be finite floating-point [{self.layout.hidden_dim}]"
             )
-        mean_array = jax.device_put(
+        mean_array = replicate_process_local_array(
             jnp.asarray(host_mean, jnp.float32),
-            NamedSharding(self.mesh, P()),
+            self.mesh,
         )
         return placed, mean_array
 

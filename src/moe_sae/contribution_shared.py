@@ -67,6 +67,7 @@ from moe_sae.distributed import (
     _param_specs,
     batch_shardings,
     init_distributed_state,
+    replicate_process_local_array,
     shard_batch,
     shard_process_local_batch,
     stack_microbatches,
@@ -1203,9 +1204,9 @@ class SharedQDistributedTrainer:
             raise ValueError(
                 f"shared-Q mean must be finite [{self.config.hidden_dim}]"
             )
-        return placed, jax.device_put(
+        return placed, replicate_process_local_array(
             jnp.asarray(host_mean, jnp.float32),
-            NamedSharding(self.mesh, P()),
+            self.mesh,
         )
 
     def step(
@@ -1399,9 +1400,9 @@ class SharedQDistributedEvaluator:
             raise ValueError(
                 f"shared-Q mean must be finite [{self.config.hidden_dim}]"
             )
-        mean_array = jax.device_put(
+        mean_array = replicate_process_local_array(
             jnp.asarray(host_mean, jnp.float32),
-            NamedSharding(self.mesh, P()),
+            self.mesh,
         )
         _loss, aux, device_rows = self._compiled(
             params,

@@ -12,6 +12,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 
 import moe_sae.distributed as distributed_module
 from moe_sae.checkpointing import (
@@ -27,6 +29,7 @@ from moe_sae.distributed import (
     evaluate_distributed,
     init_distributed_state,
     precompute_distributed_a_capacity,
+    replicate_process_local_array,
     restore_distributed_checkpoint,
     run_distributed_training,
     save_distributed_checkpoint,
@@ -34,7 +37,7 @@ from moe_sae.distributed import (
 )
 from moe_sae.pipeline import ActivationBatch, TrainingConfig
 from moe_sae.metrics_journal import JournalIdentity, MetricsJournal
-from moe_sae.sae import SAEConfig
+from moe_sae.sae import SAEConfig, init_train_state
 
 
 def test_default_mesh_is_process_by_local_devices() -> None:
@@ -45,6 +48,127 @@ def test_default_mesh_is_process_by_local_devices() -> None:
         jax.process_count(),
         jax.local_device_count(),
     )
+
+
+def test_replicated_array_uses_process_local_global_assembly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mesh = create_mesh()
+    real_assemble = jax.make_array_from_process_local_data
+    calls: list[tuple[NamedSharding, tuple[int, ...], tuple[int, ...] | None]] = []
+
+    def record_assemble(sharding, local_data, global_shape=None):
+        assert isinstance(local_data, np.ndarray)
+        calls.append((sharding, tuple(local_data.shape), global_shape))
+        return real_assemble(
+            sharding,
+            local_data,
+            global_shape=global_shape,
+        )
+
+    monkeypatch.setattr(
+        jax,
+        "make_array_from_process_local_data",
+        record_assemble,
+    )
+    value = np.asarray([1.25, -0.5, 3.0], np.float32)
+    actual = replicate_process_local_array(value, mesh)
+
+    assert calls == [
+        (
+            NamedSharding(mesh, P()),
+            value.shape,
+            value.shape,
+        )
+    ]
+    assert actual.sharding == NamedSharding(mesh, P())
+    assert actual.is_fully_replicated
+    np.testing.assert_array_equal(np.asarray(actual), value)
+
+
+@pytest.mark.parametrize("typed_key", [False, True])
+def test_distributed_initialization_assembles_a_replicated_process_local_key(
+    monkeypatch: pytest.MonkeyPatch,
+    typed_key: bool,
+) -> None:
+    mesh = create_mesh()
+    config = SAEConfig(
+        "B",
+        hidden_dim=3,
+        num_experts=2,
+        top_routed=1,
+        bank_width=2,
+        k=1,
+        parameter_dtype="float32",
+        warmup_steps=0,
+        total_steps=1,
+    )
+    key = jax.random.key(7) if typed_key else jax.random.PRNGKey(7)
+    observed: list[np.ndarray] = []
+    real_replicate = distributed_module.replicate_process_local_array
+
+    def record_replicate(value, selected_mesh):
+        observed.append(value)
+        return real_replicate(value, selected_mesh)
+
+    monkeypatch.setattr(
+        distributed_module,
+        "replicate_process_local_array",
+        record_replicate,
+    )
+    actual = init_distributed_state(key, mesh, config)
+    repeated = init_distributed_state(key, mesh, config)
+    expected = init_train_state(key, config)
+
+    assert len(observed) == 2
+    np.testing.assert_array_equal(observed[0], jax.random.key_data(key))
+    np.testing.assert_array_equal(observed[1], jax.random.key_data(key))
+    assert observed[0].dtype == np.uint32
+    assert observed[1].dtype == np.uint32
+    for actual_leaf, repeated_leaf, expected_leaf in zip(
+        jax.tree_util.tree_leaves(actual),
+        jax.tree_util.tree_leaves(repeated),
+        jax.tree_util.tree_leaves(expected),
+        strict=True,
+    ):
+        np.testing.assert_array_equal(
+            np.asarray(actual_leaf),
+            np.asarray(repeated_leaf),
+        )
+        np.testing.assert_allclose(
+            np.asarray(actual_leaf),
+            np.asarray(expected_leaf),
+            rtol=2e-7,
+            atol=1e-7,
+            equal_nan=True,
+        )
+
+
+def test_legacy_and_typed_keys_have_identical_distributed_initialization() -> None:
+    mesh = create_mesh()
+    config = SAEConfig(
+        "B",
+        hidden_dim=3,
+        num_experts=2,
+        top_routed=1,
+        bank_width=2,
+        k=1,
+        parameter_dtype="float32",
+        warmup_steps=0,
+        total_steps=1,
+    )
+    legacy = init_distributed_state(jax.random.PRNGKey(11), mesh, config)
+    typed = init_distributed_state(jax.random.key(11), mesh, config)
+
+    for legacy_leaf, typed_leaf in zip(
+        jax.tree_util.tree_leaves(legacy),
+        jax.tree_util.tree_leaves(typed),
+        strict=True,
+    ):
+        np.testing.assert_array_equal(
+            np.asarray(legacy_leaf),
+            np.asarray(typed_leaf),
+        )
 
 
 def test_capacity_scan_uses_static_local_microbatches_and_margin() -> None:

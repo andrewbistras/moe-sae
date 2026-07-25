@@ -260,6 +260,29 @@ def batch_shardings(mesh: Mesh, config: DistributedConfig) -> DistributedBatch:
     )
 
 
+def replicate_process_local_array(value: Any, mesh: Mesh) -> jax.Array:
+    """Assemble an identical process-local value as a global replicated array.
+
+    A multi-controller :class:`NamedSharding` names devices that are not
+    addressable by any one process.  Consequently, ``jax.device_put(value,
+    NamedSharding(mesh, P()))`` cannot construct a replicated global array
+    from a host-local value on such a mesh.  JAX's process-local assembly API
+    creates only the addressable replica buffers on each controller while
+    preserving the global ``P()`` sharding.
+
+    Callers are responsible for supplying the same deterministic value on
+    every process.  Initialization keys come from the shared run seed and
+    centering means come from the sealed capture manifest.
+    """
+
+    local_value = np.asarray(jax.device_get(value))
+    return jax.make_array_from_process_local_data(
+        NamedSharding(mesh, P()),
+        local_value,
+        global_shape=local_value.shape,
+    )
+
+
 def shard_train_state(
     state: TrainState,
     mesh: Mesh,
@@ -285,12 +308,24 @@ def init_distributed_state(
     distributed = distributed or DistributedConfig()
     _validate_mesh_model(mesh, sae_config, distributed)
     output_shardings = state_shardings(mesh, distributed)
+    typed_key = jax.dtypes.issubdtype(key.dtype, jax.dtypes.prng_key)
+    key_impl = jax.random.key_impl(key) if typed_key else None
+    key_data = np.asarray(jax.device_get(jax.random.key_data(key)))
+
+    def initialize_from_key_data(rng_data: jax.Array) -> TrainState:
+        rng = (
+            jax.random.wrap_key_data(rng_data, impl=key_impl)
+            if typed_key
+            else rng_data
+        )
+        return init_train_state(rng, sae_config)
+
     initialize = jax.jit(
-        lambda rng: init_train_state(rng, sae_config),
+        initialize_from_key_data,
         in_shardings=NamedSharding(mesh, P()),
         out_shardings=output_shardings,
     )
-    return initialize(jax.device_put(key, NamedSharding(mesh, P())))
+    return initialize(replicate_process_local_array(key_data, mesh))
 
 
 def _validate_mesh_model(
@@ -752,8 +787,8 @@ class DistributedTrainer:
             if process_local
             else shard_batch(batch, self.mesh, self.distributed)
         )
-        mean_array = jax.device_put(
-            jnp.asarray(mean, jnp.float32), NamedSharding(self.mesh, P())
+        mean_array = replicate_process_local_array(
+            jnp.asarray(mean, jnp.float32), self.mesh
         )
         return batch, mean_array
 
@@ -2092,8 +2127,8 @@ def distributed_evaluate(
             if process_local_inputs
             else shard_batch(stacked, mesh, distributed)
         )
-        mean_array = jax.device_put(
-            jnp.asarray(mean, jnp.float32), NamedSharding(mesh, P())
+        mean_array = replicate_process_local_array(
+            jnp.asarray(mean, jnp.float32), mesh
         )
         _, aux = compiled(
             params,
@@ -2740,6 +2775,7 @@ __all__ = [
     "evaluate_distributed",
     "init_distributed_state",
     "precompute_distributed_a_capacity",
+    "replicate_process_local_array",
     "restore_distributed_checkpoint",
     "run_distributed_training",
     "save_distributed_checkpoint",

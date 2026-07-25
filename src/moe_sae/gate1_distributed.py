@@ -26,6 +26,7 @@ from moe_sae.distributed import (
     _param_specs,
     _validate_mesh_model,
     batch_shardings,
+    replicate_process_local_array,
     shard_batch,
     shard_process_local_batch,
 )
@@ -246,8 +247,8 @@ class Gate1DistributedScorer:
             if process_local
             else shard_batch(batch, self.mesh, self.distributed)
         )
-        placed_mean = jax.device_put(
-            jnp.asarray(mean, jnp.float32), NamedSharding(self.mesh, P())
+        placed_mean = replicate_process_local_array(
+            jnp.asarray(mean, jnp.float32), self.mesh
         )
         return self._compiled(
             params,
