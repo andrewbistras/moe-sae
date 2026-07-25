@@ -434,7 +434,12 @@ class SharedQProcessInput:
         )
         if role not in {"train", "evaluation"}:
             raise SharedQError("shared-Q input role must be train or evaluation")
-        expected_split = "train" if role == "train" else "validation"
+        # Contribution manifests bind the artifact role (train/eval), while
+        # provenance separately binds the underlying corpus split
+        # (train/validation).  Do not compare the artifact field to the corpus
+        # name here: the sealed held-out contribution capture is exactly
+        # ``split="eval"``.
+        expected_split = "train" if role == "train" else "eval"
         if _manifest["metadata"]["split"] != expected_split:
             raise SharedQError(
                 f"shared-Q {role} input requires split {expected_split!r}"

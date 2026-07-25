@@ -244,7 +244,7 @@ def test_shared_q_input_prefers_selective_shared_tensor_reader() -> None:
     evaluation = _SelectiveDataset(
         _wire(3, offset=0.2),
         sidecar,
-        split="validation",
+        split="eval",
     )
     source = SharedQProcessInput(
         evaluation,
@@ -266,8 +266,8 @@ def test_shared_q_input_prefers_selective_shared_tensor_reader() -> None:
 def test_shared_q_process_lanes_are_disjoint_exhaustive_and_static() -> None:
     sidecar = _sidecar()
     train = _Dataset(_wire(10), sidecar, split="train")
-    evaluation0 = _SelectiveDataset(_wire(10), sidecar, split="validation")
-    evaluation1 = _SelectiveDataset(_wire(10), sidecar, split="validation")
+    evaluation0 = _SelectiveDataset(_wire(10), sidecar, split="eval")
+    evaluation1 = _SelectiveDataset(_wire(10), sidecar, split="eval")
     centering = build_shared_q_centering(train, sidecar)
     sources = [
         SharedQProcessInput(
@@ -309,7 +309,7 @@ def test_shared_q_process_lanes_are_disjoint_exhaustive_and_static() -> None:
 def test_shared_q_input_uses_exact_sidecar_mean_sst_and_tail_identity() -> None:
     sidecar = _sidecar()
     train = _Dataset(_wire(6), sidecar, split="train")
-    evaluation = _Dataset(_wire(5, offset=0.1), sidecar, split="validation")
+    evaluation = _Dataset(_wire(5, offset=0.1), sidecar, split="eval")
     centering = build_shared_q_centering(train, sidecar)
     train_normalized = bf16_bits_to_float32(
         maxtext_rmsnorm_bf16(
@@ -394,6 +394,19 @@ def test_shared_q_input_uses_exact_sidecar_mean_sst_and_tail_identity() -> None:
             sidecar,
             centering,
             role="train",
+            total_tokens=5,
+        )
+    validation_named = _Dataset(
+        _wire(5, offset=0.1),
+        sidecar,
+        split="validation",
+    )
+    with pytest.raises(SharedQError, match="split 'eval'"):
+        SharedQProcessInput(
+            validation_named,
+            sidecar,
+            centering,
+            role="evaluation",
             total_tokens=5,
         )
 
