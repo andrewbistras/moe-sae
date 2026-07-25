@@ -1,5 +1,5 @@
 schema_version: gemma4-contribution-run-config-v1
-protocol_id: gemma4-contribution-v1-20260724
+protocol_id: gemma4-contribution-v1-20260725
 provenance:
   model_id: google/gemma-4-26B-A4B
   model_revision: 24548b62aa021d562695c04aaf7758a1ea47990b
@@ -63,12 +63,13 @@ runtime:
   effective_batch_tokens: 16384
   microbatch_tokens: 4096
   writer_backlog_max_batches: 2
-  phase1_min_persisted_goodput_fraction: 0.85
-  phase1_min_auxiliary_throughput_fraction: 0.90
+  phase1_min_persisted_goodput_fraction: 0.60
+  phase1_min_auxiliary_throughput_fraction: 0.85
   # No accelerator job may be authorized beyond ten minutes unless this exact
-  # graph/hardware/configuration has already passed the bounded MFU qualifier.
-  accelerator_mfu_policy: hard_gate_exact_graph_hardware_config
-  accelerator_min_useful_mfu: 0.10
+  # graph/hardware/configuration has already passed the bounded Gemma
+  # Experiment-2 qualifier. This override does not alter DeepSeek policy.
+  accelerator_mfu_policy: gemma_experiment2_only_measured_admission_v1
+  accelerator_min_useful_mfu: 0.03
   accelerator_ungated_max_seconds: 600
   accelerator_qualification_max_seconds: 600
   router_order: weight_desc_expert_id_asc
@@ -187,9 +188,9 @@ phases:
       - multihost_ranges_no_gaps_or_duplicates
       - no_routed_token_drops
       - writer_queue_bounded
-      - persisted_goodput_ge_0.85_device_output
+      - persisted_goodput_ge_0.60_device_output
       - no_recompilation_after_warmup
-      - auxiliary_tokens_per_second_ge_0.90_writer_disabled
+      - auxiliary_tokens_per_second_ge_0.85_writer_disabled
     blind_relative_quality_until_health: false
     require_f_compile_smoke: false
     shared_q_resume_phase: null

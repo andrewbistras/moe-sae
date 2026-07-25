@@ -26,7 +26,7 @@ import numpy as np
 SCHEMA_VERSION = "gemma4-expert-contribution-v2"
 RECOMPOSITION_SIDECAR_SCHEMA_VERSION = "gemma4-recomposition-sidecar-v1"
 LEGACY_AGGREGATE_SCHEMA_VERSION = "gemma4-router-aggregate-v1"
-PROTOCOL_ID = "gemma4-contribution-v1-20260724"
+PROTOCOL_ID = "gemma4-contribution-v1-20260725"
 
 MODEL_ID = "google/gemma-4-26B-A4B"
 MAXTEXT_BASE_COMMIT = "48c7da3e28e8f57fe36ddf09d00eec53072a2ea0"

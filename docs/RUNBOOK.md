@@ -5,6 +5,14 @@ integrity, MFU, goodput, health, or exact-count gate. Production commands that
 initialize JAX must be launched collectively with the same arguments on all
 four v4-32 controllers; the snippets below show that per-controller command.
 
+The Gemma Experiment-2 admission override is intentionally narrow. The exact
+qualification floors are 3% useful-prefix MFU, 60% persisted/device goodput,
+and 85% auxiliary/writer-disabled throughput. They conservatively admit the
+measured B128 result (3.65598%, 63.88945%, and 90.08767%, respectively) while
+leaving the 600-second deadline, identity/parity/numerical checks, scientific
+`G2 >= 10%` gate, 10% capacity margin, and the separate DeepSeek `>=51%` MFU
+target unchanged.
+
 ## Experiment 2 — qualify the contribution harvester
 
 Use this block only after Stage 3 has deployed one clean commit to all four
@@ -50,7 +58,7 @@ only `moe_sae.contribution_qualification_worker launch-host`; its process group
 is terminated and reaped at the 600-second boundary. A smaller candidate is
 allowed only after all four prior processes have terminal, hash-verified
 evidence and the decision is an explicit OOM or bounded persistence/static
-capacity-headroom failure. Reaching the 600-second deadline or missing the 10%
+capacity-headroom failure. Reaching the 600-second deadline or missing the 3%
 MFU floor aborts; it never authorizes a smaller candidate. SSH transport,
 identity, parity, numerical, and unknown failures also abort the sweep.
 

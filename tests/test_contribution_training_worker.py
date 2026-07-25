@@ -10,7 +10,10 @@ import pytest
 
 from moe_sae import contribution_training_worker as training_worker_module
 from moe_sae.contribution_config import load_contribution_config
-from moe_sae.contribution_performance import ExactPerformanceIdentity
+from moe_sae.contribution_performance import (
+    MINIMUM_USEFUL_PREFIX_MFU,
+    ExactPerformanceIdentity,
+)
 from moe_sae.contribution_training_performance import (
     SAEArithmetic,
     SAEQualificationObservation,
@@ -463,7 +466,10 @@ def test_qualifier_benchmarks_both_modes_and_binds_faster_receipt() -> None:
     mode, selected_identity, receipt = chosen_mode_evidence(checked)
     assert mode == "resident"
     assert selected_identity == identity("resident")
-    assert receipt["performance"]["useful_prefix_mfu"] >= 0.10
+    assert (
+        receipt["performance"]["useful_prefix_mfu"]
+        >= MINIMUM_USEFUL_PREFIX_MFU
+    )
     assert receipt["evidence"]["qualification_wall_seconds"] == 4.0
 
 

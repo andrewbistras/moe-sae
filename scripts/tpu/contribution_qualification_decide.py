@@ -34,7 +34,13 @@ from moe_sae.contribution_artifacts import (
     validate_recomposition_sidecar,
 )
 from moe_sae.contribution_maxtext import useful_flops_ledger
-from moe_sae.contribution_performance import ContributionPerformanceError
+from moe_sae.contribution_performance import (
+    AUXILIARY_THROUGHPUT_ADMISSION_MESSAGE,
+    MINIMUM_USEFUL_PREFIX_MFU,
+    PERSISTED_GOODPUT_ADMISSION_MESSAGE,
+    USEFUL_MFU_ADMISSION_MESSAGE,
+    ContributionPerformanceError,
+)
 from moe_sae.contribution_qualification_worker import (
     aggregate_supervised_host_evidence,
     validate_supervised_host_evidence,
@@ -67,12 +73,10 @@ _FALLBACK_ADMISSION_MESSAGES = {
     "qualification observed an OOM": "explicit_oom",
     "writer backlog reached or exceeded its hard bound":
         "persistence_headroom",
-    "persisted goodput is below 85% of device output goodput":
-        "persistence_headroom",
-    "auxiliary capture throughput is below 90% of writer-disabled":
-        "persistence_headroom",
+    PERSISTED_GOODPUT_ADMISSION_MESSAGE: "persistence_headroom",
+    AUXILIARY_THROUGHPUT_ADMISSION_MESSAGE: "persistence_headroom",
 }
-_LOW_MFU_ADMISSION_MESSAGE = "useful-prefix MFU is below the 10% hard gate"
+_LOW_MFU_ADMISSION_MESSAGE = USEFUL_MFU_ADMISSION_MESSAGE
 _DECLARED_CANDIDATES = (
     {
         "candidate_id": "b128-ep8-fsdp2",
@@ -493,7 +497,7 @@ def _qualification_metrics(
     )
     metrics = {
         "useful_prefix_mfu": useful_mfu,
-        "minimum_useful_prefix_mfu": 0.10,
+        "minimum_useful_prefix_mfu": MINIMUM_USEFUL_PREFIX_MFU,
         "useful_flops": useful_flops,
         "measured_device_seconds": measured_seconds,
         "device_output_tokens_per_second": device_output_tps,
@@ -570,7 +574,8 @@ def decide_candidate(args: argparse.Namespace) -> int:
                 or admission_reason_code == "persistence_headroom"
             )
             if (
-                measured_metrics["useful_prefix_mfu"] < 0.10
+                measured_metrics["useful_prefix_mfu"]
+                < MINIMUM_USEFUL_PREFIX_MFU
                 and low_mfu_has_precedence
             ):
                 reason = _LOW_MFU_ADMISSION_MESSAGE
@@ -590,7 +595,10 @@ def decide_candidate(args: argparse.Namespace) -> int:
                 outcome = "fallback_allowed"
                 exit_code = FALLBACK_EXIT
         else:
-            if measured_metrics["useful_prefix_mfu"] < 0.10:
+            if (
+                measured_metrics["useful_prefix_mfu"]
+                < MINIMUM_USEFUL_PREFIX_MFU
+            ):
                 bundle = None
                 reason = _LOW_MFU_ADMISSION_MESSAGE
                 reason_code = "useful_mfu_below_hard_gate"

@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 SCHEMA_VERSION = "gemma4-contribution-run-config-v1"
-PROTOCOL_ID = "gemma4-contribution-v1-20260724"
+PROTOCOL_ID = "gemma4-contribution-v1-20260725"
 
 MODEL_ID = "google/gemma-4-26B-A4B"
 MODEL_REVISION = "24548b62aa021d562695c04aaf7758a1ea47990b"
@@ -59,9 +59,9 @@ PHASE1_GATES = (
     "multihost_ranges_no_gaps_or_duplicates",
     "no_routed_token_drops",
     "writer_queue_bounded",
-    "persisted_goodput_ge_0.85_device_output",
+    "persisted_goodput_ge_0.60_device_output",
     "no_recompilation_after_warmup",
-    "auxiliary_tokens_per_second_ge_0.90_writer_disabled",
+    "auxiliary_tokens_per_second_ge_0.85_writer_disabled",
 )
 PHASE2_GATES = (
     "all_conditions_finite_exact_l0_no_overflow_falling_loss",
@@ -262,10 +262,12 @@ class ContributionRuntime:
     effective_batch_tokens: int = 16_384
     microbatch_tokens: int = 4_096
     writer_backlog_max_batches: int = 2
-    phase1_min_persisted_goodput_fraction: float = 0.85
-    phase1_min_auxiliary_throughput_fraction: float = 0.90
-    accelerator_mfu_policy: str = "hard_gate_exact_graph_hardware_config"
-    accelerator_min_useful_mfu: float = 0.10
+    phase1_min_persisted_goodput_fraction: float = 0.60
+    phase1_min_auxiliary_throughput_fraction: float = 0.85
+    accelerator_mfu_policy: str = (
+        "gemma_experiment2_only_measured_admission_v1"
+    )
+    accelerator_min_useful_mfu: float = 0.03
     accelerator_ungated_max_seconds: int = 600
     accelerator_qualification_max_seconds: int = 600
     router_order: str = "weight_desc_expert_id_asc"

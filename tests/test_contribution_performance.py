@@ -7,9 +7,14 @@ import pytest
 
 from moe_sae.contribution_artifacts import canonical_sha256
 from moe_sae.contribution_performance import (
+    AUXILIARY_THROUGHPUT_ADMISSION_MESSAGE,
     MAX_QUALIFICATION_SECONDS,
     MAX_UNGATED_ACCELERATOR_SECONDS,
+    MINIMUM_AUXILIARY_THROUGHPUT_FRACTION,
+    MINIMUM_PERSISTED_GOODPUT_FRACTION,
     MINIMUM_USEFUL_PREFIX_MFU,
+    PERSISTED_GOODPUT_ADMISSION_MESSAGE,
+    USEFUL_MFU_ADMISSION_MESSAGE,
     ContributionPerformanceError,
     ExactPerformanceIdentity,
     QualificationEvidence,
@@ -47,7 +52,7 @@ def identity(label: str = "qualified") -> ExactPerformanceIdentity:
 def passing_evidence(
     *,
     selected_identity: ExactPerformanceIdentity | None = None,
-    mfu: float = 0.10,
+    mfu: float = MINIMUM_USEFUL_PREFIX_MFU,
 ) -> QualificationEvidence:
     peak = 4_400_000_000_000_000
     device_seconds = 40.0
@@ -127,7 +132,7 @@ def test_receipt_derives_mfu_throughput_parity_and_self_hash():
     )
 
     assert validated["status"] == "passed"
-    assert validated["performance"]["useful_prefix_mfu"] == pytest.approx(0.10)
+    assert validated["performance"]["useful_prefix_mfu"] == pytest.approx(0.03)
     assert validated["performance"]["device_output_tokens_per_second"] == pytest.approx(
         100_000.0
     )
@@ -172,14 +177,52 @@ def test_receipt_derives_mfu_throughput_parity_and_self_hash():
             "instrumentation changed",
         ),
         ({"persisted_tokens": 3_999_999}, "token count differs"),
-        ({"persisted_window_seconds": 48.0}, "below 85%"),
-        ({"writer_disabled_device_seconds": 35.0}, "below 90%"),
-        ({"useful_flops": 1}, "below the 10%"),
+        ({"persisted_window_seconds": 68.0}, "60%"),
+        ({"writer_disabled_device_seconds": 33.0}, "85%"),
+        ({"useful_flops": 1}, "3%"),
     ],
 )
 def test_receipt_fails_closed_on_each_performance_fault(changes, message):
     with pytest.raises(ContributionPerformanceError, match=message):
         build_qualification_receipt(replace(passing_evidence(), **changes))
+
+
+def test_measured_b128_evidence_clears_only_the_frozen_experiment2_floors():
+    measured = replace(
+        passing_evidence(mfu=0.0365598),
+        persisted_window_seconds=(
+            40.0 / 0.6388945
+        ),
+        writer_disabled_device_seconds=40.0 * 0.9008767,
+    )
+    receipt = build_qualification_receipt(measured)
+
+    assert receipt["policy"] == {
+        "minimum_useful_prefix_mfu": 0.03,
+        "qualification_max_seconds": 600,
+        "minimum_persisted_goodput_fraction": 0.60,
+        "minimum_auxiliary_throughput_fraction": 0.85,
+    }
+    assert receipt["performance"]["useful_prefix_mfu"] == pytest.approx(
+        0.0365598
+    )
+    assert (
+        receipt["performance"]["persisted_tokens_per_second"]
+        / receipt["performance"]["device_output_tokens_per_second"]
+        == pytest.approx(0.6388945)
+    )
+    assert receipt["performance"]["auxiliary_throughput_fraction"] == pytest.approx(
+        0.9008767
+    )
+
+
+def test_experiment2_admission_constants_and_messages_are_exact():
+    assert MINIMUM_USEFUL_PREFIX_MFU == 0.03
+    assert MINIMUM_PERSISTED_GOODPUT_FRACTION == 0.60
+    assert MINIMUM_AUXILIARY_THROUGHPUT_FRACTION == 0.85
+    assert "Gemma Experiment-2 3%" in USEFUL_MFU_ADMISSION_MESSAGE
+    assert "Gemma Experiment-2 60%" in PERSISTED_GOODPUT_ADMISSION_MESSAGE
+    assert "Gemma Experiment-2 85%" in AUXILIARY_THROUGHPUT_ADMISSION_MESSAGE
 
 
 def test_receipt_rejects_tampering_even_if_claimed_status_remains_passed():

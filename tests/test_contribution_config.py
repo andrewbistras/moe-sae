@@ -28,7 +28,7 @@ from moe_sae.contribution_config import (
 ROOT = Path(__file__).resolve().parents[1]
 CHECKED_IN_CONFIG = ROOT / "configs" / "gemma4_contribution_v1.yaml"
 DEFAULT_CONFIG_SHA256 = (
-    "acab4ae914dfc32a4b9de319c2c598ba22260d8584f5907ed0966a0278006de9"
+    "2fbdbed94d317ae2c8e4a8a156bd25f2456eff28be20de8ed9a50928eafe2248"
 )
 
 
@@ -165,13 +165,13 @@ def test_runtime_does_not_reintroduce_experiment1_capture_defaults():
     assert runtime.capture_schema_version == "gemma4-expert-contribution-v2"
     assert runtime.max_shard_tokens == 16_384
     assert runtime.accelerator_mfu_policy == (
-        "hard_gate_exact_graph_hardware_config"
+        "gemma_experiment2_only_measured_admission_v1"
     )
-    assert runtime.accelerator_min_useful_mfu == 0.10
+    assert runtime.accelerator_min_useful_mfu == 0.03
     assert runtime.accelerator_ungated_max_seconds == 600
     assert runtime.accelerator_qualification_max_seconds == 600
-    assert runtime.phase1_min_persisted_goodput_fraction == 0.85
-    assert runtime.phase1_min_auxiliary_throughput_fraction == 0.90
+    assert runtime.phase1_min_persisted_goodput_fraction == 0.60
+    assert runtime.phase1_min_auxiliary_throughput_fraction == 0.85
     assert runtime.router_order == "weight_desc_expert_id_asc"
     assert runtime.contribution_loss == "normalized_router_weighted_sse"
     assert runtime.router_weight_math_dtype == "float32"
@@ -181,6 +181,12 @@ def test_runtime_does_not_reintroduce_experiment1_capture_defaults():
     assert runtime.phase3_min_g2_percent == 10.0
     assert runtime.phase3_max_c2_percent == 50.0
     assert runtime.bootstrap_replicates == 20_000
+    assert "persisted_goodput_ge_0.60_device_output" in (
+        Experiment2Config().phase(1).escalation_gates
+    )
+    assert "auxiliary_tokens_per_second_ge_0.85_writer_disabled" in (
+        Experiment2Config().phase(1).escalation_gates
+    )
 
 
 @pytest.mark.parametrize(
@@ -215,7 +221,7 @@ def test_runtime_does_not_reintroduce_experiment1_capture_defaults():
             "runtime.max_shard_tokens is pinned",
         ),
         (
-            lambda: ContributionRuntime(accelerator_min_useful_mfu=0.09),
+            lambda: ContributionRuntime(accelerator_min_useful_mfu=0.02),
             "runtime.accelerator_min_useful_mfu is pinned",
         ),
         (

@@ -3,8 +3,8 @@
 Harvester and SAE graphs have different arithmetic.  This module supplies an
 honest SAE ledger, then adapts a deterministic training-step qualification to
 the repository-wide exact-identity receipt format.  The shared receipt
-validator still enforces the same hard floor: no graph below 10% useful MFU
-may authorize accelerator work beyond 600 seconds.
+validator still enforces the Gemma Experiment-2 floor: no graph below 3%
+useful MFU may authorize accelerator work beyond 600 seconds.
 
 Only algorithmic reconstruction FLOPs are counted.  Capacity padding,
 rematerialization, TopK, collectives, normalization, Adam, and input stalls
@@ -14,19 +14,19 @@ and comparable across A/R/B/F/Q execution choices.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
 import math
+from dataclasses import asdict, dataclass
 from typing import Any, Literal
 
 from moe_sae.contribution_artifacts import canonical_sha256
 from moe_sae.contribution_performance import (
     MAX_QUALIFICATION_SECONDS,
+    MINIMUM_USEFUL_PREFIX_MFU,
     ExactPerformanceIdentity,
     QualificationEvidence,
     build_qualification_receipt,
 )
 from moe_sae.contribution_sae import ContributionSAEConfig
-
 
 SAE_FLOPS_LEDGER_SCHEMA_VERSION = "gemma4-contribution-sae-useful-flops-v1"
 SAE_QUALIFICATION_OBSERVATION_SCHEMA_VERSION = (
@@ -72,7 +72,7 @@ class SAEArithmetic:
     def from_contribution_layout(
         cls,
         layout: ContributionSAEConfig,
-    ) -> "SAEArithmetic":
+    ) -> SAEArithmetic:
         return cls(
             workload="routed",
             condition=layout.condition,
@@ -88,7 +88,7 @@ class SAEArithmetic:
         hidden_dim: int = 2_816,
         total_features: int = 8_192,
         k: int = 64,
-    ) -> "SAEArithmetic":
+    ) -> SAEArithmetic:
         return cls(
             workload="shared_q",
             condition="Q",
@@ -273,7 +273,7 @@ def build_sae_qualification_receipt(
     arithmetic: SAEArithmetic,
     *,
     peak_flops_per_second: int,
-    minimum_useful_mfu: float = 0.10,
+    minimum_useful_mfu: float = MINIMUM_USEFUL_PREFIX_MFU,
 ) -> tuple[QualificationEvidence, dict[str, Any]]:
     """Validate a deterministic SAE probe and seal the shared gate receipt."""
 

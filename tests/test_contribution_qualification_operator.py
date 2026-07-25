@@ -316,9 +316,9 @@ def test_only_explicit_admission_messages_allow_fallback(decider) -> None:
         "qualification observed an OOM": "explicit_oom",
         "writer backlog reached or exceeded its hard bound":
             "persistence_headroom",
-        "persisted goodput is below 85% of device output goodput":
+        decider.PERSISTED_GOODPUT_ADMISSION_MESSAGE:
             "persistence_headroom",
-        "auxiliary capture throughput is below 90% of writer-disabled":
+        decider.AUXILIARY_THROUGHPUT_ADMISSION_MESSAGE:
             "persistence_headroom",
     }
     assert any(
@@ -363,9 +363,9 @@ def test_low_mfu_preempts_persistence_fallback_and_seals_measured_abort(
                         "global_output_tokens": output_tokens,
                         "local_persisted_tokens": output_tokens // 4,
                         "writer_disabled_global_output_tokens": output_tokens,
-                        "measured_device_seconds": 1_000.0,
-                        "persisted_window_seconds": 1_010.0,
-                        "writer_disabled_device_seconds": 990.0,
+                        "measured_device_seconds": 2_000.0,
+                        "persisted_window_seconds": 2_010.0,
+                        "writer_disabled_device_seconds": 1_990.0,
                     },
                 },
             )
@@ -384,7 +384,7 @@ def test_low_mfu_preempts_persistence_fallback_and_seals_measured_abort(
 
     def reject_persistence_headroom(*_args, **_kwargs):
         raise decider.ContributionPerformanceError(
-            "persisted goodput is below 85% of device output goodput"
+            decider.PERSISTED_GOODPUT_ADMISSION_MESSAGE
         )
 
     monkeypatch.setattr(
@@ -418,7 +418,7 @@ def test_low_mfu_preempts_persistence_fallback_and_seals_measured_abort(
     assert decision["next_action"] == "abort_operator_investigation_required"
     assert (
         decision["qualification_metrics"]["minimum_useful_prefix_mfu"]
-        == 0.10
+        == 0.03
     )
     expected_flops = decider.useful_flops_ledger(
         batch_sequences=128,
@@ -427,9 +427,13 @@ def test_low_mfu_preempts_persistence_fallback_and_seals_measured_abort(
     )["useful_flops"]
     assert decision["qualification_metrics"]["useful_flops"] == expected_flops
     assert decision["qualification_metrics"]["useful_prefix_mfu"] == pytest.approx(
-        expected_flops / (decider.V4_32_BF16_PEAK_FLOPS * 1_000.0)
+        expected_flops / (decider.V4_32_BF16_PEAK_FLOPS * 2_000.0)
     )
-    assert 0.0 < decision["qualification_metrics"]["useful_prefix_mfu"] < 0.10
+    assert (
+        0.0
+        < decision["qualification_metrics"]["useful_prefix_mfu"]
+        < decider.MINIMUM_USEFUL_PREFIX_MFU
+    )
     assert decision["qualification_metrics"]["output_tokens"] == output_tokens
     assert (
         decision["qualification_metrics"]["persisted_tokens"]
@@ -437,10 +441,10 @@ def test_low_mfu_preempts_persistence_fallback_and_seals_measured_abort(
     )
     assert decision["qualification_metrics"][
         "device_output_tokens_per_second"
-    ] == pytest.approx(output_tokens / 1_000.0)
+    ] == pytest.approx(output_tokens / 2_000.0)
     assert decision["qualification_metrics"][
         "persisted_tokens_per_second"
-    ] == pytest.approx(output_tokens / 1_010.0)
+    ] == pytest.approx(output_tokens / 2_010.0)
     assert not Path(args.output).exists()
     assert not Path(args.qualification_receipt).exists()
     assert not Path(args.recomposition_sidecar).exists()

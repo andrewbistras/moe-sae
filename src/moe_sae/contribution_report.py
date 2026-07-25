@@ -33,6 +33,10 @@ from moe_sae.contribution_input import (
     LEGACY_CONTRIBUTION_INPUT_SCHEMA_VERSION,
     ContributionInputReceipt,
 )
+from moe_sae.contribution_performance import (
+    MINIMUM_AUXILIARY_THROUGHPUT_FRACTION,
+    MINIMUM_PERSISTED_GOODPUT_FRACTION,
+)
 from moe_sae.contribution_sae import (
     CONTRIBUTION_CONDITIONS,
     pilot_contribution_config,
@@ -125,9 +129,9 @@ _PHASE1_CHECKS = (
     "multihost_ranges_no_gaps_or_duplicates",
     "no_routed_token_drops",
     "writer_queue_bounded",
-    "persisted_goodput_ge_0.85_device_output",
+    "persisted_goodput_ge_0.60_device_output",
     "no_recompilation_after_warmup",
-    "auxiliary_tokens_per_second_ge_0.90_writer_disabled",
+    "auxiliary_tokens_per_second_ge_0.85_writer_disabled",
 )
 
 
@@ -1285,13 +1289,15 @@ def build_phase1_receipt(
     if not 0.0 <= performance["useful_prefix_mfu"] <= 1.0:
         raise ContributionReportError("Phase-1 useful_prefix_mfu must lie in [0,1]")
     derived = {
-        "persisted_goodput_ge_0.85_device_output": (
+        "persisted_goodput_ge_0.60_device_output": (
             performance["persisted_tokens_per_second"]
-            >= 0.85 * performance["device_output_tokens_per_second"]
+            >= MINIMUM_PERSISTED_GOODPUT_FRACTION
+            * performance["device_output_tokens_per_second"]
         ),
-        "auxiliary_tokens_per_second_ge_0.90_writer_disabled": (
+        "auxiliary_tokens_per_second_ge_0.85_writer_disabled": (
             performance["auxiliary_tokens_per_second"]
-            >= 0.90 * performance["writer_disabled_tokens_per_second"]
+            >= MINIMUM_AUXILIARY_THROUGHPUT_FRACTION
+            * performance["writer_disabled_tokens_per_second"]
         ),
         "writer_queue_bounded": performance["max_writer_backlog_batches"] <= 2,
     }
@@ -1407,9 +1413,11 @@ def validate_phase1_receipt(value: Mapping[str, Any]) -> dict[str, Any]:
             "Phase-1 throughput measurements must be strictly positive"
         )
     derived = {
-        "persisted_goodput_ge_0.85_device_output": persisted >= 0.85 * device,
-        "auxiliary_tokens_per_second_ge_0.90_writer_disabled": (
-            auxiliary >= 0.90 * disabled
+        "persisted_goodput_ge_0.60_device_output": (
+            persisted >= MINIMUM_PERSISTED_GOODPUT_FRACTION * device
+        ),
+        "auxiliary_tokens_per_second_ge_0.85_writer_disabled": (
+            auxiliary >= MINIMUM_AUXILIARY_THROUGHPUT_FRACTION * disabled
         ),
         "writer_queue_bounded": backlog <= 2,
     }

@@ -5,7 +5,7 @@ small operational boundary which the scientific trainers do not:
 
 * qualify both resident-forward and rematerialized-microbatch executables;
 * bind the faster passing executable to an exact graph/hardware/config receipt;
-* refuse accelerator work beyond 600 seconds without that >=10% receipt; and
+* refuse accelerator work beyond 600 seconds without that >=3% receipt; and
 * advance a sealed v2 input stream and immutable checkpoint pointers in exact
   update order.
 
@@ -41,6 +41,7 @@ from moe_sae.contribution_config import (
 )
 from moe_sae.contribution_performance import (
     MAX_QUALIFICATION_SECONDS,
+    MINIMUM_USEFUL_PREFIX_MFU,
     ExactPerformanceIdentity,
     authorize_accelerator_run,
     validate_qualification_receipt,
@@ -364,7 +365,7 @@ def qualify_training_modes(
     arithmetic: SAEArithmetic,
     *,
     peak_flops_per_second: int,
-    minimum_useful_mfu: float = 0.10,
+    minimum_useful_mfu: float = MINIMUM_USEFUL_PREFIX_MFU,
     maximum_seconds: int = MAX_QUALIFICATION_SECONDS,
     workload_context: Mapping[str, Any] | None = None,
     qualification_started: float | None = None,

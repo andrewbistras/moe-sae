@@ -497,9 +497,9 @@ def phase1_receipt(*, passing: bool = True):
         "multihost_ranges_no_gaps_or_duplicates": True,
         "no_routed_token_drops": True,
         "writer_queue_bounded": True,
-        "persisted_goodput_ge_0.85_device_output": True,
+        "persisted_goodput_ge_0.60_device_output": True,
         "no_recompilation_after_warmup": True,
-        "auxiliary_tokens_per_second_ge_0.90_writer_disabled": True,
+        "auxiliary_tokens_per_second_ge_0.85_writer_disabled": True,
     }
     return build_phase1_receipt(
         protocol_sha256=PROTOCOL,
@@ -682,7 +682,7 @@ def test_phase1_receipt_derives_performance_checks_and_is_self_hashed():
     assert receipt["status"] == "passed"
 
     checks = dict(receipt["checks"])
-    checks["persisted_goodput_ge_0.85_device_output"] = False
+    checks["persisted_goodput_ge_0.60_device_output"] = False
     with pytest.raises(ContributionReportError, match="disagrees"):
         build_phase1_receipt(
             protocol_sha256=PROTOCOL,
@@ -697,6 +697,26 @@ def test_phase1_receipt_derives_performance_checks_and_is_self_hashed():
             auxiliary_tokens_per_second=1_000.0,
             max_writer_backlog_batches=1,
         )
+
+
+def test_phase1_receipt_accepts_exact_new_goodput_boundaries():
+    checks = dict(phase1_receipt()["checks"])
+    receipt = build_phase1_receipt(
+        protocol_sha256=PROTOCOL,
+        training_capture_manifest_sha256=PHASE1_TRAIN_CAPTURE,
+        evaluation_capture_manifest_sha256=PHASE1_EVAL_CAPTURE,
+        recomposition_sidecar_sha256=SIDECAR,
+        checks=checks,
+        useful_prefix_mfu=0.03,
+        device_output_tokens_per_second=1_000.0,
+        persisted_tokens_per_second=600.0,
+        writer_disabled_tokens_per_second=1_000.0,
+        auxiliary_tokens_per_second=850.0,
+        max_writer_backlog_batches=1,
+    )
+
+    assert receipt["status"] == "passed"
+    assert validate_phase1_receipt(receipt) == receipt
 
 
 def test_phase1_validation_rejects_rehashed_nonpositive_throughput():

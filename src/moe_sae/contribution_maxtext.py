@@ -46,6 +46,7 @@ from moe_sae.contribution_model import (
 )
 from moe_sae.contribution_performance import (
     MAX_QUALIFICATION_SECONDS,
+    MINIMUM_USEFUL_PREFIX_MFU,
     ExactPerformanceIdentity,
     QualificationEvidence,
     build_qualification_receipt,
@@ -1109,9 +1110,9 @@ def aggregate_qualification_hosts(
     batch_sequences: int,
     sequence_length: int,
     peak_flops_per_second: int = int(V4_32_BF16_PEAK_FLOPS),
-    minimum_useful_mfu: float = 0.10,
+    minimum_useful_mfu: float = MINIMUM_USEFUL_PREFIX_MFU,
 ) -> tuple[QualificationEvidence, dict[str, Any]]:
-    """Aggregate all controllers and seal the hard >=10% MFU receipt."""
+    """Aggregate controllers and seal the Experiment-2 admission receipt."""
 
     if not observations:
         raise ContributionMaxTextError("qualification has no host observations")

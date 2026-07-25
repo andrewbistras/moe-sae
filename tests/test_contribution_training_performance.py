@@ -5,6 +5,7 @@ from dataclasses import replace
 import pytest
 
 from moe_sae.contribution_performance import (
+    MINIMUM_USEFUL_PREFIX_MFU,
     ContributionPerformanceError,
     ExactPerformanceIdentity,
 )
@@ -19,7 +20,6 @@ from moe_sae.contribution_training_performance import (
     sae_training_useful_flops,
     sae_useful_flops_ledger,
 )
-
 
 _SHA = "a" * 64
 
@@ -75,7 +75,7 @@ def _observation(*, device_seconds: float = 1.0) -> SAEQualificationObservation:
     )
 
 
-def test_sae_receipt_applies_the_same_ten_percent_gate() -> None:
+def test_sae_receipt_applies_the_same_experiment2_three_percent_gate() -> None:
     arithmetic = SAEArithmetic.from_contribution_layout(
         pilot_contribution_config("A", randomization_key=0)
     )
@@ -84,14 +84,14 @@ def test_sae_receipt_applies_the_same_ten_percent_gate() -> None:
         arithmetic,
         peak_flops_per_second=3_000_000_000_000,
     )
-    assert evidence.useful_prefix_mfu >= 0.10
+    assert evidence.useful_prefix_mfu >= MINIMUM_USEFUL_PREFIX_MFU
     assert bundle["qualification_receipt"]["status"] == "passed"
     assert (
         bundle["qualification_receipt"]["identity_sha256"]
         == _identity().identity_sha256
     )
 
-    with pytest.raises(ContributionPerformanceError, match="10%"):
+    with pytest.raises(ContributionPerformanceError, match="3%"):
         build_sae_qualification_receipt(
             _observation(device_seconds=600.0),
             arithmetic,

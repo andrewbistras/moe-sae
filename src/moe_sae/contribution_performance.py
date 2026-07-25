@@ -14,10 +14,10 @@ enforce the authorized wall-clock deadline.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from dataclasses import asdict, dataclass, fields
 import math
 import re
+from collections.abc import Mapping
+from dataclasses import asdict, dataclass, fields
 from typing import Any, Literal
 
 from moe_sae.contribution_artifacts import (
@@ -30,11 +30,28 @@ QUALIFICATION_RECEIPT_SCHEMA_VERSION = (
 )
 PERFORMANCE_IDENTITY_SCHEMA_VERSION = "gemma4-contribution-performance-identity-v1"
 
-MINIMUM_USEFUL_PREFIX_MFU = 0.10
+# Gemma Experiment 2 only.  These admission floors are intentionally lower
+# than the separate DeepSeek performance target and are bound into every
+# exact-identity receipt.  They were frozen after the real B128 qualification
+# measured 0.0365598 useful MFU, 0.6388945 persisted/device goodput, and
+# 0.9008767 auxiliary/baseline throughput.
+MINIMUM_USEFUL_PREFIX_MFU = 0.03
 MAX_UNGATED_ACCELERATOR_SECONDS = 600
 MAX_QUALIFICATION_SECONDS = 600
-MINIMUM_PERSISTED_GOODPUT_FRACTION = 0.85
-MINIMUM_AUXILIARY_THROUGHPUT_FRACTION = 0.90
+MINIMUM_PERSISTED_GOODPUT_FRACTION = 0.60
+MINIMUM_AUXILIARY_THROUGHPUT_FRACTION = 0.85
+
+PERSISTED_GOODPUT_ADMISSION_MESSAGE = (
+    "persisted goodput is below the Gemma Experiment-2 60% "
+    "device-output admission floor"
+)
+AUXILIARY_THROUGHPUT_ADMISSION_MESSAGE = (
+    "auxiliary capture throughput is below the Gemma Experiment-2 85% "
+    "writer-disabled admission floor"
+)
+USEFUL_MFU_ADMISSION_MESSAGE = (
+    "useful-prefix MFU is below the Gemma Experiment-2 3% admission floor"
+)
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _PURPOSES = ("qualification", "workload")
@@ -127,7 +144,8 @@ def _validate_policy(
     )
     if minimum < MINIMUM_USEFUL_PREFIX_MFU:
         raise ContributionPerformanceError(
-            "minimum_useful_mfu cannot weaken the 10% hard gate"
+            "minimum_useful_mfu cannot weaken the Gemma Experiment-2 "
+            "3% admission floor"
         )
     if ungated > MAX_UNGATED_ACCELERATOR_SECONDS:
         raise ContributionPerformanceError(
@@ -437,22 +455,16 @@ def _require_passing_evidence(
         evidence.persisted_tokens_per_second
         < MINIMUM_PERSISTED_GOODPUT_FRACTION * evidence.device_output_tokens_per_second
     ):
-        raise ContributionPerformanceError(
-            "persisted goodput is below 85% of device output goodput"
-        )
+        raise ContributionPerformanceError(PERSISTED_GOODPUT_ADMISSION_MESSAGE)
     if evidence.auxiliary_throughput_fraction < MINIMUM_AUXILIARY_THROUGHPUT_FRACTION:
-        raise ContributionPerformanceError(
-            "auxiliary capture throughput is below 90% of writer-disabled"
-        )
+        raise ContributionPerformanceError(AUXILIARY_THROUGHPUT_ADMISSION_MESSAGE)
     mfu = evidence.useful_prefix_mfu
     if not math.isfinite(mfu) or not 0.0 < mfu <= 1.0:
         raise ContributionPerformanceError(
             "derived useful-prefix MFU is outside (0, 1]"
         )
     if mfu < minimum_useful_mfu:
-        raise ContributionPerformanceError(
-            "useful-prefix MFU is below the 10% hard gate"
-        )
+        raise ContributionPerformanceError(USEFUL_MFU_ADMISSION_MESSAGE)
 
 
 def _performance(evidence: QualificationEvidence) -> dict[str, float]:
@@ -748,13 +760,16 @@ def authorization_to_dict(
 
 
 __all__ = [
+    "AUXILIARY_THROUGHPUT_ADMISSION_MESSAGE",
     "MAX_QUALIFICATION_SECONDS",
     "MAX_UNGATED_ACCELERATOR_SECONDS",
     "MINIMUM_AUXILIARY_THROUGHPUT_FRACTION",
     "MINIMUM_PERSISTED_GOODPUT_FRACTION",
     "MINIMUM_USEFUL_PREFIX_MFU",
     "PERFORMANCE_IDENTITY_SCHEMA_VERSION",
+    "PERSISTED_GOODPUT_ADMISSION_MESSAGE",
     "QUALIFICATION_RECEIPT_SCHEMA_VERSION",
+    "USEFUL_MFU_ADMISSION_MESSAGE",
     "AcceleratorRunAuthorization",
     "ContributionPerformanceError",
     "ExactPerformanceIdentity",

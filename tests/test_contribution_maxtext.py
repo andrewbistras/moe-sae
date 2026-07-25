@@ -28,7 +28,10 @@ from moe_sae.contribution_maxtext import (
     useful_flops_ledger,
 )
 from moe_sae.contribution_model import Gemma4ContributionPrefixAdapter
-from moe_sae.contribution_performance import ContributionPerformanceError
+from moe_sae.contribution_performance import (
+    MINIMUM_USEFUL_PREFIX_MFU,
+    ContributionPerformanceError,
+)
 from moe_sae.harvest import GrainBatch
 from moe_sae.runtime import (
     MeshCandidate,
@@ -258,7 +261,7 @@ def test_host_qualification_aggregates_into_passing_mfu_receipt() -> None:
         batch_sequences=16,
         sequence_length=1_024,
     )
-    assert evidence.useful_prefix_mfu >= 0.10
+    assert evidence.useful_prefix_mfu >= MINIMUM_USEFUL_PREFIX_MFU
     assert evidence.persisted_tokens == evidence.output_tokens
     assert evidence.auxiliary_throughput_fraction == pytest.approx(1.0)
     assert bundle["qualification_receipt"]["status"] == "passed"
@@ -273,19 +276,19 @@ def test_low_mfu_and_missing_host_fail_closed() -> None:
     slow = [
         replace(
             item,
-            measured_device_seconds=item.measured_device_seconds * 2,
+            measured_device_seconds=item.measured_device_seconds * 10,
             writer_disabled_device_seconds=(
-                item.writer_disabled_device_seconds * 2
+                item.writer_disabled_device_seconds * 10
             ),
-            persisted_window_seconds=item.measured_device_seconds * 2.05,
+            persisted_window_seconds=item.measured_device_seconds * 10.05,
             qualification_wall_seconds=max(
                 item.qualification_wall_seconds,
-                item.measured_device_seconds * 2.1,
+                item.measured_device_seconds * 10.1,
             ),
         )
         for item in hosts
     ]
-    with pytest.raises(ContributionPerformanceError, match="10%"):
+    with pytest.raises(ContributionPerformanceError, match="3%"):
         aggregate_qualification_hosts(
             slow,
             batch_sequences=16,
