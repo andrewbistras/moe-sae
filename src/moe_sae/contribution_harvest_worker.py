@@ -458,17 +458,22 @@ def _validate_sidecar_run_linkage(
     sidecar: Mapping[str, Any],
     *,
     config: Experiment2Config,
+    checkpoint_sha256: str,
     environment_sha256: str,
     maxtext_provenance: Mapping[str, str],
+    allow_environment_drift: bool,
 ) -> None:
     fingerprints = sidecar.get("source_fingerprints")
     if not isinstance(fingerprints, Mapping):
         raise ContributionHarvestWorkerError(
             "recomposition sidecar lacks source fingerprints"
         )
+    sidecar_environment = _sha256(
+        "recomposition sidecar environment fingerprint",
+        fingerprints.get("environment"),
+    )
     expected = {
         "experiment_config": config.config_hash,
-        "environment": environment_sha256,
         "maxtext_routed_moe": maxtext_provenance["routed_moe_sha256"],
     }
     failures = {
@@ -476,6 +481,23 @@ def _validate_sidecar_run_linkage(
         for name, wanted in expected.items()
         if fingerprints.get(name) != wanted
     }
+    direct_expected = {
+        "checkpoint_sha256": checkpoint_sha256,
+        "maxtext_fork_commit": config.provenance.maxtext_fork_commit,
+    }
+    failures.update(
+        {
+            name: {"expected": wanted, "observed": sidecar.get(name)}
+            for name, wanted in direct_expected.items()
+            if sidecar.get(name) != wanted
+        }
+    )
+    environment_drift = sidecar_environment != environment_sha256
+    if environment_drift and not allow_environment_drift:
+        failures["environment"] = {
+            "expected": environment_sha256,
+            "observed": sidecar_environment,
+        }
     if failures:
         raise ContributionHarvestWorkerError(
             "recomposition sidecar is not bound to this qualified run: "
@@ -1020,11 +1042,17 @@ def run_harvest_child(
         "environment.sha256",
         environment.get("sha256"),
     )
+    bounded = (
+        invocation.maximum_runtime_seconds
+        <= config.runtime.accelerator_ungated_max_seconds
+    )
     _validate_sidecar_run_linkage(
         sidecar,
         config=config,
+        checkpoint_sha256=invocation.checkpoint_sha256,
         environment_sha256=environment_sha256,
         maxtext_provenance=maxtext_provenance,
+        allow_environment_drift=bounded,
     )
     metadata = _metadata(
         invocation=invocation,
@@ -1129,10 +1157,6 @@ def run_harvest_child(
                 receipt=receipt,
                 invocation=invocation,
                 config=config,
-            )
-            bounded = (
-                invocation.maximum_runtime_seconds
-                <= config.runtime.accelerator_ungated_max_seconds
             )
             if (
                 (

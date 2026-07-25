@@ -50,6 +50,7 @@ CONFIG_PATH = (
 CHECKPOINT_SHA = "1" * 64
 DATASET_SHA = "2" * 64
 ENVIRONMENT_SHA = "3" * 64
+DRIFTED_ENVIRONMENT_SHA = "f" * 64
 SOURCE_MANIFEST_SHA = "4" * 64
 SIDE_FINGERPRINT = "5" * 64
 OBJECT_PREFIX = "gs://experiment-2-test/contributions"
@@ -504,6 +505,97 @@ def test_bounded_real_data_harvest_records_its_observed_identity_without_gate(
     assert checked["observed_identity_sha256"] != case.identity.identity_sha256
     assert checked["prepared_graph"] == actual_graph
     assert case.writer_state["created"] is True
+
+
+def test_bounded_harvest_accepts_and_records_sidecar_environment_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = _case(
+        tmp_path,
+        monkeypatch,
+        maximum_runtime_seconds=600,
+    )
+    dependencies = replace(
+        case.dependencies,
+        environment=lambda _root: {"sha256": DRIFTED_ENVIRONMENT_SHA},
+    )
+
+    evidence = worker.run_harvest_child(
+        case.invocation,
+        dependencies=dependencies,
+    )
+
+    checked = worker.validate_child_evidence(evidence)
+    assert checked["metadata"]["environment_sha256"] == DRIFTED_ENVIRONMENT_SHA
+    assert (
+        case.sidecar["source_fingerprints"]["environment"]
+        == ENVIRONMENT_SHA
+    )
+    assert (
+        checked["recomposition_sidecar_sha256"]
+        == case.sidecar["sidecar_sha256"]
+    )
+    assert case.writer_state["created"] is True
+
+
+def test_long_harvest_rejects_sidecar_environment_drift_before_writer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = _case(tmp_path, monkeypatch)
+    dependencies = replace(
+        case.dependencies,
+        environment=lambda _root: {"sha256": DRIFTED_ENVIRONMENT_SHA},
+    )
+
+    with pytest.raises(
+        worker.ContributionHarvestWorkerError,
+        match="recomposition sidecar.*environment",
+    ):
+        worker.run_harvest_child(
+            case.invocation,
+            dependencies=dependencies,
+        )
+
+    assert case.writer_state["created"] is False
+    assert not case.invocation.child_evidence_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("mismatch", "failure"),
+    (
+        ("checkpoint_sha256", "checkpoint_sha256"),
+        ("experiment_config", "experiment_config"),
+        ("maxtext_routed_moe", "maxtext_routed_moe"),
+        ("maxtext_fork_commit", "maxtext_fork_commit"),
+    ),
+)
+def test_bounded_environment_exception_keeps_scientific_linkage_strict(
+    mismatch: str,
+    failure: str,
+) -> None:
+    config = load_contribution_config(CONFIG_PATH)
+    sidecar = _sidecar()
+    if mismatch in {"checkpoint_sha256", "maxtext_fork_commit"}:
+        sidecar[mismatch] = "0" * (64 if mismatch == "checkpoint_sha256" else 40)
+    else:
+        sidecar["source_fingerprints"][mismatch] = "0" * 64
+
+    with pytest.raises(
+        worker.ContributionHarvestWorkerError,
+        match=failure,
+    ):
+        worker._validate_sidecar_run_linkage(
+            sidecar,
+            config=config,
+            checkpoint_sha256=CHECKPOINT_SHA,
+            environment_sha256=DRIFTED_ENVIRONMENT_SHA,
+            maxtext_provenance={
+                "routed_moe_sha256": MAXTEXT_ROUTED_MOE_PATCHED_SHA256,
+            },
+            allow_environment_drift=True,
+        )
 
 
 def test_phase2_adopts_exact_phase1_parent_before_appending(
