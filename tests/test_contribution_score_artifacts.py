@@ -17,6 +17,7 @@ from moe_sae.contribution_score_artifacts import (
     ScoreArtifactRef,
     resolve_score_manifest,
     resolve_score_manifest_matrix,
+    resolve_score_manifest_matrix_with_receipt,
     resolve_score_row_shard,
     seal_score_manifest,
     seal_score_row_shard,
@@ -117,6 +118,7 @@ def retain_condition(
     seed: int = 0,
     token_mutation: tuple[int, int] | None = None,
     sst_mutation: tuple[int, int] | None = None,
+    sst_delta: float = 1.0,
 ):
     randomization_key = 7 if condition == "R" else 0
     receipts = tuple(
@@ -138,7 +140,7 @@ def retain_condition(
             if token_mutation == (process_index, update_index):
                 score_evidence.sequence_id[0, 0] += 10_000
             if sst_mutation == (process_index, update_index):
-                score_evidence.scores.component_token_sst[0, 0] += 1.0
+                score_evidence.scores.component_token_sst[0, 0] += sst_delta
             reference, blob = seal_score_row_shard(
                 score_evidence,
                 routed,
@@ -351,12 +353,55 @@ def test_matrix_requires_exact_common_keys_sst_and_centering():
         )
         for condition in CONTRIBUTION_CONDITIONS
     ]
-    with pytest.raises(ContributionScoreArtifactError, match="exact.*SST"):
+    with pytest.raises(
+        ContributionScoreArtifactError,
+        match="materially different component SST",
+    ):
         resolve_score_manifest_matrix(
             sst_refs,
             sst_resolver,
             expected_seeds=(0,),
         )
+
+
+def test_matrix_canonicalizes_bounded_binary32_sst_drift_with_receipt():
+    resolver = MemoryResolver()
+    refs = [
+        retain_condition(
+            resolver,
+            condition,
+            sst_mutation=(0, 0) if condition == "F" else None,
+            sst_delta=1e-7,
+        )
+        for condition in CONTRIBUTION_CONDITIONS
+    ]
+    matrix, receipt = resolve_score_manifest_matrix_with_receipt(
+        refs,
+        resolver,
+        expected_seeds=(0,),
+    )
+    canonical = matrix[(0, "A")].component_sst
+    assert all(
+        np.array_equal(matrix[(0, condition)].component_sst, canonical)
+        for condition in CONTRIBUTION_CONDITIONS
+    )
+    assert receipt.canonical_condition == "A"
+    assert receipt.canonical_seed == 0
+    assert receipt.component_nonexact_values == 1
+    assert receipt.routed_nonexact_values == 0
+    assert receipt.component_max_absolute_difference == pytest.approx(1e-7)
+    assert receipt.component_max_relative_difference < receipt.relative_tolerance
+    body = receipt.to_dict()
+    claimed = body.pop("receipt_sha256")
+    assert claimed == canonical_sha256(body)
+
+
+def test_matrix_requires_nonempty_unique_expected_seeds():
+    resolver = MemoryResolver()
+    with pytest.raises(ContributionScoreArtifactError, match="nonempty and unique"):
+        resolve_score_manifest_matrix([], resolver, expected_seeds=())
+    with pytest.raises(ContributionScoreArtifactError, match="nonempty and unique"):
+        resolve_score_manifest_matrix([], resolver, expected_seeds=(0, 0))
 
 
 def test_row_resolver_rejects_reference_media_type_confusion():

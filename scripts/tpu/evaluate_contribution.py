@@ -18,7 +18,7 @@ from pathlib import Path
 PROCESS_COUNT = 4
 _SHA = re.compile(r"^[0-9a-f]{40}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
-RESULT_SCHEMA_VERSION = "gemma4-contribution-phase2-scientific-result-v1"
+RESULT_SCHEMA_VERSION = "gemma4-contribution-phase2-scientific-result-v2"
 
 
 class OperatorError(RuntimeError):

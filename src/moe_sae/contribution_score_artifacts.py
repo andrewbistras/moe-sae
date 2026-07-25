@@ -45,11 +45,20 @@ SCORE_ROW_SCHEMA_VERSION = "gemma4-contribution-sequence-score-row-v1"
 SCORE_MANIFEST_SCHEMA_VERSION = "gemma4-contribution-sequence-score-manifest-v1"
 SCORE_ROW_MEDIA_TYPE = "application/x.moe-sae-score-row+safetensors"
 SCORE_MANIFEST_MEDIA_TYPE = "application/x.moe-sae-score-manifest+json"
+COMMON_SST_RECEIPT_SCHEMA_VERSION = (
+    "gemma4-contribution-common-sst-canonicalization-v1"
+)
 
 _ENVELOPE_MAGIC = b"MOE-SAE-SCORE-ROW-V1\0"
 _MAX_METADATA_BYTES = 4 * 1024 * 1024
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _POSITION_BITMAP_WORDS = SEQUENCE_LENGTH // 64
+# The target-only score is emitted by binary32 accelerator reductions before
+# it is accumulated into float64 sequence rows.  Four binary32 epsilons admit
+# reduction-order drift while remaining far below a scientifically material
+# denominator change.
+_COMMON_SST_RTOL = float(4 * np.finfo(np.float32).eps)
+_COMMON_SST_ATOL = float(4 * np.finfo(np.float32).eps)
 _ROW_TENSORS = {
     "sequence_id",
     "position_bitmap",
@@ -194,6 +203,35 @@ class ResolvedScoreManifest:
             self.position_bitmap,
             self.token_count,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class CommonSSTCanonicalizationReceipt:
+    """Audit record for selecting one target-only SST across evaluator paths."""
+
+    schema_version: str
+    canonical_seed: int
+    canonical_condition: str
+    canonical_manifest_sha256: str
+    token_identity_sha256: str
+    source_reduction_dtype: str
+    relative_tolerance: float
+    absolute_tolerance: float
+    component_sst_sha256: str
+    routed_sst_sha256: str
+    component_sst_total: float
+    routed_sst_total: float
+    component_max_absolute_difference: float
+    routed_max_absolute_difference: float
+    component_max_relative_difference: float
+    routed_max_relative_difference: float
+    component_nonexact_values: int
+    routed_nonexact_values: int
+    compared_manifests: int
+    receipt_sha256: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return dataclasses.asdict(self)
 
 
 def _exact_mapping(
@@ -1341,18 +1379,55 @@ def resolve_score_manifest(
     )
 
 
-def resolve_score_manifest_matrix(
+def _score_vector_sha256(endpoint: str, value: np.ndarray) -> str:
+    digest = hashlib.sha256()
+    digest.update(b"gemma4-contribution-common-sst-v1\0")
+    digest.update(endpoint.encode("ascii") + b"\0")
+    digest.update(np.asarray(value, dtype="<f8").tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def _relative_difference(left: np.ndarray, right: np.ndarray) -> np.ndarray:
+    absolute = np.abs(left - right)
+    scale = np.maximum(np.abs(left), np.abs(right))
+    return np.divide(
+        absolute,
+        scale,
+        out=np.zeros_like(absolute),
+        where=scale != 0,
+    )
+
+
+def resolve_score_manifest_matrix_with_receipt(
     references: Sequence[ScoreArtifactRef | Mapping[str, Any]],
     resolver: ScoreArtifactResolver,
     *,
     expected_seeds: Sequence[int],
-) -> dict[tuple[int, str], ResolvedScoreManifest]:
-    """Resolve an exact A/R/B/F manifest matrix and verify common held-out rows."""
+) -> tuple[
+    dict[tuple[int, str], ResolvedScoreManifest],
+    CommonSSTCanonicalizationReceipt,
+]:
+    """Resolve A/R/B/F evidence and canonicalize binary32 target-only SST.
 
+    The evaluator's grouped and global compiled paths can legally choose
+    different binary32 reduction orders for the identical target-only SST.
+    Token identities must still match exactly.  We select the lowest seed's A
+    rows as the deterministic common denominator, reject any SST disagreement
+    beyond a small binary32-derived tolerance, and replace every resolved
+    manifest's SST vectors with those canonical rows before returning.
+    """
+
+    selected_seeds = tuple(
+        _nonnegative_int("expected seed", seed) for seed in expected_seeds
+    )
+    if not selected_seeds or len(set(selected_seeds)) != len(selected_seeds):
+        raise ContributionScoreArtifactError(
+            "expected seeds must be nonempty and unique"
+        )
     resolved = [resolve_score_manifest(item, resolver) for item in references]
     expected = {
         (seed, condition)
-        for seed in expected_seeds
+        for seed in selected_seeds
         for condition in CONTRIBUTION_CONDITIONS
     }
     result = {(item.seed, item.condition): item for item in resolved}
@@ -1360,24 +1435,23 @@ def resolve_score_manifest_matrix(
         raise ContributionScoreArtifactError(
             "score manifest matrix is incomplete or contains unexpected cells"
         )
-    common_identity: str | None = None
-    common_sequence: np.ndarray | None = None
-    common_position_bitmap: np.ndarray | None = None
-    common_token_count: np.ndarray | None = None
-    common_component_sst: np.ndarray | None = None
-    common_routed_sst: np.ndarray | None = None
-    common_centering: str | None = None
+    canonical_key = (min(selected_seeds), "A")
+    canonical = result[canonical_key]
+    common_identity = canonical.token_identity_sha256
+    common_sequence = canonical.sequence_id
+    common_position_bitmap = canonical.position_bitmap
+    common_token_count = canonical.token_count
+    common_component_sst = canonical.component_sst
+    common_routed_sst = canonical.routed_sst
+    common_centering = canonical.centering_mean_sha256
+    component_max_absolute = 0.0
+    routed_max_absolute = 0.0
+    component_max_relative = 0.0
+    routed_max_relative = 0.0
+    component_nonexact = 0
+    routed_nonexact = 0
     for key in sorted(result):
         item = result[key]
-        if common_identity is None:
-            common_identity = item.token_identity_sha256
-            common_sequence = item.sequence_id
-            common_position_bitmap = item.position_bitmap
-            common_token_count = item.token_count
-            common_component_sst = item.component_sst
-            common_routed_sst = item.routed_sst
-            common_centering = item.centering_mean_sha256
-            continue
         if (
             item.token_identity_sha256 != common_identity
             or not np.array_equal(item.sequence_id, common_sequence)
@@ -1390,17 +1464,117 @@ def resolve_score_manifest_matrix(
             raise ContributionScoreArtifactError(
                 "score manifests use different scientific token inventories"
             )
-        if not np.array_equal(
-            item.component_sst, common_component_sst
-        ) or not np.array_equal(item.routed_sst, common_routed_sst):
-            raise ContributionScoreArtifactError(
-                "score manifests do not share exact component/routed SST rows"
-            )
         if item.centering_mean_sha256 != common_centering:
             raise ContributionScoreArtifactError(
                 "score manifests use different centering means"
             )
-    return result
+        endpoint_differences = (
+            (
+                "component",
+                item.component_sst,
+                common_component_sst,
+            ),
+            (
+                "routed",
+                item.routed_sst,
+                common_routed_sst,
+            ),
+        )
+        for endpoint, selected, common in endpoint_differences:
+            absolute = np.abs(selected - common)
+            relative = _relative_difference(selected, common)
+            if not np.allclose(
+                selected,
+                common,
+                rtol=_COMMON_SST_RTOL,
+                atol=_COMMON_SST_ATOL,
+            ):
+                raise ContributionScoreArtifactError(
+                    f"score manifests use materially different {endpoint} SST "
+                    "rows; target-only binary32 reduction tolerance exceeded"
+                )
+            maximum_absolute = float(absolute.max(initial=0.0))
+            maximum_relative = float(relative.max(initial=0.0))
+            nonexact = int(np.count_nonzero(selected != common))
+            if endpoint == "component":
+                component_max_absolute = max(
+                    component_max_absolute,
+                    maximum_absolute,
+                )
+                component_max_relative = max(
+                    component_max_relative,
+                    maximum_relative,
+                )
+                component_nonexact += nonexact
+            else:
+                routed_max_absolute = max(
+                    routed_max_absolute,
+                    maximum_absolute,
+                )
+                routed_max_relative = max(
+                    routed_max_relative,
+                    maximum_relative,
+                )
+                routed_nonexact += nonexact
+
+    canonicalized = {
+        key: dataclasses.replace(
+            item,
+            component_sst=common_component_sst,
+            routed_sst=common_routed_sst,
+        )
+        for key, item in result.items()
+    }
+    receipt_body = {
+        "schema_version": COMMON_SST_RECEIPT_SCHEMA_VERSION,
+        "canonical_seed": canonical.seed,
+        "canonical_condition": canonical.condition,
+        "canonical_manifest_sha256": canonical.reference.sha256,
+        "token_identity_sha256": common_identity,
+        "source_reduction_dtype": "float32",
+        "relative_tolerance": _COMMON_SST_RTOL,
+        "absolute_tolerance": _COMMON_SST_ATOL,
+        "component_sst_sha256": _score_vector_sha256(
+            "component",
+            common_component_sst,
+        ),
+        "routed_sst_sha256": _score_vector_sha256(
+            "routed",
+            common_routed_sst,
+        ),
+        "component_sst_total": float(
+            common_component_sst.sum(dtype=np.float64)
+        ),
+        "routed_sst_total": float(common_routed_sst.sum(dtype=np.float64)),
+        "component_max_absolute_difference": component_max_absolute,
+        "routed_max_absolute_difference": routed_max_absolute,
+        "component_max_relative_difference": component_max_relative,
+        "routed_max_relative_difference": routed_max_relative,
+        "component_nonexact_values": component_nonexact,
+        "routed_nonexact_values": routed_nonexact,
+        "compared_manifests": len(result) - 1,
+    }
+    receipt = CommonSSTCanonicalizationReceipt(
+        **receipt_body,
+        receipt_sha256=canonical_sha256(receipt_body),
+    )
+    return canonicalized, receipt
+
+
+def resolve_score_manifest_matrix(
+    references: Sequence[ScoreArtifactRef | Mapping[str, Any]],
+    resolver: ScoreArtifactResolver,
+    *,
+    expected_seeds: Sequence[int],
+) -> dict[tuple[int, str], ResolvedScoreManifest]:
+    """Resolve A/R/B/F evidence with one validated common SST denominator."""
+
+    matrix, _ = resolve_score_manifest_matrix_with_receipt(
+        references,
+        resolver,
+        expected_seeds=expected_seeds,
+    )
+    return matrix
 
 
 __all__ = [
@@ -1408,6 +1582,8 @@ __all__ = [
     "SCORE_MANIFEST_SCHEMA_VERSION",
     "SCORE_ROW_MEDIA_TYPE",
     "SCORE_ROW_SCHEMA_VERSION",
+    "COMMON_SST_RECEIPT_SCHEMA_VERSION",
+    "CommonSSTCanonicalizationReceipt",
     "ContributionScoreArtifactError",
     "ResolvedScoreManifest",
     "ResolvedScoreRows",
@@ -1415,6 +1591,7 @@ __all__ = [
     "ScoreArtifactResolver",
     "resolve_score_manifest",
     "resolve_score_manifest_matrix",
+    "resolve_score_manifest_matrix_with_receipt",
     "resolve_score_row_shard",
     "seal_aggregated_score_row_shard",
     "seal_score_manifest",

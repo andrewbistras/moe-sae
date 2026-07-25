@@ -61,7 +61,7 @@ from moe_sae.contribution_report import (
 from moe_sae.contribution_sae import ContributionSAEConfig
 from moe_sae.contribution_score_artifacts import (
     ScoreArtifactRef,
-    resolve_score_manifest_matrix,
+    resolve_score_manifest_matrix_with_receipt,
     seal_score_manifest,
     seal_score_row_shard,
 )
@@ -96,7 +96,7 @@ from moe_sae.runtime import initialize_jax_distributed, require_v4_32_runtime
 
 CONDITIONS = ("A", "R", "B", "F")
 ALL_CONDITIONS = (*CONDITIONS, "Q")
-RESULT_SCHEMA_VERSION = "gemma4-contribution-phase2-scientific-result-v1"
+RESULT_SCHEMA_VERSION = "gemma4-contribution-phase2-scientific-result-v2"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -808,7 +808,7 @@ def run(args: argparse.Namespace) -> int:
             )
             for condition in CONDITIONS
         ]
-        matrix = resolve_score_manifest_matrix(
+        matrix, common_sst_receipt = resolve_score_manifest_matrix_with_receipt(
             references,
             store,
             expected_seeds=[args.seed],
@@ -933,6 +933,7 @@ def run(args: argparse.Namespace) -> int:
                 condition: reference.to_dict()
                 for condition, reference in zip(CONDITIONS, references, strict=True)
             },
+            "common_sst_canonicalization": common_sst_receipt.to_dict(),
             "endpoints": endpoints,
             "paired_sequence_effects": effects,
             "primary": {
