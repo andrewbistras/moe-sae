@@ -349,15 +349,106 @@ def test_noncomplete_fanout_cannot_reach_publish(
         return subprocess.CompletedProcess(command, 0)
 
     monkeypatch.setattr(operator, "_run_logged", fake_logged)
-    monkeypatch.setattr(
-        operator,
-        "_fanout",
-        lambda *_args, **_kwargs: [0, 17, 0, 0],
-    )
-    with pytest.raises(operator.OperatorError, match="publication was not attempted"):
+    def fanout(_commands, log_paths, **_kwargs):
+        for path in log_paths:
+            path.write_text("gcloud transport diagnostic\n", encoding="utf-8")
+        return [0, 17, 0, 0]
+
+    monkeypatch.setattr(operator, "_fanout", fanout)
+    with pytest.raises(operator.OperatorError, match="terminal markers"):
         operator.run(settings)
     assert len(logged) == 1
     assert "_init-attempt" in " ".join(logged[0])
+
+
+def test_nonzero_gcloud_transport_requires_four_exact_terminal_markers(
+    operator,
+    tmp_path: Path,
+) -> None:
+    settings = _settings(operator, tmp_path)
+    logs = []
+    expected_statuses = [0, 0, 7, 0]
+    for controller_index, harvest_status in enumerate(expected_statuses):
+        path = tmp_path / f"host-{controller_index:05d}.ssh.log"
+        path.write_text(
+            "gcloud transport diagnostic\n"
+            f"terminal phase={settings.phase} split={settings.split} "
+            f"controller={controller_index} status={harvest_status}\n",
+            encoding="utf-8",
+        )
+        logs.append(path)
+
+    assert operator._validated_transport_completion(
+        settings=settings,
+        returncodes=[1, 1, 1, 1],
+        log_paths=logs,
+    ) == expected_statuses
+
+
+def test_run_reaches_publish_after_nonzero_transports_with_exact_markers(
+    operator,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(operator, tmp_path)
+    monkeypatch.setattr(operator.shutil, "which", lambda _name: "/usr/bin/gcloud")
+    monkeypatch.setattr(operator, "_verify_local_checkout", lambda _settings: None)
+
+    def fanout(_commands, log_paths, **_kwargs):
+        for controller_index, log_path in enumerate(log_paths):
+            log_path.write_text(
+                f"terminal phase={settings.phase} split={settings.split} "
+                f"controller={controller_index} status=0\n",
+                encoding="utf-8",
+            )
+        return [1, 1, 1, 1]
+
+    logged: list[Path] = []
+
+    def run_logged(command, log_path):
+        logged.append(log_path)
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(operator, "_fanout", fanout)
+    monkeypatch.setattr(operator, "_run_logged", run_logged)
+
+    assert operator.run(settings) == 0
+    assert [path.name for path in logged] == [
+        "init-attempt.ssh.log",
+        "publish.ssh.log",
+    ]
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        "",
+        (
+            "terminal phase=phase1_smoke split=train controller=0 status=0\n"
+            "terminal phase=phase1_smoke split=train controller=0 status=0\n"
+        ),
+        "terminal phase=phase2_canary split=train controller=0 status=0\n",
+        "terminal phase=phase1_smoke split=eval controller=0 status=0\n",
+        "terminal phase=phase1_smoke split=train controller=1 status=0\n",
+        "terminal phase=phase1_smoke split=train controller=0 status=unknown\n",
+        "terminal phase=phase1_smoke split=train controller=0 status=256\n",
+        "terminal phase=phase1_smoke split=train controller=0 status=0 extra\n",
+    ],
+)
+def test_transport_marker_is_fail_closed(
+    operator,
+    tmp_path: Path,
+    marker: str,
+) -> None:
+    settings = _settings(operator, tmp_path)
+    log = tmp_path / "host-00000.ssh.log"
+    log.write_text(marker, encoding="utf-8")
+    with pytest.raises(operator.OperatorError, match="terminal marker"):
+        operator._terminal_harvest_status(
+            log,
+            settings=settings,
+            controller_index=0,
+        )
 
 
 def test_operator_has_no_bucket_listing_progress_path() -> None:

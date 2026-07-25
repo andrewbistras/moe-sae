@@ -1007,6 +1007,89 @@ def _fanout(
             handle.close()
 
 
+def _terminal_harvest_status(
+    log_path: Path,
+    *,
+    settings: Settings,
+    controller_index: int,
+) -> int:
+    """Read one exact remote harvest terminal marker from an SSH log.
+
+    A completed remote shell can be followed by a nonzero local
+    ``gcloud ... ssh`` transport status.  This marker authorizes only the
+    immutable four-host publication check; it does not replace that check.
+    """
+
+    try:
+        lines = log_path.read_bytes().splitlines()
+    except OSError as error:
+        raise OperatorError(
+            f"cannot read controller {controller_index} SSH log: {log_path}"
+        ) from error
+    marker_lines = [
+        line for line in lines if line.startswith(b"terminal phase=")
+    ]
+    if len(marker_lines) != 1:
+        raise OperatorError(
+            f"controller {controller_index} SSH log has "
+            f"{len(marker_lines)} terminal markers; exactly one is required"
+        )
+    expected_prefix = (
+        f"terminal phase={settings.phase} split={settings.split} "
+        f"controller={controller_index} status="
+    ).encode("ascii")
+    marker = marker_lines[0]
+    if not marker.startswith(expected_prefix):
+        raise OperatorError(
+            f"controller {controller_index} SSH terminal marker does not "
+            "match the exact phase/split/controller"
+        )
+    raw_status = marker[len(expected_prefix) :]
+    if re.fullmatch(rb"(?:0|[1-9][0-9]{0,2})", raw_status) is None:
+        raise OperatorError(
+            f"controller {controller_index} SSH terminal marker has an "
+            "invalid harvest status"
+        )
+    status = int(raw_status)
+    if status > 255:
+        raise OperatorError(
+            f"controller {controller_index} SSH terminal marker harvest "
+            "status is outside the shell exit-code range"
+        )
+    return status
+
+
+def _validated_transport_completion(
+    *,
+    settings: Settings,
+    returncodes: Sequence[int],
+    log_paths: Sequence[Path],
+) -> list[int]:
+    """Require exact remote completion before attempting publication."""
+
+    if len(returncodes) != PROCESS_COUNT or len(log_paths) != PROCESS_COUNT:
+        raise OperatorError(
+            "transport completion requires exactly four codes and logs"
+        )
+    harvest_statuses = [
+        _terminal_harvest_status(
+            log_path,
+            settings=settings,
+            controller_index=controller_index,
+        )
+        for controller_index, log_path in enumerate(log_paths)
+    ]
+    nonzero = [int(code) for code in returncodes if int(code) != 0]
+    if nonzero:
+        print(
+            "[exp2-harvest] local gcloud transport returned nonzero codes "
+            f"{list(returncodes)} after all four exact terminal markers; "
+            "continuing only to immutable four-host publication validation",
+            flush=True,
+        )
+    return harvest_statuses
+
+
 def _dry_run(settings: Settings) -> int:
     built = [
         _host_command(settings, controller_index)
@@ -1065,20 +1148,20 @@ def run(settings: Settings) -> int:
         f"attempt={settings.attempt_id}",
         flush=True,
     )
+    log_paths = [
+        settings.local_log_root / f"host-{index:05d}.ssh.log"
+        for index in range(PROCESS_COUNT)
+    ]
     returncodes = _fanout(
         commands,
-        [
-            settings.local_log_root / f"host-{index:05d}.ssh.log"
-            for index in range(PROCESS_COUNT)
-        ],
+        log_paths,
         maximum_runtime_seconds=settings.maximum_runtime_seconds,
     )
-    if any(code != 0 for code in returncodes):
-        raise OperatorError(
-            "one or more supervised hosts did not complete "
-            f"(transport/worker codes={returncodes}); publication was not "
-            f"attempted; inspect {settings.local_log_root}"
-        )
+    _validated_transport_completion(
+        settings=settings,
+        returncodes=returncodes,
+        log_paths=log_paths,
+    )
 
     publish_log = settings.local_log_root / "publish.ssh.log"
     published = _run_logged(
