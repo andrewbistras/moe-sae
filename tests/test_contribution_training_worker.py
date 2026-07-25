@@ -849,10 +849,10 @@ def test_checkpoint_receipt_paths_are_identical_on_every_process(
     )
 
 
-def test_bounded_direct_training_rejects_an_extended_deadline() -> None:
+def test_bounded_direct_training_rejects_more_than_one_hour() -> None:
     with pytest.raises(
         ContributionTrainingWorkerError,
-        match="cannot exceed 600 seconds",
+        match="cannot exceed 3600 seconds",
     ):
         run_qualified_training(
             plan(),
@@ -861,7 +861,7 @@ def test_bounded_direct_training_rejects_an_extended_deadline() -> None:
             selection=None,
             dependencies=dependencies(Checkpoints()),
             expected_l0=2,
-            maximum_runtime_seconds=601,
+            maximum_runtime_seconds=3_601,
             direct_bounded_resident=True,
         )
 

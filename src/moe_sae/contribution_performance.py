@@ -5,7 +5,7 @@ inventory, and complete runtime configuration it observed.  This module
 derives the performance gates, seals a self-hashed receipt, and admits only:
 
 * a qualification run bounded to at most ten minutes;
-* any other deliberately bounded run of at most ten minutes; or
+* any direct Experiment-2 workload bounded to at most one hour; or
 * a longer run whose exact graph/hardware/configuration has a passing receipt.
 
 This is an admission seam, not a process supervisor.  The launcher must still
@@ -36,7 +36,10 @@ PERFORMANCE_IDENTITY_SCHEMA_VERSION = "gemma4-contribution-performance-identity-
 # measured 0.0365598 useful MFU, 0.6388945 persisted/device goodput, and
 # 0.9008767 auxiliary/baseline throughput.
 MINIMUM_USEFUL_PREFIX_MFU = 0.03
-MAX_UNGATED_ACCELERATOR_SECONDS = 600
+# The user explicitly authorized the exploratory Experiment-2 workload to run
+# directly for one hour without first spending accelerator time on a separate
+# qualifier. Qualification remains independently bounded to ten minutes.
+MAX_UNGATED_ACCELERATOR_SECONDS = 3_600
 MAX_QUALIFICATION_SECONDS = 600
 MINIMUM_PERSISTED_GOODPUT_FRACTION = 0.60
 MINIMUM_AUXILIARY_THROUGHPUT_FRACTION = 0.85
@@ -149,7 +152,7 @@ def _validate_policy(
         )
     if ungated > MAX_UNGATED_ACCELERATOR_SECONDS:
         raise ContributionPerformanceError(
-            "ungated accelerator duration cannot exceed 600 seconds"
+            "direct Experiment-2 duration cannot exceed 3600 seconds"
         )
     if qualification > MAX_QUALIFICATION_SECONDS:
         raise ContributionPerformanceError(
@@ -694,7 +697,7 @@ def authorize_accelerator_run(
     ungated_max_seconds: int = MAX_UNGATED_ACCELERATOR_SECONDS,
     qualification_max_seconds: int = MAX_QUALIFICATION_SECONDS,
 ) -> AcceleratorRunAuthorization:
-    """Authorize only a bounded probe or an exactly qualified longer run."""
+    """Authorize a bounded direct experiment or an exactly qualified longer run."""
 
     if type(identity) is not ExactPerformanceIdentity:
         raise ContributionPerformanceError("accelerator identity has the wrong type")
@@ -729,7 +732,7 @@ def authorize_accelerator_run(
         )
     if qualification_receipt is None:
         raise ContributionPerformanceError(
-            "accelerator work beyond ten minutes requires an exact "
+            "accelerator work beyond one hour requires an exact "
             "qualification receipt"
         )
     validated = validate_qualification_receipt(

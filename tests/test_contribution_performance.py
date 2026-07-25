@@ -271,7 +271,7 @@ def test_long_run_receipt_must_match_each_exact_identity_component(field):
         )
 
 
-def test_ten_minute_boundary_and_exact_receipt_authorization():
+def test_direct_hour_boundary_and_exact_receipt_authorization():
     selected_identity = identity()
 
     qualification = authorize_accelerator_run(
@@ -320,7 +320,7 @@ def test_no_path_authorizes_an_overlong_qualification_or_unreceipted_workload():
     ):
         authorize_accelerator_run(
             identity=selected_identity,
-            maximum_runtime_seconds=601,
+            maximum_runtime_seconds=MAX_UNGATED_ACCELERATOR_SECONDS + 1,
             purpose="workload",
         )
 
@@ -340,10 +340,10 @@ def test_policy_arguments_may_be_stricter_but_never_weaker():
             evidence,
             minimum_useful_mfu=MINIMUM_USEFUL_PREFIX_MFU - 0.01,
         )
-    with pytest.raises(ContributionPerformanceError, match="exceed 600"):
+    with pytest.raises(ContributionPerformanceError, match="exceed 3600"):
         authorize_accelerator_run(
             identity=evidence.identity,
             maximum_runtime_seconds=1,
             purpose="workload",
-            ungated_max_seconds=601,
+            ungated_max_seconds=MAX_UNGATED_ACCELERATOR_SECONDS + 1,
         )

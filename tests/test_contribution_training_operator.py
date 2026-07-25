@@ -346,11 +346,11 @@ def test_bounded_train_creates_direct_resident_contract_without_selection(
         inputs,
         action="train",
         attempt_id="direct001",
-        maximum_runtime_seconds=600,
+        maximum_runtime_seconds=3_600,
     )
     plan = operator.initialize_attempt(train_args)
     assert plan["action"] == "train"
-    assert plan["maximum_runtime_seconds"] == 600
+    assert plan["maximum_runtime_seconds"] == 3_600
     assert plan["admission_mode"] == operator.DIRECT_BOUNDED_ADMISSION
     run_root = Path(train_args.run_root)
     assert not (run_root / "mode-selection.json").exists()
@@ -407,13 +407,13 @@ def test_commands_keep_controller_transport_and_jax_lane_distinct(
             operator,
             tmp_path,
             action="train",
-            maximum_runtime_seconds=600,
+            maximum_runtime_seconds=3_600,
         ),
         controller_index=1,
         process_index=3,
     )
     joined = " ".join(direct)
-    assert "--maximum-runtime-seconds 600" in joined
+    assert "--maximum-runtime-seconds 3600" in joined
     assert "--direct-bounded-resident" in joined
 
 

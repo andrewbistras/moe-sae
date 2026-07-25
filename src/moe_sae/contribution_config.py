@@ -265,10 +265,10 @@ class ContributionRuntime:
     phase1_min_persisted_goodput_fraction: float = 0.60
     phase1_min_auxiliary_throughput_fraction: float = 0.85
     accelerator_mfu_policy: str = (
-        "gemma_experiment2_only_measured_admission_v1"
+        "gemma_experiment2_direct_3600s_v2"
     )
     accelerator_min_useful_mfu: float = 0.03
-    accelerator_ungated_max_seconds: int = 600
+    accelerator_ungated_max_seconds: int = 3_600
     accelerator_qualification_max_seconds: int = 600
     router_order: str = "weight_desc_expert_id_asc"
     pooled_centering: str = "one_raw_expert_output_mean"

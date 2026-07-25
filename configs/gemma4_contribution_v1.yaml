@@ -65,12 +65,12 @@ runtime:
   writer_backlog_max_batches: 2
   phase1_min_persisted_goodput_fraction: 0.60
   phase1_min_auxiliary_throughput_fraction: 0.85
-  # No accelerator job may be authorized beyond ten minutes unless this exact
-  # graph/hardware/configuration has already passed the bounded Gemma
-  # Experiment-2 qualifier. This override does not alter DeepSeek policy.
-  accelerator_mfu_policy: gemma_experiment2_only_measured_admission_v1
+  # The exploratory Experiment-2 workload may run directly for at most one
+  # hour. Qualification remains separately limited to ten minutes. This
+  # explicit user-authorized override does not alter DeepSeek policy.
+  accelerator_mfu_policy: gemma_experiment2_direct_3600s_v2
   accelerator_min_useful_mfu: 0.03
-  accelerator_ungated_max_seconds: 600
+  accelerator_ungated_max_seconds: 3600
   accelerator_qualification_max_seconds: 600
   router_order: weight_desc_expert_id_asc
   pooled_centering: one_raw_expert_output_mean

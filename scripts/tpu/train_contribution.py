@@ -7,7 +7,7 @@ bundle's physical-controller -> observed-JAX-process permutation to:
 
 1. prefetch and hash-prove exactly one contiguous contribution lane on each
    mapped controller; and
-2. fan out a bounded direct resident run, a hard-600-second two-mode
+2. fan out a bounded direct resident experiment, a hard-600-second two-mode
    qualifier, or a longer exactly receipt-authorized training run.
 
 The operator never assumes that ``--worker=N`` implies ``jax.process_index=N``.
@@ -32,6 +32,7 @@ from typing import BinaryIO
 
 PROCESS_COUNT = 4
 QUALIFICATION_SECONDS = 600
+DIRECT_EXPERIMENT_SECONDS = 3_600
 QUALIFICATION_TRANSPORT_WAIT_SECONDS = 720
 PREFETCH_SECONDS = 600
 PREFETCH_TRANSPORT_WAIT_SECONDS = 720
@@ -331,12 +332,12 @@ def _settings(
 def _admission_mode(action: str, maximum_runtime_seconds: int) -> str:
     """Select the explicit training admission path.
 
-    A bounded train is itself the at-most-600-second experiment and therefore
+    A bounded train is itself the at-most-one-hour experiment and therefore
     lowers the fixed resident graph directly.  Longer runs preserve the
     existing two-mode qualification contract.
     """
 
-    if action == "train" and maximum_runtime_seconds <= QUALIFICATION_SECONDS:
+    if action == "train" and maximum_runtime_seconds <= DIRECT_EXPERIMENT_SECONDS:
         return DIRECT_BOUNDED_ADMISSION
     return QUALIFIED_ADMISSION
 

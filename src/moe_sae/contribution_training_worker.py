@@ -3,10 +3,10 @@
 This module is intentionally independent of :mod:`moe_sae.cli`.  It owns the
 small operational boundary which the scientific trainers do not:
 
-* run the fixed resident executable directly under a <=600-second deadline;
+* run the fixed resident executable directly under a <=3600-second deadline;
 * optionally qualify resident and rematerialized executables for longer runs;
 * bind the faster passing executable to an exact graph/hardware/config receipt;
-* refuse accelerator work beyond 600 seconds without that >=3% receipt; and
+* refuse accelerator work beyond 3600 seconds without that >=3% receipt; and
 * advance a sealed v2 input stream and immutable checkpoint pointers in exact
   update order.
 
@@ -42,6 +42,7 @@ from moe_sae.contribution_config import (
 )
 from moe_sae.contribution_performance import (
     MAX_QUALIFICATION_SECONDS,
+    MAX_UNGATED_ACCELERATOR_SECONDS,
     MINIMUM_USEFUL_PREFIX_MFU,
     ExactPerformanceIdentity,
     authorize_accelerator_run,
@@ -842,7 +843,7 @@ def run_qualified_training(
 
     ``direct_bounded_resident`` deliberately bypasses mode benchmarking and
     receipt admission only while the complete child is hard-limited to at
-    most 600 seconds.  It still derives the checkpoint identity from the
+    most 3600 seconds.  It still derives the checkpoint identity from the
     actually lowered resident StableHLO/hardware/config tuple.
     """
 
@@ -857,9 +858,9 @@ def run_qualified_training(
     _positive_int("expected_l0", expected_l0)
     maximum = _positive_int("maximum_runtime_seconds", maximum_runtime_seconds)
     if direct_bounded_resident:
-        if maximum > MAX_QUALIFICATION_SECONDS:
+        if maximum > MAX_UNGATED_ACCELERATOR_SECONDS:
             raise ContributionTrainingWorkerError(
-                "direct resident training cannot exceed 600 seconds"
+                "direct resident training cannot exceed 3600 seconds"
             )
         if selection is not None:
             raise ContributionTrainingWorkerError(
@@ -2918,7 +2919,7 @@ def _parser() -> argparse.ArgumentParser:
         "--direct-bounded-resident",
         action="store_true",
         help=(
-            "run the resident graph directly under the <=600-second hard "
+            "run the resident graph directly under the <=3600-second hard "
             "deadline without a mode-selection receipt"
         ),
     )
@@ -3314,10 +3315,10 @@ def _qualify_child_command(args: argparse.Namespace) -> int:
 def _train_command(args: argparse.Namespace) -> int:
     if (
         args.direct_bounded_resident
-        and args.maximum_runtime_seconds > MAX_QUALIFICATION_SECONDS
+        and args.maximum_runtime_seconds > MAX_UNGATED_ACCELERATOR_SECONDS
     ):
         raise ContributionTrainingWorkerError(
-            "direct resident training cannot exceed 600 seconds"
+            "direct resident training cannot exceed 3600 seconds"
         )
     if args.direct_bounded_resident:
         selection = None
@@ -3387,10 +3388,10 @@ def _train_child_command(args: argparse.Namespace) -> int:
     _verify_repository_revision(args.source_revision)
     if (
         args.direct_bounded_resident
-        and args.maximum_runtime_seconds > MAX_QUALIFICATION_SECONDS
+        and args.maximum_runtime_seconds > MAX_UNGATED_ACCELERATOR_SECONDS
     ):
         raise ContributionTrainingWorkerError(
-            "direct resident training cannot exceed 600 seconds"
+            "direct resident training cannot exceed 3600 seconds"
         )
     if args.direct_bounded_resident:
         selection = None

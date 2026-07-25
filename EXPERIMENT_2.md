@@ -448,14 +448,11 @@ built.
 ### Phase 1 — 100k numerical and writer smoke
 
 Capture 100,000 predeclared training tokens and a disjoint 25,000 held-out
-tokens. Before this or any later accelerator command is allowed to remain live
-past 600 seconds, its exact compiled graph, hardware topology, runtime,
-checkpoint/config identity, mesh, dtype policy, and static batch shape must
-have a self-hashed qualification receipt showing at least 3% useful MFU.
-Qualification itself has a 600-second wall-clock kill deadline, including
-compilation, and cannot be waived. A receipt from an instrumentation-disabled
-graph, another SAE layout, another TPU generation, or a drifted runtime does
-not authorize the requested command.
+tokens. The user-authorized exploratory Experiment-2 workload may run directly
+for at most 3,600 seconds. Qualification remains available and has a
+600-second wall-clock kill deadline; work beyond one hour still requires an
+exact self-hashed receipt for the compiled graph, hardware topology, runtime,
+checkpoint/config identity, mesh, dtype policy, and static batch shape.
 
 Then require:
 
@@ -538,10 +535,9 @@ Seed 0 and all pilot decisions remain visible but never enter the headline.
 
 Every accelerator entry point has two modes:
 
-1. a fail-closed qualifier whose entire accelerator lease is killed at 600
-   seconds; and
+1. a direct exploratory workload whose lease is killed at 3,600 seconds; and
 2. an extended run that requires a passing receipt for its exact execution
-   identity.
+   identity. The optional qualifier remains bounded to 600 seconds.
 
 The receipt derives useful MFU from explicitly enumerated, non-padding FLOPs
 and synchronized device time divided by the documented peak of the chips

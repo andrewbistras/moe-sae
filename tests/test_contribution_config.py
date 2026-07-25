@@ -28,7 +28,7 @@ from moe_sae.contribution_config import (
 ROOT = Path(__file__).resolve().parents[1]
 CHECKED_IN_CONFIG = ROOT / "configs" / "gemma4_contribution_v1.yaml"
 DEFAULT_CONFIG_SHA256 = (
-    "2fbdbed94d317ae2c8e4a8a156bd25f2456eff28be20de8ed9a50928eafe2248"
+    "a03624b24b444f6d1bc9e8a95d72c085c705325fc629f898febf8a94c197ebfc"
 )
 
 
@@ -165,10 +165,10 @@ def test_runtime_does_not_reintroduce_experiment1_capture_defaults():
     assert runtime.capture_schema_version == "gemma4-expert-contribution-v2"
     assert runtime.max_shard_tokens == 16_384
     assert runtime.accelerator_mfu_policy == (
-        "gemma_experiment2_only_measured_admission_v1"
+        "gemma_experiment2_direct_3600s_v2"
     )
     assert runtime.accelerator_min_useful_mfu == 0.03
-    assert runtime.accelerator_ungated_max_seconds == 600
+    assert runtime.accelerator_ungated_max_seconds == 3_600
     assert runtime.accelerator_qualification_max_seconds == 600
     assert runtime.phase1_min_persisted_goodput_fraction == 0.60
     assert runtime.phase1_min_auxiliary_throughput_fraction == 0.85
