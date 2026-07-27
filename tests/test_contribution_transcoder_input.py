@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -16,6 +17,9 @@ from moe_sae.contribution_artifacts import (
 from moe_sae.contribution_sae import ContributionSAEConfig
 from moe_sae.contribution_transcoder_config import (
     PHASE_NAME,
+    PROTOCOL_ID,
+    SCHEMA_VERSION as RUN_CONFIG_SCHEMA_VERSION,
+    ContributionTranscoderConfigError,
     load_contribution_transcoder_config,
 )
 from moe_sae.contribution_transcoder_input import (
@@ -27,7 +31,15 @@ from moe_sae.contribution_transcoder_input import (
 from moe_sae.contribution_training_worker import (
     TRANSCODER_PREFETCH_RECEIPT_SCHEMA_VERSION,
     ContributionTrainingWorkerError,
+    prefetch_transcoder_process_lane,
     validate_transcoder_prefetch_receipt,
+)
+
+TRAIN_SOURCE_OVERLAY_SHA256 = (
+    "8d947629e57d64d054a3086e2729090eed1e9f6afc4568b76e5c90da5f378e3c"
+)
+EVAL_SOURCE_OVERLAY_SHA256 = (
+    "f68e2fe6e4cf568e694925697dd5d65fe10160a52d357c641892de85ee5c3da7"
 )
 
 
@@ -250,7 +262,27 @@ def test_source_and_target_means_are_independent_identities():
 
 
 def test_strict_transcoder_config_exposes_one_pilot_and_canonical_hash():
-    config = load_contribution_transcoder_config("configs/gemma4_transcoder_v1.yaml")
+    config = load_contribution_transcoder_config("configs/gemma4_transcoder_v2.yaml")
+    assert config.encoder_activation == "softplus"
+    assert (
+        config.raw["schema_version"]
+        == "gemma4-contribution-transcoder-run-config-v2"
+        == RUN_CONFIG_SCHEMA_VERSION
+    )
+    assert (
+        config.raw["protocol_id"]
+        == "gemma4-contribution-transcoder-v2-20260727"
+        == PROTOCOL_ID
+    )
+    assert config.raw["source_overlay"]["schema_version"] == SOURCE_SCHEMA_VERSION
+    assert (
+        config.parents["train_source_overlay_manifest_sha256"]
+        == TRAIN_SOURCE_OVERLAY_SHA256
+    )
+    assert (
+        config.parents["eval_source_overlay_manifest_sha256"]
+        == EVAL_SOURCE_OVERLAY_SHA256
+    )
 
     assert config.phase(PHASE_NAME).planned_updates == 123
     assert config.phase(PHASE_NAME).checkpoint_tokens == (2_000_000,)
@@ -262,6 +294,83 @@ def test_strict_transcoder_config_exposes_one_pilot_and_canonical_hash():
     ]
     assert config.runtime.accelerator_min_useful_mfu == 0.10
     assert len(config.config_hash) == 64
+
+
+def test_v2_config_rejects_a_different_overlay_manifest(tmp_path: Path):
+    checked_in = Path("configs/gemma4_transcoder_v2.yaml").read_text(
+        encoding="utf-8"
+    )
+    changed = checked_in.replace(
+        TRAIN_SOURCE_OVERLAY_SHA256,
+        "0" * 64,
+    )
+    assert changed != checked_in
+    path = tmp_path / "different-overlay.yaml"
+    path.write_text(changed, encoding="utf-8")
+
+    with pytest.raises(
+        ContributionTranscoderConfigError,
+        match="parents.train_source_overlay_manifest_sha256",
+    ):
+        load_contribution_transcoder_config(path)
+
+
+def test_training_prefetch_rejects_nonpinned_overlay(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    config = load_contribution_transcoder_config(
+        "configs/gemma4_transcoder_v2.yaml"
+    )
+
+    class Target:
+        total_tokens = 2_000_000
+        manifest_sha256 = config.parents["train_target_manifest_sha256"]
+        manifest = {"manifest_sha256": manifest_sha256}
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+    class Source:
+        total_tokens = 2_000_000
+        manifest_sha256 = "0" * 64
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+    class Cache:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+    monkeypatch.setattr(
+        "moe_sae.contribution_storage.ContributionDataset",
+        Target,
+    )
+    monkeypatch.setattr(
+        "moe_sae.contribution_transcoder_storage.RoutedInputDataset",
+        Source,
+    )
+    monkeypatch.setattr("moe_sae.object_store.ShardCache", Cache)
+
+    with pytest.raises(
+        ContributionTrainingWorkerError,
+        match="config-pinned parent",
+    ):
+        prefetch_transcoder_process_lane(
+            config=config,
+            phase=PHASE_NAME,
+            source_revision="1" * 40,
+            capture_control_root=tmp_path / "target",
+            object_prefix="gs://bucket/target",
+            source_overlay_control_root=tmp_path / "source",
+            source_overlay_object_prefix="gs://bucket/source",
+            cache_root=tmp_path / "cache",
+            cache_max_bytes=1_000,
+            process_count=4,
+            process_index=0,
+            recomposition_sidecar=None,
+            object_store=object(),
+        )
 
 
 def test_paired_prefetch_receipt_names_both_immutable_object_sets():

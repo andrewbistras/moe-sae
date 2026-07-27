@@ -1,5 +1,5 @@
-schema_version: gemma4-contribution-transcoder-run-config-v1
-protocol_id: gemma4-contribution-transcoder-v1-20260727
+schema_version: gemma4-contribution-transcoder-run-config-v2
+protocol_id: gemma4-contribution-transcoder-v2-20260727
 parent_protocol_id: gemma4-contribution-v1-20260725
 
 provenance:
@@ -31,6 +31,8 @@ parents:
   target_schema_version: gemma4-expert-contribution-v2
   train_target_manifest_sha256: a2f23aef6b9121e81a5bfea473c64039ca5bf6b073e4f70f4703938a1d8a6903
   eval_target_manifest_sha256: 31454e5ce8693521c41a2a95f2ef88d40c5d26c726a0efac5c26d882ed341f5e
+  train_source_overlay_manifest_sha256: 8d947629e57d64d054a3086e2729090eed1e9f6afc4568b76e5c90da5f378e3c
+  eval_source_overlay_manifest_sha256: f68e2fe6e4cf568e694925697dd5d65fe10160a52d357c641892de85ee5c3da7
   train_tokens: 2000000
   eval_tokens: 250000
   recomposition_sidecar_schema_version: gemma4-contribution-recomposition-v1
@@ -51,6 +53,7 @@ source_overlay:
 
 training:
   mode: contribution_transcoder
+  encoder_activation: softplus
   seed: 0
   train_tokens: 2000000
   eval_tokens: 250000

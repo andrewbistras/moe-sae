@@ -60,6 +60,7 @@ from moe_sae.contribution_evaluation import (
 )
 from moe_sae.contribution_sae import ContributionSAEConfig
 from moe_sae.contribution_transcoder import (
+    ENCODER_ACTIVATION,
     ContributionTranscoderParams,
     transcoder_params_from_sae,
     transcoder_params_to_sae,
@@ -1086,6 +1087,7 @@ def _build_transcoder_mapped_evaluator(
                     layout,
                     feature_axis=feature_axis,
                     capacity=capacity,
+                    encoder_activation=ENCODER_ACTIVATION,
                 )
             else:
                 local_values, local_ids = _local_rank_candidates(
@@ -1094,6 +1096,7 @@ def _build_transcoder_mapped_evaluator(
                     component_valid,
                     layout,
                     feature_axis=feature_axis,
+                    encoder_activation=ENCODER_ACTIVATION,
                 )
                 overflow = jnp.asarray(False)
             selection = _merge_local_candidates(

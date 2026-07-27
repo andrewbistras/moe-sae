@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -19,7 +20,12 @@ from moe_sae.contribution_transcoder_evaluation_worker import (
     _load_process_evidence,
     _seal_process_evidence,
     _training_ledger,
+    _validate_phase_datasets,
     _validate_run_contract,
+)
+from moe_sae.contribution_transcoder_config import (
+    PHASE_NAME,
+    load_contribution_transcoder_config,
 )
 
 
@@ -156,6 +162,53 @@ def test_run_contract_proves_source_only_manifest_binding(tmp_path: Path):
             target_manifest_sha256="2" * 64,
             source_revision="a" * 40,
         )
+
+
+def test_evaluator_rejects_a_different_train_or_eval_overlay():
+    config = load_contribution_transcoder_config(
+        "configs/gemma4_transcoder_v2.yaml"
+    )
+    phase = config.phase(PHASE_NAME)
+    train_target = SimpleNamespace(
+        total_tokens=phase.train_tokens,
+        manifest_sha256=config.parents["train_target_manifest_sha256"],
+    )
+    eval_target = SimpleNamespace(
+        total_tokens=phase.eval_tokens,
+        manifest_sha256=config.parents["eval_target_manifest_sha256"],
+    )
+    train_source = SimpleNamespace(
+        total_tokens=phase.train_tokens,
+        manifest_sha256=config.parents[
+            "train_source_overlay_manifest_sha256"
+        ],
+    )
+    eval_source = SimpleNamespace(
+        total_tokens=phase.eval_tokens,
+        manifest_sha256=config.parents[
+            "eval_source_overlay_manifest_sha256"
+        ],
+    )
+    arguments = {
+        "train_target": train_target,
+        "train_source": train_source,
+        "eval_target": eval_target,
+        "eval_source": eval_source,
+    }
+    _validate_phase_datasets(config, phase, **arguments)
+
+    for role in ("train_source", "eval_source"):
+        changed = dict(arguments)
+        selected = changed[role]
+        changed[role] = SimpleNamespace(
+            total_tokens=selected.total_tokens,
+            manifest_sha256="0" * 64,
+        )
+        with pytest.raises(
+            Experiment3EvaluationWorkerError,
+            match="frozen phase",
+        ):
+            _validate_phase_datasets(config, phase, **changed)
 
 
 def test_training_ledger_uses_measured_marginal_cost_and_diagnostic_mfu():

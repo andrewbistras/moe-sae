@@ -52,6 +52,29 @@ _EPS = 1e-12
 _SENTINEL_ID = np.iinfo(np.int32).max
 
 
+def _encoder_activation(
+    preactivation: jax.Array,
+    *,
+    kind: str,
+) -> jax.Array:
+    """Apply the caller-selected encoder nonlinearity in FP32.
+
+    ReLU remains the default for Experiment 2.  Experiment 3 explicitly opts
+    into softplus.  The FP32-normal floor preserves mathematical softplus's
+    strict positivity when an accelerator flushes subnormal values.
+    """
+
+    value = jnp.asarray(preactivation, jnp.float32)
+    if kind == "relu":
+        return jax.nn.relu(value)
+    if kind == "softplus":
+        return jnp.maximum(
+            jax.nn.softplus(value),
+            jnp.finfo(jnp.float32).tiny,
+        )
+    raise ValueError(f"unsupported encoder activation: {kind!r}")
+
+
 class ContributionDistributedBatch(NamedTuple):
     """Static stacked microbatches with source-token data sharding."""
 
@@ -444,6 +467,7 @@ def _local_grouped_candidates(
     *,
     feature_axis: str,
     capacity: int,
+    encoder_activation: str = "relu",
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Take local TopK after a fixed-capacity whole-bank A/R GEMM."""
 
@@ -493,7 +517,10 @@ def _local_grouped_candidates(
         preferred_element_type=jnp.float32,
         precision=jax.lax.Precision.DEFAULT,
     ) + bias[:, None, :].astype(jnp.float32)
-    grouped = jax.nn.relu(grouped).reshape(
+    grouped = _encoder_activation(
+        grouped,
+        kind=encoder_activation,
+    ).reshape(
         local_banks * capacity,
         layout.bank_width,
     )
@@ -536,6 +563,7 @@ def _local_rank_candidates(
     layout: ContributionSAEConfig,
     *,
     feature_axis: str,
+    encoder_activation: str = "relu",
 ) -> tuple[jax.Array, jax.Array]:
     """Take local TopK for complete B/F router-rank banks."""
 
@@ -571,7 +599,7 @@ def _local_rank_candidates(
     ) + bias[:, None, :].astype(jnp.float32)
     grouped = jnp.where(
         local_valid[..., None],
-        jax.nn.relu(grouped),
+        _encoder_activation(grouped, kind=encoder_activation),
         -jnp.inf,
     )
     global_banks = bank_start + jnp.arange(local_banks, dtype=jnp.int32)

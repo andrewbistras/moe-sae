@@ -1,8 +1,43 @@
 # Experiment 3: Expert-Aligned Contribution Transcoders
 
-Status: frozen seed-0 mechanism-pilot contract, 2026-07-27
+Status: frozen seed-0 mechanism-pilot v2 reset, 2026-07-27
 
-Protocol ID: `gemma4-contribution-transcoder-v1-20260727`
+Protocol ID: `gemma4-contribution-transcoder-v2-20260727`
+
+## Pre-result protocol reset
+
+The first production attempt exposed a flaw in the v1 training contract
+before any held-out evaluation or A/R/B/F contrast was produced. Condition F
+completed its training loop under v1, but condition A stopped before update 21
+after 20 healthy updates (327,680 tokens). The fail-closed error was:
+
+```text
+invalid transcoder inputs or fewer than k positive features
+```
+
+The paired input path had already validated finite source and target tensors,
+router weights, bank ranges, bank uniqueness, and token alignment. Capacity
+overflow has a separate hard error. The remaining failure mode was therefore
+one v1 made possible: a 256-wide expert bank could present fewer than two
+strictly positive ReLU activations for a valid component. The hard stop was
+correct under v1; padding TopK with zero-valued features would not have been.
+
+Before inspecting a scientific result, v1 was retired and replaced by this v2
+contract. V2 uses softplus encoder activations for all four conditions. This
+makes strict-positive TopK a model invariant instead of a probabilistic hope.
+The implementation saturates underflowed softplus outputs at the smallest
+normal positive FP32 value so accelerator subnormal handling cannot silently
+reintroduce zero. Ties still resolve by ascending global latent ID.
+
+This is a full training reset: the v1 F checkpoint is not mixed with v2 runs.
+The source overlay remains valid because its
+`gemma4-routed-input-overlay-v1` schema, capture site, token identities, and
+payloads are independent of the downstream encoder activation. V2 pins and
+reuses the exact sealed train manifest
+`8d947629e57d64d054a3086e2729090eed1e9f6afc4568b76e5c90da5f378e3c`
+and eval manifest
+`f68e2fe6e4cf568e694925697dd5d65fe10160a52d357c641892de85ee5c3da7`;
+the overlay harvester must not be pointed at either sealed production root.
 
 ## Decision
 
@@ -137,7 +172,7 @@ There are no per-bank means and no trainable output bias.
 For condition-specific bank `b_ts`:
 
 ```text
-a_ts     = ReLU(W_enc[b_ts] @ (x_t - mu_x) + beta[b_ts])
+a_ts     = softplus(W_enc[b_ts] @ (x_t - mu_x) + beta[b_ts])
 z_ts     = exact_positive_TopK_2(a_ts)
 e_hat_ts = mu_e + W_dec[b_ts, z_ts] @ z_ts
 ```
@@ -145,12 +180,15 @@ e_hat_ts = mu_e + W_dec[b_ts, z_ts] @ z_ts
 Each selected slot is scored independently. The eight reconstructions are
 combined only after decoding. Exact-positive TopK requires two strictly
 positive activations per slot, uses global latent ID as the deterministic
-tie-break, and never materializes a dense latent vector for decode.
+tie-break, and never materializes a dense latent vector for decode. Softplus
+is applied identically by the independent NumPy oracle, dense JAX oracle,
+grouped A/R accelerator path, and rank-banked B/F accelerator path.
 
 The numerical and optimizer contract remains matched to Experiment 2:
 
 - BF16 parameters and matmuls;
 - FP32 reductions and Adam moments;
+- FP32 softplus outputs with a smallest-normal positive numerical floor;
 - Adam beta1 0.9, beta2 0.999, epsilon 1e-8;
 - no weight decay and global gradient clip 1.0;
 - 12-update linear warmup to `3e-4`, cosine decay to `3e-5`;
@@ -333,6 +371,8 @@ width, or target-derived encoder features after looking at quality.
 - NumPy/JAX parity with independent source and target arrays;
 - leakage test: changing targets cannot change pre-update latent selections;
 - A/R/B/F deterministic TopK and sparse-decode parity;
+- exact-positive TopK for typical and strongly negative finite
+  preactivations;
 - interrupted-versus-uninterrupted checkpoint parity binding both manifests;
 - exact tail-mask and L0 checks;
 - exact recomposition against the sealed sidecar;

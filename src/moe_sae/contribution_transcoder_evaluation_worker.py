@@ -776,6 +776,36 @@ def _training_ledger(
     )
 
 
+def _validate_phase_datasets(
+    config: Any,
+    phase: Any,
+    *,
+    train_target: Any,
+    train_source: Any,
+    eval_target: Any,
+    eval_source: Any,
+) -> None:
+    """Require the exact four frozen target/overlay manifests."""
+
+    if (
+        int(train_target.total_tokens) != phase.train_tokens
+        or int(train_source.total_tokens) != phase.train_tokens
+        or int(eval_target.total_tokens) != phase.eval_tokens
+        or int(eval_source.total_tokens) != phase.eval_tokens
+        or train_target.manifest_sha256
+        != config.parents["train_target_manifest_sha256"]
+        or eval_target.manifest_sha256
+        != config.parents["eval_target_manifest_sha256"]
+        or train_source.manifest_sha256
+        != config.parents["train_source_overlay_manifest_sha256"]
+        or eval_source.manifest_sha256
+        != config.parents["eval_source_overlay_manifest_sha256"]
+    ):
+        raise Experiment3EvaluationWorkerError(
+            "source/target manifests differ from the frozen phase"
+        )
+
+
 def run(args: argparse.Namespace) -> int:
     import jax
 
@@ -838,19 +868,14 @@ def run(args: argparse.Namespace) -> int:
         target_manifest=eval_target.manifest,
     )
     phase = config.phase(args.phase)
-    if (
-        int(train_target.total_tokens) != phase.train_tokens
-        or int(train_source.total_tokens) != phase.train_tokens
-        or int(eval_target.total_tokens) != phase.eval_tokens
-        or int(eval_source.total_tokens) != phase.eval_tokens
-        or train_target.manifest_sha256
-        != config.parents["train_target_manifest_sha256"]
-        or eval_target.manifest_sha256
-        != config.parents["eval_target_manifest_sha256"]
-    ):
-        raise Experiment3EvaluationWorkerError(
-            "source/target manifests differ from the frozen phase"
-        )
+    _validate_phase_datasets(
+        config,
+        phase,
+        train_target=train_target,
+        train_source=train_source,
+        eval_target=eval_target,
+        eval_source=eval_source,
+    )
     output = Path(args.result_root).expanduser().resolve()
     lane_root = output / f"process-p{jax.process_index():05d}"
     lane_root.mkdir(parents=True, exist_ok=True, mode=0o700)

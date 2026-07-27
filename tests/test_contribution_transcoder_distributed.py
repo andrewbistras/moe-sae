@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import jax
 import numpy as np
+import pytest
 
 from moe_sae.contribution_sae import ContributionSAEConfig
 from moe_sae.contribution_training import ContributionOptimizerConfig
@@ -14,9 +15,9 @@ from moe_sae.contribution_transcoder_distributed import (
 from moe_sae.distributed import DistributedConfig, create_mesh
 
 
-def _layout() -> ContributionSAEConfig:
+def _layout(condition: str = "B") -> ContributionSAEConfig:
     return ContributionSAEConfig(
-        condition="B",
+        condition=condition,  # type: ignore[arg-type]
         hidden_dim=4,
         num_experts=4,
         top_routed=2,
@@ -77,8 +78,11 @@ def test_stack_has_one_source_operand_and_separate_decoder_targets():
     assert left.expert_output.shape == (1, 2, 2, 4)
 
 
-def test_cpu_distributed_transcoder_update_is_finite_and_exact_l0():
-    layout = _layout()
+@pytest.mark.parametrize("condition", ["A", "R", "B", "F"])
+def test_cpu_distributed_strongly_negative_update_is_finite_and_exact_l0(
+    condition: str,
+):
+    layout = _layout(condition)
     distributed = DistributedConfig(
         data_axis_size=1,
         feature_axis_size=1,
@@ -93,11 +97,14 @@ def test_cpu_distributed_transcoder_update_is_finite_and_exact_l0():
         optimizer,
         distributed,
     )
-    # A positive encoder bias makes the exact-positive TopK precondition
-    # deterministic for this tiny production-shaped update.
     state = state._replace(
         params=state.params._replace(
-            encoder_bias=np.ones(state.params.encoder_bias.shape, np.float32)
+            encoder=np.zeros(state.params.encoder.shape, np.float32),
+            encoder_bias=np.full(
+                state.params.encoder_bias.shape,
+                -1.0e6,
+                np.float32,
+            ),
         )
     )
     trainer = ContributionTranscoderDistributedTrainer(
@@ -105,6 +112,7 @@ def test_cpu_distributed_transcoder_update_is_finite_and_exact_l0():
         layout,
         optimizer,
         distributed,
+        bank_capacity=2 if condition in {"A", "R"} else None,
         rematerialize_microbatch=False,
     )
     updated, metrics = trainer.step(

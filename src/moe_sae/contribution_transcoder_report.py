@@ -21,13 +21,14 @@ from typing import Any
 import numpy as np
 
 from moe_sae.contribution_artifacts import canonical_sha256
+from moe_sae.contribution_transcoder_config import PROTOCOL_ID
 from moe_sae.contribution_transcoder_evaluation import (
     CONDITIONS,
     ENDPOINTS,
     TranscoderPairedSequenceScores,
 )
 
-RESULT_SCHEMA_VERSION = "gemma4-contribution-transcoder-scientific-result-v1"
+RESULT_SCHEMA_VERSION = "gemma4-contribution-transcoder-scientific-result-v2"
 BOOTSTRAP_ALGORITHM = "paired-packed-sequence-percentile-bootstrap-v1"
 BOOTSTRAP_REPLICATES = 20_000
 BOOTSTRAP_SEED = 2_026_072_700
@@ -640,7 +641,7 @@ def build_transcoder_scientific_result(
         }
     unsigned = {
         "schema_version": RESULT_SCHEMA_VERSION,
-        "protocol_id": "gemma4-contribution-transcoder-v1-20260727",
+        "protocol_id": PROTOCOL_ID,
         "status": verdict,
         "seed": 0,
         "source_revision": source_revision,
@@ -725,6 +726,8 @@ def validate_transcoder_scientific_result(
         raise ContributionTranscoderReportError("result self-hash mismatch")
     if selected.get("schema_version") != RESULT_SCHEMA_VERSION:
         raise ContributionTranscoderReportError("result schema is incompatible")
+    if selected.get("protocol_id") != PROTOCOL_ID:
+        raise ContributionTranscoderReportError("result protocol is incompatible")
     if scores is not None:
         if (
             selected.get("paired_scores", {}).get("score_artifact_sha256")

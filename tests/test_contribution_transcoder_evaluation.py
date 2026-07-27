@@ -37,12 +37,14 @@ from moe_sae.contribution_transcoder_distributed import (
 from moe_sae.distributed import DistributedConfig, create_mesh
 from moe_sae.contribution_transcoder_report import (
     ContributionTranscoderReportError,
+    RESULT_SCHEMA_VERSION,
     TranscoderTrainingLedger,
     build_condition_summary,
     build_transcoder_scientific_result,
     render_transcoder_report,
     validate_transcoder_scientific_result,
 )
+from moe_sae.contribution_transcoder_config import PROTOCOL_ID
 
 
 def _digest(label: str) -> str:
@@ -126,8 +128,10 @@ def test_host_scoring_uses_exact_common_shared_branch_and_padding() -> None:
 
 
 @pytest.mark.parametrize("condition", ["A", "R", "B", "F"])
+@pytest.mark.parametrize("encoder_bias", [10.0, -1.0e6])
 def test_distributed_transcoder_evaluator_uses_source_only_operand(
     condition: str,
+    encoder_bias: float,
 ) -> None:
     layout = ContributionSAEConfig(
         condition=condition,  # type: ignore[arg-type]
@@ -154,7 +158,12 @@ def test_distributed_transcoder_evaluator_uses_source_only_operand(
     )
     state = state._replace(
         params=state.params._replace(
-            encoder_bias=10.0 * jnp.ones_like(state.params.encoder_bias),
+            encoder=(
+                jnp.zeros_like(state.params.encoder)
+                if encoder_bias < 0
+                else state.params.encoder
+            ),
+            encoder_bias=encoder_bias * jnp.ones_like(state.params.encoder_bias),
         )
     )
     source = np.arange(18, dtype=np.float32).reshape(6, 3) / 20.0
@@ -417,6 +426,8 @@ def test_report_recomputes_direct_a_f_gain_cost_and_effect_retention() -> None:
     scores = _paired_scores()
     result = _result(scores)
 
+    assert result["schema_version"] == RESULT_SCHEMA_VERSION
+    assert result["protocol_id"] == PROTOCOL_ID
     assert result["status"] == "transfer_passed"
     assert result["primary"]["g3"]["status"] == "stable"
     assert result["primary"]["g3"]["gain_recovery_percent"] == pytest.approx(
@@ -446,6 +457,26 @@ def test_report_recomputes_direct_a_f_gain_cost_and_effect_retention() -> None:
     markdown = render_transcoder_report(result)
     assert "200.00% (stable)" in markdown
     assert result["result_sha256"] in markdown
+
+
+def test_result_validation_rejects_old_or_mislabeled_protocol() -> None:
+    scores = _paired_scores()
+    result = _result(scores)
+    changed = copy.deepcopy(result)
+    changed["protocol_id"] = "gemma4-contribution-transcoder-v1-20260727"
+    unsigned = {
+        name: value
+        for name, value in changed.items()
+        if name != "result_sha256"
+    }
+    from moe_sae.contribution_artifacts import canonical_sha256
+
+    changed["result_sha256"] = canonical_sha256(unsigned)
+    with pytest.raises(
+        ContributionTranscoderReportError,
+        match="protocol",
+    ):
+        validate_transcoder_scientific_result(changed)
 
 
 def test_g3_is_undefined_when_f_minus_b_is_nonpositive() -> None:

@@ -1203,7 +1203,7 @@ def authorize_extended_workload_after_lowering(
     maximum_runtime_seconds: int,
     config: Experiment2Config,
 ) -> AuthorizedContributionExecutable:
-    """Bind a >600-second workload to the just-lowered executable.
+    """Bind work beyond the configured ungated limit to the lowered executable.
 
     This function is intentionally downstream of lowering: it derives the
     observed StableHLO/hardware/launch identity, validates the qualification
@@ -1222,7 +1222,8 @@ def authorize_extended_workload_after_lowering(
     )
     if maximum <= config.runtime.accelerator_ungated_max_seconds:
         raise ContributionQualificationWorkerError(
-            "extended workload seam is only for work beyond 600 seconds"
+            "extended workload seam is only for work beyond the configured "
+            "ungated runtime limit"
         )
     observed = exact_performance_identity(
         graph=prepared.graph,

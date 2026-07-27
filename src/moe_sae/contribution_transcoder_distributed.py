@@ -33,6 +33,7 @@ from moe_sae.contribution_training import (
     optimizer_sae_config,
 )
 from moe_sae.contribution_transcoder import (
+    ENCODER_ACTIVATION,
     ContributionTranscoderParams,
     ContributionTranscoderTrainState,
     transcoder_params_from_sae,
@@ -420,6 +421,7 @@ def _build_mapped_objective(
                     layout,
                     feature_axis=feature_axis,
                     capacity=capacity,
+                    encoder_activation=ENCODER_ACTIVATION,
                 )
             else:
                 local_values, local_ids = _local_rank_candidates(
@@ -428,6 +430,7 @@ def _build_mapped_objective(
                     component_valid,
                     layout,
                     feature_axis=feature_axis,
+                    encoder_activation=ENCODER_ACTIVATION,
                 )
                 overflow_here = jnp.asarray(False)
             selection = _merge_local_candidates(

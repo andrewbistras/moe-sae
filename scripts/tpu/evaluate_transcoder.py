@@ -16,7 +16,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 PROCESS_COUNT = 4
-RESULT_SCHEMA_VERSION = "gemma4-contribution-transcoder-scientific-result-v1"
+RESULT_SCHEMA_VERSION = "gemma4-contribution-transcoder-scientific-result-v2"
+PROTOCOL_ID = "gemma4-contribution-transcoder-v2-20260727"
 _GIT = re.compile(r"^[0-9a-f]{40}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
@@ -254,7 +255,7 @@ def _worker(settings: Settings, process: int) -> list[str]:
         "-m",
         "moe_sae.contribution_transcoder_evaluation_worker",
         "--config",
-        f"{settings.root}/configs/gemma4_transcoder_v1.yaml",
+        f"{settings.root}/configs/gemma4_transcoder_v2.yaml",
         "--source-revision",
         settings.commit,
         "--train-target-root",
@@ -430,6 +431,7 @@ def _validate_result(path: Path) -> dict[str, object]:
     claimed = body.pop("result_sha256", None)
     if (
         body.get("schema_version") != RESULT_SCHEMA_VERSION
+        or body.get("protocol_id") != PROTOCOL_ID
         or not isinstance(claimed, str)
         or _SHA256.fullmatch(claimed) is None
         or _canonical_sha256(body) != claimed

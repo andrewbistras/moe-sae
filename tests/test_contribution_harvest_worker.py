@@ -195,7 +195,7 @@ def _case(
     receipt_graph: dict | None = None,
     controller_index: int = 0,
     observed_process_index: int = 0,
-    maximum_runtime_seconds: int = 3_600,
+    maximum_runtime_seconds: int = 3_601,
 ) -> SimpleNamespace:
     config = load_contribution_config(CONFIG_PATH)
     source_manifest = _source_manifest(config)

@@ -1734,9 +1734,13 @@ def prefetch_transcoder_process_lane(
         cache=cache,
         target_manifest=target.manifest,
     )
-    if int(source.total_tokens) != selected_phase.train_tokens:
+    if (
+        int(source.total_tokens) != selected_phase.train_tokens
+        or source.manifest_sha256
+        != config.parents["train_source_overlay_manifest_sha256"]
+    ):
         raise ContributionTrainingWorkerError(
-            "transcoder prefetch source differs from the phase token plan"
+            "transcoder prefetch source differs from its config-pinned parent"
         )
     start = int(partition["range_start"])
     end = int(partition["range_end"])
@@ -1894,6 +1898,8 @@ def _prove_transcoder_prefetch_for_plan(
         target.manifest_sha256 != selected["target_manifest_sha256"]
         or source.manifest_sha256 != selected["source_manifest_sha256"]
         or target.manifest_sha256 != config.parents["train_target_manifest_sha256"]
+        or source.manifest_sha256
+        != config.parents["train_source_overlay_manifest_sha256"]
         or int(target.total_tokens) != plan.total_tokens
         or int(source.total_tokens) != plan.total_tokens
     ):
@@ -2723,9 +2729,13 @@ def _build_production_workload(
             cache=cache,
             target_manifest=dataset.manifest,
         )
-        if int(source_dataset.total_tokens) != plan.total_tokens:
+        if (
+            int(source_dataset.total_tokens) != plan.total_tokens
+            or source_dataset.manifest_sha256
+            != config.parents["train_source_overlay_manifest_sha256"]
+        ):
             raise ContributionTrainingWorkerError(
-                "routed-input overlay differs from the phase token plan"
+                "routed-input overlay differs from the config-pinned parent"
             )
     distributed = DistributedConfig(
         data_axis_size=int(jax.process_count()),

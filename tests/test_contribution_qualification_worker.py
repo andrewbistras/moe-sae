@@ -831,7 +831,7 @@ def test_extended_workload_is_callable_only_after_observed_receipt_match() -> No
         hardware=hardware,
         launch_config=launch,
         qualification_receipt=receipt,
-        maximum_runtime_seconds=601,
+        maximum_runtime_seconds=3_601,
         config=load_contribution_config(CONFIG_PATH),
     )
     assert authorized.authorization.basis == "qualified_exact_identity"
@@ -845,7 +845,7 @@ def test_extended_workload_is_callable_only_after_observed_receipt_match() -> No
             hardware=hardware,
             launch_config=launch,
             qualification_receipt=receipt,
-            maximum_runtime_seconds=601,
+            maximum_runtime_seconds=3_601,
             config=load_contribution_config(CONFIG_PATH),
         )
 

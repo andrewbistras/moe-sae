@@ -16,8 +16,8 @@ import yaml
 
 from moe_sae.contribution_artifacts import canonical_sha256
 
-SCHEMA_VERSION = "gemma4-contribution-transcoder-run-config-v1"
-PROTOCOL_ID = "gemma4-contribution-transcoder-v1-20260727"
+SCHEMA_VERSION = "gemma4-contribution-transcoder-run-config-v2"
+PROTOCOL_ID = "gemma4-contribution-transcoder-v2-20260727"
 PHASE_NAME = "mechanism_pilot"
 CONDITIONS = ("A", "R", "B", "F")
 
@@ -101,6 +101,7 @@ class Experiment3Config:
     raw: Mapping[str, Any]
     config_hash: str
     protocol_id: str
+    encoder_activation: str
     provenance: TranscoderProvenance
     model: TranscoderModel
     runtime: TranscoderRuntime
@@ -226,6 +227,8 @@ def _validate_document(value: Any) -> Experiment3Config:
             "target_schema_version",
             "train_target_manifest_sha256",
             "eval_target_manifest_sha256",
+            "train_source_overlay_manifest_sha256",
+            "eval_source_overlay_manifest_sha256",
             "train_tokens",
             "eval_tokens",
             "recomposition_sidecar_schema_version",
@@ -238,6 +241,12 @@ def _validate_document(value: Any) -> Experiment3Config:
         ),
         "eval_target_manifest_sha256": (
             "31454e5ce8693521c41a2a95f2ef88d40c5d26c726a0efac5c26d882ed341f5e"
+        ),
+        "train_source_overlay_manifest_sha256": (
+            "8d947629e57d64d054a3086e2729090eed1e9f6afc4568b76e5c90da5f378e3c"
+        ),
+        "eval_source_overlay_manifest_sha256": (
+            "f68e2fe6e4cf568e694925697dd5d65fe10160a52d357c641892de85ee5c3da7"
         ),
         "train_tokens": 2_000_000,
         "eval_tokens": 250_000,
@@ -286,6 +295,7 @@ def _validate_document(value: Any) -> Experiment3Config:
         owner="training",
         keys={
             "mode",
+            "encoder_activation",
             "seed",
             "train_tokens",
             "eval_tokens",
@@ -307,6 +317,7 @@ def _validate_document(value: Any) -> Experiment3Config:
     )
     frozen_training = {
         "mode": "contribution_transcoder",
+        "encoder_activation": "softplus",
         "seed": 0,
         "train_tokens": 2_000_000,
         "eval_tokens": 250_000,
@@ -472,6 +483,7 @@ def _validate_document(value: Any) -> Experiment3Config:
         raw=canonical,
         config_hash=canonical_sha256(canonical),
         protocol_id=PROTOCOL_ID,
+        encoder_activation=str(training["encoder_activation"]),
         provenance=TranscoderProvenance(
             maxtext_fork_commit=str(provenance["maxtext_fork_commit"])
         ),

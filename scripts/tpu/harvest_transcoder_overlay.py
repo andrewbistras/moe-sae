@@ -6,6 +6,10 @@ module on TPU VM workers 0--3 concurrently; the worker module itself performs
 the JAX barrier and lets JAX process zero seal the manifest.  All scientific
 inputs are explicit CLI arguments.  Environment variables are used only by
 ``gcloud`` for its ordinary account/SDK configuration.
+
+The frozen v2 experiment reuses its two already-sealed overlay-v1 manifests.
+This command is therefore recovery/new-protocol machinery: a new capture
+requires an explicit acknowledgement and cannot target a sealed control root.
 """
 
 from __future__ import annotations
@@ -57,6 +61,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--maximum-runtime-seconds", type=int, default=600)
     parser.add_argument("--local-log-root", required=True)
     parser.add_argument("--ssh-key-file")
+    parser.add_argument(
+        "--new-overlay",
+        action="store_true",
+        help=(
+            "acknowledge that this is a new overlay capture using a fresh "
+            "control root; frozen v2 production reuses its sealed v1 overlays"
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true")
     return parser
 
@@ -85,7 +97,7 @@ def _worker_command(args: argparse.Namespace, controller: int) -> list[str]:
         "-m",
         "moe_sae.contribution_transcoder_harvest_worker",
         "--config",
-        f"{args.project_root}/configs/gemma4_transcoder_v1.yaml",
+        f"{args.project_root}/configs/gemma4_transcoder_v2.yaml",
         "--split",
         args.split,
         "--checkpoint",
@@ -130,6 +142,11 @@ def _worker_command(args: argparse.Namespace, controller: int) -> list[str]:
         ),
         'test -z "$(git status --porcelain=v1 --untracked-files=all)"',
         (
+            f"if test -e {shlex.quote(str(Path(args.control_root) / 'manifest.json'))}; "
+            "then echo 'sealed overlay already exists; reuse it or choose a "
+            "fresh --control-root' >&2; exit 2; fi"
+        ),
+        (
             "install -d -m 0700 "
             f"{shlex.quote(source_cache)} "
             f"{shlex.quote(local_buffer)} "
@@ -165,6 +182,11 @@ def _worker_command(args: argparse.Namespace, controller: int) -> list[str]:
 
 
 def run(args: argparse.Namespace) -> int:
+    if not args.new_overlay:
+        raise OperatorError(
+            "frozen v2 reuses its sealed overlay-v1 manifests; a new capture "
+            "requires --new-overlay and a fresh --control-root"
+        )
     if not 0 < args.maximum_runtime_seconds <= 600:
         raise OperatorError("maximum runtime must lie in [1,600] seconds")
     if args.source_cache_max_bytes <= 0 or args.per_device_sequence_batch <= 0:

@@ -51,6 +51,33 @@ from moe_sae.sae import (
 )
 
 _EPS = 1e-12
+ENCODER_ACTIVATION = "softplus"
+
+
+def _positive_softplus(value: jax.Array) -> jax.Array:
+    """Numerically positive FP32 softplus for exact-positive sparse codes.
+
+    Mathematical softplus is strictly positive for every finite input, but
+    sufficiently negative FP32 inputs can underflow to zero (and TPU hardware
+    may flush subnormals).  Saturating at the smallest normal FP32 value keeps
+    the implemented activation faithful to that positivity invariant.
+    """
+
+    activated = jax.nn.softplus(jnp.asarray(value, jnp.float32))
+    return jnp.maximum(activated, jnp.finfo(jnp.float32).tiny)
+
+
+def _numpy_positive_softplus(value: np.ndarray) -> np.ndarray:
+    """Independent NumPy implementation of :func:`_positive_softplus`."""
+
+    activated = np.logaddexp(
+        np.float32(0.0),
+        np.asarray(value, np.float32),
+    ).astype(np.float32, copy=False)
+    return np.maximum(
+        activated,
+        np.finfo(np.float32).tiny,
+    )
 
 
 class ContributionTranscoderParams(NamedTuple):
@@ -374,7 +401,7 @@ def numpy_forward_contribution_transcoder(
         bank_encoder[safe_banks],
         dtype=np.float32,
     ) + bank_bias[safe_banks]
-    scores = np.maximum(pre, np.float32(0))
+    scores = _numpy_positive_softplus(pre)
     scores = np.where(valid_banks[:, None], scores, -np.inf)
     local_ids = np.arange(layout.bank_width, dtype=np.int32)
     candidate_ids = (
@@ -475,7 +502,11 @@ def contribution_transcoder_candidate_scores(
 
     local_ids = jnp.arange(layout.bank_width, dtype=jnp.int32)
     latent_ids = safe_banks[:, None] * layout.bank_width + local_ids[None, :]
-    scores = jnp.where(valid_banks[:, None], jax.nn.relu(pre), -jnp.inf)
+    scores = jnp.where(
+        valid_banks[:, None],
+        _positive_softplus(pre),
+        -jnp.inf,
+    )
     return scores, latent_ids
 
 
@@ -807,6 +838,7 @@ __all__ = [
     "ContributionTranscoderNumpyForward",
     "ContributionTranscoderParams",
     "ContributionTranscoderTrainState",
+    "ENCODER_ACTIVATION",
     "contribution_transcoder_bank_ids",
     "contribution_transcoder_candidate_scores",
     "contribution_transcoder_loss_and_grad_sums",

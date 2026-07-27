@@ -160,7 +160,13 @@ def test_candidate_scores_repeat_one_input_but_gather_only_assigned_banks() -> N
 
     # Shape is routed slots times one bank width, not all three banks.
     assert scores.shape == (2, selected.bank_width)
-    np.testing.assert_allclose(scores, [[2, 1], [6, 3]])
+    np.testing.assert_allclose(
+        scores,
+        np.logaddexp(
+            np.float32(0),
+            np.asarray([[2, 1], [6, 3]], np.float32),
+        ),
+    )
     np.testing.assert_array_equal(latent_ids, [[0, 1], [4, 5]])
 
 
@@ -199,12 +205,24 @@ def test_forward_keeps_source_and_target_centers_distinct_and_decodes_sparse() -
         selected,
     )
 
-    # The source-center yields [1, 0].  Bank 0 selects value 1 and bank 1
-    # selects value 2; only then is the independent target-center added.
+    # The source-center yields [1, 0]. Bank 0 selects softplus(1) and bank 1
+    # selects softplus(2); only then is the independent target-center added.
     np.testing.assert_array_equal(output.selection.latent_ids, [[0], [3]])
+    first = np.logaddexp(np.float32(0), np.float32(1))
+    second = np.logaddexp(np.float32(0), np.float32(2))
     np.testing.assert_allclose(
         output.reconstruction,
-        np.asarray([[[15, 26], [6, 26]]], np.float32),
+        np.asarray(
+            [
+                [
+                    [10 + 5 * first, 20 + 6 * first],
+                    [10 - 2 * second, 20 + 3 * second],
+                ]
+            ],
+            np.float32,
+        ),
+        rtol=1e-6,
+        atol=1e-6,
     )
 
 
@@ -433,7 +451,7 @@ def test_weighted_loss_matches_numpy_metric_and_counts_exact_source_l0() -> None
     assert host_scores.sst == pytest.approx(float(sums.sst))
 
 
-def test_invalid_bank_router_or_sparse_row_fails_scientific_loss() -> None:
+def test_softplus_row_is_valid_while_invalid_bank_or_router_fails() -> None:
     selected = layout("A", experts=2, routed=2, width=2, k=1)
     params = ContributionTranscoderParams(
         encoder=jnp.zeros((4, 2), jnp.float32),
@@ -444,7 +462,7 @@ def test_invalid_bank_router_or_sparse_row_fails_scientific_loss() -> None:
     target = jnp.ones((1, 2, 2), jnp.float32)
     valid = jnp.ones((1,), bool)
 
-    sparse_loss, sparse_sums = normalized_contribution_transcoder_loss(
+    softplus_loss, softplus_sums = normalized_contribution_transcoder_loss(
         params,
         source,
         target,
@@ -482,12 +500,90 @@ def test_invalid_bank_router_or_sparse_row_fails_scientific_loss() -> None:
         )
     )
 
-    assert not bool(sparse_sums.topk_valid)
-    assert np.isnan(float(sparse_loss))
+    assert bool(softplus_sums.topk_valid)
+    assert np.isfinite(float(softplus_loss))
     assert not bool(invalid_bank_sums.topk_valid)
     assert np.isnan(float(invalid_bank_loss))
     assert not bool(invalid_router_sums.topk_valid)
     assert np.isnan(float(invalid_router_loss))
+
+
+@pytest.mark.parametrize("condition", ["A", "R", "B", "F"])
+def test_strongly_negative_finite_rows_still_select_exact_positive_topk(
+    condition: str,
+) -> None:
+    selected = layout(
+        condition,
+        hidden=2,
+        experts=4,
+        routed=2,
+        width=4,
+        k=2,
+    )
+    params = ContributionTranscoderParams(
+        encoder=jnp.zeros(
+            (selected.total_features, selected.hidden_dim),
+            jnp.float32,
+        ),
+        decoder=jnp.zeros(
+            (selected.hidden_dim, selected.total_features),
+            jnp.float32,
+        ),
+        encoder_bias=jnp.full(
+            (selected.total_features,),
+            -1.0e6,
+            jnp.float32,
+        ),
+    )
+    source = np.asarray([[1.0, -2.0], [-3.0, 4.0]], np.float32)
+    source_mean = np.asarray([0.25, -0.5], np.float32)
+    target_mean = np.asarray([0.0, 0.0], np.float32)
+    if condition in {"A", "R"}:
+        banks = np.asarray([[0, 3], [2, 1]], np.int32)
+    else:
+        banks = np.broadcast_to(
+            np.arange(selected.top_routed, dtype=np.int32),
+            (source.shape[0], selected.top_routed),
+        ).copy()
+
+    numpy_output = numpy_forward_contribution_transcoder(
+        params,
+        source,
+        banks,
+        source_mean,
+        target_mean,
+        selected,
+    )
+    jax_output = forward_contribution_transcoder(
+        params,
+        jnp.asarray(source),
+        jnp.asarray(banks),
+        jnp.asarray(source_mean),
+        jnp.asarray(target_mean),
+        selected,
+    )
+
+    assert np.all(numpy_output.valid)
+    assert bool(jnp.all(jax_output.selection.valid))
+    assert np.all(numpy_output.values > 0)
+    assert bool(jnp.all(jax_output.selection.values > 0))
+    np.testing.assert_array_equal(
+        numpy_output.latent_ids,
+        jax_output.selection.latent_ids,
+    )
+    np.testing.assert_array_equal(
+        numpy_output.latent_ids,
+        (
+            banks.reshape(-1, 1) * selected.bank_width
+            + np.arange(selected.k_per_contribution, dtype=np.int32)[None, :]
+        ),
+    )
+    np.testing.assert_allclose(
+        numpy_output.values,
+        jax_output.selection.values,
+        rtol=0,
+        atol=0,
+    )
 
 
 @pytest.mark.parametrize(

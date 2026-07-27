@@ -157,6 +157,7 @@ def test_operator_result_validation_rejects_tampering(
 ) -> None:
     body = {
         "schema_version": operator.RESULT_SCHEMA_VERSION,
+        "protocol_id": operator.PROTOCOL_ID,
         "status": "transfer_passed",
     }
     result = {**body, "result_sha256": canonical_sha256(body)}
@@ -166,4 +167,19 @@ def test_operator_result_validation_rejects_tampering(
     result["status"] = "changed"
     path.write_text(json.dumps(result))
     with pytest.raises(operator.OperatorError, match="self-hash"):
+        operator._validate_result(path)
+
+    wrong_protocol = {
+        **body,
+        "protocol_id": "gemma4-contribution-transcoder-v1-20260727",
+    }
+    path.write_text(
+        json.dumps(
+            {
+                **wrong_protocol,
+                "result_sha256": canonical_sha256(wrong_protocol),
+            }
+        )
+    )
+    with pytest.raises(operator.OperatorError, match="identity"):
         operator._validate_result(path)

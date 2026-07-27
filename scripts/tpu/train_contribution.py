@@ -111,7 +111,7 @@ class Settings:
     @property
     def config_path(self) -> str:
         filename = (
-            "gemma4_transcoder_v1.yaml"
+            "gemma4_transcoder_v2.yaml"
             if self.scientific_model == "transcoder"
             else "gemma4_contribution_v1.yaml"
         )

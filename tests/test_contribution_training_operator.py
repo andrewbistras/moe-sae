@@ -390,7 +390,7 @@ def test_transcoder_operator_binds_and_forwards_source_overlay(
         maximum_runtime_seconds=3_600,
     )
     args.scientific_model = "transcoder"
-    args.config = str(ROOT / "configs" / "gemma4_transcoder_v1.yaml")
+    args.config = str(ROOT / "configs" / "gemma4_transcoder_v2.yaml")
     args.phase = "mechanism_pilot"
     args.source_overlay_control_root = str(source)
     args.source_overlay_object_prefix = "gs://bucket/experiment3/source"
@@ -418,7 +418,7 @@ def test_transcoder_operator_binds_and_forwards_source_overlay(
         source_overlay_object_prefix="gs://bucket/experiment3/source/train",
         phase="mechanism_pilot",
     )
-    assert settings.config_path.endswith("configs/gemma4_transcoder_v1.yaml")
+    assert settings.config_path.endswith("configs/gemma4_transcoder_v2.yaml")
     for command in (
         operator._prefetch_command(
             settings, controller_index=1, process_index=3
