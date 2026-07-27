@@ -89,8 +89,6 @@ class Settings:
         commit = _required("PROJECT_COMMIT")
         if _GIT.fullmatch(commit) is None:
             raise OperatorError("PROJECT_COMMIT must be a full lowercase Git SHA")
-        artifact_root = _required("ARTIFACT_ROOT").rstrip("/")
-        bulk_root = _required("BULK_GCS_ROOT").rstrip("/")
         control = _required("CONTRIBUTION_SAE_CONTROL_ROOT").rstrip("/")
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         harvest_sha = os.environ.get("TRANSCODER_HARVEST_RECEIPT_SHA256")
@@ -139,12 +137,19 @@ class Settings:
             run_roots=run_roots,
             result_root=os.environ.get(
                 "TRANSCODER_EVALUATION_ROOT",
-                f"{artifact_root}/experiment3/evaluation/seed0",
+                f"{control}/evaluation/experiment3-seed0",
             ),
             log_root=Path(
                 os.environ.get(
                     "TRANSCODER_EVALUATION_LOG_ROOT",
-                    f"{artifact_root}/experiment3/evaluation/operator-{stamp}",
+                    str(
+                        Path.cwd()
+                        / "artifacts"
+                        / "gemma4_v1"
+                        / "operator-results"
+                        / "experiment3-evaluation"
+                        / f"operator-{stamp}"
+                    ),
                 )
             ),
             peak_flops_per_second=_positive_int(
@@ -163,21 +168,79 @@ class Settings:
         )
 
 
-def _mapping(bundle_path: str) -> dict[int, int]:
+def _mapping_payload(payload: bytes) -> dict[int, int]:
     try:
-        bundle = json.loads(Path(bundle_path).read_text(encoding="ascii"))
+        bundle = json.loads(payload)
         rows = bundle["controller_to_jax_process_index"]
         result = {
             int(row["controller_index"]): int(row["process_index"])
             for row in rows
         }
-    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as error:
+    except (
+        UnicodeDecodeError,
+        ValueError,
+        KeyError,
+        TypeError,
+        json.JSONDecodeError,
+    ) as error:
         raise OperatorError("qualification bundle has no controller mapping") from error
     if set(result) != set(range(PROCESS_COUNT)) or set(result.values()) != set(
         range(PROCESS_COUNT)
     ):
         raise OperatorError("controller/JAX process mapping is not a permutation")
     return result
+
+
+def _remote_bytes(
+    settings: Settings,
+    *,
+    controller: int,
+    remote_path: str,
+) -> bytes:
+    """Read one remote control artifact from the Mac through gcloud."""
+
+    command = [
+        "gcloud",
+        "compute",
+        "tpus",
+        "tpu-vm",
+        "ssh",
+        settings.tpu,
+        f"--project={settings.project}",
+        f"--zone={settings.zone}",
+        f"--worker={controller}",
+        "--quiet",
+        "--command",
+        "cat " + shlex.quote(remote_path),
+    ]
+    if settings.ssh_key:
+        command.insert(-2, f"--ssh-key-file={settings.ssh_key}")
+    environment = os.environ.copy()
+    for name in ("LD_PRELOAD", "GLIBCXX_FORCE_NEW", "GLIBCPP_FORCE_NEW"):
+        environment.pop(name, None)
+    completed = subprocess.run(
+        command,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=environment,
+    )
+    if completed.returncode != 0:
+        raise OperatorError(
+            f"cannot read remote control artifact {remote_path}: "
+            + completed.stderr.decode("utf-8", errors="replace")[-2_000:]
+        )
+    return completed.stdout
+
+
+def _mapping(settings: Settings) -> dict[int, int]:
+    return _mapping_payload(
+        _remote_bytes(
+            settings,
+            controller=0,
+            remote_path=settings.bundle,
+        )
+    )
 
 
 def _worker(settings: Settings, process: int) -> list[str]:
@@ -375,9 +438,27 @@ def _validate_result(path: Path) -> dict[str, object]:
     return value
 
 
+def _fetch_result(
+    settings: Settings,
+    *,
+    controller: int,
+) -> Path:
+    """Fetch the process-zero result without assuming the Mac mounts NFS."""
+
+    remote = settings.result_root.rstrip("/") + "/scientific-result.json"
+    payload = _remote_bytes(
+        settings,
+        controller=controller,
+        remote_path=remote,
+    )
+    local = settings.log_root / "scientific-result.json"
+    local.write_bytes(payload)
+    return local
+
+
 def main() -> int:
     settings = Settings.from_environment()
-    mapping = _mapping(settings.bundle)
+    mapping = _mapping(settings)
     settings.log_root.mkdir(parents=True, exist_ok=False, mode=0o700)
     logs = {
         controller: settings.log_root
@@ -410,7 +491,13 @@ def main() -> int:
             f"one or more evaluator workers failed: {statuses}; "
             f"transports={codes}; logs={settings.log_root}"
         )
-    result = Path(settings.result_root) / "scientific-result.json"
+    process_zero_controller = next(
+        controller for controller, process in mapping.items() if process == 0
+    )
+    result = _fetch_result(
+        settings,
+        controller=process_zero_controller,
+    )
     sealed = _validate_result(result)
     print(
         json.dumps(

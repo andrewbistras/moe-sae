@@ -105,8 +105,8 @@ def test_mapping_and_terminal_marker_are_exact(
     tmp_path: Path,
 ) -> None:
     environment = _environment(tmp_path)
-    mapping = operator._mapping(
-        environment["CONTRIBUTION_QUALIFICATION_BUNDLE"]
+    mapping = operator._mapping_payload(
+        Path(environment["CONTRIBUTION_QUALIFICATION_BUNDLE"]).read_bytes()
     )
     assert mapping == {0: 3, 1: 2, 2: 1, 3: 0}
     log = tmp_path / "worker.log"
@@ -117,6 +117,38 @@ def test_mapping_and_terminal_marker_are_exact(
     assert operator._terminal_status(log, controller=1, process=2) == 0
     with pytest.raises(operator.OperatorError, match="terminal"):
         operator._terminal_status(log, controller=1, process=3)
+
+
+def test_mapping_is_fetched_by_mac_from_remote_worker_zero(
+    operator,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    environment = _environment(tmp_path)
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+    settings = operator.Settings.from_environment()
+    bundle = Path(
+        environment["CONTRIBUTION_QUALIFICATION_BUNDLE"]
+    ).read_bytes()
+    calls = []
+
+    class Completed:
+        returncode = 0
+        stdout = bundle
+        stderr = b""
+
+    def run(command, **kwargs):
+        calls.append((command, kwargs))
+        return Completed()
+
+    monkeypatch.setattr(operator.subprocess, "run", run)
+    assert operator._mapping(settings) == {0: 3, 1: 2, 2: 1, 3: 0}
+    command = calls[0][0]
+    assert "--worker=0" in command
+    assert command[-1].endswith(
+        environment["CONTRIBUTION_QUALIFICATION_BUNDLE"]
+    )
 
 
 def test_operator_result_validation_rejects_tampering(
