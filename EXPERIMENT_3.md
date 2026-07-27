@@ -39,6 +39,20 @@ and eval manifest
 `f68e2fe6e4cf568e694925697dd5d65fe10160a52d357c641892de85ee5c3da7`;
 the overlay harvester must not be pointed at either sealed production root.
 
+The first v2 held-out evaluation attempt then stopped before scoring while
+restoring A. No condition evidence or scientific result was published. The
+checkpoint correctly bound the grouped-GEMM capacity used for training, while
+the evaluator had incorrectly substituted the larger capacity required by the
+held-out token order into that immutable checkpoint identity. The repaired
+evaluator restores with the training capacity and uses
+`max(training_capacity, evaluation_capacity)` only for the held-out executable;
+capacity does not affect parameter shapes. A regression test freezes this
+separation. Because the evaluator repair is a new commit while the four
+checkpoints remain immutable, the result separately binds the evaluator
+revision, training revision, and exact A/R/B/F run-contract hashes. The failed
+namespace and four terminal logs are preserved at
+`gs://moe-sae-bucket/moe-sae/gemma4_v1/experiment3/attempt-evidence/evaluation-v2-capacity-mismatch-20260727T231300Z/`.
+
 ## Decision
 
 Experiment 2 established that Gemma block-15 expert identity is useful when

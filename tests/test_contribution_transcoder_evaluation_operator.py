@@ -45,6 +45,7 @@ def _environment(tmp_path: Path) -> dict[str, str]:
         "TPU_NAME": "gemma4-exp3",
         "TPU_ZONE": "us-central2-b",
         "PROJECT_COMMIT": "a" * 40,
+        "TRAINING_PROJECT_COMMIT": "c" * 40,
         "TPU_PROJECT_ROOT": "/home/user/moe-sae",
         "REMOTE_UV": "/home/user/.local/bin/uv",
         "CONTRIBUTION_QUALIFICATION_BUNDLE": str(bundle),
@@ -86,6 +87,8 @@ def test_settings_and_worker_bind_all_four_runs_and_both_manifests(
         "F": "/nfs/sae/runs/experiment3-f-seed0",
     }
     assert "moe_sae.contribution_transcoder_evaluation_worker" in worker
+    assert settings.commit == "a" * 40
+    assert settings.training_commit == "c" * 40
     for flag, value in (
         ("--train-target-root", "/nfs/target/train"),
         ("--eval-target-root", "/nfs/target/eval"),
@@ -94,10 +97,27 @@ def test_settings_and_worker_bind_all_four_runs_and_both_manifests(
         ("--run-root-a", settings.run_roots["A"]),
         ("--run-root-f", settings.run_roots["F"]),
         ("--shared-harvest-receipt-sha256", "b" * 64),
+        ("--source-revision", "a" * 40),
+        ("--training-source-revision", "c" * 40),
     ):
         index = worker.index(flag)
         assert worker[index + 1] == value
     assert worker[worker.index("--process-index") + 1] == "2"
+
+
+def test_training_revision_is_required(
+    operator,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    environment = _environment(tmp_path)
+    environment.pop("TRAINING_PROJECT_COMMIT")
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv("TRAINING_PROJECT_COMMIT", raising=False)
+
+    with pytest.raises(operator.OperatorError, match="TRAINING_PROJECT_COMMIT"):
+        operator.Settings.from_environment()
 
 
 def test_mapping_and_terminal_marker_are_exact(
@@ -159,15 +179,34 @@ def test_operator_result_validation_rejects_tampering(
         "schema_version": operator.RESULT_SCHEMA_VERSION,
         "protocol_id": operator.PROTOCOL_ID,
         "status": "transfer_passed",
+        "source_revision": "a" * 40,
+        "training_source_revision": "c" * 40,
+        "parents": {
+            "run_contract_sha256": {
+                condition: canonical_sha256({"condition": condition})
+                for condition in ("A", "R", "B", "F")
+            }
+        },
     }
     result = {**body, "result_sha256": canonical_sha256(body)}
     path = tmp_path / "scientific-result.json"
     path.write_text(json.dumps(result))
-    assert operator._validate_result(path)["status"] == "transfer_passed"
+    assert (
+        operator._validate_result(
+            path,
+            expected_source_revision="a" * 40,
+            expected_training_source_revision="c" * 40,
+        )["status"]
+        == "transfer_passed"
+    )
     result["status"] = "changed"
     path.write_text(json.dumps(result))
     with pytest.raises(operator.OperatorError, match="self-hash"):
-        operator._validate_result(path)
+        operator._validate_result(
+            path,
+            expected_source_revision="a" * 40,
+            expected_training_source_revision="c" * 40,
+        )
 
     wrong_protocol = {
         **body,
@@ -182,4 +221,23 @@ def test_operator_result_validation_rejects_tampering(
         )
     )
     with pytest.raises(operator.OperatorError, match="identity"):
-        operator._validate_result(path)
+        operator._validate_result(
+            path,
+            expected_source_revision="a" * 40,
+            expected_training_source_revision="c" * 40,
+        )
+
+    valid = {**body, "result_sha256": canonical_sha256(body)}
+    path.write_text(json.dumps(valid))
+    with pytest.raises(operator.OperatorError, match="identity"):
+        operator._validate_result(
+            path,
+            expected_source_revision="d" * 40,
+            expected_training_source_revision="c" * 40,
+        )
+    with pytest.raises(operator.OperatorError, match="identity"):
+        operator._validate_result(
+            path,
+            expected_source_revision="a" * 40,
+            expected_training_source_revision="d" * 40,
+        )

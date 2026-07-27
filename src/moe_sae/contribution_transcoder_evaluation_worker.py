@@ -128,6 +128,46 @@ class Experiment3EvaluationWorkerError(RuntimeError):
     """Final Experiment-3 evaluation cannot produce authoritative evidence."""
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class _EvaluationCapacityRoles:
+    """Keep checkpoint identity separate from held-out execution shape."""
+
+    checkpoint: int | None
+    execution: int | None
+
+
+def _evaluation_capacity_roles(
+    condition: str,
+    *,
+    training_capacity: int | None,
+    evaluation_capacity: int | None,
+) -> _EvaluationCapacityRoles:
+    """Return immutable-restore and execution-only capacities.
+
+    A/R checkpoint metadata hashes the capacity used during training. Held-out
+    data may require a larger grouped-GEMM shape, but that execution capacity
+    is not part of checkpoint identity and must never be supplied to restore.
+    """
+
+    if condition not in CONDITIONS:
+        raise ValueError(f"unsupported transcoder condition: {condition!r}")
+    if condition not in {"A", "R"}:
+        if training_capacity is not None or evaluation_capacity is not None:
+            raise ValueError("B/F capacity roles must both be absent")
+        return _EvaluationCapacityRoles(checkpoint=None, execution=None)
+    for name, value in (
+        ("training_capacity", training_capacity),
+        ("evaluation_capacity", evaluation_capacity),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{name} must be a positive integer for A/R")
+    assert training_capacity is not None and evaluation_capacity is not None
+    return _EvaluationCapacityRoles(
+        checkpoint=training_capacity,
+        execution=max(training_capacity, evaluation_capacity),
+    )
+
+
 def _read_json(path: str | Path, *, name: str) -> dict[str, Any]:
     selected = Path(path)
     try:
@@ -203,7 +243,7 @@ def _validate_run_contract(
     condition: str,
     source_manifest_sha256: str,
     target_manifest_sha256: str,
-    source_revision: str,
+    training_source_revision: str,
 ) -> dict[str, Any]:
     contract = _read_json(run_root / "run-contract.json", name="run contract")
     claimed = contract.get("run_contract_sha256")
@@ -226,7 +266,7 @@ def _validate_run_contract(
         contract.get("scientific_model") != "transcoder"
         or contract.get("condition") != condition
         or contract.get("seed") != 0
-        or contract.get("project_commit") != source_revision
+        or contract.get("project_commit") != training_source_revision
         or contract.get("source_overlay_manifest_sha256")
         != source_manifest_sha256
         or contract.get("capture_manifest_sha256")
@@ -821,6 +861,13 @@ def run(args: argparse.Namespace) -> int:
         raise Experiment3EvaluationWorkerError(
             "source revision must be a full lowercase Git SHA"
         )
+    if (
+        not isinstance(args.training_source_revision, str)
+        or _GIT_RE.fullmatch(args.training_source_revision) is None
+    ):
+        raise Experiment3EvaluationWorkerError(
+            "training source revision must be a full lowercase Git SHA"
+        )
     initialize_jax_distributed()
     require_v4_32_runtime()
     if int(jax.process_index()) != args.process_index:
@@ -916,6 +963,7 @@ def run(args: argparse.Namespace) -> int:
         for condition in CONDITIONS
     }
     runs: dict[str, tuple[dict[str, Any], dict[str, Any], Path]] = {}
+    run_contract_sha256: dict[str, str] = {}
     for condition in CONDITIONS:
         run_root = _condition_run_root(args, condition)
         result, pointer = _load_run(
@@ -923,12 +971,15 @@ def run(args: argparse.Namespace) -> int:
             plans[condition],
             args.checkpoint_payload_root,
         )
-        _validate_run_contract(
+        contract = _validate_run_contract(
             run_root,
             condition=condition,
             source_manifest_sha256=train_source.manifest_sha256,
             target_manifest_sha256=train_target.manifest_sha256,
-            source_revision=args.source_revision,
+            training_source_revision=args.training_source_revision,
+        )
+        run_contract_sha256[condition] = str(
+            contract["run_contract_sha256"]
         )
         runs[condition] = (result, pointer, run_root)
 
@@ -970,14 +1021,17 @@ def run(args: argparse.Namespace) -> int:
                 raise Experiment3EvaluationWorkerError(
                     "cannot merge complete held-out A/R capacity evidence"
                 ) from error
-            if training_capacity is None:
-                raise Experiment3EvaluationWorkerError(
-                    "A/R checkpoint lacks its immutable training capacity"
+            try:
+                capacity_roles = _evaluation_capacity_roles(
+                    condition,
+                    training_capacity=training_capacity,
+                    evaluation_capacity=int(evaluation_capacity.capacity),
                 )
-            capacity = max(
-                int(training_capacity),
-                int(evaluation_capacity.capacity),
-            )
+            except ValueError as error:
+                raise Experiment3EvaluationWorkerError(
+                    "A/R checkpoint or held-out capacity is invalid"
+                ) from error
+            capacity = capacity_roles.execution
             capacity_unsigned = {
                 "schema_version": (
                     "gemma4-transcoder-evaluation-capacity-contract-v1"
@@ -991,7 +1045,12 @@ def run(args: argparse.Namespace) -> int:
                 "selected_capacity": capacity,
             }
         else:
-            capacity = None
+            capacity_roles = _evaluation_capacity_roles(
+                condition,
+                training_capacity=None,
+                evaluation_capacity=None,
+            )
+            capacity = capacity_roles.execution
             capacity_unsigned = {
                 "schema_version": (
                     "gemma4-transcoder-evaluation-capacity-contract-v1"
@@ -1024,7 +1083,7 @@ def run(args: argparse.Namespace) -> int:
                 # training config while the restored target remains explicitly
                 # transcoder-typed.
                 optimizer_sae_config(layout, optimizer),
-                bank_capacity=capacity,
+                bank_capacity=capacity_roles.checkpoint,
             ),
             checkpoint_payload_root=args.checkpoint_payload_root,
             checkpoint_identity=result["run_identity"],
@@ -1296,6 +1355,8 @@ def run(args: argparse.Namespace) -> int:
             summaries=summaries,
             ledgers=ledgers,
             source_revision=args.source_revision,
+            training_source_revision=args.training_source_revision,
+            run_contract_sha256=run_contract_sha256,
             config_sha256=config.config_hash,
             train_source_manifest_sha256=train_source.manifest_sha256,
             train_target_manifest_sha256=train_target.manifest_sha256,
@@ -1324,6 +1385,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--phase", default="mechanism_pilot")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--source-revision", required=True)
+    parser.add_argument("--training-source-revision", required=True)
     parser.add_argument("--train-target-root", required=True)
     parser.add_argument("--eval-target-root", required=True)
     parser.add_argument("--train-target-object-prefix", required=True)

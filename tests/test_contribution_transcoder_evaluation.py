@@ -412,6 +412,11 @@ def _result(
         summaries=summaries,
         ledgers=ledgers,
         source_revision="a" * 40,
+        training_source_revision="b" * 40,
+        run_contract_sha256={
+            condition: _digest(f"run-contract:{condition}")
+            for condition in CONDITIONS
+        },
         config_sha256=_digest("config"),
         train_source_manifest_sha256=_digest("train-source"),
         train_target_manifest_sha256=_digest("train-target"),
@@ -428,6 +433,9 @@ def test_report_recomputes_direct_a_f_gain_cost_and_effect_retention() -> None:
 
     assert result["schema_version"] == RESULT_SCHEMA_VERSION
     assert result["protocol_id"] == PROTOCOL_ID
+    assert result["source_revision"] == "a" * 40
+    assert result["training_source_revision"] == "b" * 40
+    assert set(result["parents"]["run_contract_sha256"]) == set(CONDITIONS)
     assert result["status"] == "transfer_passed"
     assert result["primary"]["g3"]["status"] == "stable"
     assert result["primary"]["g3"]["gain_recovery_percent"] == pytest.approx(
@@ -456,6 +464,8 @@ def test_report_recomputes_direct_a_f_gain_cost_and_effect_retention() -> None:
     )
     markdown = render_transcoder_report(result)
     assert "200.00% (stable)" in markdown
+    assert f"`{'a' * 40}`" in markdown
+    assert f"`{'b' * 40}`" in markdown
     assert result["result_sha256"] in markdown
 
 
@@ -477,6 +487,43 @@ def test_result_validation_rejects_old_or_mislabeled_protocol() -> None:
         match="protocol",
     ):
         validate_transcoder_scientific_result(changed)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "match"),
+    [
+        ("missing_training_revision", "training_source_revision"),
+        ("invalid_training_revision", "training_source_revision"),
+        ("missing_run_contract", "run_contract_sha256"),
+    ],
+)
+def test_result_validation_rejects_missing_or_invalid_training_provenance(
+    mutation: str,
+    match: str,
+) -> None:
+    result = copy.deepcopy(_result(_paired_scores()))
+    if mutation == "missing_training_revision":
+        result.pop("training_source_revision")
+    elif mutation == "invalid_training_revision":
+        result["training_source_revision"] = "not-a-commit"
+    else:
+        result["parents"]["run_contract_sha256"].pop("R")
+    unsigned = {
+        name: value for name, value in result.items() if name != "result_sha256"
+    }
+    from moe_sae.contribution_artifacts import canonical_sha256
+
+    result["result_sha256"] = canonical_sha256(unsigned)
+    with pytest.raises(ContributionTranscoderReportError, match=match):
+        validate_transcoder_scientific_result(result)
+
+
+def test_result_validation_rejects_post_seal_run_contract_tampering() -> None:
+    result = copy.deepcopy(_result(_paired_scores()))
+    result["parents"]["run_contract_sha256"]["A"] = _digest("substitute")
+
+    with pytest.raises(ContributionTranscoderReportError, match="self-hash"):
+        validate_transcoder_scientific_result(result)
 
 
 def test_g3_is_undefined_when_f_minus_b_is_nonpositive() -> None:

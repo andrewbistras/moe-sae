@@ -17,6 +17,7 @@ from moe_sae.contribution_transcoder_evaluation import (
 from moe_sae.contribution_transcoder_evaluation_worker import (
     Experiment3EvaluationWorkerError,
     _concatenate_condition_evidence,
+    _evaluation_capacity_roles,
     _load_process_evidence,
     _seal_process_evidence,
     _training_ledger,
@@ -125,7 +126,7 @@ def test_run_contract_proves_source_only_manifest_binding(tmp_path: Path):
         "scientific_model": "transcoder",
         "condition": "A",
         "seed": 0,
-        "project_commit": "a" * 40,
+        "project_commit": "b" * 40,
         "source_overlay_manifest_sha256": "1" * 64,
         "capture_manifest_sha256": "2" * 64,
     }
@@ -138,10 +139,21 @@ def test_run_contract_proves_source_only_manifest_binding(tmp_path: Path):
             condition="A",
             source_manifest_sha256="1" * 64,
             target_manifest_sha256="2" * 64,
-            source_revision="a" * 40,
+            training_source_revision="b" * 40,
         )["scientific_model"]
         == "transcoder"
     )
+    with pytest.raises(
+        Experiment3EvaluationWorkerError,
+        match="selected source-only run",
+    ):
+        _validate_run_contract(
+            tmp_path,
+            condition="A",
+            source_manifest_sha256="1" * 64,
+            target_manifest_sha256="2" * 64,
+            training_source_revision="a" * 40,
+        )
     changed = dict(contract)
     changed["scientific_model"] = "sae"
     unsigned = {
@@ -160,7 +172,7 @@ def test_run_contract_proves_source_only_manifest_binding(tmp_path: Path):
             condition="A",
             source_manifest_sha256="1" * 64,
             target_manifest_sha256="2" * 64,
-            source_revision="a" * 40,
+            training_source_revision="b" * 40,
         )
 
 
@@ -247,3 +259,29 @@ def test_training_ledger_uses_measured_marginal_cost_and_diagnostic_mfu():
     assert ledger.compilation_wall_seconds == 3.0
     assert ledger.total_wall_seconds == 22.0
     assert ledger.useful_mfu > 0
+
+
+@pytest.mark.parametrize("condition", ["A", "R"])
+def test_restore_keeps_training_capacity_while_eval_uses_larger_capacity(
+    condition: str,
+) -> None:
+    roles = _evaluation_capacity_roles(
+        condition,
+        training_capacity=8,
+        evaluation_capacity=24,
+    )
+
+    assert roles.checkpoint == 8
+    assert roles.execution == 24
+
+
+@pytest.mark.parametrize("condition", ["B", "F"])
+def test_rank_banked_capacity_roles_remain_absent(condition: str) -> None:
+    roles = _evaluation_capacity_roles(
+        condition,
+        training_capacity=None,
+        evaluation_capacity=None,
+    )
+
+    assert roles.checkpoint is None
+    assert roles.execution is None

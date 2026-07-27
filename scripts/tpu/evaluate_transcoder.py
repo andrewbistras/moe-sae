@@ -61,6 +61,7 @@ class Settings:
     tpu: str
     zone: str
     commit: str
+    training_commit: str
     root: str
     uv: str
     bundle: str
@@ -90,6 +91,11 @@ class Settings:
         commit = _required("PROJECT_COMMIT")
         if _GIT.fullmatch(commit) is None:
             raise OperatorError("PROJECT_COMMIT must be a full lowercase Git SHA")
+        training_commit = _required("TRAINING_PROJECT_COMMIT")
+        if _GIT.fullmatch(training_commit) is None:
+            raise OperatorError(
+                "TRAINING_PROJECT_COMMIT must be a full lowercase Git SHA"
+            )
         control = _required("CONTRIBUTION_SAE_CONTROL_ROOT").rstrip("/")
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         harvest_sha = os.environ.get("TRANSCODER_HARVEST_RECEIPT_SHA256")
@@ -112,6 +118,7 @@ class Settings:
             tpu=_required("TPU_NAME"),
             zone=_required("TPU_ZONE"),
             commit=commit,
+            training_commit=training_commit,
             root=_required("TPU_PROJECT_ROOT"),
             uv=_required("REMOTE_UV"),
             bundle=_required("CONTRIBUTION_QUALIFICATION_BUNDLE"),
@@ -258,6 +265,8 @@ def _worker(settings: Settings, process: int) -> list[str]:
         f"{settings.root}/configs/gemma4_transcoder_v2.yaml",
         "--source-revision",
         settings.commit,
+        "--training-source-revision",
+        settings.training_commit,
         "--train-target-root",
         settings.train_target_root,
         "--eval-target-root",
@@ -420,7 +429,12 @@ def _canonical_sha256(value: object) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def _validate_result(path: Path) -> dict[str, object]:
+def _validate_result(
+    path: Path,
+    *,
+    expected_source_revision: str,
+    expected_training_source_revision: str,
+) -> dict[str, object]:
     try:
         value = json.loads(path.read_text(encoding="ascii"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -432,11 +446,31 @@ def _validate_result(path: Path) -> dict[str, object]:
     if (
         body.get("schema_version") != RESULT_SCHEMA_VERSION
         or body.get("protocol_id") != PROTOCOL_ID
+        or body.get("source_revision") != expected_source_revision
+        or body.get("training_source_revision")
+        != expected_training_source_revision
         or not isinstance(claimed, str)
         or _SHA256.fullmatch(claimed) is None
         or _canonical_sha256(body) != claimed
     ):
         raise OperatorError("scientific result identity or self-hash is invalid")
+    parents = body.get("parents")
+    contracts = (
+        parents.get("run_contract_sha256")
+        if isinstance(parents, dict)
+        else None
+    )
+    if (
+        not isinstance(contracts, dict)
+        or set(contracts) != {"A", "R", "B", "F"}
+        or any(
+            not isinstance(value, str) or _SHA256.fullmatch(value) is None
+            for value in contracts.values()
+        )
+    ):
+        raise OperatorError(
+            "scientific result lacks exact training run-contract provenance"
+        )
     return value
 
 
@@ -500,7 +534,11 @@ def main() -> int:
         settings,
         controller=process_zero_controller,
     )
-    sealed = _validate_result(result)
+    sealed = _validate_result(
+        result,
+        expected_source_revision=settings.commit,
+        expected_training_source_revision=settings.training_commit,
+    )
     print(
         json.dumps(
             {

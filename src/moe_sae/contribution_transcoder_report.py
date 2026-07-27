@@ -543,6 +543,8 @@ def build_transcoder_scientific_result(
     ],
     ledgers: Mapping[str, TranscoderTrainingLedger | Mapping[str, Any]],
     source_revision: str,
+    training_source_revision: str,
+    run_contract_sha256: Mapping[str, str],
     config_sha256: str,
     train_source_manifest_sha256: str,
     train_target_manifest_sha256: str,
@@ -559,6 +561,25 @@ def build_transcoder_scientific_result(
         raise ContributionTranscoderReportError(
             "source_revision must be a lowercase 40-character Git commit"
         )
+    if (
+        not isinstance(training_source_revision, str)
+        or _REVISION_RE.fullmatch(training_source_revision) is None
+    ):
+        raise ContributionTranscoderReportError(
+            "training_source_revision must be a lowercase 40-character Git commit"
+        )
+    checked_run_contracts = _exact_fields(
+        "run_contract_sha256",
+        run_contract_sha256,
+        set(CONDITIONS),
+    )
+    checked_run_contracts = {
+        condition: _sha256(
+            f"run_contract_sha256.{condition}",
+            checked_run_contracts[condition],
+        )
+        for condition in CONDITIONS
+    }
     for name, digest in (
         ("config_sha256", config_sha256),
         ("train_source_manifest_sha256", train_source_manifest_sha256),
@@ -645,6 +666,7 @@ def build_transcoder_scientific_result(
         "status": verdict,
         "seed": 0,
         "source_revision": source_revision,
+        "training_source_revision": training_source_revision,
         "config_sha256": config_sha256,
         "parents": {
             "train_source_manifest_sha256": train_source_manifest_sha256,
@@ -655,6 +677,7 @@ def build_transcoder_scientific_result(
                 scores.recomposition_sidecar_sha256
             ),
             "common_sst_receipt_sha256": common_sst_receipt_sha256,
+            "run_contract_sha256": checked_run_contracts,
         },
         "paired_scores": {
             "score_artifact_sha256": scores.score_artifact_sha256,
@@ -728,6 +751,25 @@ def validate_transcoder_scientific_result(
         raise ContributionTranscoderReportError("result schema is incompatible")
     if selected.get("protocol_id") != PROTOCOL_ID:
         raise ContributionTranscoderReportError("result protocol is incompatible")
+    for name in ("source_revision", "training_source_revision"):
+        revision = selected.get(name)
+        if not isinstance(revision, str) or _REVISION_RE.fullmatch(revision) is None:
+            raise ContributionTranscoderReportError(
+                f"{name} must be a lowercase 40-character Git commit"
+            )
+    parents = selected.get("parents")
+    if not isinstance(parents, Mapping):
+        raise ContributionTranscoderReportError("result parents must be a mapping")
+    run_contracts = _exact_fields(
+        "parents.run_contract_sha256",
+        parents.get("run_contract_sha256"),
+        set(CONDITIONS),
+    )
+    for condition in CONDITIONS:
+        _sha256(
+            f"parents.run_contract_sha256.{condition}",
+            run_contracts[condition],
+        )
     if scores is not None:
         if (
             selected.get("paired_scores", {}).get("score_artifact_sha256")
@@ -757,6 +799,8 @@ def validate_transcoder_scientific_result(
             summaries=summaries,
             ledgers=ledgers,
             source_revision=selected["source_revision"],
+            training_source_revision=selected["training_source_revision"],
+            run_contract_sha256=parents["run_contract_sha256"],
             config_sha256=selected["config_sha256"],
             train_source_manifest_sha256=parents[
                 "train_source_manifest_sha256"
@@ -797,6 +841,9 @@ def render_transcoder_report(value: Mapping[str, Any]) -> str:
         "# Experiment 3 result",
         "",
         f"Verdict: **{result['verdict']['label']}**",
+        "",
+        f"Evaluator commit: `{result['source_revision']}`",
+        f"Training commit: `{result['training_source_revision']}`",
         "",
         (
             "Router-conditioned A recovered "
