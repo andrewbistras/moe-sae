@@ -187,13 +187,39 @@ load_config() {
 }
 
 install_system_packages() {
+  local attempt
   require_command sudo
   sudo -n true >/dev/null 2>&1 || die "passwordless sudo is required on the TPU VM"
   log "installing bootstrap packages"
   export DEBIAN_FRONTEND=noninteractive
-  sudo apt-get update
-  sudo apt-get install -y --no-install-recommends \
-    ca-certificates curl git jq nfs-common tmux util-linux
+
+  # Fresh TPU images commonly start apt-daily/unattended-upgrades at the same
+  # time as the first SSH connection.  A single apt invocation then fails on a
+  # transient dpkg or lists lock and leaves a four-controller deployment
+  # needlessly half-bootstrapped.  Keep the retry bounded and rerun the exact
+  # idempotent command; do not kill the image updater or delete lock files.
+  for attempt in $(seq 1 30); do
+    if sudo apt-get update; then
+      break
+    fi
+    if (( attempt == 30 )); then
+      die "apt-get update did not succeed after waiting five minutes"
+    fi
+    log "apt metadata is temporarily locked; retrying in 10 seconds ($attempt/30)"
+    sleep 10
+  done
+
+  for attempt in $(seq 1 30); do
+    if sudo apt-get -o DPkg::Lock::Timeout=300 install -y --no-install-recommends \
+      ca-certificates curl git jq nfs-common tmux util-linux; then
+      return
+    fi
+    if (( attempt == 30 )); then
+      die "bootstrap package installation did not succeed after bounded retries"
+    fi
+    log "apt packages are temporarily unavailable; retrying in 10 seconds ($attempt/30)"
+    sleep 10
+  done
 }
 
 ensure_deployment_user_linger() {
