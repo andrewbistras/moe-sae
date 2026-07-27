@@ -55,23 +55,18 @@ from moe_sae.contribution_training_performance import (
 )
 
 TRAINING_WORKER_SCHEMA_VERSION = "gemma4-contribution-training-worker-v1"
-TRAINING_MODE_SELECTION_SCHEMA_VERSION = (
-    "gemma4-contribution-sae-mode-selection-v1"
-)
-TRAINING_RUN_IDENTITY_SCHEMA_VERSION = (
-    "gemma4-contribution-sae-run-identity-v2"
-)
+TRAINING_MODE_SELECTION_SCHEMA_VERSION = "gemma4-contribution-sae-mode-selection-v1"
+TRAINING_RUN_IDENTITY_SCHEMA_VERSION = "gemma4-contribution-sae-run-identity-v2"
 TRAINING_RESULT_SCHEMA_VERSION = "gemma4-contribution-sae-training-result-v1"
-TRAINING_EXECUTION_CONFIG_SCHEMA_VERSION = (
-    "gemma4-contribution-sae-execution-config-v1"
-)
+TRAINING_EXECUTION_CONFIG_SCHEMA_VERSION = "gemma4-contribution-sae-execution-config-v1"
 TRAINING_GRAPH_SCHEMA_VERSION = "gemma4-contribution-sae-stablehlo-v1"
 TRAINING_HARDWARE_SCHEMA_VERSION = "gemma4-contribution-sae-hardware-v1"
 TRAINING_SUPERVISION_SCHEMA_VERSION = (
     "gemma4-contribution-sae-supervised-qualification-v1"
 )
-PREFETCH_RECEIPT_SCHEMA_VERSION = (
-    "gemma4-contribution-sae-process-lane-prefetch-v1"
+PREFETCH_RECEIPT_SCHEMA_VERSION = "gemma4-contribution-sae-process-lane-prefetch-v1"
+TRANSCODER_PREFETCH_RECEIPT_SCHEMA_VERSION = (
+    "gemma4-contribution-transcoder-paired-process-lane-prefetch-v1"
 )
 CHIP_SECONDS_SCOPE = (
     "fixed_capacity_scan_in_training_invocation_plus_synchronized_"
@@ -88,6 +83,8 @@ CHIP_SECONDS_EXCLUDES = (
 
 InputMode = Literal["resident", "rematerialized"]
 INPUT_MODES: tuple[InputMode, ...] = ("resident", "rematerialized")
+ScientificModel = Literal["sae", "transcoder"]
+SCIENTIFIC_MODELS: tuple[ScientificModel, ...] = ("sae", "transcoder")
 CONDITIONS = ("A", "R", "B", "F", "Q")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -106,18 +103,14 @@ def _positive_int(name: str, value: Any, *, allow_zero: bool = False) -> int:
     minimum = 0 if allow_zero else 1
     if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
         qualifier = "nonnegative" if allow_zero else "positive"
-        raise ContributionTrainingWorkerError(
-            f"{name} must be a {qualifier} integer"
-        )
+        raise ContributionTrainingWorkerError(f"{name} must be a {qualifier} integer")
     return value
 
 
 def _finite_nonnegative(name: str, value: Any) -> float:
     selected = float(value)
     if not math.isfinite(selected) or selected < 0.0:
-        raise ContributionTrainingWorkerError(
-            f"{name} must be finite and nonnegative"
-        )
+        raise ContributionTrainingWorkerError(f"{name} must be finite and nonnegative")
     return selected
 
 
@@ -214,14 +207,11 @@ class TrainingWorkerPlan:
             raise ContributionTrainingWorkerError(
                 "planned updates differ from the exact token plan"
             )
-        if (
-            tuple(sorted(set(self.checkpoint_tokens))) != self.checkpoint_tokens
-            or any(
-                isinstance(value, bool)
-                or not isinstance(value, int)
-                or not 0 < value <= self.total_tokens
-                for value in self.checkpoint_tokens
-            )
+        if tuple(sorted(set(self.checkpoint_tokens))) != self.checkpoint_tokens or any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 0 < value <= self.total_tokens
+            for value in self.checkpoint_tokens
         ):
             raise ContributionTrainingWorkerError(
                 "checkpoint tokens must be unique, ordered, and in range"
@@ -402,9 +392,7 @@ def qualify_training_modes(
     _positive_int("peak_flops_per_second", peak_flops_per_second)
     started = clock() if qualification_started is None else float(qualification_started)
     if not math.isfinite(started):
-        raise ContributionTrainingWorkerError(
-            "qualification start time is invalid"
-        )
+        raise ContributionTrainingWorkerError("qualification start time is invalid")
     raw: list[tuple[InputMode, SAEQualificationObservation | BaseException]] = []
     for mode in INPUT_MODES:
         try:
@@ -539,9 +527,7 @@ def validate_training_mode_selection(
     if selected["schema_version"] != TRAINING_MODE_SELECTION_SCHEMA_VERSION:
         raise ContributionTrainingWorkerError("mode-selection schema changed")
     if canonical_sha256(selected) != claimed:
-        raise ContributionTrainingWorkerError(
-            "mode-selection self-hash is invalid"
-        )
+        raise ContributionTrainingWorkerError("mode-selection self-hash is invalid")
     elapsed = _finite_nonnegative(
         "qualification_total_wall_seconds",
         selected["qualification_total_wall_seconds"],
@@ -563,10 +549,9 @@ def validate_training_mode_selection(
             "mode-selection workload context is malformed"
         )
     candidates = selected["candidates"]
-    if (
-        not isinstance(candidates, list)
-        or [item.get("mode") for item in candidates] != list(INPUT_MODES)
-    ):
+    if not isinstance(candidates, list) or [
+        item.get("mode") for item in candidates
+    ] != list(INPUT_MODES):
         raise ContributionTrainingWorkerError(
             "mode-selection candidate order is invalid"
         )
@@ -640,9 +625,7 @@ def chosen_mode_evidence(
 ) -> tuple[InputMode, ExactPerformanceIdentity, dict[str, Any]]:
     checked = validate_training_mode_selection(selection)
     mode: InputMode = checked["chosen_mode"]
-    candidate = next(
-        item for item in checked["candidates"] if item["mode"] == mode
-    )
+    candidate = next(item for item in checked["candidates"] if item["mode"] == mode)
     raw = candidate["identity"]
     identity = ExactPerformanceIdentity(
         graph_sha256=raw["graph_sha256"],
@@ -702,17 +685,15 @@ def _run_identity(
         "qualified_exact_identity",
         "bounded_ungated_resident",
     }:
-        raise ContributionTrainingWorkerError(
-            "training run admission basis is invalid"
-        )
+        raise ContributionTrainingWorkerError("training run admission basis is invalid")
     if admission_evidence_sha256 is not None:
         _sha256(
             "admission evidence SHA-256",
             admission_evidence_sha256,
         )
-    if (
-        admission_basis == "qualified_exact_identity"
-    ) != (admission_evidence_sha256 is not None):
+    if (admission_basis == "qualified_exact_identity") != (
+        admission_evidence_sha256 is not None
+    ):
         raise ContributionTrainingWorkerError(
             "training run admission evidence is inconsistent"
         )
@@ -927,9 +908,11 @@ def run_qualified_training(
     restored = dependencies.restore(initial, provisional_identity)
     prior_timing = _restored_timing(restored)
     state = initial if restored is None else restored.state
-    if restored is not None and dict(restored.metadata).get(
-        "run_identity_sha256"
-    ) != provisional_identity["run_identity_sha256"]:
+    if (
+        restored is not None
+        and dict(restored.metadata).get("run_identity_sha256")
+        != provisional_identity["run_identity_sha256"]
+    ):
         raise ContributionTrainingWorkerError(
             "restored checkpoint metadata belongs to another run"
         )
@@ -946,17 +929,16 @@ def run_qualified_training(
             "restored state exceeds the phase update plan"
         )
 
-    preprocessing_seconds = float(
-        prior_timing.get("preprocessing_wall_seconds", 0.0)
-    ) + current_preprocessing_seconds
-    lowering_seconds = float(
-        prior_timing.get("lowering_seconds", 0.0)
-    ) + current_lowering_seconds
+    preprocessing_seconds = (
+        float(prior_timing.get("preprocessing_wall_seconds", 0.0))
+        + current_preprocessing_seconds
+    )
+    lowering_seconds = (
+        float(prior_timing.get("lowering_seconds", 0.0)) + current_lowering_seconds
+    )
     compile_seconds = float(prior_timing.get("compile_seconds", 0.0))
     optimizer_seconds = float(prior_timing.get("optimizer_wall_seconds", 0.0))
-    checkpoint_seconds = float(
-        prior_timing.get("checkpoint_seconds_before_save", 0.0)
-    )
+    checkpoint_seconds = float(prior_timing.get("checkpoint_seconds_before_save", 0.0))
 
     iterator = itertools.islice(source.iter_updates(), start_step, None)
     if start_step == plan.planned_updates:
@@ -1019,8 +1001,7 @@ def run_qualified_training(
         )
         if prepared.identity != receipt_identity:
             raise ContributionTrainingWorkerError(
-                "lowered graph/hardware/config differs from the chosen "
-                "qualification"
+                "lowered graph/hardware/config differs from the chosen " "qualification"
             )
     authorization = authorize_accelerator_run(
         identity=prepared.identity,
@@ -1028,8 +1009,7 @@ def run_qualified_training(
         purpose="workload",
         qualification_receipt=(
             receipt
-            if not direct_bounded_resident
-            and maximum > MAX_QUALIFICATION_SECONDS
+            if not direct_bounded_resident and maximum > MAX_QUALIFICATION_SECONDS
             else None
         ),
     )
@@ -1174,9 +1154,7 @@ def run_qualified_training(
         "metric_count": len(metrics),
         "last_metric": metrics[-1],
         "authorization_basis": authorization.basis,
-        "qualification_receipt_sha256": (
-            authorization.qualification_receipt_sha256
-        ),
+        "qualification_receipt_sha256": (authorization.qualification_receipt_sha256),
         "checkpoint_receipts": checkpoints,
     }
     return {
@@ -1209,9 +1187,7 @@ def _prefetch_object_summary(
     range_start: int,
     range_end: int,
 ) -> dict[str, Any]:
-    identities = tuple(
-        dataset.token_range_object_identities(range_start, range_end)
-    )
+    identities = tuple(dataset.token_range_object_identities(range_start, range_end))
     if not identities:
         raise ContributionTrainingWorkerError(
             "process lane intersects no sealed contribution objects"
@@ -1250,9 +1226,7 @@ def validate_prefetch_receipt(value: Mapping[str, Any]) -> dict[str, Any]:
     }
     selected = dict(value)
     if set(selected) != fields:
-        raise ContributionTrainingWorkerError(
-            "prefetch receipt fields are not exact"
-        )
+        raise ContributionTrainingWorkerError("prefetch receipt fields are not exact")
     claimed = _sha256("prefetch receipt_sha256", selected.pop("receipt_sha256"))
     if selected["schema_version"] != PREFETCH_RECEIPT_SCHEMA_VERSION:
         raise ContributionTrainingWorkerError("prefetch receipt schema is incompatible")
@@ -1271,10 +1245,9 @@ def validate_prefetch_receipt(value: Mapping[str, Any]) -> dict[str, Any]:
         )
     if not isinstance(selected["phase"], str) or not selected["phase"]:
         raise ContributionTrainingWorkerError("prefetch phase is empty")
-    if (
-        not isinstance(selected["object_prefix"], str)
-        or not selected["object_prefix"].startswith("gs://")
-    ):
+    if not isinstance(selected["object_prefix"], str) or not selected[
+        "object_prefix"
+    ].startswith("gs://"):
         raise ContributionTrainingWorkerError("prefetch object_prefix is invalid")
     cache_root = Path(str(selected["cache_root"]))
     if not cache_root.is_absolute():
@@ -1539,6 +1512,422 @@ def _prove_prefetch_for_plan(
     return selected
 
 
+def validate_transcoder_prefetch_receipt(
+    value: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate one paired target+source resident-cache proof."""
+
+    fields = {
+        "schema_version",
+        "config_sha256",
+        "phase",
+        "source_revision",
+        "target_manifest_sha256",
+        "source_manifest_sha256",
+        "target_object_prefix",
+        "source_object_prefix",
+        "cache_root",
+        "cache_max_bytes",
+        "process_partition",
+        "target_objects",
+        "source_objects",
+        "combined_object_count",
+        "combined_object_bytes",
+        "combined_object_set_sha256",
+        "elapsed_seconds",
+        "resident_only_complete",
+        "receipt_sha256",
+    }
+    selected = dict(value)
+    if set(selected) != fields:
+        raise ContributionTrainingWorkerError(
+            "transcoder prefetch receipt fields are not exact"
+        )
+    claimed = _sha256(
+        "transcoder prefetch receipt_sha256",
+        selected.pop("receipt_sha256"),
+    )
+    if selected["schema_version"] != TRANSCODER_PREFETCH_RECEIPT_SCHEMA_VERSION:
+        raise ContributionTrainingWorkerError(
+            "transcoder prefetch receipt schema is incompatible"
+        )
+    for name in (
+        "config_sha256",
+        "target_manifest_sha256",
+        "source_manifest_sha256",
+        "combined_object_set_sha256",
+    ):
+        _sha256(f"transcoder prefetch {name}", selected[name])
+    if (
+        not isinstance(selected["source_revision"], str)
+        or re.fullmatch(r"[0-9a-f]{40}", selected["source_revision"]) is None
+    ):
+        raise ContributionTrainingWorkerError(
+            "transcoder prefetch source revision is invalid"
+        )
+    if not isinstance(selected["phase"], str) or not selected["phase"]:
+        raise ContributionTrainingWorkerError("transcoder prefetch phase is empty")
+    for name in ("target_object_prefix", "source_object_prefix"):
+        if not isinstance(selected[name], str) or not selected[name].startswith(
+            "gs://"
+        ):
+            raise ContributionTrainingWorkerError(
+                f"transcoder prefetch {name} is invalid"
+            )
+    if not Path(str(selected["cache_root"])).is_absolute():
+        raise ContributionTrainingWorkerError(
+            "transcoder prefetch cache_root is not absolute"
+        )
+    _positive_int(
+        "transcoder prefetch cache_max_bytes",
+        selected["cache_max_bytes"],
+    )
+    partition = selected["process_partition"]
+    if not isinstance(partition, Mapping):
+        raise ContributionTrainingWorkerError(
+            "transcoder prefetch process partition is malformed"
+        )
+    from moe_sae.contribution_input import PROCESS_PARTITION_STRATEGY
+
+    if (
+        set(partition)
+        != {
+            "strategy",
+            "process_count",
+            "process_index",
+            "range_start",
+            "range_end",
+            "tokens",
+        }
+        or partition.get("strategy") != PROCESS_PARTITION_STRATEGY
+    ):
+        raise ContributionTrainingWorkerError(
+            "transcoder prefetch process partition is incompatible"
+        )
+    for name in ("process_count", "range_end", "tokens"):
+        _positive_int(f"transcoder prefetch partition {name}", partition[name])
+    for name in ("process_index", "range_start"):
+        _positive_int(
+            f"transcoder prefetch partition {name}",
+            partition[name],
+            allow_zero=True,
+        )
+    if (
+        int(partition["process_index"]) >= int(partition["process_count"])
+        or int(partition["range_end"]) <= int(partition["range_start"])
+        or int(partition["tokens"])
+        != int(partition["range_end"]) - int(partition["range_start"])
+    ):
+        raise ContributionTrainingWorkerError(
+            "transcoder prefetch process partition bounds are invalid"
+        )
+    for role in ("target", "source"):
+        summary = selected[f"{role}_objects"]
+        if not isinstance(summary, Mapping) or set(summary) != {
+            "object_count",
+            "object_bytes",
+            "object_set_sha256",
+        }:
+            raise ContributionTrainingWorkerError(
+                f"transcoder prefetch {role} object summary is malformed"
+            )
+        _positive_int(f"{role} object_count", summary["object_count"])
+        _positive_int(f"{role} object_bytes", summary["object_bytes"])
+        _sha256(f"{role} object_set_sha256", summary["object_set_sha256"])
+    expected_count = sum(
+        int(selected[f"{role}_objects"]["object_count"])
+        for role in ("target", "source")
+    )
+    expected_bytes = sum(
+        int(selected[f"{role}_objects"]["object_bytes"])
+        for role in ("target", "source")
+    )
+    expected_set_sha = canonical_sha256(
+        {
+            "target": selected["target_objects"]["object_set_sha256"],
+            "source": selected["source_objects"]["object_set_sha256"],
+        }
+    )
+    if (
+        selected["combined_object_count"] != expected_count
+        or selected["combined_object_bytes"] != expected_bytes
+        or selected["combined_object_set_sha256"] != expected_set_sha
+    ):
+        raise ContributionTrainingWorkerError(
+            "transcoder prefetch combined object totals are inconsistent"
+        )
+    if expected_bytes > int(selected["cache_max_bytes"]):
+        raise ContributionTrainingWorkerError(
+            "transcoder prefetch object bytes exceed cache capacity"
+        )
+    if selected["resident_only_complete"] is not True:
+        raise ContributionTrainingWorkerError(
+            "transcoder prefetch lacks a resident-only completeness proof"
+        )
+    _finite_nonnegative(
+        "transcoder prefetch elapsed_seconds",
+        selected["elapsed_seconds"],
+    )
+    if canonical_sha256(selected) != claimed:
+        raise ContributionTrainingWorkerError(
+            "transcoder prefetch receipt self-hash is invalid"
+        )
+    return {**selected, "receipt_sha256": claimed}
+
+
+def prefetch_transcoder_process_lane(
+    *,
+    config: Any,
+    phase: str,
+    source_revision: str,
+    capture_control_root: str | Path,
+    object_prefix: str,
+    source_overlay_control_root: str | Path,
+    source_overlay_object_prefix: str,
+    cache_root: str | Path,
+    cache_max_bytes: int,
+    process_count: int,
+    process_index: int,
+    recomposition_sidecar: Mapping[str, Any] | None,
+    object_store: Any | None = None,
+    clock: Callable[[], float] = time.perf_counter,
+) -> dict[str, Any]:
+    """Materialize and re-prove one exact paired process lane."""
+
+    from moe_sae.contribution_input import process_partition_identity
+    from moe_sae.contribution_storage import ContributionDataset
+    from moe_sae.contribution_transcoder_storage import RoutedInputDataset
+    from moe_sae.object_store import GCSObjectStore, ShardCache
+
+    config.validate()
+    selected_phase = config.phase(phase)
+    cache_max_bytes = _positive_int("cache_max_bytes", cache_max_bytes)
+    partition = process_partition_identity(
+        selected_phase.train_tokens,
+        process_count=process_count,
+        process_index=process_index,
+    )
+    selected_cache_root = Path(cache_root).expanduser().resolve()
+    store = GCSObjectStore() if object_store is None else object_store
+    cache = ShardCache(
+        selected_cache_root,
+        store,
+        max_bytes=cache_max_bytes,
+        resident_only=False,
+    )
+    target = ContributionDataset(
+        capture_control_root,
+        object_prefix=object_prefix,
+        cache=cache,
+        recomposition_sidecar=recomposition_sidecar,
+    )
+    if (
+        int(target.total_tokens) != selected_phase.train_tokens
+        or target.manifest_sha256 != config.parents["train_target_manifest_sha256"]
+    ):
+        raise ContributionTrainingWorkerError(
+            "transcoder prefetch target differs from its config-pinned parent"
+        )
+    source = RoutedInputDataset(
+        source_overlay_control_root,
+        object_prefix=source_overlay_object_prefix,
+        cache=cache,
+        target_manifest=target.manifest,
+    )
+    if int(source.total_tokens) != selected_phase.train_tokens:
+        raise ContributionTrainingWorkerError(
+            "transcoder prefetch source differs from the phase token plan"
+        )
+    start = int(partition["range_start"])
+    end = int(partition["range_end"])
+    target_summary = _prefetch_object_summary(
+        target,
+        range_start=start,
+        range_end=end,
+    )
+    source_summary = _prefetch_object_summary(
+        source,
+        range_start=start,
+        range_end=end,
+    )
+    combined_bytes = int(target_summary["object_bytes"]) + int(
+        source_summary["object_bytes"]
+    )
+    if combined_bytes > cache_max_bytes:
+        raise ContributionTrainingWorkerError(
+            "paired process-lane objects exceed resident cache capacity"
+        )
+    started = clock()
+    try:
+        target_materialized = target.prefetch_token_range(start, end)
+        source_materialized = source.prefetch_token_range(start, end)
+        resident_cache = ShardCache(
+            selected_cache_root,
+            _ResidentOnlyObjectStore(),
+            max_bytes=cache_max_bytes,
+            resident_only=True,
+        )
+        resident_target = ContributionDataset(
+            capture_control_root,
+            object_prefix=object_prefix,
+            cache=resident_cache,
+            recomposition_sidecar=recomposition_sidecar,
+        )
+        resident_source = RoutedInputDataset(
+            source_overlay_control_root,
+            object_prefix=source_overlay_object_prefix,
+            cache=resident_cache,
+            target_manifest=resident_target.manifest,
+        )
+        target_resident = resident_target.require_resident_token_range(start, end)
+        source_resident = resident_source.require_resident_token_range(start, end)
+    except Exception as error:
+        raise ContributionTrainingWorkerError(
+            "paired process-lane prefetch or resident proof failed"
+        ) from error
+    for observed, summary in (
+        (target_materialized, target_summary),
+        (target_resident, target_summary),
+        (source_materialized, source_summary),
+        (source_resident, source_summary),
+    ):
+        if observed != {
+            "objects": int(summary["object_count"]),
+            "bytes": int(summary["object_bytes"]),
+        }:
+            raise ContributionTrainingWorkerError(
+                "paired prefetch object counts differ from sealed manifests"
+            )
+    combined_set = canonical_sha256(
+        {
+            "target": target_summary["object_set_sha256"],
+            "source": source_summary["object_set_sha256"],
+        }
+    )
+    unsigned = {
+        "schema_version": TRANSCODER_PREFETCH_RECEIPT_SCHEMA_VERSION,
+        "config_sha256": config.config_hash,
+        "phase": selected_phase.name,
+        "source_revision": source_revision,
+        "target_manifest_sha256": target.manifest_sha256,
+        "source_manifest_sha256": source.manifest_sha256,
+        "target_object_prefix": object_prefix.rstrip("/"),
+        "source_object_prefix": source_overlay_object_prefix.rstrip("/"),
+        "cache_root": str(selected_cache_root),
+        "cache_max_bytes": cache_max_bytes,
+        "process_partition": partition,
+        "target_objects": target_summary,
+        "source_objects": source_summary,
+        "combined_object_count": int(target_summary["object_count"])
+        + int(source_summary["object_count"]),
+        "combined_object_bytes": combined_bytes,
+        "combined_object_set_sha256": combined_set,
+        "elapsed_seconds": max(0.0, float(clock() - started)),
+        "resident_only_complete": True,
+    }
+    return validate_transcoder_prefetch_receipt(
+        {**unsigned, "receipt_sha256": canonical_sha256(unsigned)}
+    )
+
+
+def _prove_transcoder_prefetch_for_plan(
+    receipt: Mapping[str, Any],
+    *,
+    config: Any,
+    plan: TrainingWorkerPlan,
+    source_revision: str,
+    capture_control_root: str | Path,
+    object_prefix: str,
+    source_overlay_control_root: str | Path,
+    source_overlay_object_prefix: str,
+    cache_root: str | Path,
+    cache_max_bytes: int,
+    recomposition_sidecar: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Re-derive both object sets and prove the pair remains resident."""
+
+    from moe_sae.contribution_input import process_partition_identity
+    from moe_sae.contribution_storage import ContributionDataset
+    from moe_sae.contribution_transcoder_storage import RoutedInputDataset
+    from moe_sae.object_store import ShardCache
+
+    selected = validate_transcoder_prefetch_receipt(receipt)
+    partition = selected["process_partition"]
+    expected_partition = process_partition_identity(
+        plan.total_tokens,
+        process_count=int(partition["process_count"]),
+        process_index=int(partition["process_index"]),
+    )
+    expected = {
+        "config_sha256": config.config_hash,
+        "phase": plan.phase_name,
+        "source_revision": source_revision,
+        "target_object_prefix": object_prefix.rstrip("/"),
+        "source_object_prefix": source_overlay_object_prefix.rstrip("/"),
+        "cache_root": str(Path(cache_root).expanduser().resolve()),
+        "cache_max_bytes": int(cache_max_bytes),
+        "process_partition": expected_partition,
+    }
+    if any(selected[name] != value for name, value in expected.items()):
+        raise ContributionTrainingWorkerError(
+            "paired prefetch receipt differs from the requested workload"
+        )
+    cache = ShardCache(
+        cache_root,
+        _ResidentOnlyObjectStore(),
+        max_bytes=cache_max_bytes,
+        resident_only=True,
+    )
+    target = ContributionDataset(
+        capture_control_root,
+        object_prefix=object_prefix,
+        cache=cache,
+        recomposition_sidecar=recomposition_sidecar,
+    )
+    source = RoutedInputDataset(
+        source_overlay_control_root,
+        object_prefix=source_overlay_object_prefix,
+        cache=cache,
+        target_manifest=target.manifest,
+    )
+    if (
+        target.manifest_sha256 != selected["target_manifest_sha256"]
+        or source.manifest_sha256 != selected["source_manifest_sha256"]
+        or target.manifest_sha256 != config.parents["train_target_manifest_sha256"]
+        or int(target.total_tokens) != plan.total_tokens
+        or int(source.total_tokens) != plan.total_tokens
+    ):
+        raise ContributionTrainingWorkerError(
+            "paired prefetch receipt and sealed datasets differ"
+        )
+    start = int(expected_partition["range_start"])
+    end = int(expected_partition["range_end"])
+    for role, dataset in (("target", target), ("source", source)):
+        summary = _prefetch_object_summary(
+            dataset,
+            range_start=start,
+            range_end=end,
+        )
+        if summary != selected[f"{role}_objects"]:
+            raise ContributionTrainingWorkerError(
+                f"paired prefetch {role} object set changed"
+            )
+        try:
+            resident = dataset.require_resident_token_range(start, end)
+        except Exception as error:
+            raise ContributionTrainingWorkerError(
+                f"paired prefetch {role} lane is no longer resident"
+            ) from error
+        if resident != {
+            "objects": int(summary["object_count"]),
+            "bytes": int(summary["object_bytes"]),
+        }:
+            raise ContributionTrainingWorkerError(
+                f"paired prefetch {role} resident proof is inconsistent"
+            )
+    return selected
+
+
 @dataclass(slots=True)
 class _PreparedHandle:
     trainer: Any
@@ -1550,8 +1939,9 @@ class _PreparedHandle:
 
 @dataclass(frozen=True, slots=True)
 class _ProductionWorkload:
+    scientific_model: ScientificModel
     source: Any
-    mean: np.ndarray
+    mean: Any
     routed_layout: Any | None
     q_config: Any | None
     optimizer: Any | None
@@ -1706,7 +2096,9 @@ def _states_exact_equal(left: Any, right: Any) -> bool:
     return all(bool(value) for value in jax.device_get(checks))
 
 
-def _stablehlo_manifest(lowered: Any, *, condition: str, mode: InputMode) -> dict[str, Any]:
+def _stablehlo_manifest(
+    lowered: Any, *, condition: str, mode: InputMode
+) -> dict[str, Any]:
     compiler_ir = getattr(lowered, "compiler_ir", None)
     if not callable(compiler_ir):
         raise ContributionTrainingWorkerError(
@@ -1724,6 +2116,7 @@ def _stablehlo_manifest(lowered: Any, *, condition: str, mode: InputMode) -> dic
         "schema_version": TRAINING_GRAPH_SCHEMA_VERSION,
         "condition": condition,
         "input_mode": mode,
+        "scientific_model": workload.scientific_model,
         "stablehlo_sha256": hashlib.sha256(stablehlo.encode("utf-8")).hexdigest(),
         "stablehlo_bytes": len(stablehlo.encode("utf-8")),
     }
@@ -1812,14 +2205,10 @@ def _execution_config(
             else None
         ),
         "q_config": (
-            asdict(workload.q_config)
-            if workload.q_config is not None
-            else None
+            asdict(workload.q_config) if workload.q_config is not None else None
         ),
         "optimizer": (
-            asdict(workload.optimizer)
-            if workload.optimizer is not None
-            else None
+            asdict(workload.optimizer) if workload.optimizer is not None else None
         ),
         "distributed": asdict(workload.distributed),
         "workload_context": dict(workload.workload_context),
@@ -1827,7 +2216,11 @@ def _execution_config(
         "jaxlib_version": jaxlib_version,
         "xla_flags": os.environ.get("XLA_FLAGS", ""),
         "parameter_residency": "feature_sharded_device",
-        "input_residency": "sealed_v2_resident_only_cache",
+        "input_residency": (
+            "paired_overlay_and_sealed_v2_resident_only_cache"
+            if workload.scientific_model == "transcoder"
+            else "sealed_v2_resident_only_cache"
+        ),
     }
     return {
         **unsigned,
@@ -1854,6 +2247,19 @@ class _ProductionEngine:
     def initialize_state(self) -> Any:
         import jax
 
+        if self.workload.scientific_model == "transcoder":
+            from moe_sae.contribution_transcoder_distributed import (
+                init_contribution_transcoder_distributed_state,
+            )
+
+            assert self.workload.routed_layout is not None
+            return init_contribution_transcoder_distributed_state(
+                jax.random.key(self.plan.seed),
+                self.workload.mesh,
+                self.workload.routed_layout,
+                self.workload.optimizer,
+                self.workload.distributed,
+            )
         if self.workload.routed_layout is not None:
             from moe_sae.contribution_distributed import (
                 init_contribution_distributed_state,
@@ -1885,7 +2291,21 @@ class _ProductionEngine:
     ) -> PreparedTrainingExecutable:
         rematerialize = mode == "rematerialized"
         process_local = int(self.workload.source.process_count) > 1
-        if self.workload.routed_layout is not None:
+        if self.workload.scientific_model == "transcoder":
+            from moe_sae.contribution_transcoder_distributed import (
+                ContributionTranscoderDistributedTrainer,
+            )
+
+            assert self.workload.routed_layout is not None
+            trainer = ContributionTranscoderDistributedTrainer(
+                self.workload.mesh,
+                self.workload.routed_layout,
+                self.workload.optimizer,
+                self.workload.distributed,
+                bank_capacity=self.workload.bank_capacity,
+                rematerialize_microbatch=rematerialize,
+            )
+        elif self.workload.routed_layout is not None:
             from moe_sae.contribution_distributed import (
                 ContributionDistributedTrainer,
             )
@@ -1913,7 +2333,15 @@ class _ProductionEngine:
             mean,
             process_local=process_local,
         )
-        lowered = trainer._compiled.lower(state, device_batch, device_mean)
+        if self.workload.scientific_model == "transcoder":
+            lowered = trainer._compiled.lower(
+                state,
+                device_batch,
+                device_mean.source_mean,
+                device_mean.target_mean,
+            )
+        else:
+            lowered = trainer._compiled.lower(state, device_batch, device_mean)
         graph = _stablehlo_manifest(
             lowered,
             condition=self.plan.condition,
@@ -2102,9 +2530,7 @@ class _OrbaxCheckpointBackend:
         from moe_sae.distributed import save_distributed_checkpoint
 
         local_attempt = (
-            bytes.fromhex(new_attempt_id())
-            if jax.process_index() == 0
-            else bytes(16)
+            bytes.fromhex(new_attempt_id()) if jax.process_index() == 0 else bytes(16)
         )
         attempt_bytes = np.asarray(
             multihost_utils.broadcast_one_to_all(
@@ -2160,9 +2586,7 @@ class _OrbaxCheckpointBackend:
         # has completed.  Returning process-local ``None`` values here used to
         # make otherwise successful multi-host results hash differently.
         latest_path = str(pointer_path(self.control_root, "latest"))
-        final_path = (
-            str(pointer_path(self.control_root, "final")) if final else None
-        )
+        final_path = str(pointer_path(self.control_root, "final")) if final else None
         return {
             "payload_uri": payload_uri,
             "step": step,
@@ -2194,9 +2618,7 @@ def _pooled_routed_mean(dataset: Any) -> tuple[np.ndarray, str]:
         raise ContributionTrainingWorkerError(
             "pooled expert statistic count differs from tokens × routes"
         )
-    mean = (
-        np.asarray(pooled["sum"], dtype=np.float64) / count
-    ).astype(np.float32)
+    mean = (np.asarray(pooled["sum"], dtype=np.float64) / count).astype(np.float32)
     mean = np.ascontiguousarray(mean)
     digest = hashlib.sha256()
     digest.update(b"gemma4-contribution-centering-mean-v1\0")
@@ -2218,11 +2640,14 @@ def _phase_layout(config: Experiment2Config, plan: TrainingWorkerPlan) -> Any:
 
 
 def _build_production_workload(
-    config: Experiment2Config,
+    config: Any,
     plan: TrainingWorkerPlan,
     *,
+    scientific_model: ScientificModel = "sae",
     capture_control_root: str | Path,
     object_prefix: str,
+    source_overlay_control_root: str | Path | None = None,
+    source_overlay_object_prefix: str | None = None,
     resident_cache_root: str | Path,
     resident_cache_max_bytes: int,
     recomposition_sidecar: Mapping[str, Any] | None,
@@ -2270,6 +2695,33 @@ def _build_production_workload(
         raise ContributionTrainingWorkerError(
             "training requires the exact phase-specific sealed v2 manifest"
         )
+    source_dataset: Any | None = None
+    if scientific_model == "transcoder":
+        if plan.condition == "Q":
+            raise ContributionTrainingWorkerError(
+                "Experiment-3 routed transcoder mode excludes shared Q"
+            )
+        if source_overlay_control_root is None or source_overlay_object_prefix is None:
+            raise ContributionTrainingWorkerError(
+                "transcoder training requires an explicit routed-input overlay"
+            )
+        expected_target = config.parents.get("train_target_manifest_sha256")
+        if dataset.manifest_sha256 != expected_target:
+            raise ContributionTrainingWorkerError(
+                "transcoder target differs from the config-pinned parent manifest"
+            )
+        from moe_sae.contribution_transcoder_storage import RoutedInputDataset
+
+        source_dataset = RoutedInputDataset(
+            source_overlay_control_root,
+            object_prefix=source_overlay_object_prefix,
+            cache=cache,
+            target_manifest=dataset.manifest,
+        )
+        if int(source_dataset.total_tokens) != plan.total_tokens:
+            raise ContributionTrainingWorkerError(
+                "routed-input overlay differs from the phase token plan"
+            )
     distributed = DistributedConfig(
         data_axis_size=int(jax.process_count()),
         feature_axis_size=int(jax.local_device_count()),
@@ -2323,9 +2775,7 @@ def _build_production_workload(
             "kind": "shared_q",
             "contract_sha256": centering.contract_sha256,
             "mean_sha256": centering.mean_sha256,
-            "recomposition_sidecar_sha256": (
-                centering.recomposition_sidecar_sha256
-            ),
+            "recomposition_sidecar_sha256": (centering.recomposition_sidecar_sha256),
         }
         arithmetic = SAEArithmetic.shared_q(
             hidden_dim=q_layout.hidden_dim,
@@ -2343,15 +2793,33 @@ def _build_production_workload(
             k_per_contribution=selected_layout.topk_per_component,
             randomization_key=plan.randomization_key,
         )
-        source = ContributionProcessInput(
-            dataset,
-            routed_layout,
-            total_tokens=plan.total_tokens,
-            global_microbatch_tokens=plan.global_microbatch_tokens,
-            microbatches_per_update=plan.microbatches_per_update,
-            process_count=int(jax.process_count()),
-            process_index=int(jax.process_index()),
-        )
+        if scientific_model == "transcoder":
+            from moe_sae.contribution_transcoder_input import (
+                ContributionTranscoderProcessInput,
+                routed_input_mean,
+            )
+
+            assert source_dataset is not None
+            source = ContributionTranscoderProcessInput(
+                source_dataset,
+                dataset,
+                routed_layout,
+                total_tokens=plan.total_tokens,
+                global_microbatch_tokens=plan.global_microbatch_tokens,
+                microbatches_per_update=plan.microbatches_per_update,
+                process_count=int(jax.process_count()),
+                process_index=int(jax.process_index()),
+            )
+        else:
+            source = ContributionProcessInput(
+                dataset,
+                routed_layout,
+                total_tokens=plan.total_tokens,
+                global_microbatch_tokens=plan.global_microbatch_tokens,
+                microbatches_per_update=plan.microbatches_per_update,
+                process_count=int(jax.process_count()),
+                process_index=int(jax.process_index()),
+            )
         optimizer = ContributionOptimizerConfig(
             parameter_dtype=config.optimizer.parameter_dtype,
             adam_beta1=config.optimizer.adam_beta1,
@@ -2363,11 +2831,38 @@ def _build_production_workload(
             warmup_steps=plan.warmup_updates,
             total_steps=plan.planned_updates,
         )
-        mean, mean_sha256 = _pooled_routed_mean(dataset)
-        centering_identity = {
-            "kind": "pooled_raw_expert",
-            "mean_sha256": mean_sha256,
-        }
+        target_mean, target_mean_sha256 = _pooled_routed_mean(dataset)
+        if scientific_model == "transcoder":
+            from moe_sae.contribution_transcoder_distributed import (
+                ContributionTranscoderCentering,
+            )
+
+            assert source_dataset is not None
+            source_mean, source_mean_sha256 = routed_input_mean(source_dataset)
+            mean = ContributionTranscoderCentering(
+                source_mean=source_mean,
+                target_mean=target_mean,
+            )
+            mean_sha256 = canonical_sha256(
+                {
+                    "schema_version": ("gemma4-contribution-transcoder-centering-v1"),
+                    "source_mean_sha256": source_mean_sha256,
+                    "target_mean_sha256": target_mean_sha256,
+                }
+            )
+            centering_identity = {
+                "kind": "routed_input_to_pooled_raw_expert",
+                "source_mean_sha256": source_mean_sha256,
+                "target_mean_sha256": target_mean_sha256,
+                "contract_sha256": mean_sha256,
+            }
+        else:
+            mean = target_mean
+            mean_sha256 = target_mean_sha256
+            centering_identity = {
+                "kind": "pooled_raw_expert",
+                "mean_sha256": mean_sha256,
+            }
         arithmetic = SAEArithmetic.from_contribution_layout(routed_layout)
         from moe_sae.contribution_training import optimizer_sae_config
 
@@ -2384,7 +2879,11 @@ def _build_production_workload(
         raise ContributionTrainingWorkerError(
             "collective process input receipts contain duplicates"
         )
-    checked_prefetch = validate_prefetch_receipt(prefetch_receipt)
+    checked_prefetch = (
+        validate_transcoder_prefetch_receipt(prefetch_receipt)
+        if scientific_model == "transcoder"
+        else validate_prefetch_receipt(prefetch_receipt)
+    )
     expected_partition = {
         "strategy": source.process_partition_strategy,
         "process_count": source.process_count,
@@ -2398,15 +2897,15 @@ def _build_production_workload(
             "prefetch receipt does not match the process-local training lane"
         )
     prefetch_records = _collective_records(checked_prefetch)
-    if [int(item["process_partition"]["process_index"]) for item in prefetch_records] != list(
-        range(jax.process_count())
-    ):
+    if [
+        int(item["process_partition"]["process_index"]) for item in prefetch_records
+    ] != list(range(jax.process_count())):
         raise ContributionTrainingWorkerError(
             "collective prefetch receipts are not process ordered"
         )
-    if len(
-        {item["receipt_sha256"] for item in prefetch_records}
-    ) != len(prefetch_records):
+    if len({item["receipt_sha256"] for item in prefetch_records}) != len(
+        prefetch_records
+    ):
         raise ContributionTrainingWorkerError(
             "collective prefetch receipts contain duplicates"
         )
@@ -2425,9 +2924,7 @@ def _build_production_workload(
             merged = merge_capacity_receipts(capacity_receipts)
             bank_capacity = int(merged.capacity)
             merged_capacity = merged.to_dict()
-            preprocessing_wall_seconds = (
-                time.perf_counter() - preprocessing_started
-            )
+            preprocessing_wall_seconds = time.perf_counter() - preprocessing_started
         else:
             raw_capacity = expected_context.get("capacity_receipts")
             if not isinstance(raw_capacity, list):
@@ -2445,7 +2942,12 @@ def _build_production_workload(
         merged_capacity = None
 
     workload_context = {
+        "scientific_model": scientific_model,
         "capture_manifest_sha256": dataset.manifest_sha256,
+        "target_manifest_sha256": dataset.manifest_sha256,
+        "source_manifest_sha256": (
+            source_dataset.manifest_sha256 if source_dataset is not None else None
+        ),
         "input_receipts": list(input_records),
         "input_receipt_set_sha256": canonical_sha256(input_records),
         "prefetch_receipts": list(prefetch_records),
@@ -2472,6 +2974,7 @@ def _build_production_workload(
         a_capacity=bank_capacity,
     )
     return _ProductionWorkload(
+        scientific_model=scientific_model,
         source=source,
         mean=mean,
         routed_layout=routed_layout,
@@ -2683,9 +3186,7 @@ def _run_production_training(
         metric_sink=metric_sink,
         direct_bounded_resident=direct_bounded_resident,
         preprocessing_wall_seconds=workload.preprocessing_wall_seconds,
-        global_chip_count=int(
-            np.asarray(workload.mesh.devices, dtype=object).size
-        ),
+        global_chip_count=int(np.asarray(workload.mesh.devices, dtype=object).size),
     )
 
 
@@ -2710,6 +3211,32 @@ def _absolute_path(value: str) -> str:
 
 def _load_sidecar(path: str | None) -> dict[str, Any] | None:
     return None if path is None else _read_json(path, name="recomposition sidecar")
+
+
+def _load_worker_config(
+    path: str | Path,
+    scientific_model: ScientificModel,
+) -> Any:
+    if scientific_model == "transcoder":
+        from moe_sae.contribution_transcoder_config import (
+            load_contribution_transcoder_config,
+        )
+
+        return load_contribution_transcoder_config(path)
+    return load_contribution_config(path)
+
+
+def _require_transcoder_source_arguments(args: argparse.Namespace) -> None:
+    if args.scientific_model != "transcoder":
+        return
+    if (
+        args.source_overlay_control_root is None
+        or args.source_overlay_object_prefix is None
+    ):
+        raise ContributionTrainingWorkerError(
+            "transcoder mode requires --source-overlay-control-root and "
+            "--source-overlay-object-prefix"
+        )
 
 
 def _verify_repository_revision(expected: str) -> None:
@@ -2746,6 +3273,12 @@ def _verify_repository_revision(expected: str) -> None:
 
 def _add_workload_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
+        "--scientific-model",
+        "--mode",
+        choices=SCIENTIFIC_MODELS,
+        default="sae",
+    )
+    parser.add_argument(
         "--config",
         default="configs/gemma4_contribution_v1.yaml",
     )
@@ -2761,6 +3294,11 @@ def _add_workload_arguments(parser: argparse.ArgumentParser) -> None:
         type=_absolute_path,
     )
     parser.add_argument("--object-prefix", required=True)
+    parser.add_argument(
+        "--source-overlay-control-root",
+        type=_absolute_path,
+    )
+    parser.add_argument("--source-overlay-object-prefix")
     parser.add_argument(
         "--resident-cache-root",
         required=True,
@@ -2794,6 +3332,12 @@ def _add_workload_arguments(parser: argparse.ArgumentParser) -> None:
 
 def _add_prefetch_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
+        "--scientific-model",
+        "--mode",
+        choices=SCIENTIFIC_MODELS,
+        default="sae",
+    )
+    parser.add_argument(
         "--config",
         default="configs/gemma4_contribution_v1.yaml",
     )
@@ -2807,6 +3351,11 @@ def _add_prefetch_arguments(parser: argparse.ArgumentParser) -> None:
         type=_absolute_path,
     )
     parser.add_argument("--object-prefix", required=True)
+    parser.add_argument(
+        "--source-overlay-control-root",
+        type=_absolute_path,
+    )
+    parser.add_argument("--source-overlay-object-prefix")
     parser.add_argument(
         "--resident-cache-root",
         required=True,
@@ -2955,6 +3504,8 @@ def _parser() -> argparse.ArgumentParser:
 
 def _workload_argv(args: argparse.Namespace) -> list[str]:
     result = [
+        "--scientific-model",
+        args.scientific_model,
         "--config",
         str(Path(args.config).expanduser().resolve()),
         "--phase",
@@ -2979,8 +3530,16 @@ def _workload_argv(args: argparse.Namespace) -> list[str]:
         str(args.peak_flops_per_second),
     ]
     if args.recomposition_sidecar is not None:
+        result.extend(["--recomposition-sidecar", args.recomposition_sidecar])
+    if args.scientific_model == "transcoder":
+        _require_transcoder_source_arguments(args)
         result.extend(
-            ["--recomposition-sidecar", args.recomposition_sidecar]
+            [
+                "--source-overlay-control-root",
+                args.source_overlay_control_root,
+                "--source-overlay-object-prefix",
+                args.source_overlay_object_prefix,
+            ]
         )
     return result
 
@@ -2995,9 +3554,7 @@ def _supervision_paths(
     if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", args.host_id) is None:
         raise ContributionTrainingWorkerError("host-id is invalid")
     if operation == "prefetch":
-        prefix = (
-            f"prefetch-p{int(args.process_index):05d}-{args.host_id}"
-        )
+        prefix = f"prefetch-p{int(args.process_index):05d}-{args.host_id}"
     else:
         prefix = f"{operation}-{args.condition}-seed{args.seed}-{args.host_id}"
     return {
@@ -3023,9 +3580,7 @@ def _prelaunch_identity(
         },
         hardware=(
             {
-                "schema_version": (
-                    "gemma4-contribution-sae-requested-hardware-v1"
-                ),
+                "schema_version": ("gemma4-contribution-sae-requested-hardware-v1"),
                 "platform": "tpu",
                 "accelerator": "v4-32",
                 "global_chip_count": 16,
@@ -3033,9 +3588,7 @@ def _prelaunch_identity(
             }
             if uses_accelerator
             else {
-                "schema_version": (
-                    "gemma4-contribution-prefetch-host-runtime-v1"
-                ),
+                "schema_version": ("gemma4-contribution-prefetch-host-runtime-v1"),
                 "platform": "host",
                 "accelerator": None,
                 "jax_initialized": False,
@@ -3087,6 +3640,8 @@ def _supervise(
 
 def _prefetch_argv(args: argparse.Namespace) -> list[str]:
     result = [
+        "--scientific-model",
+        args.scientific_model,
         "--config",
         str(Path(args.config).expanduser().resolve()),
         "--phase",
@@ -3109,8 +3664,16 @@ def _prefetch_argv(args: argparse.Namespace) -> list[str]:
         args.source_revision,
     ]
     if args.recomposition_sidecar is not None:
+        result.extend(["--recomposition-sidecar", args.recomposition_sidecar])
+    if args.scientific_model == "transcoder":
+        _require_transcoder_source_arguments(args)
         result.extend(
-            ["--recomposition-sidecar", args.recomposition_sidecar]
+            [
+                "--source-overlay-control-root",
+                args.source_overlay_control_root,
+                "--source-overlay-object-prefix",
+                args.source_overlay_object_prefix,
+            ]
         )
     return result
 
@@ -3146,8 +3709,14 @@ def _prefetch_command(args: argparse.Namespace) -> int:
         qualification_receipt=None,
         operation="prefetch",
     )
-    receipt = validate_prefetch_receipt(
-        _read_json(args.prefetch_receipt_path, name="prefetch receipt")
+    raw_receipt = _read_json(
+        args.prefetch_receipt_path,
+        name="prefetch receipt",
+    )
+    receipt = (
+        validate_transcoder_prefetch_receipt(raw_receipt)
+        if args.scientific_model == "transcoder"
+        else validate_prefetch_receipt(raw_receipt)
     )
     print(
         json.dumps(
@@ -3155,8 +3724,14 @@ def _prefetch_command(args: argparse.Namespace) -> int:
                 "supervision_result_sha256": result["result_sha256"],
                 "receipt_sha256": receipt["receipt_sha256"],
                 "process_partition": receipt["process_partition"],
-                "objects": receipt["object_count"],
-                "bytes": receipt["object_bytes"],
+                "objects": receipt.get(
+                    "object_count",
+                    receipt.get("combined_object_count"),
+                ),
+                "bytes": receipt.get(
+                    "object_bytes",
+                    receipt.get("combined_object_bytes"),
+                ),
                 "elapsed_seconds": receipt["elapsed_seconds"],
             },
             sort_keys=True,
@@ -3170,28 +3745,51 @@ def _prefetch_child_command(args: argparse.Namespace) -> int:
     """Run the bounded-cache transfer without importing JAX."""
 
     _verify_repository_revision(args.source_revision)
-    config = load_contribution_config(args.config)
+    _require_transcoder_source_arguments(args)
+    config = _load_worker_config(args.config, args.scientific_model)
     sidecar = _load_sidecar(args.recomposition_sidecar)
-    receipt = prefetch_process_lane(
-        config=config,
-        phase=args.phase,
-        source_revision=args.source_revision,
-        capture_control_root=args.capture_control_root,
-        object_prefix=args.object_prefix,
-        cache_root=args.resident_cache_root,
-        cache_max_bytes=args.resident_cache_max_bytes,
-        process_count=args.process_count,
-        process_index=args.process_index,
-        recomposition_sidecar=sidecar,
-    )
+    if args.scientific_model == "transcoder":
+        receipt = prefetch_transcoder_process_lane(
+            config=config,
+            phase=args.phase,
+            source_revision=args.source_revision,
+            capture_control_root=args.capture_control_root,
+            object_prefix=args.object_prefix,
+            source_overlay_control_root=args.source_overlay_control_root,
+            source_overlay_object_prefix=args.source_overlay_object_prefix,
+            cache_root=args.resident_cache_root,
+            cache_max_bytes=args.resident_cache_max_bytes,
+            process_count=args.process_count,
+            process_index=args.process_index,
+            recomposition_sidecar=sidecar,
+        )
+    else:
+        receipt = prefetch_process_lane(
+            config=config,
+            phase=args.phase,
+            source_revision=args.source_revision,
+            capture_control_root=args.capture_control_root,
+            object_prefix=args.object_prefix,
+            cache_root=args.resident_cache_root,
+            cache_max_bytes=args.resident_cache_max_bytes,
+            process_count=args.process_count,
+            process_index=args.process_index,
+            recomposition_sidecar=sidecar,
+        )
     _write_create_only_json(args.prefetch_receipt_path, receipt)
     print(
         json.dumps(
             {
                 "receipt_sha256": receipt["receipt_sha256"],
                 "process_partition": receipt["process_partition"],
-                "objects": receipt["object_count"],
-                "bytes": receipt["object_bytes"],
+                "objects": receipt.get(
+                    "object_count",
+                    receipt.get("combined_object_count"),
+                ),
+                "bytes": receipt.get(
+                    "object_bytes",
+                    receipt.get("combined_object_bytes"),
+                ),
                 "elapsed_seconds": receipt["elapsed_seconds"],
             },
             sort_keys=True,
@@ -3246,7 +3844,8 @@ def _qualify_child_command(args: argparse.Namespace) -> int:
     from moe_sae.runtime import initialize_jax_distributed, require_v4_32_runtime
 
     _verify_repository_revision(args.source_revision)
-    config = load_contribution_config(args.config)
+    _require_transcoder_source_arguments(args)
+    config = _load_worker_config(args.config, args.scientific_model)
     plan = TrainingWorkerPlan.from_config(
         config,
         phase=args.phase,
@@ -3254,24 +3853,46 @@ def _qualify_child_command(args: argparse.Namespace) -> int:
         seed=args.seed,
     )
     sidecar = _load_sidecar(args.recomposition_sidecar)
-    prefetch_receipt = _prove_prefetch_for_plan(
-        _read_json(args.prefetch_receipt_path, name="prefetch receipt"),
-        config=config,
-        plan=plan,
-        source_revision=args.source_revision,
-        capture_control_root=args.capture_control_root,
-        object_prefix=args.object_prefix,
-        cache_root=args.resident_cache_root,
-        cache_max_bytes=args.resident_cache_max_bytes,
-        recomposition_sidecar=sidecar,
+    raw_prefetch = _read_json(
+        args.prefetch_receipt_path,
+        name="prefetch receipt",
     )
+    if args.scientific_model == "transcoder":
+        prefetch_receipt = _prove_transcoder_prefetch_for_plan(
+            raw_prefetch,
+            config=config,
+            plan=plan,
+            source_revision=args.source_revision,
+            capture_control_root=args.capture_control_root,
+            object_prefix=args.object_prefix,
+            source_overlay_control_root=args.source_overlay_control_root,
+            source_overlay_object_prefix=args.source_overlay_object_prefix,
+            cache_root=args.resident_cache_root,
+            cache_max_bytes=args.resident_cache_max_bytes,
+            recomposition_sidecar=sidecar,
+        )
+    else:
+        prefetch_receipt = _prove_prefetch_for_plan(
+            raw_prefetch,
+            config=config,
+            plan=plan,
+            source_revision=args.source_revision,
+            capture_control_root=args.capture_control_root,
+            object_prefix=args.object_prefix,
+            cache_root=args.resident_cache_root,
+            cache_max_bytes=args.resident_cache_max_bytes,
+            recomposition_sidecar=sidecar,
+        )
     initialize_jax_distributed()
     require_v4_32_runtime()
     workload = _build_production_workload(
         config,
         plan,
+        scientific_model=args.scientific_model,
         capture_control_root=args.capture_control_root,
         object_prefix=args.object_prefix,
+        source_overlay_control_root=args.source_overlay_control_root,
+        source_overlay_object_prefix=args.source_overlay_object_prefix,
         resident_cache_root=args.resident_cache_root,
         resident_cache_max_bytes=args.resident_cache_max_bytes,
         recomposition_sidecar=sidecar,
@@ -3291,9 +3912,7 @@ def _qualify_child_command(args: argparse.Namespace) -> int:
 
     if jax.process_index() == 0:
         _write_create_only_json(args.selection_path, selection)
-    _collective_barrier(
-        f"contribution-sae-selection-{plan.condition}-{plan.seed}"
-    )
+    _collective_barrier(f"contribution-sae-selection-{plan.condition}-{plan.seed}")
     observed = validate_training_mode_selection(
         _read_json(args.selection_path, name="mode selection")
     )
@@ -3404,7 +4023,8 @@ def _train_child_command(args: argparse.Namespace) -> int:
             _read_json(args.selection_path, name="mode selection")
         )
         context = selection["workload_context"]
-    config = load_contribution_config(args.config)
+    _require_transcoder_source_arguments(args)
+    config = _load_worker_config(args.config, args.scientific_model)
     plan = TrainingWorkerPlan.from_config(
         config,
         phase=args.phase,
@@ -3412,24 +4032,46 @@ def _train_child_command(args: argparse.Namespace) -> int:
         seed=args.seed,
     )
     sidecar = _load_sidecar(args.recomposition_sidecar)
-    prefetch_receipt = _prove_prefetch_for_plan(
-        _read_json(args.prefetch_receipt_path, name="prefetch receipt"),
-        config=config,
-        plan=plan,
-        source_revision=args.source_revision,
-        capture_control_root=args.capture_control_root,
-        object_prefix=args.object_prefix,
-        cache_root=args.resident_cache_root,
-        cache_max_bytes=args.resident_cache_max_bytes,
-        recomposition_sidecar=sidecar,
+    raw_prefetch = _read_json(
+        args.prefetch_receipt_path,
+        name="prefetch receipt",
     )
+    if args.scientific_model == "transcoder":
+        prefetch_receipt = _prove_transcoder_prefetch_for_plan(
+            raw_prefetch,
+            config=config,
+            plan=plan,
+            source_revision=args.source_revision,
+            capture_control_root=args.capture_control_root,
+            object_prefix=args.object_prefix,
+            source_overlay_control_root=args.source_overlay_control_root,
+            source_overlay_object_prefix=args.source_overlay_object_prefix,
+            cache_root=args.resident_cache_root,
+            cache_max_bytes=args.resident_cache_max_bytes,
+            recomposition_sidecar=sidecar,
+        )
+    else:
+        prefetch_receipt = _prove_prefetch_for_plan(
+            raw_prefetch,
+            config=config,
+            plan=plan,
+            source_revision=args.source_revision,
+            capture_control_root=args.capture_control_root,
+            object_prefix=args.object_prefix,
+            cache_root=args.resident_cache_root,
+            cache_max_bytes=args.resident_cache_max_bytes,
+            recomposition_sidecar=sidecar,
+        )
     initialize_jax_distributed()
     require_v4_32_runtime()
     workload = _build_production_workload(
         config,
         plan,
+        scientific_model=args.scientific_model,
         capture_control_root=args.capture_control_root,
         object_prefix=args.object_prefix,
+        source_overlay_control_root=args.source_overlay_control_root,
+        source_overlay_object_prefix=args.source_overlay_object_prefix,
         resident_cache_root=args.resident_cache_root,
         resident_cache_max_bytes=args.resident_cache_max_bytes,
         recomposition_sidecar=sidecar,
@@ -3453,9 +4095,7 @@ def _train_child_command(args: argparse.Namespace) -> int:
 
     if jax.process_index() == 0:
         _write_create_only_json(args.result_path, result)
-    _collective_barrier(
-        f"contribution-sae-result-{plan.condition}-{plan.seed}"
-    )
+    _collective_barrier(f"contribution-sae-result-{plan.condition}-{plan.seed}")
     observed = _read_json(args.result_path, name="training result")
     if observed != result:
         raise ContributionTrainingWorkerError(

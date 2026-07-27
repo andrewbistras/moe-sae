@@ -23,6 +23,7 @@ model:
   use_multimodal: false
   scan_layers: false
   pure_nnx_decoder: true
+  attention: autoselected
   dropout_rate: 0.0
   load_balance_loss_weight: 0.0
 
@@ -37,7 +38,7 @@ parents:
 source_overlay:
   schema_version: gemma4-routed-input-overlay-v1
   field: routed_input
-  capture_site: target.mlp.pre_feedforward_layernorm_2.block15_post_attention_residual
+  capture_site: target.mlp.pre_feedforward_layernorm_2(block15.post_attention_residual)
   dtype: bfloat16
   hidden_size: 2816
   max_shard_tokens: 16384
