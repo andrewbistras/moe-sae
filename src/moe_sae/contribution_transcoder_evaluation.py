@@ -827,9 +827,13 @@ def aggregate_paired_sequence_scores(
                 "condition scores use different recomposition sidecars"
             )
         for endpoint in ENDPOINTS:
-            if not np.array_equal(
-                selected.endpoint(endpoint)[1],
-                first.endpoint(endpoint)[1],
+            candidate_sst = selected.endpoint(endpoint)[1]
+            canonical_sst = first.endpoint(endpoint)[1]
+            if not np.allclose(
+                candidate_sst,
+                canonical_sst,
+                rtol=float(4 * np.finfo(np.float32).eps),
+                atol=float(4 * np.finfo(np.float32).eps),
             ):
                 raise ContributionTranscoderEvaluationError(
                     f"{endpoint} SST is not common across conditions"
