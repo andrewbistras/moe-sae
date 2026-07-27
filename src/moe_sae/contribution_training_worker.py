@@ -2097,7 +2097,11 @@ def _states_exact_equal(left: Any, right: Any) -> bool:
 
 
 def _stablehlo_manifest(
-    lowered: Any, *, condition: str, mode: InputMode
+    lowered: Any,
+    *,
+    condition: str,
+    mode: InputMode,
+    scientific_model: ScientificModel,
 ) -> dict[str, Any]:
     compiler_ir = getattr(lowered, "compiler_ir", None)
     if not callable(compiler_ir):
@@ -2116,7 +2120,7 @@ def _stablehlo_manifest(
         "schema_version": TRAINING_GRAPH_SCHEMA_VERSION,
         "condition": condition,
         "input_mode": mode,
-        "scientific_model": workload.scientific_model,
+        "scientific_model": scientific_model,
         "stablehlo_sha256": hashlib.sha256(stablehlo.encode("utf-8")).hexdigest(),
         "stablehlo_bytes": len(stablehlo.encode("utf-8")),
     }
@@ -2346,6 +2350,7 @@ class _ProductionEngine:
             lowered,
             condition=self.plan.condition,
             mode=mode,
+            scientific_model=self.workload.scientific_model,
         )
         hardware = _hardware_manifest(
             self.workload.mesh,

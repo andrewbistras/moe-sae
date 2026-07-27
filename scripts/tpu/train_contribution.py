@@ -63,6 +63,7 @@ _COORDINATOR_BUNDLE_FIELDS = {
 }
 
 CONDITIONS = ("A", "R", "B", "F", "Q")
+SCIENTIFIC_MODELS = ("sae", "transcoder")
 ACTIONS = ("qualify", "train")
 DIRECT_BOUNDED_ADMISSION = "bounded_direct_resident"
 QUALIFIED_ADMISSION = "qualified_mode_selection"
@@ -103,10 +104,18 @@ class Settings:
     attempt_id: str
     maximum_runtime_seconds: int
     local_log_root: Path
+    scientific_model: str = "sae"
+    source_overlay_control_root: str | None = None
+    source_overlay_object_prefix: str | None = None
 
     @property
     def config_path(self) -> str:
-        return f"{self.project_root}/configs/gemma4_contribution_v1.yaml"
+        filename = (
+            "gemma4_transcoder_v1.yaml"
+            if self.scientific_model == "transcoder"
+            else "gemma4_contribution_v1.yaml"
+        )
+        return f"{self.project_root}/configs/{filename}"
 
     @property
     def run_root(self) -> str:
@@ -243,8 +252,12 @@ def _settings(
         raise OperatorError("PROJECT_COMMIT must be a full lowercase Git SHA")
     if args.action not in ACTIONS:
         raise OperatorError("--action is invalid")
+    if args.scientific_model not in SCIENTIFIC_MODELS:
+        raise OperatorError("--scientific-model is invalid")
     if args.condition not in CONDITIONS:
         raise OperatorError("--condition is invalid")
+    if args.scientific_model == "transcoder" and args.condition == "Q":
+        raise OperatorError("transcoder mode supports routed A/R/B/F only")
     if _SAFE_PHASE_RE.fullmatch(args.phase) is None:
         raise OperatorError("--phase is invalid")
     if _SAFE_ID_RE.fullmatch(args.run_id) is None:
@@ -265,7 +278,11 @@ def _settings(
         / "artifacts"
         / "gemma4_v1"
         / "operator-results"
-        / "experiment2-sae"
+        / (
+            "experiment3-transcoder"
+            if args.scientific_model == "transcoder"
+            else "experiment2-sae"
+        )
         / args.run_id
         / f"{args.action}-{args.attempt_id}"
     )
@@ -285,6 +302,7 @@ def _settings(
             "REMOTE_UV",
             _required(environment, "REMOTE_UV"),
         ),
+        scientific_model=args.scientific_model,
         capture_control_root=_absolute_remote_path(
             "CONTRIBUTION_TRAIN_CAPTURE_ROOT",
             _required(environment, "CONTRIBUTION_TRAIN_CAPTURE_ROOT"),
@@ -292,6 +310,22 @@ def _settings(
         object_prefix=_gcs_prefix(
             "CONTRIBUTION_OBJECT_PREFIX",
             _required(environment, "CONTRIBUTION_OBJECT_PREFIX"),
+        ),
+        source_overlay_control_root=(
+            _absolute_remote_path(
+                "CONTRIBUTION_SOURCE_OVERLAY_ROOT",
+                _required(environment, "CONTRIBUTION_SOURCE_OVERLAY_ROOT"),
+            )
+            if args.scientific_model == "transcoder"
+            else None
+        ),
+        source_overlay_object_prefix=(
+            _gcs_prefix(
+                "CONTRIBUTION_SOURCE_OVERLAY_PREFIX",
+                _required(environment, "CONTRIBUTION_SOURCE_OVERLAY_PREFIX"),
+            )
+            if args.scientific_model == "transcoder"
+            else None
         ),
         recomposition_sidecar=_absolute_remote_path(
             "CONTRIBUTION_RECOMPOSITION_SIDECAR",
@@ -561,6 +595,26 @@ def initialize_attempt(args: argparse.Namespace) -> dict[str, object]:
         or not (capture_root / "manifest.json").is_file()
     ):
         raise OperatorError("capture_control_root is not one sealed directory")
+    scientific_model = getattr(args, "scientific_model", "sae")
+    if scientific_model not in SCIENTIFIC_MODELS:
+        raise OperatorError("scientific_model is invalid")
+    source_overlay_root: Path | None = None
+    if scientific_model == "transcoder":
+        source_control = getattr(args, "source_overlay_control_root", None)
+        source_prefix = getattr(args, "source_overlay_object_prefix", None)
+        if not source_control or not source_prefix:
+            raise OperatorError(
+                "transcoder initialization requires the routed-input overlay"
+            )
+        source_overlay_root = Path(source_control).expanduser().resolve()
+        if (
+            not source_overlay_root.is_dir()
+            or source_overlay_root.is_symlink()
+            or not (source_overlay_root / "manifest.json").is_file()
+        ):
+            raise OperatorError(
+                "source_overlay_control_root is not one sealed directory"
+            )
     sae_control_root = Path(args.sae_control_root).expanduser().resolve()
     run_root = Path(args.run_root).expanduser().resolve()
     attempt_root = Path(args.attempt_root).expanduser().resolve()
@@ -603,6 +657,19 @@ def initialize_attempt(args: argparse.Namespace) -> dict[str, object]:
         "checkpoint_payload_root": args.checkpoint_payload_root.rstrip("/"),
         "admission_mode": admission_mode,
     }
+    if source_overlay_root is not None:
+        contract_body.update(
+            {
+                "scientific_model": scientific_model,
+                "source_overlay_control_root": str(source_overlay_root),
+                "source_overlay_manifest_sha256": _manifest_sha256(
+                    source_overlay_root
+                ),
+                "source_overlay_object_prefix": (
+                    source_prefix.rstrip("/")
+                ),
+            }
+        )
     contract = {
         **contract_body,
         "run_contract_sha256": _canonical_sha256(contract_body),
@@ -761,6 +828,8 @@ def _init_command(settings: Settings) -> list[str]:
         settings.attempt_id,
         "--project-commit",
         settings.project_commit,
+        "--scientific-model",
+        settings.scientific_model,
         "--config",
         settings.config_path,
         "--phase",
@@ -792,6 +861,20 @@ def _init_command(settings: Settings) -> list[str]:
         "--maximum-runtime-seconds",
         str(settings.maximum_runtime_seconds),
     ]
+    if settings.scientific_model == "transcoder":
+        if (
+            settings.source_overlay_control_root is None
+            or settings.source_overlay_object_prefix is None
+        ):
+            raise OperatorError("transcoder settings lack their source overlay")
+        command.extend(
+            (
+                "--source-overlay-control-root",
+                settings.source_overlay_control_root,
+                "--source-overlay-object-prefix",
+                settings.source_overlay_object_prefix,
+            )
+        )
     return _gcloud(
         settings,
         worker=0,
@@ -807,7 +890,9 @@ def _common_worker_arguments(
     controller_index: int,
     process_index: int,
 ) -> list[str]:
-    return [
+    result = [
+        "--scientific-model",
+        settings.scientific_model,
         "--config",
         settings.config_path,
         "--phase",
@@ -831,6 +916,21 @@ def _common_worker_arguments(
         "--source-revision",
         settings.project_commit,
     ]
+    if settings.scientific_model == "transcoder":
+        if (
+            settings.source_overlay_control_root is None
+            or settings.source_overlay_object_prefix is None
+        ):
+            raise OperatorError("transcoder settings lack their source overlay")
+        result.extend(
+            (
+                "--source-overlay-control-root",
+                settings.source_overlay_control_root,
+                "--source-overlay-object-prefix",
+                settings.source_overlay_object_prefix,
+            )
+        )
+    return result
 
 
 def _prefetch_command(
@@ -862,6 +962,8 @@ def _prefetch_command(
         "-m",
         "moe_sae.contribution_training_worker",
         "prefetch",
+        "--scientific-model",
+        settings.scientific_model,
         "--config",
         settings.config_path,
         "--phase",
@@ -891,6 +993,20 @@ def _prefetch_command(
         "--maximum-runtime-seconds",
         str(PREFETCH_SECONDS),
     ]
+    if settings.scientific_model == "transcoder":
+        if (
+            settings.source_overlay_control_root is None
+            or settings.source_overlay_object_prefix is None
+        ):
+            raise OperatorError("transcoder settings lack their source overlay")
+        command.extend(
+            (
+                "--source-overlay-control-root",
+                settings.source_overlay_control_root,
+                "--source-overlay-object-prefix",
+                settings.source_overlay_object_prefix,
+            )
+        )
     lines = [
         "set -eu",
         *_clean_checkout_lines(settings),
@@ -1429,6 +1545,11 @@ def _public_parser() -> argparse.ArgumentParser:
         )
     )
     parser.add_argument("--action", choices=ACTIONS, required=True)
+    parser.add_argument(
+        "--scientific-model",
+        choices=SCIENTIFIC_MODELS,
+        default="sae",
+    )
     parser.add_argument("--phase", required=True)
     parser.add_argument("--condition", choices=CONDITIONS, required=True)
     parser.add_argument("--seed", type=int, required=True)
@@ -1449,12 +1570,19 @@ def _init_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--attempt-id", required=True)
     parser.add_argument("--project-commit", required=True)
+    parser.add_argument(
+        "--scientific-model",
+        choices=SCIENTIFIC_MODELS,
+        default="sae",
+    )
     parser.add_argument("--config", required=True)
     parser.add_argument("--phase", required=True)
     parser.add_argument("--condition", choices=CONDITIONS, required=True)
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--capture-control-root", required=True)
     parser.add_argument("--object-prefix", required=True)
+    parser.add_argument("--source-overlay-control-root")
+    parser.add_argument("--source-overlay-object-prefix")
     parser.add_argument("--recomposition-sidecar", required=True)
     parser.add_argument("--qualification-bundle", required=True)
     parser.add_argument("--cache-root", required=True)

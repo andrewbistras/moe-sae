@@ -188,12 +188,19 @@ confirmatory result.
 Training minimizes the unchanged normalized router-weighted component loss:
 
 ```text
-SSE_c = sum_t,s || FP32(g_ts) * (FP32(e_ts) - FP32(e_hat_ts)) ||^2
-loss  = SSE_c / SST_c,train
+SSE_c,batch = sum_t,s || FP32(g_ts) * (FP32(e_ts) - FP32(e_hat_ts)) ||^2
+loss        = SSE_c,batch / SST_c,batch
 ```
 
-The target-only common SST is computed once from the sealed target inventory
-and is not recomputed inside condition-specific graphs.
+The optimizer denominator is the target-only SST of the current matched
+batch, exactly as in Experiment 2. It is mathematically independent of the
+condition and keeps the inherited LR/loss scale unchanged. Batch target SST is
+recorded so equality can be audited across A/R/B/F.
+
+For held-out evaluation, one target-only common SST is computed once from the
+sealed target inventory, bound by a receipt, and used by every condition. It
+is not recomputed inside condition-specific evaluation graphs. This is the
+common denominator required for all EV values and paired effects.
 
 Held-out predictions are passed through Gemma's frozen routed computation:
 

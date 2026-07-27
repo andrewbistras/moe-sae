@@ -25,6 +25,7 @@ from moe_sae.contribution_training_worker import (
     RestoredTrainingState,
     TrainingLoopDependencies,
     TrainingWorkerPlan,
+    _stablehlo_manifest,
     _parser,
     _prove_prefetch_for_plan,
     chosen_mode_evidence,
@@ -36,6 +37,23 @@ from moe_sae.contribution_training_worker import (
 from moe_sae.object_store import ObjectIdentity
 
 CONFIG = Path(__file__).parents[1] / "configs" / "gemma4_contribution_v1.yaml"
+
+
+def test_stablehlo_manifest_explicitly_binds_scientific_model() -> None:
+    class Lowered:
+        @staticmethod
+        def compiler_ir(*, dialect: str) -> str:
+            assert dialect == "stablehlo"
+            return "module { stablehlo.constant dense<0> : tensor<i32> }"
+
+    manifest = _stablehlo_manifest(
+        Lowered(),
+        condition="A",
+        mode="resident",
+        scientific_model="transcoder",
+    )
+    assert manifest["scientific_model"] == "transcoder"
+    assert len(manifest["stablehlo_sha256"]) == 64
 
 
 def identity(label: str) -> ExactPerformanceIdentity:

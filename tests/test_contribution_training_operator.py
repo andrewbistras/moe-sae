@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import importlib.util
 import json
 import os
@@ -358,6 +359,79 @@ def test_bounded_train_creates_direct_resident_contract_without_selection(
         (run_root / "run-contract.json").read_text(encoding="utf-8")
     )
     assert contract["admission_mode"] == operator.DIRECT_BOUNDED_ADMISSION
+
+
+def test_transcoder_operator_binds_and_forwards_source_overlay(
+    operator,
+    tmp_path: Path,
+) -> None:
+    inputs = _write_inputs(operator, tmp_path)
+    source = tmp_path / "source-overlay"
+    source.mkdir()
+    source_unsigned = {
+        "schema_version": "gemma4-routed-input-overlay-v1",
+        "sealed": True,
+    }
+    (source / "manifest.json").write_text(
+        json.dumps(
+            {
+                **source_unsigned,
+                "manifest_sha256": canonical_sha256(source_unsigned),
+            }
+        ),
+        encoding="utf-8",
+    )
+    args = _init_args(
+        operator,
+        tmp_path,
+        inputs,
+        action="train",
+        attempt_id="transcoder001",
+        maximum_runtime_seconds=3_600,
+    )
+    args.scientific_model = "transcoder"
+    args.config = str(ROOT / "configs" / "gemma4_transcoder_v1.yaml")
+    args.phase = "mechanism_pilot"
+    args.source_overlay_control_root = str(source)
+    args.source_overlay_object_prefix = "gs://bucket/experiment3/source"
+    plan = operator.initialize_attempt(args)
+    contract = json.loads(
+        (Path(args.run_root) / "run-contract.json").read_text(encoding="utf-8")
+    )
+    assert plan["admission_mode"] == operator.DIRECT_BOUNDED_ADMISSION
+    assert contract["scientific_model"] == "transcoder"
+    assert contract["source_overlay_control_root"] == str(source)
+    assert (
+        contract["source_overlay_manifest_sha256"]
+        == canonical_sha256(source_unsigned)
+    )
+
+    settings = replace(
+        _settings(
+            operator,
+            tmp_path,
+            action="train",
+            maximum_runtime_seconds=3_600,
+        ),
+        scientific_model="transcoder",
+        source_overlay_control_root="/nfs/experiment3/source/train",
+        source_overlay_object_prefix="gs://bucket/experiment3/source/train",
+        phase="mechanism_pilot",
+    )
+    assert settings.config_path.endswith("configs/gemma4_transcoder_v1.yaml")
+    for command in (
+        operator._prefetch_command(
+            settings, controller_index=1, process_index=3
+        ),
+        operator._action_command(
+            settings, controller_index=1, process_index=3
+        ),
+    ):
+        joined = " ".join(command)
+        assert "--scientific-model transcoder" in joined
+        assert "--source-overlay-control-root" in joined
+        assert "/nfs/experiment3/source/train" in joined
+        assert "--source-overlay-object-prefix" in joined
 
 
 def test_commands_keep_controller_transport_and_jax_lane_distinct(
