@@ -111,6 +111,37 @@ def routed_input_capture_to_wire(
         ) from error
 
 
+def _routed_input_capture_chunks(
+    routed_input: Any,
+    sequence_id: Any,
+    position: Any,
+    *,
+    max_tokens: int = MAX_SHARD_TOKENS,
+) -> Iterable[RoutedInputBatch]:
+    """Convert one execution batch into artifact-sized ordered wire chunks."""
+
+    routed = np.asarray(routed_input)
+    sequence = np.asarray(sequence_id)
+    positions = np.asarray(position)
+    if routed.ndim != 2:
+        raise RoutedInputHarvestError("routed-input execution output must be rank 2")
+    tokens = int(routed.shape[0])
+    if sequence.shape != (tokens,) or positions.shape != (tokens,):
+        raise RoutedInputHarvestError(
+            "routed-input execution output and token keys have different lengths"
+        )
+    if tokens <= 0:
+        raise RoutedInputHarvestError("routed-input execution output is empty")
+    for start in range(0, tokens, max_tokens):
+        stop = min(start + max_tokens, tokens)
+        yield routed_input_capture_to_wire(
+            routed[start:stop],
+            sequence[start:stop],
+            positions[start:stop],
+            max_tokens=max_tokens,
+        )
+
+
 class _RangeAccumulator:
     def __init__(self, target_entry: Mapping[str, Any]) -> None:
         self.target_entry = target_entry
@@ -411,27 +442,30 @@ def harvest_routed_input_host(
                         "process-local routed input has the wrong static shape"
                     )
                 selected = valid_indices[resumed_in_batch:desired]
-                compacted = routed_input_capture_to_wire(
+                for compacted in _routed_input_capture_chunks(
                     local_output[selected],
                     expected_batch_sequence[resumed_in_batch:desired],
                     expected_batch_position[resumed_in_batch:desired],
-                )
-                appended = 0
-                while appended < compacted.tokens:
-                    if accumulator is None:
-                        raise RoutedInputHarvestError(
-                            "captured more tokens than the target inventory"
-                        )
-                    appended += accumulator.append(compacted, appended)
-                    if accumulator.full:
-                        sink.submit(accumulator.target_entry, accumulator.take())
-                        new_tokens += int(accumulator.target_entry["tokens"])
-                        entry_index += 1
-                        accumulator = (
-                            None
-                            if entry_index == len(entries)
-                            else _RangeAccumulator(entries[entry_index])
-                        )
+                ):
+                    appended = 0
+                    while appended < compacted.tokens:
+                        if accumulator is None:
+                            raise RoutedInputHarvestError(
+                                "captured more tokens than the target inventory"
+                            )
+                        appended += accumulator.append(compacted, appended)
+                        if accumulator.full:
+                            sink.submit(
+                                accumulator.target_entry,
+                                accumulator.take(),
+                            )
+                            new_tokens += int(accumulator.target_entry["tokens"])
+                            entry_index += 1
+                            accumulator = (
+                                None
+                                if entry_index == len(entries)
+                                else _RangeAccumulator(entries[entry_index])
+                            )
             local_cursor += desired
             batches_scanned += 1
             if all_complete:

@@ -9,6 +9,7 @@ import pytest
 
 from moe_sae.contribution_artifacts import HIDDEN_SIZE
 from moe_sae.contribution_transcoder_harvest import (
+    _routed_input_capture_chunks,
     routed_input_capture_to_wire,
 )
 from moe_sae.contribution_transcoder_harvest_worker import (
@@ -55,6 +56,26 @@ def test_wire_conversion_bitcasts_bfloat16_and_rejects_extra_shape():
             np.asarray([10, 11]),
             np.asarray([0, 1]),
         )
+
+
+def test_execution_batch_is_split_into_artifact_sized_wire_chunks():
+    routed = np.arange(5 * HIDDEN_SIZE, dtype=np.float32).reshape(
+        5, HIDDEN_SIZE
+    )
+    chunks = tuple(
+        _routed_input_capture_chunks(
+            routed,
+            np.asarray([10, 11, 12, 13, 14], dtype=np.int64),
+            np.asarray([0, 1, 2, 3, 4], dtype=np.uint16),
+            max_tokens=2,
+        )
+    )
+
+    assert [chunk.tokens for chunk in chunks] == [2, 2, 1]
+    np.testing.assert_array_equal(
+        np.concatenate([chunk.sequence_id for chunk in chunks]),
+        np.asarray([10, 11, 12, 13, 14], dtype=np.int64),
+    )
 
 
 def test_worker_cli_freezes_a_maximum_600_second_bound():
