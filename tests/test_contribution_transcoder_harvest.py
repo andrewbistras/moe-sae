@@ -11,7 +11,11 @@ from moe_sae.contribution_artifacts import HIDDEN_SIZE
 from moe_sae.contribution_transcoder_harvest import (
     routed_input_capture_to_wire,
 )
-from moe_sae.contribution_transcoder_harvest_worker import _parser as worker_parser
+from moe_sae.contribution_transcoder_harvest_worker import (
+    RoutedInputHarvestWorkerError,
+    _parent_dataset_token_target,
+    _parser as worker_parser,
+)
 
 
 def _operator():
@@ -92,6 +96,25 @@ def test_worker_cli_freezes_a_maximum_600_second_bound():
         "8",
     ]
     assert parser.parse_args(required).maximum_runtime_seconds == 600
+
+
+def test_staged_dataset_target_comes_from_immutable_source_v1_parent():
+    target = {
+        "total_tokens": 2_000_000,
+        "source_v1_manifest": {"total_tokens": 50_000_000},
+    }
+    assert _parent_dataset_token_target(target) == 50_000_000
+
+    with pytest.raises(
+        RoutedInputHarvestWorkerError,
+        match="incompatible with its source-v1 parent",
+    ):
+        _parent_dataset_token_target(
+            {
+                "total_tokens": 50_000_001,
+                "source_v1_manifest": {"total_tokens": 50_000_000},
+            }
+        )
 
 
 def test_operator_builds_four_concurrent_worker_commands_with_external_timeout():

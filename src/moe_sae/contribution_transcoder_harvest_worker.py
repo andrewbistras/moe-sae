@@ -69,6 +69,34 @@ class RoutedInputHarvestWorkerError(RuntimeError):
     """The bounded TPU worker failed before sealing a valid overlay."""
 
 
+def _parent_dataset_token_target(target: Mapping[str, Any]) -> int:
+    """Return the staged-dataset size bound by the sealed source-v1 parent.
+
+    Experiment 3 replays a strict prefix of the original capture: its 2M/250k
+    contribution targets came from 50M/2M staged train/eval inventories.  The
+    ArrayRecord receipt must therefore be checked against the immutable
+    source-v1 parent size, not the smaller Experiment-3 target count.
+    """
+
+    source = target.get("source_v1_manifest")
+    value = source.get("total_tokens") if isinstance(source, Mapping) else None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise RoutedInputHarvestWorkerError(
+            "target manifest has no valid source-v1 token target"
+        )
+    target_tokens = target.get("total_tokens")
+    if (
+        isinstance(target_tokens, bool)
+        or not isinstance(target_tokens, int)
+        or target_tokens <= 0
+        or target_tokens > value
+    ):
+        raise RoutedInputHarvestWorkerError(
+            "target token count is incompatible with its source-v1 parent"
+        )
+    return value
+
+
 def _mesh(name: str):
     for candidate in HARVEST_MESHES:
         if candidate.name == name:
@@ -237,7 +265,7 @@ def run_worker(arguments: argparse.Namespace) -> dict[str, Any]:
             if arguments.split == "train"
             else config.raw["provenance"]["eval_split"]
         ),
-        expected_tokens=expected_tokens,
+        expected_tokens=_parent_dataset_token_target(target),
         tokenizer_id=config.raw["provenance"]["model_id"],
         tokenizer_revision=config.raw["provenance"]["model_revision"],
         sequence_length=1_024,
