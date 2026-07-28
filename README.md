@@ -1,14 +1,33 @@
 # moe-sae
 
-This repository runs one focused Gemma 4 experiment:
+This repository studies whether a model's native MoE routing structure can
+make sparse representation learning more effective than an unstructured
+global dictionary at the same candidate or parameter budget.
 
-> Router-conditioned A recovers **G%** of the full-dictionary reconstruction
-> gain at **C%** of its measured marginal SAE training cost.
+The active model is `google/gemma-4-26B-A4B`, text only, at one-indexed block
+15. The project now contains three linked experiments:
 
-The active model is `google/gemma-4-26B-A4B`, text only. Activations are the
-aggregate routed-MoE branch at one-indexed block 15, immediately after
-`post_feedforward_layernorm_2`. Conditions A, B, and F reconstruct exactly the
-same globally centered target with exact per-token TopK-64.
+1. aggregate routed-branch sparse autoencoders;
+2. per-expert contribution sparse autoencoders; and
+3. source-only contribution transcoders.
+
+## Current result
+
+Experiment 3 shows that expert alignment transfers from reconstruction to
+prediction. On 250,000 held-out tokens, the true-expert transcoder A reached
+component EV 0.18743, versus -0.04715 for randomized identity R, 0.15532 for
+candidate-matched router-rank B, and 0.13408 for parameter-matched full-width
+F. Paired A-minus-R, A-minus-B, and A-minus-F intervals all exclude zero.
+
+The preregistered cost-efficiency result was not established. F was worse than
+B at the component endpoint, so the F-over-B gain-recovery denominator and G3
+are undefined. A also consumed 103.37% of F's measured marginal training
+chip-seconds. This is therefore a strong positive architecture and
+fixed-budget sample-efficiency result, not a lower-cost headline.
+
+See [`EXPERIMENT_3.md`](EXPERIMENT_3.md) for the protocol and execution record,
+and [`results/experiment3/REPORT.md`](results/experiment3/REPORT.md) for the
+sealed result and immutable evidence locations.
 
 The previous DeepSeek-VL2/spec-era implementation is intentionally absent from
 the active tree. It is preserved at Git tag
@@ -17,8 +36,15 @@ the active tree. It is preserved at Git tag
 
 ## Active surface
 
-- [`configs/gemma4_26b_a4b.yaml`](configs/gemma4_26b_a4b.yaml) — the single
-  production configuration.
+- [`configs/gemma4_26b_a4b.yaml`](configs/gemma4_26b_a4b.yaml) — base Gemma
+  capture and aggregate-SAE configuration.
+- [`configs/gemma4_contribution_v1.yaml`](configs/gemma4_contribution_v1.yaml)
+  — per-expert contribution SAE configuration.
+- [`configs/gemma4_transcoder_v2.yaml`](configs/gemma4_transcoder_v2.yaml) —
+  exact-positive source-only transcoder configuration.
+- [`EXPERIMENT_2.md`](EXPERIMENT_2.md) and
+  [`EXPERIMENT_3.md`](EXPERIMENT_3.md) — frozen scientific contracts and
+  execution records.
 - `moe-sae` — the single CLI, with `stage-c4`, `qualify-storage`,
   `qualify-sae-storage`, `preflight`,
   `convert-checkpoint`, `benchmark-harvest`, `harvest`, `activation-farm`,

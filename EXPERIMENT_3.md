@@ -405,19 +405,78 @@ transcoder can be trained from `target.pre_ffw_norm(h_t)` if a learned full-FFN
 endpoint becomes scientifically necessary, but that adds no information to
 the primary expert-alignment contrast and is outside the seed-0 critical path.
 
+## Seed-0 result
+
+The sealed v2 result is `transfer_not_established` under the conjunctive
+verdict above. The expert-alignment and candidate-matched architecture tests
+both passed decisively, but the registered gain-recovery denominator did not:
+F was worse than B at the component endpoint. G3 is therefore undefined, not
+zero. A also used 103.37% of F's measured marginal chip-seconds, so this kernel
+realization does not establish lower marginal training cost.
+
+| condition | component EV | routed EV | oracle-shared EV | dead rate | chip-seconds |
+|---|---:|---:|---:|---:|---:|
+| A | 0.187430 | -0.404303 | 0.483760 | 2.2308% | 22,818.1 |
+| R | -0.047151 | -0.523583 | 0.430604 | 0.0000% | 22,973.0 |
+| B | 0.155317 | -0.491658 | 0.449652 | 0.0000% | 22,013.9 |
+| F | 0.134082 | -0.484048 | 0.425905 | 0.0000% | 22,074.8 |
+
+The paired component effects were:
+
+| contrast | effect | paired 95% interval |
+|---|---:|---:|
+| A minus R | 0.234581 | [0.229390, 0.239810] |
+| A minus B | 0.032113 | [0.031058, 0.033294] |
+| A minus F | 0.053348 | [0.052149, 0.054632] |
+| F minus B | -0.021235 | [-0.021764, -0.020686] |
+
+Thus stable expert identity transfers strongly from reconstruction to
+source-only prediction: A beats the randomized-ID control, the
+candidate-matched router-rank control, and the parameter-matched full-width
+control on held-out data. At this fixed 2M-token budget, structured
+factorization also beats raw width. This is a positive mechanism and
+sample-efficiency result, but not the preregistered cost-efficiency headline.
+It is a single-seed mechanism pilot, not a multi-seed confirmation.
+
+All conditions processed exactly 2M training tokens and 250,000 paired
+held-out tokens, used exact total L0 16, remained finite, and had no capacity
+overflow or token drops. A fired 97.77% of features and supported all 128
+experts. The measured-cost result also exposes the implementation gap:
+grouped A was 3.37% slower in chip-seconds than dense F despite exposing only
+6.25% of F's candidates.
+
+See [`results/experiment3/REPORT.md`](results/experiment3/REPORT.md) for the
+concise result and immutable evidence locations.
+
 ## Execution record
 
-To be completed only from sealed run evidence:
-
 ```text
-code commit:
+training commit:
+  e54e76b25ec53e3c6bdc7f54f8f695dc4dad5af4
+evaluator commit:
+  7125d850d0e825184c14d5355f74fafda9c85ad6
 routed-input training manifest:
+  8d947629e57d64d054a3086e2729090eed1e9f6afc4568b76e5c90da5f378e3c
 routed-input held-out manifest:
+  f68e2fe6e4cf568e694925697dd5d65fe10160a52d357c641892de85ee5c3da7
 parent training target manifest:
   a2f23aef6b9121e81a5bfea473c64039ca5bf6b073e4f70f4703938a1d8a6903
 parent held-out target manifest:
   31454e5ce8693521c41a2a95f2ef88d40c5d26c726a0efac5c26d882ed341f5e
 training namespace:
-evaluation result:
-evidence root:
+  experiment3/transcoder/pilot-e54e76b-softplus1
+evaluation namespace:
+  experiment3-v2-20260727T232836Z-7125d850d0e8
+scientific result SHA:
+  c33e83789af3120f42687f2d73a6300ce401138d5966a47068592a6109194074
+paired-score SHA:
+  c31129e9ab514bf68dffda8cbfec1298ad6fc3eee93d43802ac8869f8e5c0714
+common-SST receipt:
+  8baffabc9ddd4071426d577762c4293e67dd461edd12d15927d0d13958522536
+shared-harvest receipt:
+  b8b1e0d5c1acc65014663ebf5ea6db9e53c152731c8d7f504550978a4c054f11
+control-evidence archive SHA:
+  53b4e3eed4ef30f5a4321284332d06577134bb24c4700a11fabcdfb90a28f0fd
+operator-evidence archive SHA:
+  de3c19df4d9f1262c04621029afb49f1d10fdb62db4a27ad1ebf1815d2926517
 ```
