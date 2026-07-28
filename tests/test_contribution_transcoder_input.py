@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -31,6 +32,7 @@ from moe_sae.contribution_transcoder_input import (
 from moe_sae.contribution_training_worker import (
     TRANSCODER_PREFETCH_RECEIPT_SCHEMA_VERSION,
     ContributionTrainingWorkerError,
+    _require_transcoder_overlay_capture_contract,
     prefetch_transcoder_process_lane,
     validate_transcoder_prefetch_receipt,
 )
@@ -41,6 +43,26 @@ TRAIN_SOURCE_OVERLAY_SHA256 = (
 EVAL_SOURCE_OVERLAY_SHA256 = (
     "f68e2fe6e4cf568e694925697dd5d65fe10160a52d357c641892de85ee5c3da7"
 )
+
+
+def test_training_requires_horizon_overlay_capture_contract() -> None:
+    expected = "c" * 64
+    config = SimpleNamespace(
+        parents={"source_overlay_capture_contract_sha256": expected}
+    )
+    matching = SimpleNamespace(
+        manifest={"metadata": {"config_sha256": expected}}
+    )
+    _require_transcoder_overlay_capture_contract(config, matching)
+
+    mismatched = SimpleNamespace(
+        manifest={"metadata": {"config_sha256": "d" * 64}}
+    )
+    with pytest.raises(
+        ContributionTrainingWorkerError,
+        match="config-pinned capture contract",
+    ):
+        _require_transcoder_overlay_capture_contract(config, mismatched)
 
 
 def _target_batch(tokens: int) -> ContributionBatch:

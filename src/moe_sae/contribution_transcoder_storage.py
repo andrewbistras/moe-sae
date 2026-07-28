@@ -58,7 +58,6 @@ from moe_sae.object_store import (
     fingerprint_file,
     join_gcs_uri,
     object_identity_from_mapping,
-    sha256_file,
 )
 
 
@@ -787,6 +786,11 @@ class RoutedInputDataset:
         self.manifest = load_routed_input_manifest(
             self.root, target_manifest=self.target_manifest
         )
+        # See ContributionDataset: one full hash proof is retained only while
+        # the exact local inode/size/timestamps remain unchanged.
+        self._verified_local_objects: dict[
+            tuple[str, int], tuple[Path, tuple[int, int, int, int, int]]
+        ] = {}
 
     @property
     def total_tokens(self) -> int:
@@ -797,43 +801,9 @@ class RoutedInputDataset:
         return str(self.manifest["manifest_sha256"])
 
     def _load_entry(self, entry: Mapping[str, Any]) -> RoutedInputShard:
-        identity = object_identity_from_mapping(dict(entry["object"]))
-        expected_uri = join_gcs_uri(
-            self.object_prefix, *str(entry["path"]).split("/")
-        )
-        if identity.uri != expected_uri:
-            raise RoutedInputStorageError(
-                "overlay object URI is outside its bound object prefix"
-            )
-        path = self.cache.materialize(identity)
-        digest, size = sha256_file(path)
-        if digest != identity.sha256 or size != identity.size_bytes:
-            raise RoutedInputStorageError(
-                "materialized overlay failed SHA-256/size verification"
-            )
-        expected_metadata = _file_metadata(
-            metadata_sha256=self.manifest["metadata_sha256"],
-            host_id=entry["host_id"],
-            range_id=entry["range_id"],
-            target_range_id=entry["target_range_id"],
-            range_start=entry["range_start"],
-            range_end=entry["range_end"],
-            token_identity_sha256=entry["token_identity_sha256"],
-            target_manifest_sha256=entry["target_manifest_sha256"],
-        )
+        identity, path, expected_metadata = self._materialized_entry(entry)
         try:
-            with safe_open(path, framework="numpy") as handle:
-                if frozenset(handle.keys()) != _FILE_TENSORS:
-                    raise RoutedInputStorageError(
-                        "overlay safetensors contains missing or extra fields"
-                    )
-                if (handle.metadata() or {}) != expected_metadata:
-                    raise RoutedInputStorageError(
-                        "overlay safetensors metadata changed"
-                    )
             tensors = load_file(path)
-        except RoutedInputStorageError:
-            raise
         except Exception as error:
             raise RoutedInputStorageError(
                 f"cannot read overlay safetensors: {path}"
@@ -868,6 +838,106 @@ class RoutedInputDataset:
             statistics=entry["statistics"],
             batch=batch,
         )
+
+    @staticmethod
+    def _local_file_state(
+        path: Path,
+    ) -> tuple[int, int, int, int, int] | None:
+        try:
+            state = path.stat()
+        except FileNotFoundError:
+            return None
+        if not path.is_file() or path.is_symlink():
+            return None
+        return (
+            int(state.st_dev),
+            int(state.st_ino),
+            int(state.st_size),
+            int(state.st_mtime_ns),
+            int(state.st_ctime_ns),
+        )
+
+    def _materialized_entry(
+        self,
+        entry: Mapping[str, Any],
+    ) -> tuple[ObjectIdentity, Path, dict[str, str]]:
+        identity = object_identity_from_mapping(dict(entry["object"]))
+        expected_uri = join_gcs_uri(
+            self.object_prefix, *str(entry["path"]).split("/")
+        )
+        if identity.uri != expected_uri:
+            raise RoutedInputStorageError(
+                "overlay object URI is outside its bound object prefix"
+            )
+        key = (identity.uri, identity.generation)
+        cached = self._verified_local_objects.get(key)
+        path: Path
+        if cached is not None and self._local_file_state(cached[0]) == cached[1]:
+            path = cached[0]
+        else:
+            path = self.cache.materialize(identity)
+            state = self._local_file_state(path)
+            if state is None or state[2] != identity.size_bytes:
+                raise RoutedInputStorageError(
+                    "materialized overlay has an invalid local state"
+                )
+            self._verified_local_objects[key] = (path, state)
+        expected_metadata = _file_metadata(
+            metadata_sha256=self.manifest["metadata_sha256"],
+            host_id=entry["host_id"],
+            range_id=entry["range_id"],
+            target_range_id=entry["target_range_id"],
+            range_start=entry["range_start"],
+            range_end=entry["range_end"],
+            token_identity_sha256=entry["token_identity_sha256"],
+            target_manifest_sha256=entry["target_manifest_sha256"],
+        )
+        try:
+            with safe_open(path, framework="numpy") as handle:
+                if frozenset(handle.keys()) != _FILE_TENSORS:
+                    raise RoutedInputStorageError(
+                        "overlay safetensors contains missing or extra fields"
+                    )
+                if (handle.metadata() or {}) != expected_metadata:
+                    raise RoutedInputStorageError(
+                        "overlay safetensors metadata changed"
+                    )
+        except RoutedInputStorageError:
+            raise
+        except Exception as error:
+            raise RoutedInputStorageError(
+                f"cannot read overlay safetensors: {path}"
+            ) from error
+        return identity, path, expected_metadata
+
+    def _load_slice(
+        self,
+        entry: Mapping[str, Any],
+        *,
+        local_start: int,
+        local_end: int,
+    ) -> RoutedInputBatch:
+        _identity, path, _metadata = self._materialized_entry(entry)
+        tokens = int(entry["tokens"])
+        if not 0 <= local_start < local_end <= tokens:
+            raise RoutedInputRangeError(
+                "selective overlay shard slice is outside its sealed range"
+            )
+        try:
+            with safe_open(path, framework="numpy") as handle:
+                batch = RoutedInputBatch(
+                    **{
+                        name: np.asarray(
+                            handle.get_slice(name)[local_start:local_end]
+                        )
+                        for name in _PAYLOAD_FIELDS
+                    }
+                )
+        except Exception as error:
+            raise RoutedInputStorageError(
+                f"cannot selectively load overlay safetensors: {path}"
+            ) from error
+        return validate_routed_input_batch(batch)
 
     def iter_shards(self) -> Iterator[RoutedInputShard]:
         for entry in self.manifest["shards"]:
@@ -937,19 +1007,12 @@ class RoutedInputDataset:
         for entry in self._entries_for_range(start, end):
             overlap_start = max(start, int(entry["range_start"]))
             overlap_end = min(end, int(entry["range_end"]))
-            shard = self._load_entry(entry)
-            local_start = overlap_start - shard.range_start
-            local_end = overlap_end - shard.range_start
-            selected = RoutedInputBatch(
-                routed_input=np.ascontiguousarray(
-                    shard.batch.routed_input[local_start:local_end]
-                ),
-                sequence_id=np.ascontiguousarray(
-                    shard.batch.sequence_id[local_start:local_end]
-                ),
-                position=np.ascontiguousarray(
-                    shard.batch.position[local_start:local_end]
-                ),
+            local_start = overlap_start - int(entry["range_start"])
+            local_end = overlap_end - int(entry["range_start"])
+            selected = self._load_slice(
+                entry,
+                local_start=local_start,
+                local_end=local_end,
             )
             yielded += selected.tokens
             yield selected

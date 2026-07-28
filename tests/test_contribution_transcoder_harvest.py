@@ -6,8 +6,17 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import yaml
 
 from moe_sae.contribution_artifacts import HIDDEN_SIZE
+from moe_sae.contribution_transcoder_capture_config import (
+    HORIZON_MAXIMUM_RUNTIME_SECONDS,
+    TranscoderOverlayCaptureConfigError,
+    finalize_transcoder_overlay_capture_config,
+    load_transcoder_overlay_capture_config,
+    overlay_capture_attention,
+    overlay_capture_runtime_cap_seconds,
+)
 from moe_sae.contribution_transcoder_harvest import (
     _routed_input_capture_chunks,
     routed_input_capture_to_wire,
@@ -16,6 +25,7 @@ from moe_sae.contribution_transcoder_harvest_worker import (
     RoutedInputHarvestWorkerError,
     _parent_dataset_token_target,
     _parser as worker_parser,
+    run_worker,
 )
 
 
@@ -83,6 +93,8 @@ def test_worker_cli_freezes_a_maximum_600_second_bound():
     required = [
         "--config",
         "/repo/config.yaml",
+        "--expected-config-sha256",
+        "f" * 64,
         "--split",
         "train",
         "--checkpoint",
@@ -138,6 +150,105 @@ def test_staged_dataset_target_comes_from_immutable_source_v1_parent():
         )
 
 
+def _target_bound_horizon_capture_config(tmp_path: Path) -> Path:
+    path = tmp_path / "transcoder-overlay-capture.yaml"
+    finalize_transcoder_overlay_capture_config(
+        "configs/gemma4_transcoder_horizon_v1.yaml",
+        path,
+        train_target_manifest_sha256="1" * 64,
+    )
+    return path
+
+
+def test_horizon_capture_contract_has_one_unresolved_external_artifact(
+    tmp_path: Path,
+):
+    path = _target_bound_horizon_capture_config(tmp_path)
+    config = load_transcoder_overlay_capture_config(path)
+
+    assert config.parents["train_target_manifest_sha256"] == "1" * 64
+    assert (
+        overlay_capture_runtime_cap_seconds(config, split="train")
+        == HORIZON_MAXIMUM_RUNTIME_SECONDS
+    )
+    assert overlay_capture_attention(config) == "autoselected"
+    assert (
+        finalize_transcoder_overlay_capture_config(
+            "configs/gemma4_transcoder_horizon_v1.yaml",
+            path,
+            train_target_manifest_sha256="1" * 64,
+        ).config_hash
+        == config.config_hash
+    )
+    with pytest.raises(
+        TranscoderOverlayCaptureConfigError,
+        match="reuses the sealed 250k eval overlay",
+    ):
+        overlay_capture_runtime_cap_seconds(config, split="eval")
+
+    with pytest.raises(
+        TranscoderOverlayCaptureConfigError,
+        match="different content",
+    ):
+        finalize_transcoder_overlay_capture_config(
+            "configs/gemma4_transcoder_horizon_v1.yaml",
+            path,
+            train_target_manifest_sha256="9" * 64,
+        )
+
+
+def test_horizon_capture_contract_rejects_unsealed_target_or_filled_output(
+    tmp_path: Path,
+):
+    with pytest.raises(
+        TranscoderOverlayCaptureConfigError,
+        match="requires its sealed target",
+    ):
+        load_transcoder_overlay_capture_config(
+            "configs/gemma4_transcoder_horizon_v1.yaml"
+        )
+
+    path = _target_bound_horizon_capture_config(tmp_path)
+    value = yaml.safe_load(path.read_text(encoding="utf-8"))
+    value["artifacts"]["train_source_overlay_manifest_sha256"] = "2" * 64
+    path.write_text(yaml.safe_dump(value, sort_keys=False), encoding="utf-8")
+    with pytest.raises(
+        TranscoderOverlayCaptureConfigError,
+        match="train source overlay SHA-256 pending",
+    ):
+        load_transcoder_overlay_capture_config(path)
+
+
+def test_horizon_capture_contract_rejects_a_prepopulated_self_receipt(
+    tmp_path: Path,
+):
+    path = _target_bound_horizon_capture_config(tmp_path)
+    value = yaml.safe_load(path.read_text(encoding="utf-8"))
+    value["artifacts"]["source_overlay_capture_contract_sha256"] = "3" * 64
+    path.write_text(yaml.safe_dump(value, sort_keys=False), encoding="utf-8")
+    with pytest.raises(
+        TranscoderOverlayCaptureConfigError,
+        match="self-identity receipt pending",
+    ):
+        load_transcoder_overlay_capture_config(path)
+
+
+def test_worker_rechecks_the_operator_pinned_capture_contract(tmp_path: Path):
+    path = _target_bound_horizon_capture_config(tmp_path)
+    with pytest.raises(
+        RoutedInputHarvestWorkerError,
+        match="operator-pinned SHA-256",
+    ):
+        run_worker(
+            SimpleNamespace(
+                config=str(path),
+                split="train",
+                maximum_runtime_seconds=3_600,
+                expected_config_sha256="0" * 64,
+            )
+        )
+
+
 def test_operator_builds_four_concurrent_worker_commands_with_external_timeout():
     module = _operator()
     args = SimpleNamespace(
@@ -171,6 +282,7 @@ def test_operator_builds_four_concurrent_worker_commands_with_external_timeout()
 
     assert all("timeout --signal=TERM --kill-after=30s 600s" in item for item in rendered)
     assert all("contribution_transcoder_harvest_worker" in item for item in rendered)
+    assert all("--expected-config-sha256" in item for item in rendered)
     assert [next(part for part in command if part.startswith("--worker=")) for command in commands] == [
         "--worker=0",
         "--worker=1",

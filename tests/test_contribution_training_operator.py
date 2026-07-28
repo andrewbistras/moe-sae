@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import replace
+import hashlib
 import importlib.util
 import json
 import os
@@ -27,10 +28,22 @@ from moe_sae.contribution_performance import (
 from moe_sae.contribution_recomposition import (
     SUPPORTED_ACCUMULATION_ORDER,
 )
+from moe_sae.object_store import ObjectIdentity
+from moe_sae.regional_execution import (
+    MirrorDataset,
+    build_accelerator_contract,
+    build_controller_observation,
+    build_local_cache_observation,
+    build_regional_mirror_specification,
+    seal_controller_mapping,
+    seal_local_cache_inventory,
+    seal_regional_mirror,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 OPERATOR_PATH = ROOT / "scripts" / "tpu" / "train_contribution.py"
 CONFIG_PATH = ROOT / "configs" / "gemma4_contribution_v1.yaml"
+HORIZON_TEMPLATE = ROOT / "configs" / "gemma4_contribution_horizon_v1.yaml"
 
 
 def _load(path: Path, name: str):
@@ -171,6 +184,120 @@ def _write_inputs(operator, root: Path) -> dict[str, Path]:
     }
 
 
+def _write_v6e_incarnation_evidence(
+    root: Path,
+    *,
+    tpu_name: str,
+    resource_create_time: str,
+    process_order: tuple[int, int, int, int],
+) -> tuple[Path, Path]:
+    contract = build_accelerator_contract(
+        run_id="phase2-A-seed0",
+        scientific_model="sae",
+        condition="A",
+        project="neural-dragnet",
+        tpu_name=tpu_name,
+        resource_create_time=resource_create_time,
+        region="us-east1",
+        zone="us-east1-d",
+    )
+    observations = [
+        build_controller_observation(
+            contract=contract,
+            probe_id=f"probe-{root.name}",
+            controller_index=controller,
+            process_index=process,
+            process_count=4,
+            global_device_count=16,
+            local_device_count=4,
+            platforms=("tpu",),
+            device_kinds=("TPU v6 lite",),
+            boot_id=(
+                f"{controller + 1:08x}-0000-0000-0000-"
+                f"{controller + 1:012d}"
+            ),
+            hostname=f"{root.name}-worker-{controller}",
+        )
+        for controller, process in enumerate(process_order)
+    ]
+    mapping = seal_controller_mapping(
+        contract=contract,
+        probe_id=f"probe-{root.name}",
+        observations=observations,
+    )
+    root.mkdir()
+    mapping_path = root / "controller-mapping.json"
+    mapping_path.write_text(json.dumps(mapping), encoding="utf-8")
+    cache_observations = [
+        build_local_cache_observation(
+            contract=contract,
+            controller_mapping=mapping,
+            controller_index=controller,
+            cache_root="/dev/shm/contribution-sae",
+            required_lane_bytes=147_000_000_000,
+            required_free_bytes=210_000_000_000,
+            available_bytes=300_000_000_000,
+            mem_available_bytes=600_000_000_000,
+            mount_target="/dev/shm",
+            mount_source="tmpfs",
+            filesystem_type="tmpfs",
+            mount_options=("rw", "nodev", "nosuid"),
+            boot_id=(
+                f"{controller + 5:08x}-0000-0000-0000-"
+                f"{controller + 5:012d}"
+            ),
+        )
+        for controller in range(4)
+    ]
+    inventory = seal_local_cache_inventory(
+        contract=contract,
+        controller_mapping=mapping,
+        observations=cache_observations,
+    )
+    inventory_path = root / "local-cache-inventory.json"
+    inventory_path.write_text(json.dumps(inventory), encoding="utf-8")
+    return mapping_path, inventory_path
+
+
+def _write_regional_mirror(root: Path) -> Path:
+    payload = b"immutable test capture"
+    source = ObjectIdentity(
+        uri="gs://origin-bucket/capture/shards/host-0/shard.safetensors",
+        generation=1,
+        size_bytes=len(payload),
+        crc32c="AAAAAA==",
+        sha256=hashlib.sha256(payload).hexdigest(),
+    )
+    dataset = MirrorDataset(
+        name="target",
+        manifest_sha256="a" * 64,
+        source_object_prefix="gs://origin-bucket/capture",
+        objects=(source,),
+    )
+    specification = build_regional_mirror_specification(
+        run_id="phase2-A-seed0",
+        region="us-east1",
+        mirror_prefix="gs://regional-bucket/phase2-A-seed0",
+        datasets=(dataset,),
+    )
+    destination_uri = specification["objects"][0]["mirror_uri"]
+    mirror = seal_regional_mirror(
+        specification,
+        {
+            destination_uri: ObjectIdentity(
+                uri=destination_uri,
+                generation=2,
+                size_bytes=source.size_bytes,
+                crc32c=source.crc32c,
+                sha256=source.sha256,
+            )
+        },
+    )
+    path = root / "regional-mirror.json"
+    path.write_text(json.dumps(mirror), encoding="utf-8")
+    return path
+
+
 def _settings(
     operator,
     tmp_path: Path,
@@ -207,6 +334,175 @@ def _settings(
         ),
         local_log_root=tmp_path / f"{action}-logs",
     )
+
+
+def test_internal_ip_transport_is_explicit_and_v6e_requires_it(
+    operator,
+    tmp_path: Path,
+) -> None:
+    settings = _settings(operator, tmp_path)
+    external = operator._gcloud(settings, worker=0, remote_command="true")
+    internal = operator._gcloud(
+        replace(settings, internal_ip=True),
+        worker=0,
+        remote_command="true",
+    )
+    assert "--internal-ip" not in external
+    assert "--internal-ip" in internal
+    with pytest.raises(operator.OperatorError, match="TPU_USE_INTERNAL_IP=1"):
+        operator._internal_ip_mode({}, accelerator_type="v6e-16")
+    assert (
+        operator._internal_ip_mode(
+            {"TPU_USE_INTERNAL_IP": "1"},
+            accelerator_type="v6e-16",
+        )
+        is True
+    )
+
+
+def test_horizon_v6e_prefetch_has_bounded_30_minute_window(
+    operator,
+    tmp_path: Path,
+) -> None:
+    finalized = tmp_path / "arbitrarily-renamed-finalized-config.yaml"
+    finalized.write_text(
+        HORIZON_TEMPLATE.read_text(encoding="utf-8").replace(
+            "PENDING_SEALED_10M_TARGET_MANIFEST",
+            "a" * 64,
+        ),
+        encoding="utf-8",
+    )
+    settings = replace(
+        _settings(operator, tmp_path),
+        accelerator_type="v6e-16",
+        selected_config_path=str(finalized),
+    )
+    assert settings.prefetch_hard_deadline_seconds == 1_800
+    command = operator._prefetch_command(
+        settings,
+        controller_index=0,
+        process_index=2,
+    )
+    joined = " ".join(command)
+    assert "--accelerator-type v6e-16" in joined
+    assert "--maximum-runtime-seconds 1800" in joined
+
+    historical = replace(
+        settings,
+        selected_config_path=str(CONFIG_PATH),
+    )
+    assert historical.prefetch_hard_deadline_seconds == 600
+
+
+def test_horizon_v6e_direct_segment_uses_no_qualification_receipt(
+    operator,
+    tmp_path: Path,
+) -> None:
+    sidecar_path = tmp_path / "sidecar.json"
+    sidecar_path.write_text(json.dumps(_sidecar()), encoding="utf-8")
+    contract = build_accelerator_contract(
+        run_id="experiment4",
+        scientific_model="sae",
+        condition="F",
+        project="neural-dragnet",
+        tpu_name="experiment4-sae-f",
+        resource_create_time="2026-07-28T10:11:12.123Z",
+        region="europe-west4",
+        zone="europe-west4-a",
+    )
+    observations = [
+        build_controller_observation(
+            contract=contract,
+            probe_id="probe-direct",
+            controller_index=index,
+            process_index=index,
+            process_count=4,
+            global_device_count=16,
+            local_device_count=4,
+            platforms=("tpu",),
+            device_kinds=("TPU v6 lite",),
+            boot_id=f"00000000-0000-0000-0000-{index + 1:012d}",
+            hostname=f"worker-{index}",
+        )
+        for index in range(4)
+    ]
+    mapping_path = tmp_path / "mapping.json"
+    mapping_path.write_text(
+        json.dumps(
+            seal_controller_mapping(
+                contract=contract,
+                probe_id="probe-direct",
+                observations=observations,
+            )
+        ),
+        encoding="utf-8",
+    )
+    lineage = operator._fresh_direct_lineage(
+        sidecar_path,
+        fresh_controller_mapping_path=mapping_path,
+        expected_tpu_name="experiment4-sae-f",
+        expected_tpu_zone="europe-west4-a",
+    )
+    assert lineage["qualification_bundle_sha256"] is None
+    assert lineage["qualification_receipt_sha256"] is None
+    assert lineage["admission_evidence_policy"].endswith(
+        "no-qualification"
+    )
+
+    finalized = tmp_path / "finalized-horizon.yaml"
+    finalized.write_text(
+        HORIZON_TEMPLATE.read_text(encoding="utf-8").replace(
+            "PENDING_SEALED_10M_TARGET_MANIFEST",
+            "a" * 64,
+        ),
+        encoding="utf-8",
+    )
+    settings = replace(
+        _settings(
+            operator,
+            tmp_path,
+            action="train",
+            maximum_runtime_seconds=3_600,
+        ),
+        tpu_name="experiment4-sae-f",
+        tpu_zone="europe-west4-a",
+        accelerator_type="v6e-16",
+        selected_config_path=str(finalized),
+        qualification_bundle=None,
+        fresh_controller_mapping=str(mapping_path),
+        regional_mirror_seal="/regional/control/mirror-seal.json",
+        local_cache_inventory="/regional/control/cache-inventory.json",
+        internal_ip=True,
+    )
+    command = operator._init_command(settings)
+    remote = next(
+        item for item in command if item.startswith("--command=")
+    )
+    assert "--qualification-bundle" not in remote
+    assert settings.prefetch_hard_deadline_seconds == 1_800
+
+
+def test_v6e_action_child_receives_exact_accelerator_type(
+    operator,
+    tmp_path: Path,
+) -> None:
+    settings = replace(
+        _settings(
+            operator,
+            tmp_path,
+            action="train",
+            maximum_runtime_seconds=3_600,
+        ),
+        accelerator_type="v6e-16",
+        internal_ip=True,
+    )
+    command = operator._action_command(
+        settings,
+        controller_index=0,
+        process_index=2,
+    )
+    joined = " ".join(command)
+    assert "--accelerator-type v6e-16" in joined
 
 
 def _init_args(
@@ -308,6 +604,10 @@ def test_attempt_contract_is_create_only_and_train_requires_qualification(
         "controller_index": 0,
         "process_index": 2,
     }
+    assert plan["config"] == str(CONFIG_PATH)
+    assert plan["config_file_sha256"] == hashlib.sha256(
+        CONFIG_PATH.read_bytes()
+    ).hexdigest()
     assert plan["prefetch_hard_deadline_seconds"] == 600
     with pytest.raises(operator.OperatorError, match="already exists"):
         operator.initialize_attempt(qualify_args)
@@ -359,6 +659,153 @@ def test_bounded_train_creates_direct_resident_contract_without_selection(
         (run_root / "run-contract.json").read_text(encoding="utf-8")
     )
     assert contract["admission_mode"] == operator.DIRECT_BOUNDED_ADMISSION
+
+
+def test_v6e_replacement_slice_reuses_one_scientific_run_contract(
+    operator,
+    tmp_path: Path,
+) -> None:
+    inputs = _write_inputs(operator, tmp_path)
+    finalized = tmp_path / "finalized-horizon.yaml"
+    finalized.write_text(
+        HORIZON_TEMPLATE.read_text(encoding="utf-8").replace(
+            "PENDING_SEALED_10M_TARGET_MANIFEST",
+            "a" * 64,
+        ),
+        encoding="utf-8",
+    )
+    mirror_path = _write_regional_mirror(tmp_path)
+    first_mapping, first_inventory = _write_v6e_incarnation_evidence(
+        tmp_path / "slice-one",
+        tpu_name="horizon-sae-a-first",
+        resource_create_time="2026-07-28T10:11:12.123Z",
+        process_order=(2, 0, 3, 1),
+    )
+    second_mapping, second_inventory = _write_v6e_incarnation_evidence(
+        tmp_path / "slice-two",
+        tpu_name="horizon-sae-a-replacement",
+        resource_create_time="2026-07-28T12:34:56.789Z",
+        process_order=(1, 3, 0, 2),
+    )
+
+    def replacement_args(
+        *,
+        attempt_id: str,
+        tpu_name: str,
+        mapping_path: Path,
+        inventory_path: Path,
+    ) -> argparse.Namespace:
+        args = _init_args(
+            operator,
+            tmp_path,
+            inputs,
+            action="train",
+            attempt_id=attempt_id,
+            maximum_runtime_seconds=3_600,
+        )
+        args.accelerator_type = "v6e-16"
+        args.tpu_name = tpu_name
+        args.tpu_zone = "us-east1-d"
+        args.config = str(finalized)
+        args.phase = "learning_horizon_10m"
+        args.cache_max_bytes = 160 * 1024**3
+        args.fresh_controller_mapping = str(mapping_path)
+        args.regional_mirror_seal = str(mirror_path)
+        args.local_cache_inventory = str(inventory_path)
+        return args
+
+    first_args = replacement_args(
+        attempt_id="segment001",
+        tpu_name="horizon-sae-a-first",
+        mapping_path=first_mapping,
+        inventory_path=first_inventory,
+    )
+    first_plan = operator.initialize_attempt(first_args)
+    contract_path = Path(first_args.run_root) / "run-contract.json"
+    first_contract = json.loads(contract_path.read_text(encoding="utf-8"))
+
+    second_args = replacement_args(
+        attempt_id="segment002",
+        tpu_name="horizon-sae-a-replacement",
+        mapping_path=second_mapping,
+        inventory_path=second_inventory,
+    )
+    second_plan = operator.initialize_attempt(second_args)
+    second_contract = json.loads(contract_path.read_text(encoding="utf-8"))
+
+    assert second_contract == first_contract
+    assert (
+        second_plan["run_contract_sha256"]
+        == first_plan["run_contract_sha256"]
+        == first_contract["run_contract_sha256"]
+    )
+    assert {
+        "controller_to_jax_process_index",
+        "fresh_controller_mapping_sha256",
+        "fresh_controller_contract_sha256",
+        "regional_mirror_sha256",
+        "local_cache_inventory_sha256",
+        "config",
+        "capture_control_root",
+        "recomposition_sidecar",
+        "qualification_bundle",
+        "cache_root",
+        "cache_max_bytes",
+    }.isdisjoint(first_contract)
+    assert first_contract["run_contract_scope"].startswith(
+        "stable-across-spot-slice-incarnations"
+    )
+
+    first_attestation = first_plan["operational_evidence"]
+    second_attestation = second_plan["operational_evidence"]
+    assert (
+        first_attestation["execution_attestation_sha256"]
+        != second_attestation["execution_attestation_sha256"]
+    )
+    for plan, attestation in (
+        (first_plan, first_attestation),
+        (second_plan, second_attestation),
+    ):
+        unsigned = dict(attestation)
+        claimed = unsigned.pop("execution_attestation_sha256")
+        assert claimed == canonical_sha256(unsigned)
+        assert (
+            attestation["controller_to_jax_process_index"]
+            == plan["controller_to_jax_process_index"]
+        )
+
+    for args, plan in (
+        (first_args, first_plan),
+        (second_args, second_plan),
+    ):
+        settings = replace(
+            _settings(
+                operator,
+                tmp_path,
+                action="train",
+                maximum_runtime_seconds=3_600,
+            ),
+            tpu_name=args.tpu_name,
+            tpu_zone=args.tpu_zone,
+            accelerator_type="v6e-16",
+            selected_config_path=str(finalized),
+            phase=args.phase,
+            sae_control_root=args.sae_control_root,
+            capture_control_root=args.capture_control_root,
+            recomposition_sidecar=args.recomposition_sidecar,
+            qualification_bundle=None,
+            cache_root=args.cache_root,
+            cache_max_bytes=args.cache_max_bytes,
+            checkpoint_payload_root=args.checkpoint_payload_root,
+            attempt_id=args.attempt_id,
+            regional_mirror_seal=args.regional_mirror_seal,
+            fresh_controller_mapping=args.fresh_controller_mapping,
+            local_cache_inventory=args.local_cache_inventory,
+            internal_ip=True,
+        )
+        validated, mapping = operator._validate_attempt_plan(plan, settings)
+        assert validated == plan
+        assert mapping == operator._controller_mapping(plan)
 
 
 def test_transcoder_operator_binds_and_forwards_source_overlay(
@@ -537,6 +984,67 @@ def test_qualification_runtime_is_exactly_600(operator, tmp_path: Path) -> None:
         operator._settings(environment, args)
 
 
+def test_public_config_override_is_absolute_and_forwarded(
+    operator,
+    tmp_path: Path,
+) -> None:
+    historical = _settings(operator, tmp_path)
+    environment = {
+        "GCP_PROJECT": historical.gcp_project,
+        "TPU_NAME": historical.tpu_name,
+        "TPU_ZONE": historical.tpu_zone,
+        "PROJECT_COMMIT": historical.project_commit,
+        "TPU_PROJECT_ROOT": historical.project_root,
+        "REMOTE_UV": historical.remote_uv,
+        "CONTRIBUTION_TRAIN_CAPTURE_ROOT": historical.capture_control_root,
+        "CONTRIBUTION_OBJECT_PREFIX": historical.object_prefix,
+        "CONTRIBUTION_RECOMPOSITION_SIDECAR": historical.recomposition_sidecar,
+        "CONTRIBUTION_QUALIFICATION_BUNDLE": historical.qualification_bundle,
+        "CONTRIBUTION_SAE_CACHE_ROOT": historical.cache_root,
+        "CONTRIBUTION_SAE_CACHE_MAX_BYTES": str(historical.cache_max_bytes),
+        "CONTRIBUTION_SAE_CONTROL_ROOT": historical.sae_control_root,
+        "CONTRIBUTION_SAE_CHECKPOINT_ROOT": historical.checkpoint_payload_root,
+    }
+    arguments = [
+        "--action",
+        "qualify",
+        "--config",
+        "/nfs/contracts/finalized-contribution-horizon.yaml",
+        "--phase",
+        historical.phase,
+        "--condition",
+        historical.condition,
+        "--seed",
+        "0",
+        "--run-id",
+        historical.run_id,
+        "--attempt-id",
+        historical.attempt_id,
+        "--maximum-runtime-seconds",
+        "600",
+    ]
+    selected = operator._settings(
+        environment,
+        operator._public_parser().parse_args(arguments),
+    )
+    assert (
+        selected.config_path
+        == "/nfs/contracts/finalized-contribution-horizon.yaml"
+    )
+    assert selected.config_path in " ".join(operator._init_command(selected))
+    with pytest.raises(operator.OperatorError, match="absolute POSIX path"):
+        operator._settings(
+            environment,
+            operator._public_parser().parse_args(
+                [
+                    *arguments[:3],
+                    "relative/config.yaml",
+                    *arguments[4:],
+                ]
+            ),
+        )
+
+
 def test_dry_run_is_read_only_and_declares_the_four_mapped_stages(
     operator,
     tmp_path: Path,
@@ -545,6 +1053,9 @@ def test_dry_run_is_read_only_and_declares_the_four_mapped_stages(
     settings = _settings(operator, tmp_path)
     assert operator._dry_run(settings) == 0
     payload = json.loads(capsys.readouterr().out)
+    assert payload["config"].endswith(
+        "configs/gemma4_contribution_v1.yaml"
+    )
     assert payload["qualification_hard_deadline_seconds"] == 600
     assert payload["prefetch_hard_deadline_seconds"] == 600
     assert len(payload["fanout_controllers"]) == 4
@@ -570,6 +1081,8 @@ def test_prefetch_failure_never_launches_accelerator_action(
         "attempt_root": settings.attempt_root,
         "run_root": settings.run_root,
         "run_contract_sha256": "a" * 64,
+        "config": settings.config_path,
+        "config_file_sha256": "b" * 64,
         "admission_mode": operator.QUALIFIED_ADMISSION,
         "controller_to_jax_process_index": [
             {"controller_index": 0, "process_index": 2},
@@ -777,6 +1290,8 @@ def test_run_uses_exact_remote_status_after_transport_teardown(
         "attempt_root": settings.attempt_root,
         "run_root": settings.run_root,
         "run_contract_sha256": "a" * 64,
+        "config": settings.config_path,
+        "config_file_sha256": "b" * 64,
         "admission_mode": operator.DIRECT_BOUNDED_ADMISSION,
         "controller_to_jax_process_index": [
             {"controller_index": controller, "process_index": process}

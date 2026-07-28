@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
@@ -11,14 +12,22 @@ import shlex
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from typing import Sequence
 
 PROCESS_COUNT = 4
+V4_32_PEAK_FLOPS_PER_SECOND = 4_400_000_000_000_000
+V6E_16_PEAK_FLOPS_PER_SECOND = 14_688_000_000_000_000
+V6E_PROCESS_CACHE_MAX_BYTES = 160 * 1024**3
 _SHA = re.compile(r"^[0-9a-f]{40}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 RESULT_SCHEMA_VERSION = "gemma4-contribution-phase2-scientific-result-v2"
+LEARNING_HORIZON_RESULT_SCHEMA_VERSION = (
+    "gemma4-contribution-learning-horizon-curve-point-v1"
+)
+LEARNING_HORIZON_PROTOCOL_ID = "gemma4-pilot-learning-horizon-v1-20260728"
 
 
 class OperatorError(RuntimeError):
@@ -53,6 +62,15 @@ class Settings:
     result_root: str
     log_root: Path
     ssh_key: str | None
+    accelerator_type: str = "v4-32"
+    peak_flops_per_second: int = V4_32_PEAK_FLOPS_PER_SECOND
+    regional_mirror_seal: str | None = None
+    internal_ip: bool = False
+    config_path: str | None = None
+    phase: str = "phase2_mechanism_pilot"
+    seed: int = 0
+    checkpoint_tokens: int | None = None
+    run_roots: dict[str, str] | None = None
 
     @classmethod
     def from_environment(cls) -> Settings:
@@ -65,6 +83,30 @@ class Settings:
         artifact_root = _required("ARTIFACT_ROOT")
         bulk_root = _required("BULK_GCS_ROOT").rstrip("/")
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        accelerator_type = os.environ.get("TPU_ACCELERATOR_TYPE", "v4-32")
+        if accelerator_type not in {"v4-32", "v6e-16"}:
+            raise OperatorError("TPU_ACCELERATOR_TYPE is unsupported")
+        mapping_receipt = (
+            _required("CONTRIBUTION_FRESH_CONTROLLER_MAPPING")
+            if accelerator_type == "v6e-16"
+            else _required("CONTRIBUTION_QUALIFICATION_BUNDLE")
+        )
+        regional_mirror = os.environ.get("CONTRIBUTION_REGIONAL_MIRROR_SEAL")
+        if accelerator_type == "v6e-16" and not regional_mirror:
+            raise OperatorError("v6e-16 evaluation requires a regional mirror seal")
+        if (
+            accelerator_type == "v6e-16"
+            and cache_bytes != V6E_PROCESS_CACHE_MAX_BYTES
+        ):
+            raise OperatorError("v6e-16 cache bound is fixed at 160GiB")
+        internal_ip_raw = os.environ.get("TPU_USE_INTERNAL_IP", "0")
+        if internal_ip_raw not in {"0", "1"}:
+            raise OperatorError("TPU_USE_INTERNAL_IP must be exactly 0 or 1")
+        internal_ip = internal_ip_raw == "1"
+        if accelerator_type == "v6e-16" and not internal_ip:
+            raise OperatorError(
+                "v6e-16 evaluation requires explicit TPU_USE_INTERNAL_IP=1"
+            )
         return cls(
             project=_required("GCP_PROJECT"),
             tpu=_required("TPU_NAME"),
@@ -72,7 +114,7 @@ class Settings:
             commit=commit,
             root=_required("TPU_PROJECT_ROOT"),
             uv=_required("REMOTE_UV"),
-            bundle=_required("CONTRIBUTION_QUALIFICATION_BUNDLE"),
+            bundle=mapping_receipt,
             sidecar=_required("CONTRIBUTION_RECOMPOSITION_SIDECAR"),
             train_capture=_required("CONTRIBUTION_TRAIN_CAPTURE_ROOT"),
             eval_capture=os.environ.get(
@@ -105,12 +147,35 @@ class Settings:
                 )
             ),
             ssh_key=os.environ.get("CONTRIBUTION_SSH_KEY_FILE") or None,
+            accelerator_type=accelerator_type,
+            peak_flops_per_second=(
+                V6E_16_PEAK_FLOPS_PER_SECOND
+                if accelerator_type == "v6e-16"
+                else V4_32_PEAK_FLOPS_PER_SECOND
+            ),
+            regional_mirror_seal=regional_mirror or None,
+            internal_ip=internal_ip,
         )
 
 
-def _mapping(bundle_path: str) -> dict[int, int]:
+def _mapping(bundle_path: str, *, accelerator_type: str = "v4-32") -> dict[int, int]:
     try:
         bundle = json.loads(Path(bundle_path).read_text(encoding="ascii"))
+        if accelerator_type == "v6e-16":
+            from moe_sae.regional_execution import (
+                validate_controller_mapping_receipt,
+            )
+
+            bundle = validate_controller_mapping_receipt(bundle)
+            if (
+                bundle["accelerator_type"] != "v6e-16"
+                or bundle["process_count"] != PROCESS_COUNT
+                or bundle["global_device_count"] != 16
+                or bundle["local_device_count"] != 4
+            ):
+                raise OperatorError(
+                    "fresh v6e controller mapping topology changed"
+                )
         rows = bundle["controller_to_jax_process_index"]
         result = {
             int(row["controller_index"]): int(row["process_index"])
@@ -125,7 +190,7 @@ def _mapping(bundle_path: str) -> dict[int, int]:
     return result
 
 
-def _command(settings: Settings, controller: int, process: int) -> list[str]:
+def _worker(settings: Settings, process: int) -> list[str]:
     worker = [
         settings.uv,
         "run",
@@ -136,11 +201,18 @@ def _command(settings: Settings, controller: int, process: int) -> list[str]:
         "-m",
         "moe_sae.contribution_evaluation_worker",
         "--config",
-        f"{settings.root}/configs/gemma4_contribution_v1.yaml",
+        (
+            settings.config_path
+            or f"{settings.root}/configs/gemma4_contribution_v1.yaml"
+        ),
+        "--accelerator-type",
+        settings.accelerator_type,
+        "--peak-flops-per-second",
+        str(settings.peak_flops_per_second),
         "--phase",
-        "phase2_mechanism_pilot",
+        settings.phase,
         "--seed",
-        "0",
+        str(settings.seed),
         "--train-capture-root",
         settings.train_capture,
         "--eval-capture-root",
@@ -164,6 +236,21 @@ def _command(settings: Settings, controller: int, process: int) -> list[str]:
         "--process-index",
         str(process),
     ]
+    if settings.checkpoint_tokens is not None:
+        worker.extend(
+            ("--checkpoint-tokens", str(settings.checkpoint_tokens))
+        )
+    for condition, run_root in (settings.run_roots or {}).items():
+        worker.extend((f"--run-root-{condition.lower()}", run_root))
+    if settings.regional_mirror_seal is not None:
+        worker.extend(
+            ("--regional-mirror-seal", settings.regional_mirror_seal)
+        )
+    return worker
+
+
+def _command(settings: Settings, controller: int, process: int) -> list[str]:
+    worker = _worker(settings, process)
     body = "\n".join(
         (
             "set -euo pipefail",
@@ -206,6 +293,8 @@ def _command(settings: Settings, controller: int, process: int) -> list[str]:
     ]
     if settings.ssh_key:
         command.insert(-2, f"--ssh-key-file={settings.ssh_key}")
+    if settings.internal_ip:
+        command.insert(-2, "--internal-ip")
     return command
 
 
@@ -294,8 +383,13 @@ def _validate_scientific_result(path: Path) -> dict[str, object]:
         raise OperatorError("scientific result must be a JSON object")
     body = dict(value)
     claimed = body.pop("result_sha256", None)
+    schema = body.get("schema_version")
+    schema_is_valid = schema == RESULT_SCHEMA_VERSION or (
+        schema == LEARNING_HORIZON_RESULT_SCHEMA_VERSION
+        and body.get("protocol_id") == LEARNING_HORIZON_PROTOCOL_ID
+    )
     if (
-        body.get("schema_version") != RESULT_SCHEMA_VERSION
+        not schema_is_valid
         or not isinstance(claimed, str)
         or _SHA256.fullmatch(claimed) is None
         or _canonical_sha256(body) != claimed
@@ -304,9 +398,104 @@ def _validate_scientific_result(path: Path) -> dict[str, object]:
     return value
 
 
-def main() -> int:
-    settings = Settings.from_environment()
-    mapping = _mapping(settings.bundle)
+def _absolute_remote_path(name: str, value: str) -> str:
+    path = PurePosixPath(value)
+    if not path.is_absolute() or ".." in path.parts or value == "/":
+        raise OperatorError(f"{name} must be a non-root absolute POSIX path")
+    return str(path)
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--config",
+        help=(
+            "absolute finalized config path on every TPU VM; defaults to "
+            "configs/gemma4_contribution_v1.yaml"
+        ),
+    )
+    parser.add_argument("--phase", default="phase2_mechanism_pilot")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--checkpoint-tokens", type=int)
+    parser.add_argument("--result-root")
+    for condition in ("A", "R", "B", "F", "Q"):
+        parser.add_argument(f"--run-root-{condition.lower()}")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the evaluator worker contract without invoking gcloud",
+    )
+    return parser
+
+
+def _apply_public_arguments(
+    settings: Settings,
+    args: argparse.Namespace,
+) -> Settings:
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", args.phase) is None:
+        raise OperatorError("--phase is invalid")
+    if args.seed < 0:
+        raise OperatorError("--seed must be nonnegative")
+    if args.checkpoint_tokens is not None and args.checkpoint_tokens <= 0:
+        raise OperatorError("--checkpoint-tokens must be positive")
+    run_roots = dict(settings.run_roots or {})
+    for condition in ("A", "R", "B", "F", "Q"):
+        selected = getattr(args, f"run_root_{condition.lower()}")
+        if selected is not None:
+            run_roots[condition] = _absolute_remote_path(
+                f"--run-root-{condition.lower()}",
+                selected,
+            )
+    return replace(
+        settings,
+        config_path=(
+            _absolute_remote_path("--config", args.config)
+            if args.config is not None
+            else settings.config_path
+        ),
+        phase=args.phase,
+        seed=args.seed,
+        checkpoint_tokens=args.checkpoint_tokens,
+        run_roots=run_roots or None,
+        result_root=(
+            _absolute_remote_path("--result-root", args.result_root)
+            if args.result_root is not None
+            else settings.result_root
+        ),
+    )
+
+
+def main(argv: Sequence[str] = ()) -> int:
+    args = _parser().parse_args(argv)
+    settings = _apply_public_arguments(Settings.from_environment(), args)
+    if args.dry_run:
+        print(
+            json.dumps(
+                {
+                    "checkpoint_tokens": settings.checkpoint_tokens,
+                    "config": (
+                        settings.config_path
+                        or (
+                            f"{settings.root}/configs/"
+                            "gemma4_contribution_v1.yaml"
+                        )
+                    ),
+                    "phase": settings.phase,
+                    "result_root": settings.result_root,
+                    "run_roots": settings.run_roots,
+                    "seed": settings.seed,
+                    "worker_process_zero": _worker(settings, 0),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+    mapping = (
+        _mapping(settings.bundle, accelerator_type="v6e-16")
+        if settings.accelerator_type == "v6e-16"
+        else _mapping(settings.bundle)
+    )
     settings.log_root.mkdir(parents=True, exist_ok=False, mode=0o700)
     logs = {
         controller: settings.log_root
@@ -350,7 +539,7 @@ def main() -> int:
 
 if __name__ == "__main__":
     try:
-        raise SystemExit(main())
+        raise SystemExit(main(sys.argv[1:]))
     except Exception as error:
         print(f"EXPERIMENT-2 EVALUATION OPERATOR FAILED: {error}", file=sys.stderr)
         raise SystemExit(1) from error

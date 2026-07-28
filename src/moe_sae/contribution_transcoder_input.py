@@ -119,6 +119,32 @@ def _total_tokens(dataset: Any, *, role: str) -> int:
     return value
 
 
+def require_overlay_capture_contract(
+    source_dataset: Any,
+    expected_config_sha256: str | None,
+) -> None:
+    """Bind a horizon overlay to the exact target-bound capture contract."""
+
+    if expected_config_sha256 is None:
+        return
+    if (
+        not isinstance(expected_config_sha256, str)
+        or _SHA256_RE.fullmatch(expected_config_sha256) is None
+    ):
+        raise ContributionTranscoderInputError(
+            "expected overlay capture contract is not a SHA-256"
+        )
+    metadata = _manifest(source_dataset, role="source").get("metadata")
+    if (
+        not isinstance(metadata, Mapping)
+        or metadata.get("config_sha256") != expected_config_sha256
+    ):
+        raise ContributionTranscoderInputError(
+            "routed-input overlay was not produced by the config-pinned "
+            "capture contract"
+        )
+
+
 def _validate_pair_identity(
     source_dataset: Any,
     target_dataset: Any,
@@ -339,7 +365,23 @@ class ContributionTranscoderProcessInput:
     def iter_updates(
         self,
     ) -> Iterator[tuple[ContributionTranscoderHostMicrobatch, ...]]:
-        for update in range(self.planned_updates):
+        yield from self.iter_updates_from(0)
+
+    def iter_updates_from(
+        self,
+        start_update: int,
+    ) -> Iterator[tuple[ContributionTranscoderHostMicrobatch, ...]]:
+        """Seek directly to an exact paired-input optimizer boundary."""
+
+        if (
+            isinstance(start_update, bool)
+            or not isinstance(start_update, int)
+            or not 0 <= start_update <= self.planned_updates
+        ):
+            raise ContributionTranscoderInputError(
+                "start_update must lie in the fixed update plan"
+            )
+        for update in range(start_update, self.planned_updates):
             start = update * self.microbatches_per_update
             yield tuple(
                 self._microbatch(index)
@@ -414,5 +456,6 @@ __all__ = [
     "PROCESS_PARTITION_STRATEGY",
     "SOURCE_SCHEMA_VERSION",
     "TRANSCODER_INPUT_SCHEMA_VERSION",
+    "require_overlay_capture_contract",
     "routed_input_mean",
 ]

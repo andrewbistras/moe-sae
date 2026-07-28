@@ -26,8 +26,12 @@ from moe_sae.contribution_artifacts import canonical_json_bytes, canonical_sha25
 from moe_sae.contribution_maxtext import build_contribution_maxtext_argv
 from moe_sae.contribution_storage import load_contribution_manifest
 from moe_sae.contribution_transcoder_artifacts import RoutedInputMetadata
-from moe_sae.contribution_transcoder_config import (
-    load_contribution_transcoder_config,
+from moe_sae.contribution_transcoder_capture_config import (
+    TRANSCODER_V2_MAXIMUM_RUNTIME_SECONDS,
+    TranscoderOverlayCaptureConfigError,
+    load_transcoder_overlay_capture_config,
+    overlay_capture_attention,
+    overlay_capture_runtime_cap_seconds,
 )
 from moe_sae.contribution_transcoder_harvest import (
     _process_target_entries,
@@ -62,7 +66,7 @@ from moe_sae.runtime import (
 )
 
 
-MAXIMUM_RUNTIME_SECONDS = 600
+MAXIMUM_RUNTIME_SECONDS = TRANSCODER_V2_MAXIMUM_RUNTIME_SECONDS
 
 
 class RoutedInputHarvestWorkerError(RuntimeError):
@@ -195,6 +199,7 @@ def _parser() -> argparse.ArgumentParser:
         prog="python -m moe_sae.contribution_transcoder_harvest_worker"
     )
     parser.add_argument("--config", required=True)
+    parser.add_argument("--expected-config-sha256", required=True)
     parser.add_argument("--split", choices=("train", "eval"), required=True)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--checkpoint-sha256", required=True)
@@ -225,11 +230,23 @@ def _parser() -> argparse.ArgumentParser:
 
 def run_worker(arguments: argparse.Namespace) -> dict[str, Any]:
     started = time.perf_counter()
-    if not 0 < arguments.maximum_runtime_seconds <= MAXIMUM_RUNTIME_SECONDS:
-        raise RoutedInputHarvestWorkerError(
-            "source harvest runtime must lie in [1,600] seconds"
+    try:
+        config = load_transcoder_overlay_capture_config(arguments.config)
+        maximum_runtime_seconds = overlay_capture_runtime_cap_seconds(
+            config,
+            split=arguments.split,
         )
-    config = load_contribution_transcoder_config(arguments.config)
+    except TranscoderOverlayCaptureConfigError as error:
+        raise RoutedInputHarvestWorkerError(str(error)) from error
+    if config.config_hash != arguments.expected_config_sha256:
+        raise RoutedInputHarvestWorkerError(
+            "overlay capture config differs from the operator-pinned SHA-256"
+        )
+    if not 0 < arguments.maximum_runtime_seconds <= maximum_runtime_seconds:
+        raise RoutedInputHarvestWorkerError(
+            "source harvest runtime must lie in "
+            f"[1,{maximum_runtime_seconds}] seconds for the selected protocol"
+        )
     target = load_contribution_manifest(arguments.target_control_root)
     expected_parent = config.parents[
         f"{arguments.split}_target_manifest_sha256"
@@ -336,7 +353,7 @@ def run_worker(arguments: argparse.Namespace) -> dict[str, Any]:
         grain_eval_files=arguments.grain_files,
         mesh=mesh,
         per_device_sequence_batch=arguments.per_device_sequence_batch,
-        attention=str(config.raw["model"]["attention"]),
+        attention=overlay_capture_attention(config),
         jax_cache_dir=arguments.jax_cache_dir,
         synthetic=False,
     )
@@ -372,7 +389,7 @@ def run_worker(arguments: argparse.Namespace) -> dict[str, Any]:
             )
             if remaining <= 0:
                 raise RoutedInputHarvestWorkerError(
-                    "compilation exhausted the 600-second authorization"
+                    "compilation exhausted the supervised runtime authorization"
                 )
             result = harvest_routed_input_host(
                 _replay_first(first, iterator),
@@ -388,8 +405,11 @@ def run_worker(arguments: argparse.Namespace) -> dict[str, Any]:
         host_evidence_unsigned = {
             "schema_version": "gemma4-routed-input-harvest-worker-v1",
             "config_sha256": config.config_hash,
+            "capture_contract_sha256": config.config_hash,
             "environment_sha256": environment["sha256"],
             "checkpoint_sha256": checkpoint,
+            "target_manifest_sha256": target["manifest_sha256"],
+            "maximum_runtime_seconds": arguments.maximum_runtime_seconds,
             "compile_seconds": compile_seconds,
             "result": result.to_dict(),
         }
@@ -419,7 +439,7 @@ def run_worker(arguments: argparse.Namespace) -> dict[str, Any]:
         )
         if time.perf_counter() - started > arguments.maximum_runtime_seconds:
             raise RoutedInputHarvestWorkerError(
-                "complete worker exceeded its 600-second authorization"
+                "complete worker exceeded its supervised runtime authorization"
             )
         return {
             "status": "complete",
@@ -447,7 +467,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
 
     def deadline(_signum, _frame):
-        raise TimeoutError("Experiment-3 source harvest hit its 600-second deadline")
+        raise TimeoutError(
+            "Experiment-3 source harvest hit its supervised deadline"
+        )
 
     prior_handler = signal.signal(signal.SIGALRM, deadline)
     signal.setitimer(signal.ITIMER_REAL, arguments.maximum_runtime_seconds)

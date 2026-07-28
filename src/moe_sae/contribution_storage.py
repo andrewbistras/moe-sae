@@ -74,7 +74,6 @@ from moe_sae.object_store import (
     fingerprint_file,
     join_gcs_uri,
     object_identity_from_mapping,
-    sha256_file,
 )
 
 
@@ -1714,6 +1713,16 @@ class ContributionDataset:
             self.root, recomposition_sidecar=recomposition_sidecar
         )
         self.metadata_sha256 = str(self.manifest["metadata_sha256"])
+        # ShardCache proves the complete generation-bound SHA-256 before it
+        # returns a path.  Training then asks for many adjacent slices of the
+        # same ~0.8 GiB shard.  Re-hashing that immutable file for every
+        # 1,024-row microbatch would turn a sequential reader into terabytes
+        # of redundant host I/O.  Retain only a process-local, stat-bound
+        # proof: replacement, mutation, eviction, or truncation changes this
+        # state and forces ShardCache to re-prove the object.
+        self._verified_local_objects: dict[
+            tuple[str, int], tuple[Path, tuple[int, int, int, int, int]]
+        ] = {}
 
     @property
     def total_tokens(self) -> int:
@@ -1754,14 +1763,41 @@ class ContributionDataset:
     ) -> tuple[ObjectIdentity, Path, dict[str, str]]:
         receipt = self._receipt(entry)
         identity = object_identity_from_mapping(receipt["object"])
-        path = self.cache.materialize(identity)
-        digest, size = sha256_file(path)
-        if digest != identity.sha256 or size != identity.size_bytes:
-            raise ContributionStorageError(
-                "materialized contribution object failed SHA-256/size verification"
-            )
+        key = (identity.uri, identity.generation)
+        cached = self._verified_local_objects.get(key)
+        path: Path
+        if cached is not None and self._local_file_state(cached[0]) == cached[1]:
+            path = cached[0]
+        else:
+            path = self.cache.materialize(identity)
+            state = self._local_file_state(path)
+            if state is None or state[2] != identity.size_bytes:
+                raise ContributionStorageError(
+                    "materialized contribution object has an invalid local state"
+                )
+            self._verified_local_objects[key] = (path, state)
         expected_metadata = self._inspect_materialized_shard(entry, path)
         return identity, path, expected_metadata
+
+    @staticmethod
+    def _local_file_state(
+        path: Path,
+    ) -> tuple[int, int, int, int, int] | None:
+        """Return the state to which one in-process SHA proof is bound."""
+
+        try:
+            state = path.stat()
+        except FileNotFoundError:
+            return None
+        if not path.is_file() or path.is_symlink():
+            return None
+        return (
+            int(state.st_dev),
+            int(state.st_ino),
+            int(state.st_size),
+            int(state.st_mtime_ns),
+            int(state.st_ctime_ns),
+        )
 
     def _inspect_materialized_shard(
         self,
@@ -1905,6 +1941,37 @@ class ContributionDataset:
             statistics=statistics,
             batch=batch,
         )
+
+    def _load_slice(
+        self,
+        entry: Mapping[str, Any],
+        *,
+        local_start: int,
+        local_end: int,
+    ) -> ContributionBatch:
+        """Read only requested payload rows from one already-proved shard."""
+
+        _identity, path, _metadata = self._materialized_shard(entry)
+        tokens = int(entry["tokens"])
+        if not 0 <= local_start < local_end <= tokens:
+            raise ContributionRangeError(
+                "selective contribution shard slice is outside its sealed range"
+            )
+        try:
+            with safe_open(path, framework="numpy") as handle:
+                batch = ContributionBatch(
+                    **{
+                        name: np.asarray(
+                            handle.get_slice(name)[local_start:local_end]
+                        )
+                        for name in _PAYLOAD_FIELDS
+                    }
+                )
+        except Exception as error:
+            raise ContributionStorageError(
+                f"cannot selectively load contribution safetensors object: {path}"
+            ) from error
+        return validate_contribution_batch(batch)
 
     def _load_shared_shard(
         self,
@@ -2052,16 +2119,14 @@ class ContributionDataset:
         entries = self._entries_for_range(start, end)
         yielded = 0
         for entry in entries:
-            shard = self._load_shard(entry)
-            local_start = max(start, shard.range_start) - shard.range_start
-            local_end = min(end, shard.range_end) - shard.range_start
-            selected = ContributionBatch(
-                **{
-                    name: np.ascontiguousarray(
-                        np.asarray(getattr(shard.batch, name))[local_start:local_end]
-                    )
-                    for name in _PAYLOAD_FIELDS
-                }
+            range_start = int(entry["range_start"])
+            range_end = int(entry["range_end"])
+            local_start = max(start, range_start) - range_start
+            local_end = min(end, range_end) - range_start
+            selected = self._load_slice(
+                entry,
+                local_start=local_start,
+                local_end=local_end,
             )
             yielded += selected.tokens
             yield validate_contribution_batch(selected)

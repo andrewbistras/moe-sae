@@ -37,6 +37,7 @@ from moe_sae.contribution_transcoder_distributed import (
 from moe_sae.distributed import DistributedConfig, create_mesh
 from moe_sae.contribution_transcoder_report import (
     ContributionTranscoderReportError,
+    LEARNING_HORIZON_RESULT_SCHEMA_VERSION,
     RESULT_SCHEMA_VERSION,
     TranscoderTrainingLedger,
     build_condition_summary,
@@ -45,6 +46,9 @@ from moe_sae.contribution_transcoder_report import (
     validate_transcoder_scientific_result,
 )
 from moe_sae.contribution_transcoder_config import PROTOCOL_ID
+from moe_sae.learning_horizon_config import (
+    PROTOCOL_ID as LEARNING_HORIZON_PROTOCOL_ID,
+)
 
 
 def _digest(label: str) -> str:
@@ -387,6 +391,7 @@ def _result(
     scores: TranscoderPairedSequenceScores,
     *,
     replicates: int = 200,
+    learning_horizon: bool = False,
 ) -> dict:
     summaries = {
         condition: build_condition_summary(
@@ -424,6 +429,20 @@ def _result(
         shared_harvest_receipt_sha256=_digest("harvest"),
         shared_harvest_chip_seconds=400.0,
         bootstrap_replicates=replicates,
+        protocol_id=(
+            LEARNING_HORIZON_PROTOCOL_ID
+            if learning_horizon
+            else PROTOCOL_ID
+        ),
+        checkpoint_target_tokens=(
+            2_000_000 if learning_horizon else None
+        ),
+        checkpoint_actual_tokens=(
+            {condition: 2_015_232 for condition in CONDITIONS}
+            if learning_horizon
+            else None
+        ),
+        enforce_relative_quality_gates=not learning_horizon,
     )
 
 
@@ -467,6 +486,30 @@ def test_report_recomputes_direct_a_f_gain_cost_and_effect_retention() -> None:
     assert f"`{'a' * 40}`" in markdown
     assert f"`{'b' * 40}`" in markdown
     assert result["result_sha256"] in markdown
+
+
+def test_learning_horizon_report_measures_without_relative_quality_gate() -> None:
+    scores = _paired_scores(
+        f_sse=np.asarray([55.0, 57.0, 53.0, 55.0])
+    )
+    result = _result(scores, learning_horizon=True)
+
+    assert result["schema_version"] == LEARNING_HORIZON_RESULT_SCHEMA_VERSION
+    assert result["protocol_id"] == LEARNING_HORIZON_PROTOCOL_ID
+    assert result["status"] == "curve_point_measured"
+    assert result["verdict"]["gates_enforced"] is False
+    assert result["verdict"]["passed"] is None
+    assert result["learning_curve_checkpoint"] == {
+        "target_tokens": 2_000_000,
+        "actual_tokens_by_condition": {
+            condition: 2_015_232 for condition in CONDITIONS
+        },
+    }
+    assert (
+        validate_transcoder_scientific_result(result, scores=scores)
+        == result
+    )
+    assert "learning horizon" in render_transcoder_report(result).lower()
 
 
 def test_result_validation_rejects_old_or_mislabeled_protocol() -> None:

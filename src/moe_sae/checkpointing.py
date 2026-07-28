@@ -168,6 +168,29 @@ def pointer_path(
     return Path(value) / f"{kind}.json"
 
 
+def milestone_pointer_path(
+    control_root: str | Path,
+    checkpoint_target_tokens: int,
+) -> Path:
+    """Return the immutable pointer path for one nominal curve point."""
+
+    value = str(control_root)
+    if "://" in value:
+        raise ValueError("checkpoint control root must be a POSIX path")
+    if (
+        isinstance(checkpoint_target_tokens, bool)
+        or not isinstance(checkpoint_target_tokens, int)
+        or checkpoint_target_tokens <= 0
+        or checkpoint_target_tokens > 999_999_999_999
+    ):
+        raise ValueError("milestone token count must be in [1, 999999999999]")
+    return (
+        Path(value)
+        / "milestones"
+        / f"target-tokens-{checkpoint_target_tokens:012d}.json"
+    )
+
+
 def make_pointer(
     *,
     kind: Literal["latest", "final"],
@@ -295,6 +318,99 @@ def publish_pointer(
     finally:
         os.close(descriptor)
     return destination
+
+
+def publish_milestone_pointer(
+    control_root: str | Path,
+    pointer: Mapping[str, Any],
+    *,
+    checkpoint_target_tokens: int | None = None,
+) -> Path:
+    """Publish one create-only named pointer to an immutable curve payload.
+
+    A milestone retains the already-validated ``latest`` pointer body.  Its
+    filename supplies the scientific token identity; keeping ``kind=latest``
+    avoids widening the pointer wire schema or checkpoint restore code.
+    """
+
+    record = dict(pointer)
+    if record.get("kind") != "latest":
+        raise ValueError("milestone pointer source must be latest")
+    target = (
+        record.get("tokens_seen")
+        if checkpoint_target_tokens is None
+        else checkpoint_target_tokens
+    )
+    destination = milestone_pointer_path(control_root, target)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    payload = _canonical_json(record) + b"\n"
+    try:
+        descriptor = os.open(
+            destination,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o640,
+        )
+    except FileExistsError:
+        try:
+            existing = json.loads(destination.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise RuntimeError(
+                f"cannot read existing milestone pointer: {destination}"
+            ) from error
+        if existing != record:
+            raise RuntimeError(
+                "milestone pointer already exists with different content"
+            )
+        return destination
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        directory = os.open(destination.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except BaseException:
+        destination.unlink(missing_ok=True)
+        raise
+    return destination
+
+
+def load_milestone_pointer(
+    control_root: str | Path,
+    *,
+    checkpoint_target_tokens: int,
+    payload_root: str | Path,
+    run_identity: Mapping[str, Any],
+    expected_tokens_seen: int | None = None,
+) -> dict[str, Any] | None:
+    """Load and validate a named learning-curve checkpoint pointer."""
+
+    source = milestone_pointer_path(control_root, checkpoint_target_tokens)
+    if not source.exists():
+        return None
+    try:
+        raw = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"cannot read milestone pointer: {source}") from error
+    if not isinstance(raw, dict):
+        raise RuntimeError("milestone pointer must be a JSON object")
+    checked = validate_pointer(
+        raw,
+        expected_kind="latest",
+        payload_root=payload_root,
+        run_identity=run_identity,
+    )
+    if (
+        expected_tokens_seen is not None
+        and checked["tokens_seen"] != expected_tokens_seen
+    ):
+        raise RuntimeError(
+            "milestone pointer progress differs from its checkpoint target"
+        )
+    return checked
 
 
 def load_pointer(

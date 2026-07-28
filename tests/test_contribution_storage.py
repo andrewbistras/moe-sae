@@ -325,6 +325,63 @@ def test_shared_reader_does_not_load_expert_payload_tensors(
     )
 
 
+def test_training_range_reader_slices_payload_and_reuses_local_hash_proof(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset, _store, _control, expected = sealed_dataset(tmp_path)
+
+    def reject_full_load(_path):
+        raise AssertionError("training ranges must not load whole shards")
+
+    real_safe_open = contribution_storage_module.safe_open
+    sliced_fields: list[str] = []
+
+    @contextmanager
+    def recording_safe_open(*args, **kwargs):
+        with real_safe_open(*args, **kwargs) as handle:
+
+            class RecordingHandle:
+                def keys(self):
+                    return handle.keys()
+
+                def metadata(self):
+                    return handle.metadata()
+
+                def get_slice(self, name):
+                    sliced_fields.append(name)
+                    return handle.get_slice(name)
+
+            yield RecordingHandle()
+
+    monkeypatch.setattr(contribution_storage_module, "load_file", reject_full_load)
+    monkeypatch.setattr(
+        contribution_storage_module,
+        "safe_open",
+        recording_safe_open,
+    )
+    materializations = 0
+    real_materialize = dataset.cache.materialize
+
+    def counted_materialize(identity):
+        nonlocal materializations
+        materializations += 1
+        return real_materialize(identity)
+
+    monkeypatch.setattr(dataset.cache, "materialize", counted_materialize)
+    first = tuple(dataset.iter_token_range(0, 1))
+    second = tuple(dataset.iter_token_range(1, 2))
+
+    assert materializations == 1
+    assert sliced_fields == list(ContributionBatch.__dataclass_fields__) * 2
+    for observed, start, end in ((first[0], 0, 1), (second[0], 1, 2)):
+        for field in ContributionBatch.__dataclass_fields__:
+            np.testing.assert_array_equal(
+                getattr(observed, field),
+                getattr(expected[0], field)[start:end],
+            )
+
+
 def test_capacity_reader_loads_only_route_fields(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

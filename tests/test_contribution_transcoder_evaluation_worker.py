@@ -222,6 +222,24 @@ def test_evaluator_rejects_a_different_train_or_eval_overlay():
         ):
             _validate_phase_datasets(config, phase, **changed)
 
+    capture_contract = "c" * 64
+    horizon_config = SimpleNamespace(
+        parents={
+            **config.parents,
+            "source_overlay_capture_contract_sha256": capture_contract,
+        }
+    )
+    train_source.manifest = {
+        "metadata": {"config_sha256": capture_contract}
+    }
+    _validate_phase_datasets(horizon_config, phase, **arguments)
+    train_source.manifest["metadata"]["config_sha256"] = "d" * 64
+    with pytest.raises(
+        Experiment3EvaluationWorkerError,
+        match="config-pinned capture contract",
+    ):
+        _validate_phase_datasets(horizon_config, phase, **arguments)
+
 
 def test_training_ledger_uses_measured_marginal_cost_and_diagnostic_mfu():
     layout = ContributionSAEConfig(
@@ -251,7 +269,7 @@ def test_training_ledger_uses_measured_marginal_cost_and_diagnostic_mfu():
         result,
         layout=layout,
         evaluation_wall_seconds=5.0,
-        peak_flops_per_second=1_000_000,
+        peak_flops_per_second=1_000_000_000,
     )
 
     assert ledger.chip_count == 16
@@ -259,6 +277,60 @@ def test_training_ledger_uses_measured_marginal_cost_and_diagnostic_mfu():
     assert ledger.compilation_wall_seconds == 3.0
     assert ledger.total_wall_seconds == 22.0
     assert ledger.useful_mfu > 0
+
+
+def test_curve_ledger_uses_checkpoint_cumulative_timing_not_final_cost():
+    layout = ContributionSAEConfig(
+        condition="A",
+        hidden_dim=3,
+        num_experts=4,
+        top_routed=2,
+        bank_width=4,
+        k_per_contribution=2,
+        randomization_key=0,
+    )
+    final = {
+        "result_sha256": "1" * 64,
+        "compile_seconds": 20.0,
+        "lowering_seconds": 10.0,
+        "preprocessing_wall_seconds": 30.0,
+        "optimizer_wall_seconds": 70.0,
+        "marginal_wall_seconds": 100.0,
+        "checkpoint_seconds": 40.0,
+        "chip_seconds": 1_600.0,
+        "chip_seconds_scope": "test",
+        "chip_seconds_excludes": ["compile"],
+        "tokens_per_second": 100_000.0,
+        "tokens": 10_000_000,
+    }
+    pointer = {
+        "pointer_sha256": "2" * 64,
+        "tokens_seen": 2_015_232,
+    }
+    metadata = {
+        "timing": {
+            "compile_seconds": 2.0,
+            "lowering_seconds": 1.0,
+            "preprocessing_wall_seconds": 3.0,
+            "optimizer_wall_seconds": 7.0,
+            "checkpoint_seconds_before_save": 4.0,
+            "global_chip_count": 16,
+        }
+    }
+
+    ledger = _training_ledger(
+        final,
+        layout=layout,
+        evaluation_wall_seconds=5.0,
+        peak_flops_per_second=1_000_000_000,
+        checkpoint_pointer=pointer,
+        checkpoint_metadata=metadata,
+    )
+
+    assert ledger.marginal_wall_seconds == 10.0
+    assert ledger.marginal_chip_seconds == 160.0
+    assert ledger.tokens_per_second == pytest.approx(201_523.2)
+    assert ledger.total_wall_seconds == 22.0
 
 
 @pytest.mark.parametrize("condition", ["A", "R"])

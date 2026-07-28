@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sys
 import types
 from pathlib import Path
@@ -12,7 +13,13 @@ from moe_sae.contribution_artifacts import canonical_sha256
 from moe_sae.contribution_evaluation_worker import (
     Experiment2EvaluationError,
     _ContentStore,
+    _load_run,
     _validate_training_result,
+)
+from moe_sae.checkpointing import (
+    checkpoint_payload_uri,
+    make_pointer,
+    publish_milestone_pointer,
 )
 from moe_sae.contribution_score_artifacts import ScoreArtifactRef
 from moe_sae.contribution_training_worker import (
@@ -89,6 +96,59 @@ def test_training_result_rejects_nonfinal_or_tampered_evidence() -> None:
     value["tokens"] = 31
     with pytest.raises(Experiment2EvaluationError, match="self-hash"):
         _validate_training_result(value, plan)
+
+
+def test_load_run_selects_named_nominal_curve_checkpoint(
+    tmp_path: Path,
+) -> None:
+    plan = TrainingWorkerPlan(
+        phase_name="learning_horizon_10m",
+        condition="A",
+        seed=0,
+        total_tokens=48,
+        planned_updates=3,
+        warmup_updates=1,
+        global_microbatch_tokens=8,
+        microbatches_per_update=2,
+        checkpoint_tokens=(17, 48),
+        randomization_key=0,
+    )
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+    result = _result(plan)
+    (run_root / "training-result.json").write_text(
+        json.dumps(result),
+        encoding="utf-8",
+    )
+    payload_root = tmp_path / "payloads"
+    pointer = make_pointer(
+        kind="latest",
+        payload_uri=checkpoint_payload_uri(
+            payload_root,
+            result["run_identity"],
+            step=2,
+            tokens_seen=32,
+            attempt_id="a" * 32,
+        ),
+        step=2,
+        tokens_seen=32,
+        attempt_id="a" * 32,
+        run_identity=result["run_identity"],
+    )
+    publish_milestone_pointer(
+        run_root / "checkpoints",
+        pointer,
+        checkpoint_target_tokens=17,
+    )
+
+    loaded_result, loaded_pointer = _load_run(
+        run_root,
+        plan,
+        str(payload_root),
+        checkpoint_target_tokens=17,
+    )
+    assert loaded_result == result
+    assert loaded_pointer["tokens_seen"] == 32
 
 
 def test_content_store_is_create_only_and_hash_verified(tmp_path: Path) -> None:

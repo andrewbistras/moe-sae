@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -67,6 +68,21 @@ def _write_result(operator, root: Path) -> None:
     )
 
 
+def test_internal_ip_transport_is_explicit(
+    operator,
+    tmp_path: Path,
+) -> None:
+    settings = _settings(operator, tmp_path)
+    external = operator._command(settings, 0, 2)
+    internal = operator._command(
+        replace(settings, internal_ip=True),
+        0,
+        2,
+    )
+    assert "--internal-ip" not in external
+    assert "--internal-ip" in internal
+
+
 def test_main_accepts_remote_success_after_transport_teardown(
     operator,
     tmp_path: Path,
@@ -111,6 +127,43 @@ def test_zero_transport_without_marker_fails_closed(
         )
 
 
+def test_public_horizon_selection_reaches_worker(
+    operator,
+    tmp_path: Path,
+) -> None:
+    settings = operator._apply_public_arguments(
+        _settings(operator, tmp_path),
+        operator._parser().parse_args(
+            [
+                "--config",
+                "/nfs/contracts/contribution-horizon-final.yaml",
+                "--phase",
+                "learning_horizon_10m",
+                "--checkpoint-tokens",
+                "5000000",
+                "--result-root",
+                "/nfs/evaluation/contribution-5m",
+                "--run-root-a",
+                "/nfs/runs/horizon-a",
+                "--run-root-r",
+                "/nfs/runs/horizon-r",
+                "--run-root-b",
+                "/nfs/runs/horizon-b",
+                "--run-root-f",
+                "/nfs/runs/horizon-f",
+            ]
+        ),
+    )
+    worker = operator._worker(settings, 2)
+    assert worker[worker.index("--config") + 1] == (
+        "/nfs/contracts/contribution-horizon-final.yaml"
+    )
+    assert worker[worker.index("--phase") + 1] == "learning_horizon_10m"
+    assert worker[worker.index("--checkpoint-tokens") + 1] == "5000000"
+    assert worker[worker.index("--run-root-a") + 1] == "/nfs/runs/horizon-a"
+    assert settings.result_root == "/nfs/evaluation/contribution-5m"
+
+
 def test_nonzero_remote_evaluation_status_is_preserved(
     operator,
     tmp_path: Path,
@@ -145,4 +198,41 @@ def test_scientific_result_must_be_self_hashed(
         encoding="ascii",
     )
     with pytest.raises(operator.OperatorError, match="self-hash"):
+        operator._validate_scientific_result(path)
+
+
+def test_horizon_scientific_result_identity_is_accepted(
+    operator,
+    tmp_path: Path,
+) -> None:
+    body = {
+        "schema_version": operator.LEARNING_HORIZON_RESULT_SCHEMA_VERSION,
+        "protocol_id": operator.LEARNING_HORIZON_PROTOCOL_ID,
+        "status": "curve_point_measured",
+    }
+    path = tmp_path / "scientific-result.json"
+    path.write_text(
+        json.dumps(
+            {
+                **body,
+                "result_sha256": operator._canonical_sha256(body),
+            }
+        ),
+        encoding="ascii",
+    )
+    assert operator._validate_scientific_result(path)["status"] == (
+        "curve_point_measured"
+    )
+
+    mismatched = {**body, "protocol_id": "wrong-protocol"}
+    path.write_text(
+        json.dumps(
+            {
+                **mismatched,
+                "result_sha256": operator._canonical_sha256(mismatched),
+            }
+        ),
+        encoding="ascii",
+    )
+    with pytest.raises(operator.OperatorError, match="identity"):
         operator._validate_scientific_result(path)

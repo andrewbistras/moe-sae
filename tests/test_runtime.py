@@ -21,6 +21,9 @@ from moe_sae.runtime import (
     scientific_token_mask,
     token_quota,
     updates_for_tokens,
+    accelerator_runtime_status,
+    require_accelerator_runtime,
+    RuntimeDependencyError,
 )
 
 
@@ -48,6 +51,58 @@ def test_benchmark_selection_requires_gate_and_maximizes_persisted_goodput():
     assert choose_harvest_benchmark([too_low, slower, faster]) == faster
     with pytest.raises(RuntimeError, match="no harvester benchmark"):
         choose_harvest_benchmark([too_low])
+
+
+def test_v6e_16_runtime_requires_exact_four_by_four_topology(
+    monkeypatch,
+) -> None:
+    devices = [
+        SimpleNamespace(
+            platform="tpu",
+            device_kind="TPU v6 lite",
+            process_index=index // 4,
+            id=index,
+        )
+        for index in range(16)
+    ]
+    jax = ModuleType("jax")
+    jax.devices = lambda: devices
+    jax.process_count = lambda: 4
+    jax.local_device_count = lambda: 4
+    jax.distributed = SimpleNamespace(
+        is_initialized=lambda: True,
+        initialize=lambda: None,
+    )
+    monkeypatch.setitem(sys.modules, "jax", jax)
+
+    passed, detail = accelerator_runtime_status("v6e-16")
+    assert passed is True
+    assert "process_count=4" in detail
+    require_accelerator_runtime(
+        "v6e-16",
+        peak_flops_per_second=14_688_000_000_000_000,
+    )
+
+    jax.process_count = lambda: 2
+    passed, _ = accelerator_runtime_status("v6e-16")
+    assert passed is False
+
+
+def test_v6e_runtime_rejects_v4_peak_before_authoritative_work(
+    monkeypatch,
+) -> None:
+    jax = ModuleType("jax")
+    jax.distributed = SimpleNamespace(
+        is_initialized=lambda: True,
+        initialize=lambda: None,
+    )
+    monkeypatch.setitem(sys.modules, "jax", jax)
+
+    with pytest.raises(RuntimeDependencyError, match="14688000000000000"):
+        require_accelerator_runtime(
+            "v6e-16",
+            peak_flops_per_second=4_400_000_000_000_000,
+        )
 
 
 def test_benchmark_uses_device_time_for_mfu_and_total_time_for_persistence():

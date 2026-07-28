@@ -28,6 +28,9 @@ Required environment variables (none are secrets):
 Optional environment variables:
   UV_VERSION                  pinned uv version (default: 0.11.14)
   SSH_KEY_FILE                gcloud SSH key (default: ~/.ssh/google_compute_engine)
+  TPU_ACCELERATOR_TYPE        exact expected type (default: v4-32)
+  TPU_USE_INTERNAL_IP         1 to use private TPU VM addresses (default: 0);
+                              required for v6e-16
 
 Before setting LOCAL_BUFFER_ROOT, run scripts/tpu/inspect_workers.sh. This
 script never creates a TPU, chooses a device, partitions a disk, or formats a
@@ -92,6 +95,15 @@ validate_inputs() {
   [[ "$NFS_EXPORT" =~ ^/[A-Za-z0-9._/-]+$ ]] || die "invalid NFS_EXPORT"
   [[ "$NFS_EXPORT" != */ ]] || die "NFS_EXPORT must not end with '/'"
   [[ "$UV_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "invalid UV_VERSION"
+  [[ "$TPU_ACCELERATOR_TYPE" == "v4-32" || \
+     "$TPU_ACCELERATOR_TYPE" == "v6e-16" ]] || \
+    die "TPU_ACCELERATOR_TYPE must be exactly v4-32 or v6e-16"
+  [[ "$TPU_USE_INTERNAL_IP" == "0" || "$TPU_USE_INTERNAL_IP" == "1" ]] || \
+    die "TPU_USE_INTERNAL_IP must be exactly 0 or 1"
+  if [[ "$TPU_ACCELERATOR_TYPE" == "v6e-16" ]]; then
+    [[ "$TPU_USE_INTERNAL_IP" == "1" ]] || \
+      die "v6e-16 deployment requires explicit TPU_USE_INTERNAL_IP=1"
+  fi
 }
 
 ensure_gcloud_ssh_key() {
@@ -106,6 +118,9 @@ ensure_gcloud_ssh_key() {
     --command=true
     --quiet
   )
+  if [[ "$TPU_USE_INTERNAL_IP" == "1" ]]; then
+    ssh_command+=(--internal-ip)
+  fi
 
   log "opening worker 0 once so gcloud can create/install its SSH key"
   "${ssh_command[@]}" >/dev/null
@@ -152,6 +167,8 @@ main() {
   done
   UV_VERSION=${UV_VERSION:-$DEFAULT_UV_VERSION}
   SSH_KEY_FILE=${SSH_KEY_FILE:-$HOME/.ssh/google_compute_engine}
+  TPU_ACCELERATOR_TYPE=${TPU_ACCELERATOR_TYPE:-v4-32}
+  TPU_USE_INTERNAL_IP=${TPU_USE_INTERNAL_IP:-0}
   validate_inputs
 
   require_command git
@@ -229,9 +246,9 @@ main() {
   IFS=',' read -r tpu_state accelerator_type <<< "$tpu_description"
   [[ "$tpu_state" == "READY" ]] || \
     die "TPU VM state is '$tpu_state'; wait for READY before deployment"
-  [[ "$accelerator_type" == "v4-32" ]] || \
-    die "TPU accelerator type is '$accelerator_type'; this pipeline requires v4-32"
-  log "target TPU is READY with accelerator type v4-32"
+  [[ "$accelerator_type" == "$TPU_ACCELERATOR_TYPE" ]] || \
+    die "TPU accelerator type is '$accelerator_type', not '$TPU_ACCELERATOR_TYPE'"
+  log "target TPU is READY with accelerator type $TPU_ACCELERATOR_TYPE"
   ensure_gcloud_ssh_key "$SSH_KEY_FILE"
 
   gcloud_common=(
@@ -240,6 +257,9 @@ main() {
     --ssh-key-file="$SSH_KEY_FILE"
     --quiet
   )
+  if [[ "$TPU_USE_INTERNAL_IP" == "1" ]]; then
+    gcloud_common+=(--internal-ip)
+  fi
   log "creating deployment directory on every worker"
   gcloud compute tpus tpu-vm ssh "$TPU_NAME" \
     "${gcloud_common[@]}" \

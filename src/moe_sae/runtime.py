@@ -31,6 +31,8 @@ from moe_sae.config import MAXTEXT_COMMIT, MODEL_ID
 
 V4_32_CHIPS = 16
 V4_32_BF16_PEAK_FLOPS = 4.4e15
+V6E_16_CHIPS = 16
+V6E_16_BF16_PEAK_FLOPS = 14.688e15
 TARGET_SEQUENCE_LENGTH = 1_024
 TARGET_LAYER_ONE_INDEXED = 15
 TARGET_TRAIN_TOKENS = 50_000_000
@@ -209,6 +211,80 @@ def require_v4_32_runtime() -> None:
     if not passed:
         raise RuntimeDependencyError(
             f"authoritative execution requires a v4-32: {detail}"
+        )
+
+
+def accelerator_runtime_status(accelerator_type: str) -> tuple[bool, str]:
+    """Return exact training topology status for supported 16-chip slices.
+
+    Historical v4 callers retain :func:`require_v4_32_runtime` unchanged.
+    New regional training/evaluation paths additionally require the observed
+    four-process by four-local-device topology used by one ``v6e-16`` slice.
+    """
+
+    if accelerator_type == "v4-32":
+        return v4_32_runtime_status()
+    if accelerator_type != "v6e-16":
+        return False, f"unsupported accelerator_type={accelerator_type!r}"
+    try:
+        import jax
+    except ImportError:
+        return False, "JAX unavailable"
+    devices = tuple(jax.devices())
+    platforms = sorted({str(device.platform) for device in devices})
+    kinds = sorted({str(device.device_kind) for device in devices})
+    kind_matches = all(
+        "v6e" in str(device.device_kind).lower()
+        or "v6 lite" in str(device.device_kind).lower()
+        for device in devices
+    )
+    correct = (
+        len(devices) == V6E_16_CHIPS
+        and int(jax.process_count()) == 4
+        and int(jax.local_device_count()) == 4
+        and all(device.platform == "tpu" for device in devices)
+        and kind_matches
+    )
+    return (
+        correct,
+        f"{len(devices)} devices; process_count={int(jax.process_count())}; "
+        f"local_device_count={int(jax.local_device_count())}; "
+        f"platforms={platforms}; kinds={kinds}",
+    )
+
+
+def require_accelerator_runtime(
+    accelerator_type: str,
+    *,
+    peak_flops_per_second: int | None = None,
+) -> None:
+    """Require one exact supported runtime and, when supplied, its peak."""
+
+    initialize_jax_distributed()
+    expected_peaks = {
+        "v4-32": int(V4_32_BF16_PEAK_FLOPS),
+        "v6e-16": int(V6E_16_BF16_PEAK_FLOPS),
+    }
+    expected_peak = expected_peaks.get(accelerator_type)
+    if expected_peak is None:
+        raise RuntimeDependencyError(
+            f"unsupported accelerator type: {accelerator_type!r}"
+        )
+    if (
+        peak_flops_per_second is not None
+        and peak_flops_per_second != expected_peak
+    ):
+        raise RuntimeDependencyError(
+            f"{accelerator_type} BF16 peak must be exactly {expected_peak}"
+        )
+    if accelerator_type == "v4-32":
+        # Preserve the historical v4 acceptance surface byte-for-byte.
+        require_v4_32_runtime()
+        return
+    passed, detail = accelerator_runtime_status(accelerator_type)
+    if not passed:
+        raise RuntimeDependencyError(
+            f"authoritative execution requires a {accelerator_type}: {detail}"
         )
 
 

@@ -37,6 +37,16 @@ from moe_sae.contribution_training_worker import (
 from moe_sae.object_store import ObjectIdentity
 
 CONFIG = Path(__file__).parents[1] / "configs" / "gemma4_contribution_v1.yaml"
+SAE_HORIZON_TEMPLATE = (
+    Path(__file__).parents[1]
+    / "configs"
+    / "gemma4_contribution_horizon_v1.yaml"
+)
+TRANSCODER_HORIZON_TEMPLATE = (
+    Path(__file__).parents[1]
+    / "configs"
+    / "gemma4_transcoder_horizon_v1.yaml"
+)
 
 
 def test_stablehlo_manifest_explicitly_binds_scientific_model() -> None:
@@ -345,6 +355,67 @@ def test_prefetch_parent_is_hard_bounded_and_launches_only_its_hidden_child(
     assert json.loads(capsys.readouterr().out)["receipt_sha256"] == "c" * 64
 
 
+def test_prefetch_deadline_expands_only_for_final_horizon_config_on_v6e(
+    tmp_path: Path,
+) -> None:
+    sae = tmp_path / "renamed-final-sae.yaml"
+    sae.write_text(
+        SAE_HORIZON_TEMPLATE.read_text(encoding="utf-8").replace(
+            "PENDING_SEALED_10M_TARGET_MANIFEST",
+            "a" * 64,
+        ),
+        encoding="utf-8",
+    )
+    transcoder = tmp_path / "renamed-final-transcoder.yaml"
+    transcoder.write_text(
+        TRANSCODER_HORIZON_TEMPLATE.read_text(encoding="utf-8")
+        .replace("PENDING_SEALED_10M_TARGET_MANIFEST", "a" * 64)
+        .replace("PENDING_SEALED_10M_SOURCE_OVERLAY_MANIFEST", "b" * 64)
+        .replace(
+            "PENDING_SEALED_10M_SOURCE_OVERLAY_CAPTURE_CONTRACT",
+            "c" * 64,
+        ),
+        encoding="utf-8",
+    )
+    assert (
+        training_worker_module.prefetch_runtime_limit_seconds(
+            config_path=sae,
+            accelerator_type="v6e-16",
+        )
+        == 1_800
+    )
+    assert (
+        training_worker_module.prefetch_runtime_limit_seconds(
+            config_path=transcoder,
+            accelerator_type="v6e-16",
+        )
+        == 1_800
+    )
+    unrelated = tmp_path / "not-an-approved-horizon.yaml"
+    unrelated.write_text("schema_version: unrelated-v1\n", encoding="utf-8")
+    for config_path, accelerator_type in (
+        (CONFIG, "v6e-16"),
+        (sae, "v4-32"),
+        (unrelated, "v6e-16"),
+    ):
+        assert (
+            training_worker_module.prefetch_runtime_limit_seconds(
+                config_path=config_path,
+                accelerator_type=accelerator_type,
+            )
+            == 600
+        )
+
+    with pytest.raises(
+        ContributionTrainingWorkerError,
+        match="finalized strict config",
+    ):
+        training_worker_module.prefetch_runtime_limit_seconds(
+            config_path=SAE_HORIZON_TEMPLATE,
+            accelerator_type="v6e-16",
+        )
+
+
 def test_process_lane_prefetch_is_near_one_copy_and_missing_cache_fails_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -586,6 +657,15 @@ class Source:
         yield 4
         yield 4
         yield 2
+
+
+class SeekableSource(Source):
+    def __init__(self) -> None:
+        self.requested_starts: list[int] = []
+
+    def iter_updates_from(self, start_update: int):
+        self.requested_starts.append(start_update)
+        yield from (4, 4, 2)[start_update:]
 
 
 class Checkpoints:
@@ -838,6 +918,7 @@ def test_checkpoint_receipt_paths_are_identical_on_every_process(
         payload_root=str(tmp_path / "payloads"),
         mesh=object(),
         training_config=object(),
+        retained_checkpoint_progress={10: 8},
     )
     state = type("CheckpointState", (), {"step": 3, "tokens_seen": 10})()
     run_identity_body = {"run": "same-on-every-process"}
@@ -865,6 +946,13 @@ def test_checkpoint_receipt_paths_are_identical_on_every_process(
     assert coordinator["final_pointer"] == str(
         tmp_path / "control" / "final.json"
     )
+    assert coordinator["milestone_pointer"] == str(
+        tmp_path
+        / "control"
+        / "milestones"
+        / "target-tokens-000000000008.json"
+    )
+    assert coordinator["milestone_target_tokens"] == 8
 
 
 def test_orbax_restore_binds_full_pointer_and_hash_only_payload_identity(
@@ -961,6 +1049,36 @@ def test_bounded_direct_training_resumes_from_exact_lowered_identity() -> None:
     assert result["status"] == "completed"
     assert result["tokens"] == 10
     assert store.restored[0] == State(3, 10, 77)
+
+
+def test_resume_seeks_to_checkpoint_without_replaying_input_prefix() -> None:
+    store = Checkpoints()
+    with pytest.raises(RuntimeError, match="simulated preemption"):
+        run_qualified_training(
+            plan(),
+            SeekableSource(),
+            mean=None,
+            selection=selection(),
+            dependencies=dependencies(store, fail_at_step=1),
+            expected_l0=2,
+            maximum_runtime_seconds=3_600,
+        )
+    assert store.restored is not None
+    assert store.restored[0].step == 1
+
+    source = SeekableSource()
+    result = run_qualified_training(
+        plan(),
+        source,
+        mean=None,
+        selection=selection(),
+        dependencies=dependencies(store),
+        expected_l0=2,
+        maximum_runtime_seconds=3_600,
+    )
+
+    assert source.requested_starts == [1]
+    assert result["tokens"] == 10
 
 
 def test_lowered_identity_drift_is_rejected_before_compile_or_steps() -> None:

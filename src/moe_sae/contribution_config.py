@@ -1003,8 +1003,14 @@ class Experiment2Config:
         )
 
 
-def load_contribution_config(path: str | Path) -> Experiment2Config:
-    """Load strict JSON/YAML without accepting missing or unknown fields."""
+def load_contribution_config(path: str | Path) -> Any:
+    """Load a strict contribution-SAE run contract.
+
+    The completed Experiment-2 schema remains frozen.  The only successor
+    accepted here is the explicitly SAE-typed pilot learning-horizon schema;
+    its checked-in template is rejected until sealed artifact hashes have been
+    finalized.
+    """
 
     source = Path(path)
     text = source.read_text(encoding="utf-8")
@@ -1018,6 +1024,19 @@ def load_contribution_config(path: str | Path) -> Experiment2Config:
                 "PyYAML is required to load Experiment-2 YAML"
             ) from exc
         raw = yaml.safe_load(text)
+    if (
+        isinstance(raw, Mapping)
+        and raw.get("schema_version")
+        == "gemma4-pilot-learning-horizon-run-config-v1"
+    ):
+        from moe_sae.learning_horizon_config import (
+            learning_horizon_config_from_mapping,
+        )
+
+        return learning_horizon_config_from_mapping(
+            raw,
+            expected_scientific_model="sae",
+        )
     return Experiment2Config.from_mapping(raw)
 
 

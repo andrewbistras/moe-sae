@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import copy
+from contextlib import contextmanager
 
 import numpy as np
 import pytest
 from safetensors import safe_open
 
+import moe_sae.contribution_transcoder_storage as transcoder_storage_module
 from moe_sae.contribution_artifacts import HIDDEN_SIZE, float32_to_bf16_bits
 from moe_sae.contribution_transcoder_artifacts import (
     RoutedInputBatch,
@@ -119,6 +121,92 @@ def test_content_addressed_round_trip_is_exactly_parent_bound(tmp_path):
     assert [piece.tokens for piece in pieces] == [1, 2]
     assert sum(piece.tokens for piece in pieces) == 3
     assert not list((tmp_path / "local").rglob("*.safetensors"))
+
+
+def test_training_range_reader_slices_overlay_and_reuses_local_hash_proof(
+    tmp_path,
+    monkeypatch,
+):
+    target, _sidecar = contribution_manifest()
+    store = LocalObjectStore(tmp_path / "objects")
+    control = tmp_path / "control"
+    writer = RoutedInputShardWriter(
+        control,
+        "worker-0",
+        metadata(target),
+        target_manifest=target,
+        local_buffer_root=tmp_path / "local",
+        object_prefix=OBJECT_PREFIX,
+        object_store=store,
+    )
+    expected = batch_for_target(target["shards"][0], offset=0.0)
+    for index, target_entry in enumerate(target["shards"]):
+        writer.write_range(
+            target_entry,
+            batch_for_target(target_entry, offset=float(index)),
+        )
+    writer.finalize_host()
+    publish_routed_input_manifest(
+        control,
+        metadata(target),
+        target_manifest=target,
+        object_prefix=OBJECT_PREFIX,
+        object_store=store,
+        expected_hosts=1,
+    )
+    cache = ShardCache(tmp_path / "cache", store, max_bytes=64 << 20)
+    dataset = RoutedInputDataset(
+        control,
+        object_prefix=OBJECT_PREFIX,
+        cache=cache,
+        target_manifest=target,
+    )
+
+    def reject_full_load(_path):
+        raise AssertionError("training ranges must not load whole overlay shards")
+
+    real_safe_open = transcoder_storage_module.safe_open
+    sliced_fields = []
+
+    @contextmanager
+    def recording_safe_open(*args, **kwargs):
+        with real_safe_open(*args, **kwargs) as handle:
+
+            class RecordingHandle:
+                def keys(self):
+                    return handle.keys()
+
+                def metadata(self):
+                    return handle.metadata()
+
+                def get_slice(self, name):
+                    sliced_fields.append(name)
+                    return handle.get_slice(name)
+
+            yield RecordingHandle()
+
+    monkeypatch.setattr(transcoder_storage_module, "load_file", reject_full_load)
+    monkeypatch.setattr(
+        transcoder_storage_module,
+        "safe_open",
+        recording_safe_open,
+    )
+    materializations = 0
+    real_materialize = cache.materialize
+
+    def counted_materialize(identity):
+        nonlocal materializations
+        materializations += 1
+        return real_materialize(identity)
+
+    monkeypatch.setattr(cache, "materialize", counted_materialize)
+    first = tuple(dataset.iter_token_range(0, 1))[0]
+    second = tuple(dataset.iter_token_range(1, 2))[0]
+
+    assert materializations == 1
+    assert sliced_fields == ["routed_input", "sequence_id", "position"] * 2
+    np.testing.assert_array_equal(first.routed_input, expected.routed_input[:1])
+    np.testing.assert_array_equal(second.routed_input, expected.routed_input[1:2])
 
 
 def test_writer_rejects_equal_length_but_wrong_token_alignment(tmp_path):

@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any, Literal, Protocol
 
 import numpy as np
+import yaml
 
 from moe_sae.contribution_artifacts import canonical_json_bytes, canonical_sha256
 from moe_sae.contribution_config import (
@@ -68,6 +69,8 @@ PREFETCH_RECEIPT_SCHEMA_VERSION = "gemma4-contribution-sae-process-lane-prefetch
 TRANSCODER_PREFETCH_RECEIPT_SCHEMA_VERSION = (
     "gemma4-contribution-transcoder-paired-process-lane-prefetch-v1"
 )
+HISTORICAL_PREFETCH_MAX_SECONDS = 600
+HORIZON_V6E_PREFETCH_MAX_SECONDS = 1_800
 CHIP_SECONDS_SCOPE = (
     "fixed_capacity_scan_in_training_invocation_plus_synchronized_"
     "optimizer_loop_including_input_wait"
@@ -80,6 +83,49 @@ CHIP_SECONDS_EXCLUDES = (
     "checkpoint_serialization",
     "evaluation",
 )
+
+
+def prefetch_runtime_limit_seconds(
+    *,
+    config_path: str | Path,
+    accelerator_type: str,
+) -> int:
+    """Return the exact host-prefetch cap for one immutable run shape.
+
+    Historical v4 experiments retain their 600-second bound.  Only the
+    finalized 10M horizon configs on v6e-16 receive the larger transfer/hash
+    window needed for a 133--148 GB process lane.
+    """
+
+    if accelerator_type == "v6e-16":
+        selected = Path(config_path).expanduser().resolve()
+        try:
+            raw = yaml.safe_load(selected.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, ValueError, yaml.YAMLError) as error:
+            raise ContributionTrainingWorkerError(
+                "cannot inspect the selected config for its prefetch deadline"
+            ) from error
+        if (
+            isinstance(raw, Mapping)
+            and raw.get("schema_version")
+            == "gemma4-pilot-learning-horizon-run-config-v1"
+        ):
+            # A filename is not an execution identity.  Re-load the whole
+            # document through the strict finalized horizon boundary before
+            # granting the longer regional transfer/hash window.
+            from moe_sae.learning_horizon_config import (
+                LearningHorizonConfigError,
+                load_learning_horizon_config,
+            )
+
+            try:
+                load_learning_horizon_config(selected, require_finalized=True)
+            except LearningHorizonConfigError as error:
+                raise ContributionTrainingWorkerError(
+                    "v6e horizon prefetch requires a finalized strict config"
+                ) from error
+            return HORIZON_V6E_PREFETCH_MAX_SECONDS
+    return HISTORICAL_PREFETCH_MAX_SECONDS
 
 InputMode = Literal["resident", "rematerialized"]
 INPUT_MODES: tuple[InputMode, ...] = ("resident", "rematerialized")
@@ -940,7 +986,12 @@ def run_qualified_training(
     optimizer_seconds = float(prior_timing.get("optimizer_wall_seconds", 0.0))
     checkpoint_seconds = float(prior_timing.get("checkpoint_seconds_before_save", 0.0))
 
-    iterator = itertools.islice(source.iter_updates(), start_step, None)
+    direct_seek = getattr(source, "iter_updates_from", None)
+    iterator = (
+        iter(direct_seek(start_step))
+        if callable(direct_seek)
+        else itertools.islice(source.iter_updates(), start_step, None)
+    )
     if start_step == plan.planned_updates:
         if optimizer_seconds <= 0.0:
             raise ContributionTrainingWorkerError(
@@ -1362,6 +1413,19 @@ def prefetch_process_lane(
         raise ContributionTrainingWorkerError(
             "prefetch requires the exact phase-specific sealed train capture"
         )
+    parents = getattr(config, "parents", None)
+    expected_manifest = (
+        parents.get("train_target_manifest_sha256")
+        if isinstance(parents, Mapping)
+        else None
+    )
+    if (
+        expected_manifest is not None
+        and dataset.manifest_sha256 != expected_manifest
+    ):
+        raise ContributionTrainingWorkerError(
+            "prefetch capture differs from the config-pinned train manifest"
+        )
     summary = _prefetch_object_summary(
         dataset,
         range_start=int(partition["range_start"]),
@@ -1482,6 +1546,19 @@ def _prove_prefetch_for_plan(
     ):
         raise ContributionTrainingWorkerError(
             "prefetch receipt and sealed contribution capture differ"
+        )
+    parents = getattr(config, "parents", None)
+    expected_manifest = (
+        parents.get("train_target_manifest_sha256")
+        if isinstance(parents, Mapping)
+        else None
+    )
+    if (
+        expected_manifest is not None
+        and dataset.manifest_sha256 != expected_manifest
+    ):
+        raise ContributionTrainingWorkerError(
+            "resident capture differs from the config-pinned train manifest"
         )
     summary = _prefetch_object_summary(
         dataset,
@@ -1675,6 +1752,27 @@ def validate_transcoder_prefetch_receipt(
     return {**selected, "receipt_sha256": claimed}
 
 
+def _require_transcoder_overlay_capture_contract(
+    config: Any,
+    source_dataset: Any,
+) -> None:
+    parents = getattr(config, "parents", None)
+    expected = (
+        parents.get("source_overlay_capture_contract_sha256")
+        if isinstance(parents, Mapping)
+        else None
+    )
+    try:
+        from moe_sae.contribution_transcoder_input import (
+            ContributionTranscoderInputError,
+            require_overlay_capture_contract,
+        )
+
+        require_overlay_capture_contract(source_dataset, expected)
+    except ContributionTranscoderInputError as error:
+        raise ContributionTrainingWorkerError(str(error)) from error
+
+
 def prefetch_transcoder_process_lane(
     *,
     config: Any,
@@ -1734,6 +1832,7 @@ def prefetch_transcoder_process_lane(
         cache=cache,
         target_manifest=target.manifest,
     )
+    _require_transcoder_overlay_capture_contract(config, source)
     if (
         int(source.total_tokens) != selected_phase.train_tokens
         or source.manifest_sha256
@@ -1894,6 +1993,7 @@ def _prove_transcoder_prefetch_for_plan(
         cache=cache,
         target_manifest=target.manifest,
     )
+    _require_transcoder_overlay_capture_contract(config, source)
     if (
         target.manifest_sha256 != selected["target_manifest_sha256"]
         or source.manifest_sha256 != selected["source_manifest_sha256"]
@@ -2136,7 +2236,12 @@ def _stablehlo_manifest(
     }
 
 
-def _hardware_manifest(mesh: Any, *, peak_flops_per_second: int) -> dict[str, Any]:
+def _hardware_manifest(
+    mesh: Any,
+    *,
+    peak_flops_per_second: int,
+    accelerator_type: str = "v4-32",
+) -> dict[str, Any]:
     import jax
 
     devices = sorted(
@@ -2165,6 +2270,7 @@ def _hardware_manifest(mesh: Any, *, peak_flops_per_second: int) -> dict[str, An
         )
     unsigned = {
         "schema_version": TRAINING_HARDWARE_SCHEMA_VERSION,
+        "accelerator_type": accelerator_type,
         "global_chip_count": len(devices),
         "process_count": int(jax.process_count()),
         "local_device_count": int(jax.local_device_count()),
@@ -2247,12 +2353,14 @@ class _ProductionEngine:
         *,
         source_revision: str,
         peak_flops_per_second: int,
+        accelerator_type: str = "v4-32",
     ) -> None:
         self.config = config
         self.plan = plan
         self.workload = workload
         self.source_revision = source_revision
         self.peak_flops_per_second = peak_flops_per_second
+        self.accelerator_type = accelerator_type
 
     def initialize_state(self) -> Any:
         import jax
@@ -2361,6 +2469,7 @@ class _ProductionEngine:
         hardware = _hardware_manifest(
             self.workload.mesh,
             peak_flops_per_second=self.peak_flops_per_second,
+            accelerator_type=self.accelerator_type,
         )
         execution = _execution_config(
             self.config,
@@ -2475,6 +2584,7 @@ class _OrbaxCheckpointBackend:
         payload_root: str,
         mesh: Any,
         training_config: Any,
+        retained_checkpoint_progress: Mapping[int, int] | None = None,
     ) -> None:
         from moe_sae.checkpointing import normalize_payload_root
 
@@ -2482,6 +2592,30 @@ class _OrbaxCheckpointBackend:
         self.payload_root = normalize_payload_root(payload_root)
         self.mesh = mesh
         self.training_config = training_config
+        progress = dict(retained_checkpoint_progress or {})
+        retained = tuple(progress.values())
+        if (
+            tuple(sorted(set(retained))) != retained
+            or any(
+                isinstance(tokens, bool)
+                or not isinstance(tokens, int)
+                or tokens <= 0
+                for tokens in retained
+            )
+        ):
+            raise ContributionTrainingWorkerError(
+                "retained checkpoint tokens must be unique, ordered, and positive"
+            )
+        if any(
+            isinstance(tokens_seen, bool)
+            or not isinstance(tokens_seen, int)
+            or tokens_seen < target
+            for tokens_seen, target in progress.items()
+        ):
+            raise ContributionTrainingWorkerError(
+                "retained checkpoint progress is invalid"
+            )
+        self.retained_checkpoint_progress = progress
 
     def restore(
         self,
@@ -2534,8 +2668,10 @@ class _OrbaxCheckpointBackend:
             checkpoint_payload_uri,
             final_pointer_from_latest,
             make_pointer,
+            milestone_pointer_path,
             new_attempt_id,
             pointer_path,
+            publish_milestone_pointer,
             publish_pointer,
         )
         from moe_sae.distributed import save_distributed_checkpoint
@@ -2584,8 +2720,15 @@ class _OrbaxCheckpointBackend:
             attempt_id=attempt_id,
             run_identity=run_identity,
         )
+        milestone_target = self.retained_checkpoint_progress.get(tokens)
         if jax.process_index() == 0:
             publish_pointer(self.control_root, latest)
+            if milestone_target is not None:
+                publish_milestone_pointer(
+                    self.control_root,
+                    latest,
+                    checkpoint_target_tokens=milestone_target,
+                )
             if final:
                 publish_pointer(
                     self.control_root,
@@ -2598,6 +2741,11 @@ class _OrbaxCheckpointBackend:
         # make otherwise successful multi-host results hash differently.
         latest_path = str(pointer_path(self.control_root, "latest"))
         final_path = str(pointer_path(self.control_root, "final")) if final else None
+        milestone_path = (
+            str(milestone_pointer_path(self.control_root, milestone_target))
+            if milestone_target is not None
+            else None
+        )
         return {
             "payload_uri": payload_uri,
             "step": step,
@@ -2605,6 +2753,8 @@ class _OrbaxCheckpointBackend:
             "attempt_id": attempt_id,
             "latest_pointer": latest_path,
             "final_pointer": final_path,
+            "milestone_pointer": milestone_path,
+            "milestone_target_tokens": milestone_target,
             "final": bool(final),
             "latest_pointer_sha256": latest["pointer_sha256"],
         }
@@ -2706,6 +2856,19 @@ def _build_production_workload(
         raise ContributionTrainingWorkerError(
             "training requires the exact phase-specific sealed v2 manifest"
         )
+    parents = getattr(config, "parents", None)
+    expected_target_manifest = (
+        parents.get("train_target_manifest_sha256")
+        if isinstance(parents, Mapping)
+        else None
+    )
+    if (
+        expected_target_manifest is not None
+        and dataset.manifest_sha256 != expected_target_manifest
+    ):
+        raise ContributionTrainingWorkerError(
+            "training capture differs from the config-pinned train manifest"
+        )
     source_dataset: Any | None = None
     if scientific_model == "transcoder":
         if plan.condition == "Q":
@@ -2729,6 +2892,7 @@ def _build_production_workload(
             cache=cache,
             target_manifest=dataset.manifest,
         )
+        _require_transcoder_overlay_capture_contract(config, source_dataset)
         if (
             int(source_dataset.total_tokens) != plan.total_tokens
             or source_dataset.manifest_sha256
@@ -3012,6 +3176,7 @@ def _run_production_qualification(
     *,
     source_revision: str,
     peak_flops_per_second: int,
+    accelerator_type: str = "v4-32",
     warmup_steps: int,
     measured_steps: int,
     qualification_started: float | None = None,
@@ -3026,6 +3191,7 @@ def _run_production_qualification(
         workload,
         source_revision=source_revision,
         peak_flops_per_second=peak_flops_per_second,
+        accelerator_type=accelerator_type,
     )
     try:
         static_batch = next(iter(workload.source.iter_updates()))
@@ -3142,6 +3308,7 @@ def _run_production_training(
     *,
     source_revision: str,
     peak_flops_per_second: int,
+    accelerator_type: str = "v4-32",
     checkpoint_control_root: str | Path,
     checkpoint_payload_root: str,
     maximum_runtime_seconds: int,
@@ -3154,12 +3321,23 @@ def _run_production_training(
         workload,
         source_revision=source_revision,
         peak_flops_per_second=peak_flops_per_second,
+        accelerator_type=accelerator_type,
     )
     checkpoint = _OrbaxCheckpointBackend(
         control_root=checkpoint_control_root,
         payload_root=checkpoint_payload_root,
         mesh=workload.mesh,
         training_config=workload.checkpoint_training_config,
+        retained_checkpoint_progress={
+            plan.expected_tokens_after(
+                math.ceil(target / plan.effective_batch_tokens)
+            ): target
+            for target in getattr(
+                config.phase(plan.phase_name),
+                "evaluation_checkpoint_tokens",
+                (),
+            )
+        },
     )
     metric_destination = (
         None if metric_path is None else Path(metric_path).expanduser().resolve()
@@ -3294,6 +3472,11 @@ def _add_workload_arguments(parser: argparse.ArgumentParser) -> None:
         default="sae",
     )
     parser.add_argument(
+        "--accelerator-type",
+        choices=("v4-32", "v6e-16"),
+        default="v4-32",
+    )
+    parser.add_argument(
         "--config",
         default="configs/gemma4_contribution_v1.yaml",
     )
@@ -3357,6 +3540,11 @@ def _add_prefetch_arguments(parser: argparse.ArgumentParser) -> None:
         default="configs/gemma4_contribution_v1.yaml",
     )
     parser.add_argument(
+        "--accelerator-type",
+        choices=("v4-32", "v6e-16"),
+        default="v4-32",
+    )
+    parser.add_argument(
         "--phase",
         default="phase2_mechanism_pilot",
     )
@@ -3396,6 +3584,14 @@ def _add_prefetch_arguments(parser: argparse.ArgumentParser) -> None:
         "--source-revision",
         required=True,
         type=_source_revision,
+    )
+    parser.add_argument(
+        "--regional-mirror-seal",
+        type=_absolute_path,
+        help=(
+            "optional exact regional mirror seal; objects retain their "
+            "original scientific identities in the resident cache"
+        ),
     )
 
 
@@ -3521,6 +3717,8 @@ def _workload_argv(args: argparse.Namespace) -> list[str]:
     result = [
         "--scientific-model",
         args.scientific_model,
+        "--accelerator-type",
+        args.accelerator_type,
         "--config",
         str(Path(args.config).expanduser().resolve()),
         "--phase",
@@ -3597,8 +3795,10 @@ def _prelaunch_identity(
             {
                 "schema_version": ("gemma4-contribution-sae-requested-hardware-v1"),
                 "platform": "tpu",
-                "accelerator": "v4-32",
+                "accelerator": args.accelerator_type,
                 "global_chip_count": 16,
+                "process_count": 4,
+                "local_device_count": 4,
                 "peak_flops_per_second": args.peak_flops_per_second,
             }
             if uses_accelerator
@@ -3657,6 +3857,8 @@ def _prefetch_argv(args: argparse.Namespace) -> list[str]:
     result = [
         "--scientific-model",
         args.scientific_model,
+        "--accelerator-type",
+        args.accelerator_type,
         "--config",
         str(Path(args.config).expanduser().resolve()),
         "--phase",
@@ -3680,6 +3882,10 @@ def _prefetch_argv(args: argparse.Namespace) -> list[str]:
     ]
     if args.recomposition_sidecar is not None:
         result.extend(["--recomposition-sidecar", args.recomposition_sidecar])
+    if args.regional_mirror_seal is not None:
+        result.extend(
+            ["--regional-mirror-seal", args.regional_mirror_seal]
+        )
     if args.scientific_model == "transcoder":
         _require_transcoder_source_arguments(args)
         result.extend(
@@ -3700,9 +3906,14 @@ def _prefetch_command(args: argparse.Namespace) -> int:
         "maximum_runtime_seconds",
         args.maximum_runtime_seconds,
     )
-    if maximum > MAX_QUALIFICATION_SECONDS:
+    maximum_allowed = prefetch_runtime_limit_seconds(
+        config_path=args.config,
+        accelerator_type=args.accelerator_type,
+    )
+    if maximum > maximum_allowed:
         raise ContributionTrainingWorkerError(
-            "process-lane prefetch cannot exceed 600 seconds"
+            "process-lane prefetch cannot exceed "
+            f"{maximum_allowed} seconds for this config/accelerator"
         )
     child = [
         sys.executable,
@@ -3763,6 +3974,19 @@ def _prefetch_child_command(args: argparse.Namespace) -> int:
     _require_transcoder_source_arguments(args)
     config = _load_worker_config(args.config, args.scientific_model)
     sidecar = _load_sidecar(args.recomposition_sidecar)
+    object_store = None
+    if args.regional_mirror_seal is not None:
+        from moe_sae.object_store import GCSObjectStore
+        from moe_sae.regional_execution import RegionalMirrorStore
+
+        sealed_mirror = _read_json(
+            args.regional_mirror_seal,
+            name="regional mirror seal",
+        )
+        object_store = RegionalMirrorStore(
+            sealed_mirror,
+            GCSObjectStore(),
+        )
     if args.scientific_model == "transcoder":
         receipt = prefetch_transcoder_process_lane(
             config=config,
@@ -3777,6 +4001,7 @@ def _prefetch_child_command(args: argparse.Namespace) -> int:
             process_count=args.process_count,
             process_index=args.process_index,
             recomposition_sidecar=sidecar,
+            object_store=object_store,
         )
     else:
         receipt = prefetch_process_lane(
@@ -3790,6 +4015,7 @@ def _prefetch_child_command(args: argparse.Namespace) -> int:
             process_count=args.process_count,
             process_index=args.process_index,
             recomposition_sidecar=sidecar,
+            object_store=object_store,
         )
     _write_create_only_json(args.prefetch_receipt_path, receipt)
     print(
@@ -3856,7 +4082,10 @@ def _qualify_command(args: argparse.Namespace) -> int:
 
 def _qualify_child_command(args: argparse.Namespace) -> int:
     qualification_started = time.perf_counter()
-    from moe_sae.runtime import initialize_jax_distributed, require_v4_32_runtime
+    from moe_sae.runtime import (
+        initialize_jax_distributed,
+        require_accelerator_runtime,
+    )
 
     _verify_repository_revision(args.source_revision)
     _require_transcoder_source_arguments(args)
@@ -3899,7 +4128,10 @@ def _qualify_child_command(args: argparse.Namespace) -> int:
             recomposition_sidecar=sidecar,
         )
     initialize_jax_distributed()
-    require_v4_32_runtime()
+    require_accelerator_runtime(
+        args.accelerator_type,
+        peak_flops_per_second=args.peak_flops_per_second,
+    )
     workload = _build_production_workload(
         config,
         plan,
@@ -3919,6 +4151,7 @@ def _qualify_child_command(args: argparse.Namespace) -> int:
         workload,
         source_revision=args.source_revision,
         peak_flops_per_second=args.peak_flops_per_second,
+        accelerator_type=args.accelerator_type,
         warmup_steps=args.warmup_steps,
         measured_steps=args.measured_steps,
         qualification_started=qualification_started,
@@ -4020,7 +4253,10 @@ def _train_command(args: argparse.Namespace) -> int:
 
 
 def _train_child_command(args: argparse.Namespace) -> int:
-    from moe_sae.runtime import initialize_jax_distributed, require_v4_32_runtime
+    from moe_sae.runtime import (
+        initialize_jax_distributed,
+        require_accelerator_runtime,
+    )
 
     _verify_repository_revision(args.source_revision)
     if (
@@ -4078,7 +4314,10 @@ def _train_child_command(args: argparse.Namespace) -> int:
             recomposition_sidecar=sidecar,
         )
     initialize_jax_distributed()
-    require_v4_32_runtime()
+    require_accelerator_runtime(
+        args.accelerator_type,
+        peak_flops_per_second=args.peak_flops_per_second,
+    )
     workload = _build_production_workload(
         config,
         plan,
@@ -4100,6 +4339,7 @@ def _train_child_command(args: argparse.Namespace) -> int:
         selection,
         source_revision=args.source_revision,
         peak_flops_per_second=args.peak_flops_per_second,
+        accelerator_type=args.accelerator_type,
         checkpoint_control_root=args.checkpoint_control_root,
         checkpoint_payload_root=args.checkpoint_payload_root,
         maximum_runtime_seconds=args.maximum_runtime_seconds,

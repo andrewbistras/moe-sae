@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fan out one bounded Experiment-3 routed-input overlay harvest.
+"""Fan out one bounded routed-input overlay harvest.
 
 This operator runs on the Mac/control machine.  It starts the identical worker
 module on TPU VM workers 0--3 concurrently; the worker module itself performs
@@ -8,23 +8,33 @@ inputs are explicit CLI arguments.  Environment variables are used only by
 ``gcloud`` for its ordinary account/SDK configuration.
 
 The frozen v2 experiment reuses its two already-sealed overlay-v1 manifests.
-This command is therefore recovery/new-protocol machinery: a new capture
-requires an explicit acknowledgement and cannot target a sealed control root.
+Its recovery path retains the original ten-minute limit.  The 10M learning
+horizon may instead supply a strict target-bound capture contract whose sole
+pending identity is the overlay this command will seal.  That train-only path
+has a one-hour supervised hard limit.  In both cases a new capture requires an
+explicit acknowledgement and cannot target a sealed control root.
 """
 
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import shlex
 import shutil
 import subprocess
 import sys
 import time
 
+from moe_sae.contribution_transcoder_capture_config import (
+    TranscoderOverlayCaptureConfigError,
+    load_transcoder_overlay_capture_config,
+    overlay_capture_runtime_cap_seconds,
+)
+
 
 PROCESS_COUNT = 4
 TRANSPORT_GRACE_SECONDS = 180
+DEFAULT_CONFIG = "configs/gemma4_transcoder_v2.yaml"
 
 
 class OperatorError(RuntimeError):
@@ -40,6 +50,15 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--tpu-zone", required=True)
     parser.add_argument("--project-commit", required=True)
     parser.add_argument("--project-root", required=True)
+    parser.add_argument(
+        "--config",
+        default=DEFAULT_CONFIG,
+        help=(
+            "absolute path shared by the operator and TPU workers, or a path "
+            "relative to both checkouts; the 10M path requires its strict "
+            "target-bound capture contract"
+        ),
+    )
     parser.add_argument("--remote-uv", default="uv")
     parser.add_argument("--split", choices=("train", "eval"), required=True)
     parser.add_argument("--checkpoint", required=True)
@@ -73,6 +92,42 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _remote_config_path(args: argparse.Namespace) -> str:
+    value = str(getattr(args, "config", DEFAULT_CONFIG))
+    selected = PurePosixPath(value)
+    if selected.is_absolute():
+        return str(selected)
+    if not value or ".." in selected.parts:
+        raise OperatorError(
+            "--config must be absolute or a safe project-relative path"
+        )
+    return str(PurePosixPath(args.project_root) / selected)
+
+
+def _local_config_path(args: argparse.Namespace) -> Path:
+    value = str(getattr(args, "config", DEFAULT_CONFIG))
+    selected = Path(value).expanduser()
+    if selected.is_absolute():
+        return selected.resolve()
+    if not value or ".." in selected.parts:
+        raise OperatorError(
+            "--config must be absolute or a safe project-relative path"
+        )
+    return (Path(__file__).resolve().parents[2] / selected).resolve()
+
+
+def _expected_config_sha256(args: argparse.Namespace) -> str:
+    selected = getattr(args, "expected_config_sha256", None)
+    if isinstance(selected, str) and selected:
+        return selected
+    try:
+        return load_transcoder_overlay_capture_config(
+            _local_config_path(args)
+        ).config_hash
+    except TranscoderOverlayCaptureConfigError as error:
+        raise OperatorError(str(error)) from error
+
+
 def _worker_command(args: argparse.Namespace, controller: int) -> list[str]:
     source_cache = (
         f"{args.local_buffer_root}/experiment3/source-cache/"
@@ -97,7 +152,9 @@ def _worker_command(args: argparse.Namespace, controller: int) -> list[str]:
         "-m",
         "moe_sae.contribution_transcoder_harvest_worker",
         "--config",
-        f"{args.project_root}/configs/gemma4_transcoder_v2.yaml",
+        _remote_config_path(args),
+        "--expected-config-sha256",
+        _expected_config_sha256(args),
         "--split",
         args.split,
         "--checkpoint",
@@ -187,8 +244,22 @@ def run(args: argparse.Namespace) -> int:
             "frozen v2 reuses its sealed overlay-v1 manifests; a new capture "
             "requires --new-overlay and a fresh --control-root"
         )
-    if not 0 < args.maximum_runtime_seconds <= 600:
-        raise OperatorError("maximum runtime must lie in [1,600] seconds")
+    try:
+        capture_config = load_transcoder_overlay_capture_config(
+            _local_config_path(args)
+        )
+        runtime_cap = overlay_capture_runtime_cap_seconds(
+            capture_config,
+            split=args.split,
+        )
+    except TranscoderOverlayCaptureConfigError as error:
+        raise OperatorError(str(error)) from error
+    args.expected_config_sha256 = capture_config.config_hash
+    if not 0 < args.maximum_runtime_seconds <= runtime_cap:
+        raise OperatorError(
+            "maximum runtime must lie in "
+            f"[1,{runtime_cap}] seconds for the selected protocol"
+        )
     if args.source_cache_max_bytes <= 0 or args.per_device_sequence_batch <= 0:
         raise OperatorError("cache bytes and sequence batch must be positive")
     commands = [_worker_command(args, index) for index in range(PROCESS_COUNT)]
@@ -228,7 +299,7 @@ def run(args: argparse.Namespace) -> int:
             for process in pending:
                 process.terminate()
             raise OperatorError(
-                "SSH transports exceeded the 600-second workload bound plus grace"
+                "SSH transports exceeded the supervised workload bound plus grace"
             )
         failed = [
             (index, int(process.returncode), log)
@@ -249,6 +320,7 @@ def run(args: argparse.Namespace) -> int:
     print(
         "SEALED routed-input overlay\n"
         f"manifest: {args.control_root}/manifest.json\n"
+        f"capture contract SHA-256: {capture_config.config_hash}\n"
         f"logs: {log_root}"
     )
     return 0

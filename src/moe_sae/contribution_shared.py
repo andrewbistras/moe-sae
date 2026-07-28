@@ -597,7 +597,20 @@ class SharedQProcessInput:
         )
 
     def iter_updates(self):
-        for update in range(self.planned_updates):
+        yield from self.iter_updates_from(0)
+
+    def iter_updates_from(self, start_update: int):
+        """Seek directly to an exact shared-Q optimizer boundary."""
+
+        if (
+            isinstance(start_update, bool)
+            or not isinstance(start_update, int)
+            or not 0 <= start_update <= self.planned_updates
+        ):
+            raise SharedQError(
+                "start_update must lie in the fixed update plan"
+            )
+        for update in range(start_update, self.planned_updates):
             start = update * self.microbatches_per_update
             yield tuple(
                 self._microbatch(index)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -105,6 +106,22 @@ def test_settings_and_worker_bind_all_four_runs_and_both_manifests(
     assert worker[worker.index("--process-index") + 1] == "2"
 
 
+def test_internal_ip_transport_is_explicit(
+    operator,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    environment = _environment(tmp_path)
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+    settings = operator.Settings.from_environment()
+    external = operator._command(settings, 0, 3)
+    internal_settings = replace(settings, internal_ip=True)
+    internal = operator._command(internal_settings, 0, 3)
+    assert "--internal-ip" not in external
+    assert "--internal-ip" in internal
+
+
 def test_training_revision_is_required(
     operator,
     monkeypatch: pytest.MonkeyPatch,
@@ -118,6 +135,42 @@ def test_training_revision_is_required(
 
     with pytest.raises(operator.OperatorError, match="TRAINING_PROJECT_COMMIT"):
         operator.Settings.from_environment()
+
+
+def test_public_horizon_selection_reaches_worker(
+    operator,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    for name, value in _environment(tmp_path).items():
+        monkeypatch.setenv(name, value)
+    settings = operator._apply_public_arguments(
+        operator.Settings.from_environment(),
+        operator._parser().parse_args(
+            [
+                "--config",
+                "/nfs/contracts/transcoder-horizon-final.yaml",
+                "--phase",
+                "learning_horizon_10m",
+                "--checkpoint-tokens",
+                "2000000",
+                "--result-root",
+                "/nfs/evaluation/transcoder-2m",
+                "--run-root-a",
+                "/nfs/runs/transcoder-horizon-a",
+            ]
+        ),
+    )
+    worker = operator._worker(settings, 1)
+    assert worker[worker.index("--config") + 1] == (
+        "/nfs/contracts/transcoder-horizon-final.yaml"
+    )
+    assert worker[worker.index("--phase") + 1] == "learning_horizon_10m"
+    assert worker[worker.index("--checkpoint-tokens") + 1] == "2000000"
+    assert worker[worker.index("--run-root-a") + 1] == (
+        "/nfs/runs/transcoder-horizon-a"
+    )
+    assert settings.result_root == "/nfs/evaluation/transcoder-2m"
 
 
 def test_mapping_and_terminal_marker_are_exact(
@@ -241,3 +294,39 @@ def test_operator_result_validation_rejects_tampering(
             expected_source_revision="a" * 40,
             expected_training_source_revision="d" * 40,
         )
+
+
+def test_operator_accepts_horizon_result_identity(
+    operator,
+    tmp_path: Path,
+) -> None:
+    body = {
+        "schema_version": operator.LEARNING_HORIZON_RESULT_SCHEMA_VERSION,
+        "protocol_id": operator.LEARNING_HORIZON_PROTOCOL_ID,
+        "status": "curve_point_measured",
+        "source_revision": "a" * 40,
+        "training_source_revision": "c" * 40,
+        "parents": {
+            "run_contract_sha256": {
+                condition: canonical_sha256({"condition": condition})
+                for condition in ("A", "R", "B", "F")
+            }
+        },
+    }
+    path = tmp_path / "scientific-result.json"
+    path.write_text(
+        json.dumps(
+            {
+                **body,
+                "result_sha256": canonical_sha256(body),
+            }
+        )
+    )
+    assert (
+        operator._validate_result(
+            path,
+            expected_source_revision="a" * 40,
+            expected_training_source_revision="c" * 40,
+        )["status"]
+        == "curve_point_measured"
+    )

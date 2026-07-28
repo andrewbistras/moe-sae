@@ -30,12 +30,19 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO
 
+from moe_sae.contribution_training_worker import (
+    prefetch_runtime_limit_seconds,
+)
+
 PROCESS_COUNT = 4
+V4_32_PEAK_FLOPS_PER_SECOND = 4_400_000_000_000_000
+V6E_16_PEAK_FLOPS_PER_SECOND = 14_688_000_000_000_000
+V6E_PROCESS_CACHE_MAX_BYTES = 160 * 1024**3
 QUALIFICATION_SECONDS = 600
 DIRECT_EXPERIMENT_SECONDS = 3_600
 QUALIFICATION_TRANSPORT_WAIT_SECONDS = 720
 PREFETCH_SECONDS = 600
-PREFETCH_TRANSPORT_WAIT_SECONDS = 720
+PREFETCH_TRANSPORT_GRACE_SECONDS = 120
 TRAIN_TRANSPORT_GRACE_SECONDS = 300
 
 COORDINATOR_BUNDLE_SCHEMA_VERSION = (
@@ -46,6 +53,9 @@ QUALIFICATION_RECEIPT_SCHEMA_VERSION = (
 )
 RUN_CONTRACT_SCHEMA_VERSION = "gemma4-contribution-sae-operator-run-v1"
 ATTEMPT_PLAN_SCHEMA_VERSION = "gemma4-contribution-sae-operator-attempt-v1"
+ATTEMPT_EXECUTION_ATTESTATION_SCHEMA_VERSION = (
+    "gemma4-contribution-sae-attempt-execution-attestation-v1"
+)
 
 _COORDINATOR_BUNDLE_FIELDS = {
     "schema_version",
@@ -90,7 +100,7 @@ class Settings:
     capture_control_root: str
     object_prefix: str
     recomposition_sidecar: str
-    qualification_bundle: str
+    qualification_bundle: str | None
     cache_root: str
     cache_max_bytes: int
     sae_control_root: str
@@ -107,9 +117,17 @@ class Settings:
     scientific_model: str = "sae"
     source_overlay_control_root: str | None = None
     source_overlay_object_prefix: str | None = None
+    accelerator_type: str = "v4-32"
+    regional_mirror_seal: str | None = None
+    fresh_controller_mapping: str | None = None
+    local_cache_inventory: str | None = None
+    selected_config_path: str | None = None
+    internal_ip: bool = False
 
     @property
     def config_path(self) -> str:
+        if self.selected_config_path is not None:
+            return self.selected_config_path
         filename = (
             "gemma4_transcoder_v2.yaml"
             if self.scientific_model == "transcoder"
@@ -148,6 +166,23 @@ class Settings:
         # Stable across conditions and seeds: one sealed phase capture should
         # be downloaded only once per process/controller.
         return f"{self.cache_root}/process-p{process_index:05d}"
+
+    @property
+    def peak_flops_per_second(self) -> int:
+        if self.accelerator_type == "v6e-16":
+            return V6E_16_PEAK_FLOPS_PER_SECOND
+        if self.accelerator_type == "v4-32":
+            return V4_32_PEAK_FLOPS_PER_SECOND
+        raise OperatorError(
+            f"no audited peak FLOP rate for {self.accelerator_type}"
+        )
+
+    @property
+    def prefetch_hard_deadline_seconds(self) -> int:
+        return prefetch_runtime_limit_seconds(
+            config_path=self.config_path,
+            accelerator_type=self.accelerator_type,
+        )
 
     def qualified_prefetch_receipt(
         self,
@@ -234,6 +269,42 @@ def _gcs_prefix(name: str, value: str) -> str:
     return value.rstrip("/")
 
 
+def _internal_ip_mode(
+    environment: Mapping[str, str],
+    *,
+    accelerator_type: str,
+) -> bool:
+    raw = environment.get("TPU_USE_INTERNAL_IP", "0")
+    if raw not in {"0", "1"}:
+        raise OperatorError("TPU_USE_INTERNAL_IP must be exactly 0 or 1")
+    enabled = raw == "1"
+    if accelerator_type == "v6e-16" and not enabled:
+        raise OperatorError(
+            "v6e-16 training requires explicit TPU_USE_INTERNAL_IP=1"
+        )
+    return enabled
+
+
+def _is_horizon_v6_direct(
+    *,
+    action: str,
+    maximum_runtime_seconds: int,
+    accelerator_type: str,
+    config_path: str,
+) -> bool:
+    return (
+        action == "train"
+        and _admission_mode(action, maximum_runtime_seconds)
+        == DIRECT_BOUNDED_ADMISSION
+        and accelerator_type == "v6e-16"
+        and prefetch_runtime_limit_seconds(
+            config_path=config_path,
+            accelerator_type=accelerator_type,
+        )
+        == 1_800
+    )
+
+
 def _settings(
     environment: Mapping[str, str],
     args: argparse.Namespace,
@@ -289,6 +360,52 @@ def _settings(
     local_logs = Path(
         environment.get("CONTRIBUTION_SAE_LOCAL_LOG_ROOT", str(default_logs))
     ).expanduser().resolve()
+    accelerator_type = environment.get("TPU_ACCELERATOR_TYPE", "v4-32")
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", accelerator_type) is None:
+        raise OperatorError("TPU_ACCELERATOR_TYPE is invalid")
+    regional_mirror = environment.get("CONTRIBUTION_REGIONAL_MIRROR_SEAL")
+    fresh_mapping = environment.get("CONTRIBUTION_FRESH_CONTROLLER_MAPPING")
+    cache_inventory = environment.get("CONTRIBUTION_LOCAL_CACHE_INVENTORY")
+    cache_max_bytes = _positive_int(
+        "CONTRIBUTION_SAE_CACHE_MAX_BYTES",
+        _required(environment, "CONTRIBUTION_SAE_CACHE_MAX_BYTES"),
+    )
+    if accelerator_type == "v6e-16" and (
+        not regional_mirror or not fresh_mapping or not cache_inventory
+    ):
+        raise OperatorError(
+            "v6e-16 training requires a regional mirror seal, fresh "
+            "controller/JAX mapping receipt, and local-cache inventory"
+        )
+    if (
+        accelerator_type == "v6e-16"
+        and cache_max_bytes != V6E_PROCESS_CACHE_MAX_BYTES
+    ):
+        raise OperatorError(
+            "v6e-16 process cache bound is fixed at 160GiB"
+        )
+    internal_ip = _internal_ip_mode(
+        environment,
+        accelerator_type=accelerator_type,
+    )
+    explicit_config = getattr(args, "config", None)
+    direct_fresh_only = (
+        explicit_config is not None
+        and _is_horizon_v6_direct(
+            action=args.action,
+            maximum_runtime_seconds=maximum,
+            accelerator_type=accelerator_type,
+            config_path=explicit_config,
+        )
+    )
+    qualification_bundle = (
+        None
+        if direct_fresh_only
+        else _absolute_remote_path(
+            "CONTRIBUTION_QUALIFICATION_BUNDLE",
+            _required(environment, "CONTRIBUTION_QUALIFICATION_BUNDLE"),
+        )
+    )
     return Settings(
         gcp_project=project,
         tpu_name=tpu_name,
@@ -331,18 +448,12 @@ def _settings(
             "CONTRIBUTION_RECOMPOSITION_SIDECAR",
             _required(environment, "CONTRIBUTION_RECOMPOSITION_SIDECAR"),
         ),
-        qualification_bundle=_absolute_remote_path(
-            "CONTRIBUTION_QUALIFICATION_BUNDLE",
-            _required(environment, "CONTRIBUTION_QUALIFICATION_BUNDLE"),
-        ),
+        qualification_bundle=qualification_bundle,
         cache_root=_absolute_remote_path(
             "CONTRIBUTION_SAE_CACHE_ROOT",
             _required(environment, "CONTRIBUTION_SAE_CACHE_ROOT"),
         ),
-        cache_max_bytes=_positive_int(
-            "CONTRIBUTION_SAE_CACHE_MAX_BYTES",
-            _required(environment, "CONTRIBUTION_SAE_CACHE_MAX_BYTES"),
-        ),
+        cache_max_bytes=cache_max_bytes,
         sae_control_root=_absolute_remote_path(
             "CONTRIBUTION_SAE_CONTROL_ROOT",
             _required(environment, "CONTRIBUTION_SAE_CONTROL_ROOT"),
@@ -360,6 +471,37 @@ def _settings(
         attempt_id=args.attempt_id,
         maximum_runtime_seconds=maximum,
         local_log_root=local_logs,
+        accelerator_type=accelerator_type,
+        regional_mirror_seal=(
+            _absolute_remote_path(
+                "CONTRIBUTION_REGIONAL_MIRROR_SEAL",
+                regional_mirror,
+            )
+            if regional_mirror
+            else None
+        ),
+        fresh_controller_mapping=(
+            _absolute_remote_path(
+                "CONTRIBUTION_FRESH_CONTROLLER_MAPPING",
+                fresh_mapping,
+            )
+            if fresh_mapping
+            else None
+        ),
+        local_cache_inventory=(
+            _absolute_remote_path(
+                "CONTRIBUTION_LOCAL_CACHE_INVENTORY",
+                cache_inventory,
+            )
+            if cache_inventory
+            else None
+        ),
+        selected_config_path=(
+            _absolute_remote_path("--config", getattr(args, "config", None))
+            if getattr(args, "config", None) is not None
+            else None
+        ),
+        internal_ip=internal_ip,
     )
 
 
@@ -456,6 +598,10 @@ def _absolute_file(value: str, *, name: str) -> Path:
 def _qualification_lineage(
     bundle_path: Path,
     sidecar_path: Path,
+    *,
+    fresh_controller_mapping_path: Path | None = None,
+    expected_tpu_name: str | None = None,
+    expected_tpu_zone: str | None = None,
 ) -> dict[str, object]:
     bundle = _read_json(bundle_path, name="qualification coordinator bundle")
     if set(bundle) != _COORDINATOR_BUNDLE_FIELDS:
@@ -531,7 +677,7 @@ def _qualification_lineage(
         raise OperatorError(
             "qualification bundle does not bind the exact recomposition sidecar"
         )
-    return {
+    result: dict[str, object] = {
         "qualification_bundle_sha256": bundle_sha256,
         "qualification_receipt_sha256": checked_receipt["receipt_sha256"],
         "recomposition_sidecar_sha256": semantic_sha256,
@@ -540,6 +686,106 @@ def _qualification_lineage(
             {"controller_index": controller, "process_index": process}
             for controller, process in mapping.items()
         ],
+    }
+    if fresh_controller_mapping_path is not None:
+        try:
+            from moe_sae.regional_execution import (
+                RegionalExecutionError,
+                validate_controller_mapping_receipt,
+            )
+
+            fresh = validate_controller_mapping_receipt(
+                _read_json(
+                    fresh_controller_mapping_path,
+                    name="fresh controller mapping",
+                )
+            )
+        except (RegionalExecutionError, TypeError, ValueError) as error:
+            raise OperatorError("fresh controller mapping is invalid") from error
+        if (
+            expected_tpu_name is None
+            or expected_tpu_zone is None
+            or fresh["tpu_name"] != expected_tpu_name
+            or fresh["zone"] != expected_tpu_zone
+        ):
+            raise OperatorError(
+                "fresh controller mapping belongs to another TPU slice"
+            )
+        result["controller_to_jax_process_index"] = list(
+            fresh["controller_to_jax_process_index"]
+        )
+        result["fresh_controller_mapping_sha256"] = fresh["mapping_sha256"]
+        result["fresh_controller_contract_sha256"] = fresh[
+            "contract_sha256"
+        ]
+        result["controller_mapping_source"] = (
+            "fresh-slice-incarnation-identity-probe"
+        )
+    return result
+
+
+def _fresh_direct_lineage(
+    sidecar_path: Path,
+    *,
+    fresh_controller_mapping_path: Path,
+    expected_tpu_name: str,
+    expected_tpu_zone: str,
+) -> dict[str, object]:
+    """Build bounded-v6 lineage without reading any qualification receipt."""
+
+    sidecar = _read_json(sidecar_path, name="recomposition sidecar")
+    try:
+        from moe_sae.contribution_artifacts import (
+            validate_recomposition_sidecar,
+        )
+        from moe_sae.regional_execution import (
+            RegionalExecutionError,
+            validate_controller_mapping_receipt,
+        )
+
+        checked_sidecar = validate_recomposition_sidecar(sidecar)
+        fresh = validate_controller_mapping_receipt(
+            _read_json(
+                fresh_controller_mapping_path,
+                name="fresh controller mapping",
+            )
+        )
+    except (RegionalExecutionError, TypeError, ValueError) as error:
+        raise OperatorError(
+            "fresh bounded-v6 lineage evidence is invalid"
+        ) from error
+    if (
+        fresh["tpu_name"] != expected_tpu_name
+        or fresh["zone"] != expected_tpu_zone
+        or fresh["accelerator_type"] != "v6e-16"
+        or fresh["process_count"] != PROCESS_COUNT
+        or fresh["global_device_count"] != 16
+        or fresh["local_device_count"] != 4
+    ):
+        raise OperatorError(
+            "fresh controller mapping belongs to another TPU slice/topology"
+        )
+    return {
+        "qualification_bundle_sha256": None,
+        "qualification_receipt_sha256": None,
+        "admission_evidence_policy": (
+            "fresh-v6e-incarnation-direct-bounded-no-qualification"
+        ),
+        "recomposition_sidecar_sha256": _sha256(
+            "recomposition sidecar semantic SHA-256",
+            checked_sidecar.get("sidecar_sha256"),
+        ),
+        "recomposition_sidecar_canonical_sha256": _canonical_sha256(
+            checked_sidecar
+        ),
+        "controller_to_jax_process_index": list(
+            fresh["controller_to_jax_process_index"]
+        ),
+        "fresh_controller_mapping_sha256": fresh["mapping_sha256"],
+        "fresh_controller_contract_sha256": fresh["contract_sha256"],
+        "controller_mapping_source": (
+            "fresh-slice-incarnation-identity-probe"
+        ),
     }
 
 
@@ -587,7 +833,6 @@ def initialize_attempt(args: argparse.Namespace) -> dict[str, object]:
 
     config = _absolute_file(args.config, name="config")
     sidecar = _absolute_file(args.recomposition_sidecar, name="sidecar")
-    bundle = _absolute_file(args.qualification_bundle, name="bundle")
     capture_root = Path(args.capture_control_root).expanduser().resolve()
     if (
         not capture_root.is_dir()
@@ -626,16 +871,88 @@ def initialize_attempt(args: argparse.Namespace) -> dict[str, object]:
         raise OperatorError("run/attempt paths are not canonical")
     if sae_control_root.is_symlink() or run_root.is_symlink():
         raise OperatorError("SAE control paths must not be symbolic links")
-    lineage = _qualification_lineage(bundle, sidecar)
+    accelerator_type = getattr(args, "accelerator_type", "v4-32")
     admission_mode = _admission_mode(
         args.action,
         args.maximum_runtime_seconds,
     )
     direct_bounded = admission_mode == DIRECT_BOUNDED_ADMISSION
+    direct_fresh_only = _is_horizon_v6_direct(
+        action=args.action,
+        maximum_runtime_seconds=args.maximum_runtime_seconds,
+        accelerator_type=accelerator_type,
+        config_path=str(config),
+    )
+    prefetch_deadline = prefetch_runtime_limit_seconds(
+        config_path=config,
+        accelerator_type=accelerator_type,
+    )
+    fresh_mapping_argument = getattr(args, "fresh_controller_mapping", None)
+    regional_mirror_argument = getattr(args, "regional_mirror_seal", None)
+    cache_inventory_argument = getattr(args, "local_cache_inventory", None)
+    if accelerator_type == "v6e-16" and (
+        fresh_mapping_argument is None
+        or regional_mirror_argument is None
+        or cache_inventory_argument is None
+    ):
+        raise OperatorError(
+            "v6e-16 attempts require fresh controller mapping, regional "
+            "mirror evidence, and local-cache capacity evidence"
+        )
+    fresh_mapping_path = (
+        Path(fresh_mapping_argument).expanduser().resolve()
+        if fresh_mapping_argument
+        else None
+    )
+    if fresh_mapping_path is not None and (
+        not fresh_mapping_path.is_file() or fresh_mapping_path.is_symlink()
+    ):
+        raise OperatorError("fresh controller mapping is not one regular file")
+    if direct_fresh_only:
+        if fresh_mapping_path is None:
+            raise OperatorError(
+                "bounded v6e horizon training requires a fresh mapping"
+            )
+        lineage = _fresh_direct_lineage(
+            sidecar,
+            fresh_controller_mapping_path=fresh_mapping_path,
+            expected_tpu_name=str(getattr(args, "tpu_name", "")),
+            expected_tpu_zone=str(getattr(args, "tpu_zone", "")),
+        )
+        bundle: Path | None = None
+    else:
+        raw_bundle = getattr(args, "qualification_bundle", None)
+        if raw_bundle is None:
+            raise OperatorError(
+                "this admission path requires a qualification bundle"
+            )
+        bundle = _absolute_file(raw_bundle, name="bundle")
+        lineage = _qualification_lineage(
+            bundle,
+            sidecar,
+            fresh_controller_mapping_path=fresh_mapping_path,
+            expected_tpu_name=getattr(args, "tpu_name", None),
+            expected_tpu_zone=getattr(args, "tpu_zone", None),
+        )
     mapping = {
         int(item["controller_index"]): int(item["process_index"])
         for item in lineage["controller_to_jax_process_index"]
     }
+    operational_evidence: dict[str, object] = {}
+    stable_lineage = dict(lineage)
+    if accelerator_type == "v6e-16":
+        for name in (
+            "controller_to_jax_process_index",
+            "fresh_controller_mapping_sha256",
+            "fresh_controller_contract_sha256",
+            "controller_mapping_source",
+        ):
+            if name in stable_lineage:
+                operational_evidence[name] = stable_lineage.pop(name)
+        assert fresh_mapping_path is not None
+        operational_evidence["fresh_controller_mapping"] = str(
+            fresh_mapping_path
+        )
     contract_body: dict[str, object] = {
         "schema_version": RUN_CONTRACT_SCHEMA_VERSION,
         "run_id": args.run_id,
@@ -649,14 +966,78 @@ def initialize_attempt(args: argparse.Namespace) -> dict[str, object]:
         "capture_manifest_sha256": _manifest_sha256(capture_root),
         "object_prefix": args.object_prefix.rstrip("/"),
         "recomposition_sidecar": str(sidecar),
-        "qualification_bundle": str(bundle),
-        **lineage,
+        "qualification_bundle": str(bundle) if bundle is not None else None,
+        **stable_lineage,
+        "accelerator_type": accelerator_type,
         "process_count": PROCESS_COUNT,
         "cache_root": args.cache_root,
         "cache_max_bytes": args.cache_max_bytes,
         "checkpoint_payload_root": args.checkpoint_payload_root.rstrip("/"),
         "admission_mode": admission_mode,
     }
+    if regional_mirror_argument is not None:
+        mirror_path = Path(regional_mirror_argument).expanduser().resolve()
+        if not mirror_path.is_file() or mirror_path.is_symlink():
+            raise OperatorError("regional mirror seal is not one regular file")
+        try:
+            from moe_sae.regional_execution import (
+                RegionalExecutionError,
+                validate_sealed_regional_mirror,
+            )
+
+            mirror = validate_sealed_regional_mirror(
+                _read_json(mirror_path, name="regional mirror seal")
+            )
+        except (RegionalExecutionError, TypeError, ValueError) as error:
+            raise OperatorError("regional mirror seal is invalid") from error
+        if mirror["region"] != args.tpu_zone.rsplit("-", 1)[0]:
+            raise OperatorError(
+                "regional mirror does not belong to this TPU region"
+            )
+        mirror_evidence = {
+            "regional_mirror_seal": str(mirror_path),
+            "regional_mirror_sha256": mirror["mirror_sha256"],
+        }
+        if accelerator_type == "v6e-16":
+            operational_evidence.update(mirror_evidence)
+        else:
+            contract_body.update(mirror_evidence)
+    if cache_inventory_argument is not None:
+        inventory_path = Path(cache_inventory_argument).expanduser().resolve()
+        if not inventory_path.is_file() or inventory_path.is_symlink():
+            raise OperatorError("local cache inventory is not one regular file")
+        try:
+            from moe_sae.regional_execution import (
+                RegionalExecutionError,
+                validate_local_cache_inventory,
+            )
+
+            inventory = validate_local_cache_inventory(
+                _read_json(inventory_path, name="local cache inventory"),
+                expected_contract_sha256=(
+                    str(lineage["fresh_controller_contract_sha256"])
+                    if "fresh_controller_contract_sha256" in lineage
+                    else None
+                ),
+                expected_controller_mapping_sha256=(
+                    str(lineage["fresh_controller_mapping_sha256"])
+                    if "fresh_controller_mapping_sha256" in lineage
+                    else None
+                ),
+            )
+        except (RegionalExecutionError, TypeError, ValueError) as error:
+            raise OperatorError("local cache inventory is invalid") from error
+        cache_evidence = {
+            "local_cache_inventory": str(inventory_path),
+            "local_cache_inventory_sha256": inventory[
+                "inventory_sha256"
+            ],
+            "local_cache_kind": inventory["cache_kind"],
+        }
+        if accelerator_type == "v6e-16":
+            operational_evidence.update(cache_evidence)
+        else:
+            contract_body.update(cache_evidence)
     if source_overlay_root is not None:
         contract_body.update(
             {
@@ -670,6 +1051,27 @@ def initialize_attempt(args: argparse.Namespace) -> dict[str, object]:
                 ),
             }
         )
+    if accelerator_type == "v6e-16":
+        contract_body.update(
+            {
+                "scientific_model": scientific_model,
+                "run_contract_scope": (
+                    "stable-across-spot-slice-incarnations-with-one-"
+                    "checkpoint-namespace"
+                ),
+            }
+        )
+        for name in (
+            "config",
+            "capture_control_root",
+            "recomposition_sidecar",
+            "qualification_bundle",
+            "cache_root",
+            "cache_max_bytes",
+            "source_overlay_control_root",
+        ):
+            if name in contract_body:
+                operational_evidence[name] = contract_body.pop(name)
     contract = {
         **contract_body,
         "run_contract_sha256": _canonical_sha256(contract_body),
@@ -715,6 +1117,26 @@ def initialize_attempt(args: argparse.Namespace) -> dict[str, object]:
         raise OperatorError(
             f"immutable operator attempt already exists: {attempt_root}"
         ) from error
+    execution_attestation: dict[str, object] = {}
+    if accelerator_type == "v6e-16":
+        attestation_body = {
+            "schema_version": ATTEMPT_EXECUTION_ATTESTATION_SCHEMA_VERSION,
+            "run_id": args.run_id,
+            "action": args.action,
+            "attempt_id": args.attempt_id,
+            "run_contract_sha256": contract["run_contract_sha256"],
+            "tpu_name": args.tpu_name,
+            "tpu_zone": args.tpu_zone,
+            "accelerator_type": accelerator_type,
+            "scientific_model": scientific_model,
+            **operational_evidence,
+        }
+        execution_attestation = {
+            **attestation_body,
+            "execution_attestation_sha256": _canonical_sha256(
+                attestation_body
+            ),
+        }
     plan_body: dict[str, object] = {
         "schema_version": ATTEMPT_PLAN_SCHEMA_VERSION,
         "action": args.action,
@@ -722,13 +1144,16 @@ def initialize_attempt(args: argparse.Namespace) -> dict[str, object]:
         "attempt_root": str(attempt_root),
         "run_root": str(run_root),
         "run_contract_sha256": contract["run_contract_sha256"],
+        "config": str(config),
+        "config_file_sha256": contract["config_file_sha256"],
         "admission_mode": admission_mode,
         "controller_to_jax_process_index": (
             lineage["controller_to_jax_process_index"]
         ),
         "maximum_runtime_seconds": args.maximum_runtime_seconds,
         "qualification_hard_deadline_seconds": QUALIFICATION_SECONDS,
-        "prefetch_hard_deadline_seconds": PREFETCH_SECONDS,
+        "prefetch_hard_deadline_seconds": prefetch_deadline,
+        "operational_evidence": execution_attestation,
         "terminal_policy": (
             "four_mapped_prefetches_then_four_concurrent_supervised_workers"
         ),
@@ -739,6 +1164,115 @@ def initialize_attempt(args: argparse.Namespace) -> dict[str, object]:
     }
     _atomic_create(attempt_root / "operator-plan.json", plan)
     return plan
+
+
+def _validate_execution_attestation(
+    value: object,
+    *,
+    settings: Settings,
+    run_contract_sha256: object,
+    expected_mapping: Mapping[int, int],
+) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise OperatorError("v6e attempt lacks its execution attestation")
+    unsigned, _claimed = _validate_self_hash(
+        value,
+        hash_field="execution_attestation_sha256",
+        name="v6e attempt execution attestation",
+    )
+    required = {
+        "schema_version",
+        "run_id",
+        "action",
+        "attempt_id",
+        "run_contract_sha256",
+        "tpu_name",
+        "tpu_zone",
+        "accelerator_type",
+        "scientific_model",
+        "config",
+        "capture_control_root",
+        "recomposition_sidecar",
+        "qualification_bundle",
+        "cache_root",
+        "cache_max_bytes",
+        "controller_to_jax_process_index",
+        "fresh_controller_mapping",
+        "fresh_controller_mapping_sha256",
+        "fresh_controller_contract_sha256",
+        "controller_mapping_source",
+        "regional_mirror_seal",
+        "regional_mirror_sha256",
+        "local_cache_inventory",
+        "local_cache_inventory_sha256",
+        "local_cache_kind",
+    }
+    expected_fields = (
+        required | {"source_overlay_control_root"}
+        if settings.scientific_model == "transcoder"
+        else required
+    )
+    if set(unsigned) != expected_fields:
+        raise OperatorError("v6e execution attestation fields changed")
+    if (
+        unsigned.get("schema_version")
+        != ATTEMPT_EXECUTION_ATTESTATION_SCHEMA_VERSION
+        or unsigned.get("run_id") != settings.run_id
+        or unsigned.get("action") != settings.action
+        or unsigned.get("attempt_id") != settings.attempt_id
+        or unsigned.get("run_contract_sha256") != run_contract_sha256
+        or unsigned.get("tpu_name") != settings.tpu_name
+        or unsigned.get("tpu_zone") != settings.tpu_zone
+        or unsigned.get("accelerator_type") != "v6e-16"
+        or unsigned.get("scientific_model") != settings.scientific_model
+        or unsigned.get("config") != settings.config_path
+        or unsigned.get("capture_control_root")
+        != settings.capture_control_root
+        or unsigned.get("recomposition_sidecar")
+        != settings.recomposition_sidecar
+        or unsigned.get("qualification_bundle")
+        != settings.qualification_bundle
+        or unsigned.get("cache_root") != settings.cache_root
+        or unsigned.get("cache_max_bytes") != settings.cache_max_bytes
+        or unsigned.get("fresh_controller_mapping")
+        != settings.fresh_controller_mapping
+        or unsigned.get("regional_mirror_seal")
+        != settings.regional_mirror_seal
+        or unsigned.get("local_cache_inventory")
+        != settings.local_cache_inventory
+        or unsigned.get("controller_mapping_source")
+        != "fresh-slice-incarnation-identity-probe"
+        or unsigned.get("local_cache_kind")
+        not in {"host-ram-tmpfs", "attached-zonal-disk"}
+    ):
+        raise OperatorError(
+            "v6e execution attestation differs from this slice attempt"
+        )
+    expected_source_root = settings.source_overlay_control_root
+    if settings.scientific_model == "transcoder":
+        if (
+            unsigned.get("source_overlay_control_root") != expected_source_root
+        ):
+            raise OperatorError(
+                "v6e transcoder execution attestation lacks its source overlay"
+            )
+    elif "source_overlay_control_root" in unsigned:
+        raise OperatorError(
+            "v6e SAE execution attestation unexpectedly has a source overlay"
+        )
+    for name in (
+        "run_contract_sha256",
+        "fresh_controller_mapping_sha256",
+        "fresh_controller_contract_sha256",
+        "regional_mirror_sha256",
+        "local_cache_inventory_sha256",
+    ):
+        _sha256(name, unsigned.get(name))
+    if _controller_mapping(unsigned) != dict(expected_mapping):
+        raise OperatorError(
+            "v6e execution attestation mapping differs from the attempt plan"
+        )
+    return dict(value)
 
 
 def _validate_attempt_plan(
@@ -756,6 +1290,15 @@ def _validate_attempt_plan(
         or unsigned.get("attempt_id") != settings.attempt_id
         or unsigned.get("attempt_root") != settings.attempt_root
         or unsigned.get("run_root") != settings.run_root
+        or _SHA256_RE.fullmatch(
+            str(unsigned.get("run_contract_sha256", ""))
+        )
+        is None
+        or unsigned.get("config") != settings.config_path
+        or _SHA256_RE.fullmatch(
+            str(unsigned.get("config_file_sha256", ""))
+        )
+        is None
         or unsigned.get("maximum_runtime_seconds")
         != settings.maximum_runtime_seconds
         or unsigned.get("admission_mode")
@@ -766,10 +1309,21 @@ def _validate_attempt_plan(
         or unsigned.get("qualification_hard_deadline_seconds")
         != QUALIFICATION_SECONDS
         or unsigned.get("prefetch_hard_deadline_seconds")
-        != PREFETCH_SECONDS
+        != settings.prefetch_hard_deadline_seconds
     ):
         raise OperatorError("remote SAE attempt plan differs from this request")
     mapping = _controller_mapping(unsigned)
+    if settings.accelerator_type == "v6e-16":
+        _validate_execution_attestation(
+            unsigned.get("operational_evidence"),
+            settings=settings,
+            run_contract_sha256=unsigned.get("run_contract_sha256"),
+            expected_mapping=mapping,
+        )
+    elif unsigned.get("operational_evidence") not in ({}, None):
+        raise OperatorError(
+            "v4 attempt unexpectedly contains v6e execution evidence"
+        )
     return dict(value), mapping
 
 
@@ -794,6 +1348,8 @@ def _gcloud(settings: Settings, *, worker: int, remote_command: str) -> list[str
     ]
     if settings.ssh_key_file:
         command.insert(-1, f"--ssh-key-file={settings.ssh_key_file}")
+    if settings.internal_ip:
+        command.insert(-1, "--internal-ip")
     return command
 
 
@@ -828,6 +1384,12 @@ def _init_command(settings: Settings) -> list[str]:
         settings.attempt_id,
         "--project-commit",
         settings.project_commit,
+        "--tpu-name",
+        settings.tpu_name,
+        "--tpu-zone",
+        settings.tpu_zone,
+        "--accelerator-type",
+        settings.accelerator_type,
         "--scientific-model",
         settings.scientific_model,
         "--config",
@@ -844,8 +1406,6 @@ def _init_command(settings: Settings) -> list[str]:
         settings.object_prefix,
         "--recomposition-sidecar",
         settings.recomposition_sidecar,
-        "--qualification-bundle",
-        settings.qualification_bundle,
         "--cache-root",
         settings.cache_root,
         "--cache-max-bytes",
@@ -861,6 +1421,25 @@ def _init_command(settings: Settings) -> list[str]:
         "--maximum-runtime-seconds",
         str(settings.maximum_runtime_seconds),
     ]
+    if settings.qualification_bundle is not None:
+        command.extend(
+            ("--qualification-bundle", settings.qualification_bundle)
+        )
+    if settings.regional_mirror_seal is not None:
+        command.extend(
+            ("--regional-mirror-seal", settings.regional_mirror_seal)
+        )
+    if settings.fresh_controller_mapping is not None:
+        command.extend(
+            (
+                "--fresh-controller-mapping",
+                settings.fresh_controller_mapping,
+            )
+        )
+    if settings.local_cache_inventory is not None:
+        command.extend(
+            ("--local-cache-inventory", settings.local_cache_inventory)
+        )
     if settings.scientific_model == "transcoder":
         if (
             settings.source_overlay_control_root is None
@@ -893,6 +1472,8 @@ def _common_worker_arguments(
     result = [
         "--scientific-model",
         settings.scientific_model,
+        "--accelerator-type",
+        settings.accelerator_type,
         "--config",
         settings.config_path,
         "--phase",
@@ -915,6 +1496,8 @@ def _common_worker_arguments(
         settings.recomposition_sidecar,
         "--source-revision",
         settings.project_commit,
+        "--peak-flops-per-second",
+        str(settings.peak_flops_per_second),
     ]
     if settings.scientific_model == "transcoder":
         if (
@@ -964,6 +1547,8 @@ def _prefetch_command(
         "prefetch",
         "--scientific-model",
         settings.scientific_model,
+        "--accelerator-type",
+        settings.accelerator_type,
         "--config",
         settings.config_path,
         "--phase",
@@ -991,8 +1576,12 @@ def _prefetch_command(
         "--working-directory",
         settings.project_root,
         "--maximum-runtime-seconds",
-        str(PREFETCH_SECONDS),
+        str(settings.prefetch_hard_deadline_seconds),
     ]
+    if settings.regional_mirror_seal is not None:
+        command.extend(
+            ("--regional-mirror-seal", settings.regional_mirror_seal)
+        )
     if settings.scientific_model == "transcoder":
         if (
             settings.source_overlay_control_root is None
@@ -1388,22 +1977,34 @@ def _dry_run(settings: Settings) -> int:
         "phase": settings.phase,
         "condition": settings.condition,
         "seed": settings.seed,
+        "config": settings.config_path,
         "qualification_hard_deadline_seconds": QUALIFICATION_SECONDS,
         "admission_mode": _admission_mode(
             settings.action,
             settings.maximum_runtime_seconds,
         ),
-        "prefetch_hard_deadline_seconds": PREFETCH_SECONDS,
-        "mapping_source": settings.qualification_bundle,
+        "prefetch_hard_deadline_seconds": (
+            settings.prefetch_hard_deadline_seconds
+        ),
+        "mapping_source": (
+            settings.fresh_controller_mapping
+            or settings.qualification_bundle
+        ),
         "mapping_policy": (
             "init returns sealed controller_to_jax_process_index; Mac builds "
             "prefetch/action fanout from that exact permutation"
         ),
+        "regional_mirror_seal": settings.regional_mirror_seal,
+        "local_cache_inventory": settings.local_cache_inventory,
         "init_attempt": _init_command(settings),
         "fanout_controllers": [
             {
                 "controller_index": index,
-                "process_index": "<from-sealed-v4-bundle>",
+                "process_index": (
+                    "<from-fresh-slice-identity-probe>"
+                    if settings.fresh_controller_mapping is not None
+                    else "<from-sealed-v4-bundle>"
+                ),
                 "stages": ("prefetch", settings.action),
             }
             for index in range(PROCESS_COUNT)
@@ -1460,7 +2061,10 @@ def run(settings: Settings) -> int:
             for controller, process in mapping.items()
         ],
         prefetch_logs,
-        maximum_wait_seconds=PREFETCH_TRANSPORT_WAIT_SECONDS,
+        maximum_wait_seconds=(
+            settings.prefetch_hard_deadline_seconds
+            + PREFETCH_TRANSPORT_GRACE_SECONDS
+        ),
         stage="prefetch",
     )
     prefetch_statuses = _validated_fanout_completion(
@@ -1550,6 +2154,13 @@ def _public_parser() -> argparse.ArgumentParser:
         choices=SCIENTIFIC_MODELS,
         default="sae",
     )
+    parser.add_argument(
+        "--config",
+        help=(
+            "absolute config path on every TPU VM; defaults to the historical "
+            "SAE/transcoder config under TPU_PROJECT_ROOT"
+        ),
+    )
     parser.add_argument("--phase", required=True)
     parser.add_argument("--condition", choices=CONDITIONS, required=True)
     parser.add_argument("--seed", type=int, required=True)
@@ -1570,6 +2181,9 @@ def _init_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--attempt-id", required=True)
     parser.add_argument("--project-commit", required=True)
+    parser.add_argument("--tpu-name", default="")
+    parser.add_argument("--tpu-zone", default="")
+    parser.add_argument("--accelerator-type", default="v4-32")
     parser.add_argument(
         "--scientific-model",
         choices=SCIENTIFIC_MODELS,
@@ -1584,7 +2198,10 @@ def _init_parser() -> argparse.ArgumentParser:
     parser.add_argument("--source-overlay-control-root")
     parser.add_argument("--source-overlay-object-prefix")
     parser.add_argument("--recomposition-sidecar", required=True)
-    parser.add_argument("--qualification-bundle", required=True)
+    parser.add_argument("--qualification-bundle")
+    parser.add_argument("--fresh-controller-mapping")
+    parser.add_argument("--regional-mirror-seal")
+    parser.add_argument("--local-cache-inventory")
     parser.add_argument("--cache-root", required=True)
     parser.add_argument("--cache-max-bytes", type=int, required=True)
     parser.add_argument("--sae-control-root", required=True)

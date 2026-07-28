@@ -27,8 +27,14 @@ from moe_sae.contribution_transcoder_evaluation import (
     ENDPOINTS,
     TranscoderPairedSequenceScores,
 )
+from moe_sae.learning_horizon_config import (
+    PROTOCOL_ID as LEARNING_HORIZON_PROTOCOL_ID,
+)
 
 RESULT_SCHEMA_VERSION = "gemma4-contribution-transcoder-scientific-result-v2"
+LEARNING_HORIZON_RESULT_SCHEMA_VERSION = (
+    "gemma4-contribution-transcoder-learning-horizon-result-v1"
+)
 BOOTSTRAP_ALGORITHM = "paired-packed-sequence-percentile-bootstrap-v1"
 BOOTSTRAP_REPLICATES = 20_000
 BOOTSTRAP_SEED = 2_026_072_700
@@ -552,8 +558,48 @@ def build_transcoder_scientific_result(
     shared_harvest_receipt_sha256: str,
     shared_harvest_chip_seconds: float,
     bootstrap_replicates: int = BOOTSTRAP_REPLICATES,
+    protocol_id: str = PROTOCOL_ID,
+    checkpoint_target_tokens: int | None = None,
+    checkpoint_actual_tokens: Mapping[str, int] | None = None,
+    enforce_relative_quality_gates: bool = True,
 ) -> dict[str, Any]:
     """Build the complete seed-0 transfer verdict from retained evidence."""
+
+    if protocol_id not in {PROTOCOL_ID, LEARNING_HORIZON_PROTOCOL_ID}:
+        raise ContributionTranscoderReportError("result protocol is unsupported")
+    is_horizon = protocol_id == LEARNING_HORIZON_PROTOCOL_ID
+    if is_horizon != (not enforce_relative_quality_gates):
+        raise ContributionTranscoderReportError(
+            "only the learning horizon may disable relative-quality gates"
+        )
+    if is_horizon:
+        target_tokens = _positive_int(
+            "checkpoint_target_tokens",
+            checkpoint_target_tokens,
+        )
+        actual_tokens = _exact_fields(
+            "checkpoint_actual_tokens",
+            checkpoint_actual_tokens,
+            set(CONDITIONS),
+        )
+        checked_actual_tokens = {
+            condition: _positive_int(
+                f"checkpoint_actual_tokens.{condition}",
+                actual_tokens[condition],
+            )
+            for condition in CONDITIONS
+        }
+        if any(value < target_tokens for value in checked_actual_tokens.values()):
+            raise ContributionTranscoderReportError(
+                "checkpoint actual tokens precede the nominal curve point"
+            )
+    elif checkpoint_target_tokens is not None or checkpoint_actual_tokens is not None:
+        raise ContributionTranscoderReportError(
+            "historical Experiment 3 cannot add horizon checkpoint fields"
+        )
+    else:
+        target_tokens = None
+        checked_actual_tokens = None
 
     if not isinstance(source_revision, str) or _REVISION_RE.fullmatch(
         source_revision
@@ -649,7 +695,14 @@ def build_transcoder_scientific_result(
             for summary in checked_summaries.values()
         ),
     }
-    verdict = "transfer_passed" if all(checks.values()) else "transfer_not_established"
+    if enforce_relative_quality_gates:
+        verdict = (
+            "transfer_passed"
+            if all(checks.values())
+            else "transfer_not_established"
+        )
+    else:
+        verdict = "curve_point_measured"
     condition_rows = {}
     for condition in CONDITIONS:
         summary = checked_summaries[condition]
@@ -661,8 +714,12 @@ def build_transcoder_scientific_result(
             "training": dataclasses.asdict(checked_ledgers[condition]),
         }
     unsigned = {
-        "schema_version": RESULT_SCHEMA_VERSION,
-        "protocol_id": PROTOCOL_ID,
+        "schema_version": (
+            LEARNING_HORIZON_RESULT_SCHEMA_VERSION
+            if is_horizon
+            else RESULT_SCHEMA_VERSION
+        ),
+        "protocol_id": protocol_id,
         "status": verdict,
         "seed": 0,
         "source_revision": source_revision,
@@ -687,6 +744,16 @@ def build_transcoder_scientific_result(
             "bootstrap_replicates": int(bootstrap_replicates),
             "bootstrap_algorithm": BOOTSTRAP_ALGORITHM,
         },
+        **(
+            {
+                "learning_curve_checkpoint": {
+                    "target_tokens": target_tokens,
+                    "actual_tokens_by_condition": checked_actual_tokens,
+                }
+            }
+            if is_horizon
+            else {}
+        ),
         "conditions": condition_rows,
         "paired_effects": all_effects,
         "primary": {
@@ -723,8 +790,13 @@ def build_transcoder_scientific_result(
         },
         "verdict": {
             "checks": checks,
-            "passed": bool(all(checks.values())),
+            "passed": (
+                bool(all(checks.values()))
+                if enforce_relative_quality_gates
+                else None
+            ),
             "label": verdict,
+            **({"gates_enforced": False} if is_horizon else {}),
         },
     }
     return {
@@ -747,9 +819,16 @@ def validate_transcoder_scientific_result(
     _sha256("result_sha256", claimed)
     if canonical_sha256(selected) != claimed:
         raise ContributionTranscoderReportError("result self-hash mismatch")
-    if selected.get("schema_version") != RESULT_SCHEMA_VERSION:
+    protocol_id = selected.get("protocol_id")
+    is_horizon = protocol_id == LEARNING_HORIZON_PROTOCOL_ID
+    expected_schema = (
+        LEARNING_HORIZON_RESULT_SCHEMA_VERSION
+        if is_horizon
+        else RESULT_SCHEMA_VERSION
+    )
+    if selected.get("schema_version") != expected_schema:
         raise ContributionTranscoderReportError("result schema is incompatible")
-    if selected.get("protocol_id") != PROTOCOL_ID:
+    if protocol_id not in {PROTOCOL_ID, LEARNING_HORIZON_PROTOCOL_ID}:
         raise ContributionTranscoderReportError("result protocol is incompatible")
     for name in ("source_revision", "training_source_revision"):
         revision = selected.get(name)
@@ -818,6 +897,20 @@ def validate_transcoder_scientific_result(
             bootstrap_replicates=selected["paired_scores"][
                 "bootstrap_replicates"
             ],
+            protocol_id=protocol_id,
+            checkpoint_target_tokens=(
+                selected["learning_curve_checkpoint"]["target_tokens"]
+                if is_horizon
+                else None
+            ),
+            checkpoint_actual_tokens=(
+                selected["learning_curve_checkpoint"][
+                    "actual_tokens_by_condition"
+                ]
+                if is_horizon
+                else None
+            ),
+            enforce_relative_quality_gates=not is_horizon,
         )
         if replay != dict(value):
             raise ContributionTranscoderReportError(
@@ -837,14 +930,31 @@ def render_transcoder_report(value: Mapping[str, Any]) -> str:
         if gain["gain_recovery_percent"] is None
         else f'{gain["gain_recovery_percent"]:.2f}% ({gain["status"]})'
     )
+    is_horizon = result["protocol_id"] == LEARNING_HORIZON_PROTOCOL_ID
     lines = [
-        "# Experiment 3 result",
+        (
+            "# Pilot-width learning horizon: transcoder curve point"
+            if is_horizon
+            else "# Experiment 3 result"
+        ),
         "",
         f"Verdict: **{result['verdict']['label']}**",
         "",
         f"Evaluator commit: `{result['source_revision']}`",
         f"Training commit: `{result['training_source_revision']}`",
         "",
+        *(
+            [
+                (
+                    "Checkpoint: "
+                    f"{result['learning_curve_checkpoint']['target_tokens']:,} "
+                    "nominal training tokens."
+                ),
+                "",
+            ]
+            if is_horizon
+            else []
+        ),
         (
             "Router-conditioned A recovered "
             f"{gain_text} of the full-width F-over-B component gain at "

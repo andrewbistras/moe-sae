@@ -24,6 +24,7 @@ import argparse
 import dataclasses
 import hashlib
 import json
+import math
 import os
 import re
 from collections.abc import Callable, Mapping, Sequence
@@ -32,7 +33,11 @@ from typing import Any
 
 import numpy as np
 
-from moe_sae.checkpointing import pointer_path, validate_pointer
+from moe_sae.checkpointing import (
+    milestone_pointer_path,
+    pointer_path,
+    validate_pointer,
+)
 from moe_sae.contribution_artifacts import (
     bf16_bits_to_float32,
     canonical_json_bytes,
@@ -92,11 +97,14 @@ from moe_sae.distributed import (
 )
 from moe_sae.object_store import GCSObjectStore, ShardCache
 from moe_sae.pipeline import TrainingConfig
-from moe_sae.runtime import initialize_jax_distributed, require_v4_32_runtime
+from moe_sae.runtime import initialize_jax_distributed, require_accelerator_runtime
 
 CONDITIONS = ("A", "R", "B", "F")
 ALL_CONDITIONS = (*CONDITIONS, "Q")
 RESULT_SCHEMA_VERSION = "gemma4-contribution-phase2-scientific-result-v2"
+LEARNING_HORIZON_RESULT_SCHEMA_VERSION = (
+    "gemma4-contribution-learning-horizon-curve-point-v1"
+)
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -211,24 +219,74 @@ def _load_run(
     run_root: Path,
     plan: TrainingWorkerPlan,
     checkpoint_payload_root: str,
+    *,
+    checkpoint_target_tokens: int | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     result = _validate_training_result(
         _read_json(run_root / "training-result.json", name="training result"),
         plan,
     )
-    final_path = pointer_path(run_root / "checkpoints", "final")
+    if checkpoint_target_tokens is None:
+        selected_path = pointer_path(run_root / "checkpoints", "final")
+        expected_kind = "final"
+        expected_tokens = plan.total_tokens
+        expected_step = plan.planned_updates
+    else:
+        if (
+            isinstance(checkpoint_target_tokens, bool)
+            or not isinstance(checkpoint_target_tokens, int)
+            or checkpoint_target_tokens <= 0
+            or checkpoint_target_tokens > plan.total_tokens
+        ):
+            raise Experiment2EvaluationError(
+                "checkpoint target must lie in the training token range"
+            )
+        selected_path = milestone_pointer_path(
+            run_root / "checkpoints",
+            checkpoint_target_tokens,
+        )
+        expected_step = math.ceil(
+            checkpoint_target_tokens / plan.effective_batch_tokens
+        )
+        expected_tokens = plan.expected_tokens_after(expected_step)
+        expected_kind = "latest"
     pointer = validate_pointer(
-        _read_json(final_path, name="final checkpoint pointer"),
-        expected_kind="final",
+        _read_json(selected_path, name="selected checkpoint pointer"),
+        expected_kind=expected_kind,
         payload_root=checkpoint_payload_root,
         run_identity=result["run_identity"],
     )
     if (
-        pointer["step"] != plan.planned_updates
-        or pointer["tokens_seen"] != plan.total_tokens
+        pointer["step"] != expected_step
+        or pointer["tokens_seen"] != expected_tokens
     ):
-        raise Experiment2EvaluationError("final pointer is not at the phase boundary")
+        raise Experiment2EvaluationError(
+            "selected pointer is not at the expected optimizer boundary"
+        )
     return result, pointer
+
+
+def _selected_checkpoint_path(
+    run_root: Path,
+    checkpoint_target_tokens: int | None,
+) -> Path:
+    if checkpoint_target_tokens is None:
+        return pointer_path(run_root / "checkpoints", "final")
+    return milestone_pointer_path(
+        run_root / "checkpoints",
+        checkpoint_target_tokens,
+    )
+
+
+def _condition_run_root(args: argparse.Namespace, condition: str) -> Path:
+    explicit = getattr(args, f"run_root_{condition.lower()}", None)
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    return (
+        Path(args.sae_control_root)
+        / "runs"
+        / f"phase2-{condition.lower()}-seed{args.seed}"
+    )
 
 
 def _optimizer(config: Any, plan: TrainingWorkerPlan) -> ContributionOptimizerConfig:
@@ -468,6 +526,28 @@ def run(args: argparse.Namespace) -> int:
     import jax
 
     config = load_contribution_config(args.config)
+    phase = config.phase(args.phase)
+    phase_layouts = config.layouts_for_phase(args.phase)
+    available_conditions = tuple(item.condition for item in phase_layouts)
+    if any(condition not in available_conditions for condition in CONDITIONS):
+        raise Experiment2EvaluationError(
+            "evaluation phase must contain the complete A/R/B/F matrix"
+        )
+    include_q = "Q" in available_conditions
+    evaluated_conditions = (*CONDITIONS, "Q") if include_q else CONDITIONS
+    checkpoint_target = args.checkpoint_tokens
+    if checkpoint_target is not None:
+        allowed_curve_points = tuple(
+            getattr(
+                phase,
+                "evaluation_checkpoint_tokens",
+                phase.checkpoint_tokens,
+            )
+        )
+        if checkpoint_target not in allowed_curve_points:
+            raise Experiment2EvaluationError(
+                "requested checkpoint is not a configured evaluation curve point"
+            )
     plans = {
         condition: TrainingWorkerPlan.from_config(
             config,
@@ -475,10 +555,13 @@ def run(args: argparse.Namespace) -> int:
             condition=condition,
             seed=args.seed,
         )
-        for condition in ALL_CONDITIONS
+        for condition in evaluated_conditions
     }
     initialize_jax_distributed()
-    require_v4_32_runtime()
+    require_accelerator_runtime(
+        args.accelerator_type,
+        peak_flops_per_second=args.peak_flops_per_second,
+    )
     if jax.process_index() != args.process_index:
         raise Experiment2EvaluationError(
             "physical controller/JAX process mapping changed"
@@ -494,9 +577,20 @@ def run(args: argparse.Namespace) -> int:
     mesh = create_mesh(distributed)
     sidecar = _read_json(args.recomposition_sidecar, name="recomposition sidecar")
     sidecar_identity = decode_recomposition_sidecar(sidecar)
+    object_store: Any = GCSObjectStore()
+    if args.regional_mirror_seal is not None:
+        from moe_sae.regional_execution import RegionalMirrorStore
+
+        object_store = RegionalMirrorStore(
+            _read_json(
+                args.regional_mirror_seal,
+                name="regional mirror seal",
+            ),
+            object_store,
+        )
     cache = ShardCache(
         Path(args.cache_root) / f"process-p{jax.process_index():05d}",
-        GCSObjectStore(),
+        object_store,
         max_bytes=args.cache_max_bytes,
     )
     train_dataset = ContributionDataset(
@@ -511,104 +605,109 @@ def run(args: argparse.Namespace) -> int:
         cache=cache,
         recomposition_sidecar=sidecar,
     )
-    phase = config.phase(args.phase)
     if (
         int(train_dataset.total_tokens) != phase.train_tokens
         or int(eval_dataset.total_tokens) != phase.eval_tokens
     ):
         raise Experiment2EvaluationError("capture token counts differ from the phase")
+    parents = getattr(config, "parents", None)
+    if isinstance(parents, Mapping) and (
+        train_dataset.manifest_sha256
+        != parents.get("train_target_manifest_sha256")
+        or eval_dataset.manifest_sha256
+        != parents.get("eval_target_manifest_sha256")
+    ):
+        raise Experiment2EvaluationError(
+            "contribution captures differ from the config-pinned horizon manifests"
+        )
     output = Path(args.result_root).expanduser().resolve()
     store = _ContentStore(output / "objects")
     runs: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
     for condition, plan in plans.items():
-        run_root = (
-            Path(args.sae_control_root)
-            / "runs"
-            / f"phase2-{condition.lower()}-seed{args.seed}"
-        )
+        run_root = _condition_run_root(args, condition)
         runs[condition] = _load_run(
             run_root,
             plan,
             args.checkpoint_payload_root,
+            checkpoint_target_tokens=checkpoint_target,
         )
 
-    # Q is evaluated first.  It is common diagnostic evidence and does not
-    # enter G2/C2.
-    q_plan = plans["Q"]
-    q_centering = build_shared_q_centering(train_dataset, sidecar)
-    q_source = SharedQProcessInput(
-        eval_dataset,
-        sidecar,
-        q_centering,
-        role="evaluation",
-        total_tokens=phase.eval_tokens,
-        global_microbatch_tokens=q_plan.global_microbatch_tokens,
-        microbatches_per_update=q_plan.microbatches_per_update,
-        process_count=int(jax.process_count()),
-        process_index=int(jax.process_index()),
-    )
-    q_layout = next(
-        item
-        for item in config.layouts_for_phase(args.phase)
-        if item.condition == "Q"
-    )
-    q_config = shared_q_sae_config(
-        SharedQLayout(
-            hidden_dim=config.model.hidden_size,
-            total_features=q_layout.bank_width,
-            k=q_layout.topk_per_component,
-        ),
-        parameter_dtype=config.optimizer.parameter_dtype,
-        adam_beta1=config.optimizer.adam_beta1,
-        adam_beta2=config.optimizer.adam_beta2,
-        adam_eps=config.optimizer.adam_epsilon,
-        grad_clip=config.optimizer.global_gradient_clip,
-        peak_lr=config.optimizer.peak_learning_rate,
-        min_lr=config.optimizer.minimum_learning_rate,
-        warmup_steps=q_plan.warmup_updates,
-        total_steps=q_plan.planned_updates,
-    )
-    q_training_config = _training_config(q_plan, q_config, bank_capacity=None)
-    q_state = init_shared_q_state(
-        jax.random.key(args.seed),
-        mesh,
-        q_config,
-        distributed,
-    )
-    q_pointer = runs["Q"][1]
-    q_state, _ = restore_distributed_checkpoint(
-        pointer_path(
-            Path(args.sae_control_root)
-            / "runs"
-            / f"phase2-q-seed{args.seed}"
-            / "checkpoints",
-            "final",
-        ),
-        q_state,
-        mesh,
-        q_training_config,
-        checkpoint_payload_root=args.checkpoint_payload_root,
-        checkpoint_identity=runs["Q"][0]["run_identity"],
-        checkpoint_metadata_identity={
-            "run_identity_sha256": runs["Q"][0]["run_identity"][
-                "run_identity_sha256"
-            ]
-        },
-    )
-    q_result = evaluate_shared_q_input(
-        q_state.params,
-        q_source,
-        mesh,
-        q_config,
-        checkpoint_sha256=q_pointer["pointer_sha256"],
-        distributed=distributed,
-    )
     lane_root = output / f"process-p{jax.process_index():05d}"
-    _write_json(lane_root / "q-result.json", _q_payload(q_result))
-    _write_json(lane_root / "q-input-receipt.json", dataclasses.asdict(q_source.receipt))
-    del q_state
-    jax.clear_caches()
-    _collective_barrier(f"experiment2-eval-q-{args.seed}")
+    # Historical Experiment 2 includes Q.  The horizon study intentionally
+    # evaluates only its A/R/B/F core and therefore never invents a Q run.
+    if include_q:
+        q_plan = plans["Q"]
+        q_centering = build_shared_q_centering(train_dataset, sidecar)
+        q_source = SharedQProcessInput(
+            eval_dataset,
+            sidecar,
+            q_centering,
+            role="evaluation",
+            total_tokens=phase.eval_tokens,
+            global_microbatch_tokens=q_plan.global_microbatch_tokens,
+            microbatches_per_update=q_plan.microbatches_per_update,
+            process_count=int(jax.process_count()),
+            process_index=int(jax.process_index()),
+        )
+        q_layout = next(
+            item
+            for item in phase_layouts
+            if item.condition == "Q"
+        )
+        q_config = shared_q_sae_config(
+            SharedQLayout(
+                hidden_dim=config.model.hidden_size,
+                total_features=q_layout.bank_width,
+                k=q_layout.topk_per_component,
+            ),
+            parameter_dtype=config.optimizer.parameter_dtype,
+            adam_beta1=config.optimizer.adam_beta1,
+            adam_beta2=config.optimizer.adam_beta2,
+            adam_eps=config.optimizer.adam_epsilon,
+            grad_clip=config.optimizer.global_gradient_clip,
+            peak_lr=config.optimizer.peak_learning_rate,
+            min_lr=config.optimizer.minimum_learning_rate,
+            warmup_steps=q_plan.warmup_updates,
+            total_steps=q_plan.planned_updates,
+        )
+        q_training_config = _training_config(q_plan, q_config, bank_capacity=None)
+        q_state = init_shared_q_state(
+            jax.random.key(args.seed),
+            mesh,
+            q_config,
+            distributed,
+        )
+        q_pointer = runs["Q"][1]
+        q_run_root = _condition_run_root(args, "Q")
+        q_state, _ = restore_distributed_checkpoint(
+            _selected_checkpoint_path(q_run_root, checkpoint_target),
+            q_state,
+            mesh,
+            q_training_config,
+            checkpoint_payload_root=args.checkpoint_payload_root,
+            checkpoint_identity=runs["Q"][0]["run_identity"],
+            checkpoint_metadata_identity={
+                "run_identity_sha256": runs["Q"][0]["run_identity"][
+                    "run_identity_sha256"
+                ]
+            },
+        )
+        q_result = evaluate_shared_q_input(
+            q_state.params,
+            q_source,
+            mesh,
+            q_config,
+            checkpoint_sha256=q_pointer["pointer_sha256"],
+            distributed=distributed,
+        )
+        _write_json(lane_root / "q-result.json", _q_payload(q_result))
+        _write_json(
+            lane_root / "q-input-receipt.json",
+            dataclasses.asdict(q_source.receipt),
+        )
+        del q_state
+        jax.clear_caches()
+        _collective_barrier(f"experiment2-eval-q-{args.seed}")
 
     component_mean, component_mean_sha = _pooled_routed_mean(train_dataset)
     routed_mean, routed_mean_sha = _training_routed_mean(train_dataset, sidecar)
@@ -620,6 +719,7 @@ def run(args: argparse.Namespace) -> int:
         }
     )
     local_results: dict[str, dict[str, Any]] = {}
+    checkpoint_metadata_by_condition: dict[str, Mapping[str, Any]] = {}
     for condition in CONDITIONS:
         plan = plans[condition]
         layout = _layout(config, plan)
@@ -676,13 +776,9 @@ def run(args: argparse.Namespace) -> int:
             optimizer,
             distributed,
         )
-        run_root = (
-            Path(args.sae_control_root)
-            / "runs"
-            / f"phase2-{condition.lower()}-seed{args.seed}"
-        )
-        state, _ = restore_distributed_checkpoint(
-            pointer_path(run_root / "checkpoints", "final"),
+        run_root = _condition_run_root(args, condition)
+        state, checkpoint_metadata = restore_distributed_checkpoint(
+            _selected_checkpoint_path(run_root, checkpoint_target),
             state,
             mesh,
             train_config,
@@ -694,6 +790,11 @@ def run(args: argparse.Namespace) -> int:
                 ]
             },
         )
+        if not isinstance(checkpoint_metadata, Mapping):
+            raise Experiment2EvaluationError(
+                "restored checkpoint lacks timing metadata"
+            )
+        checkpoint_metadata_by_condition[condition] = checkpoint_metadata
         row_refs: list[ScoreArtifactRef] = []
 
         def retain_row(
@@ -868,58 +969,102 @@ def run(args: argparse.Namespace) -> int:
             * (component["A"]["ev"] - component["B"]["ev"])
             / denominator
         )
-        costs = {
-            condition: float(runs[condition][0]["chip_seconds"])
-            for condition in CONDITIONS
-        }
+        if checkpoint_target is None:
+            costs = {
+                condition: float(runs[condition][0]["chip_seconds"])
+                for condition in CONDITIONS
+            }
+        else:
+            costs = {}
+            for condition in CONDITIONS:
+                timing = checkpoint_metadata_by_condition[condition].get(
+                    "timing"
+                )
+                if not isinstance(timing, Mapping):
+                    raise Experiment2EvaluationError(
+                        "curve checkpoint lacks cumulative timing"
+                    )
+                costs[condition] = (
+                    float(timing["preprocessing_wall_seconds"])
+                    + float(timing["optimizer_wall_seconds"])
+                ) * int(timing["global_chip_count"])
         c2 = 100.0 * costs["A"] / costs["F"]
-        q_rows = [
-            _read_json(
-                output / f"process-p{process_index:05d}" / "q-result.json",
-                name="Q evaluation result",
+        q_summary: dict[str, Any] | None = None
+        if include_q:
+            q_rows = [
+                _read_json(
+                    output / f"process-p{process_index:05d}" / "q-result.json",
+                    name="Q evaluation result",
+                )
+                for process_index in range(jax.process_count())
+            ]
+            q_summary = dict(q_rows[0])
+            q_summary["input_receipt_sha256s"] = sorted(
+                row["input_receipt_sha256"] for row in q_rows
             )
-            for process_index in range(jax.process_count())
-        ]
-        q_summary = dict(q_rows[0])
-        q_summary["input_receipt_sha256s"] = sorted(
-            row["input_receipt_sha256"] for row in q_rows
-        )
-        q_summary["local_sufficient_rows_total"] = sum(
-            int(row["local_sufficient_rows"]) for row in q_rows
-        )
-        for name in (
-            "input_receipt_sha256",
-            "local_sufficient_rows",
-            "receipt_sha256",
-        ):
-            q_summary.pop(name)
-        for row in q_rows[1:]:
-            comparable = dict(row)
+            q_summary["local_sufficient_rows_total"] = sum(
+                int(row["local_sufficient_rows"]) for row in q_rows
+            )
             for name in (
                 "input_receipt_sha256",
                 "local_sufficient_rows",
                 "receipt_sha256",
             ):
-                comparable.pop(name)
-            if comparable != {
-                key: value
-                for key, value in q_summary.items()
-                if key
-                not in {
-                    "input_receipt_sha256s",
-                    "local_sufficient_rows_total",
-                }
-            }:
-                raise Experiment2EvaluationError(
-                    "global Q metrics differ across processes"
-                )
+                q_summary.pop(name)
+            for row in q_rows[1:]:
+                comparable = dict(row)
+                for name in (
+                    "input_receipt_sha256",
+                    "local_sufficient_rows",
+                    "receipt_sha256",
+                ):
+                    comparable.pop(name)
+                if comparable != {
+                    key: value
+                    for key, value in q_summary.items()
+                    if key
+                    not in {
+                        "input_receipt_sha256s",
+                        "local_sufficient_rows_total",
+                    }
+                }:
+                    raise Experiment2EvaluationError(
+                        "global Q metrics differ across processes"
+                    )
         report_body = {
-            "schema_version": RESULT_SCHEMA_VERSION,
+            "schema_version": (
+                LEARNING_HORIZON_RESULT_SCHEMA_VERSION
+                if hasattr(phase, "evaluation_checkpoint_tokens")
+                else RESULT_SCHEMA_VERSION
+            ),
+            **(
+                {
+                    "protocol_id": config.protocol_id,
+                    "status": "curve_point_measured",
+                }
+                if hasattr(phase, "evaluation_checkpoint_tokens")
+                else {}
+            ),
             "phase": args.phase,
             "seed": args.seed,
             "training_capture_manifest_sha256": train_dataset.manifest_sha256,
             "evaluation_capture_manifest_sha256": eval_dataset.manifest_sha256,
             "evaluation_tokens": phase.eval_tokens,
+            **(
+                {
+                    "checkpoint_target_tokens": (
+                        phase.train_tokens
+                        if checkpoint_target is None
+                        else checkpoint_target
+                    ),
+                    "checkpoint_actual_tokens": {
+                        condition: runs[condition][1]["tokens_seen"]
+                        for condition in CONDITIONS
+                    },
+                }
+                if hasattr(phase, "evaluation_checkpoint_tokens")
+                else {}
+            ),
             "endpoint_centering": {
                 "component_mean_sha256": component_mean_sha,
                 "routed_mean_sha256": routed_mean_sha,
@@ -927,7 +1072,7 @@ def run(args: argparse.Namespace) -> int:
             },
             "checkpoint_sha256s": {
                 condition: runs[condition][1]["pointer_sha256"]
-                for condition in ALL_CONDITIONS
+                for condition in evaluated_conditions
             },
             "score_manifest_references": {
                 condition: reference.to_dict()
@@ -976,19 +1121,43 @@ def run(args: argparse.Namespace) -> int:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
+    parser.add_argument(
+        "--accelerator-type",
+        choices=("v4-32", "v6e-16"),
+        default="v4-32",
+    )
+    parser.add_argument(
+        "--peak-flops-per-second",
+        type=int,
+        default=4_400_000_000_000_000,
+    )
     parser.add_argument("--phase", default="phase2_mechanism_pilot")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--checkpoint-tokens",
+        type=int,
+        help=(
+            "configured nominal learning-curve checkpoint; omit to evaluate "
+            "the final checkpoint"
+        ),
+    )
     parser.add_argument("--train-capture-root", required=True)
     parser.add_argument("--eval-capture-root", required=True)
     parser.add_argument("--train-object-prefix", required=True)
     parser.add_argument("--eval-object-prefix", required=True)
     parser.add_argument("--cache-root", required=True)
     parser.add_argument("--cache-max-bytes", type=int, required=True)
+    parser.add_argument("--regional-mirror-seal")
     parser.add_argument("--sae-control-root", required=True)
     parser.add_argument("--checkpoint-payload-root", required=True)
     parser.add_argument("--recomposition-sidecar", required=True)
     parser.add_argument("--result-root", required=True)
     parser.add_argument("--process-index", type=int, required=True)
+    parser.add_argument("--run-root-a")
+    parser.add_argument("--run-root-r")
+    parser.add_argument("--run-root-b")
+    parser.add_argument("--run-root-f")
+    parser.add_argument("--run-root-q")
     parser.add_argument("--bootstrap-replicates", type=int, default=20_000)
     return parser
 

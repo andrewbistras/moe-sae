@@ -38,6 +38,7 @@ from moe_sae.contribution_evaluation_worker import (
     _layout,
     _load_run,
     _optimizer,
+    _selected_checkpoint_path,
     _training_config,
 )
 from moe_sae.contribution_evaluation import _validate_capacity_receipt
@@ -78,7 +79,9 @@ from moe_sae.contribution_transcoder_evaluation import (
     score_transcoder_sufficient_rows,
 )
 from moe_sae.contribution_transcoder_input import (
+    ContributionTranscoderInputError,
     ContributionTranscoderProcessInput,
+    require_overlay_capture_contract,
     routed_input_mean,
 )
 from moe_sae.contribution_transcoder_report import (
@@ -96,7 +99,10 @@ from moe_sae.distributed import (
     restore_distributed_checkpoint,
 )
 from moe_sae.object_store import GCSObjectStore, ShardCache
-from moe_sae.runtime import initialize_jax_distributed, require_v4_32_runtime
+from moe_sae.runtime import initialize_jax_distributed, require_accelerator_runtime
+from moe_sae.learning_horizon_config import (
+    PROTOCOL_ID as LEARNING_HORIZON_PROTOCOL_ID,
+)
 
 EVIDENCE_SCHEMA_VERSION = (
     "gemma4-contribution-transcoder-process-evaluation-v1"
@@ -750,14 +756,78 @@ def _training_ledger(
     layout: Any,
     evaluation_wall_seconds: float,
     peak_flops_per_second: int,
+    checkpoint_pointer: Mapping[str, Any] | None = None,
+    checkpoint_metadata: Mapping[str, Any] | None = None,
 ) -> TranscoderTrainingLedger:
-    marginal = float(training_result["marginal_wall_seconds"])
-    chip_seconds = float(training_result["chip_seconds"])
+    if checkpoint_pointer is None and checkpoint_metadata is None:
+        selected_tokens = int(training_result["tokens"])
+        compile_seconds = float(training_result["compile_seconds"])
+        lowering_seconds = float(training_result["lowering_seconds"])
+        preprocessing_seconds = float(
+            training_result["preprocessing_wall_seconds"]
+        )
+        optimizer_seconds = float(training_result["optimizer_wall_seconds"])
+        checkpoint_seconds = float(training_result["checkpoint_seconds"])
+        marginal = float(training_result["marginal_wall_seconds"])
+        chip_seconds = float(training_result["chip_seconds"])
+        chip_count_float: float | None = None
+        tokens_per_second = float(training_result["tokens_per_second"])
+        timing_unsigned = {
+            name: training_result[name]
+            for name in (
+                "compile_seconds",
+                "lowering_seconds",
+                "preprocessing_wall_seconds",
+                "optimizer_wall_seconds",
+                "marginal_wall_seconds",
+                "checkpoint_seconds",
+                "chip_seconds",
+                "chip_seconds_scope",
+                "chip_seconds_excludes",
+                "tokens_per_second",
+            )
+        }
+    elif checkpoint_pointer is None or checkpoint_metadata is None:
+        raise Experiment3EvaluationWorkerError(
+            "checkpoint pointer and metadata must be supplied together"
+        )
+    else:
+        timing = checkpoint_metadata.get("timing")
+        if not isinstance(timing, Mapping):
+            raise Experiment3EvaluationWorkerError(
+                "checkpoint metadata lacks its cumulative timing ledger"
+            )
+        selected_tokens = int(checkpoint_pointer["tokens_seen"])
+        compile_seconds = float(timing["compile_seconds"])
+        lowering_seconds = float(timing["lowering_seconds"])
+        preprocessing_seconds = float(timing["preprocessing_wall_seconds"])
+        optimizer_seconds = float(timing["optimizer_wall_seconds"])
+        checkpoint_seconds = float(timing["checkpoint_seconds_before_save"])
+        chip_count_float = float(timing["global_chip_count"])
+        marginal = preprocessing_seconds + optimizer_seconds
+        chip_seconds = marginal * chip_count_float
+        tokens_per_second = selected_tokens / marginal
+        timing_unsigned = {
+            "checkpoint_pointer_sha256": checkpoint_pointer["pointer_sha256"],
+            "tokens_seen": selected_tokens,
+            "compile_seconds": compile_seconds,
+            "lowering_seconds": lowering_seconds,
+            "preprocessing_wall_seconds": preprocessing_seconds,
+            "optimizer_wall_seconds": optimizer_seconds,
+            "marginal_wall_seconds": marginal,
+            "checkpoint_seconds_before_save": checkpoint_seconds,
+            "global_chip_count": timing["global_chip_count"],
+            "chip_seconds": chip_seconds,
+            "chip_seconds_scope": training_result["chip_seconds_scope"],
+            "chip_seconds_excludes": training_result["chip_seconds_excludes"],
+            "tokens_per_second": tokens_per_second,
+        }
     if marginal <= 0 or chip_seconds <= 0:
         raise Experiment3EvaluationWorkerError(
             "training result has non-positive marginal timing"
         )
-    chip_count_float = chip_seconds / marginal
+    if chip_count_float is None:
+        chip_count_float = chip_seconds / marginal
     chip_count = int(round(chip_count_float))
     if not math.isclose(chip_count_float, chip_count, abs_tol=1e-9):
         raise Experiment3EvaluationWorkerError(
@@ -765,53 +835,30 @@ def _training_ledger(
         )
     useful_flops = sae_training_useful_flops(
         SAEArithmetic.from_contribution_layout(layout),
-        scientific_tokens=int(training_result["tokens"]),
+        scientific_tokens=selected_tokens,
     )
-    optimizer_seconds = float(training_result["optimizer_wall_seconds"])
     useful_mfu = useful_flops / (
         int(peak_flops_per_second) * optimizer_seconds
     )
-    timing_unsigned = {
-        name: training_result[name]
-        for name in (
-            "compile_seconds",
-            "lowering_seconds",
-            "preprocessing_wall_seconds",
-            "optimizer_wall_seconds",
-            "marginal_wall_seconds",
-            "checkpoint_seconds",
-            "chip_seconds",
-            "chip_seconds_scope",
-            "chip_seconds_excludes",
-            "tokens_per_second",
-        )
-    }
     return TranscoderTrainingLedger(
         training_result_sha256=training_result["result_sha256"],
         timing_receipt_sha256=canonical_sha256(timing_unsigned),
         chip_count=chip_count,
-        preprocessing_wall_seconds=float(
-            training_result["preprocessing_wall_seconds"]
-        ),
+        preprocessing_wall_seconds=preprocessing_seconds,
         optimizer_wall_seconds=optimizer_seconds,
         marginal_wall_seconds=marginal,
         marginal_chip_seconds=chip_seconds,
-        compilation_wall_seconds=float(
-            training_result["compile_seconds"]
-        )
-        + float(training_result["lowering_seconds"]),
-        checkpoint_serialization_wall_seconds=float(
-            training_result["checkpoint_seconds"]
-        ),
+        compilation_wall_seconds=compile_seconds + lowering_seconds,
+        checkpoint_serialization_wall_seconds=checkpoint_seconds,
         evaluation_wall_seconds=float(evaluation_wall_seconds),
         total_wall_seconds=(
             marginal
-            + float(training_result["compile_seconds"])
-            + float(training_result["lowering_seconds"])
-            + float(training_result["checkpoint_seconds"])
+            + compile_seconds
+            + lowering_seconds
+            + checkpoint_seconds
             + float(evaluation_wall_seconds)
         ),
-        tokens_per_second=float(training_result["tokens_per_second"]),
+        tokens_per_second=tokens_per_second,
         useful_mfu=float(useful_mfu),
     )
 
@@ -844,16 +891,44 @@ def _validate_phase_datasets(
         raise Experiment3EvaluationWorkerError(
             "source/target manifests differ from the frozen phase"
         )
+    try:
+        require_overlay_capture_contract(
+            train_source,
+            config.parents.get(
+                "source_overlay_capture_contract_sha256"
+            ),
+        )
+    except ContributionTranscoderInputError as error:
+        raise Experiment3EvaluationWorkerError(str(error)) from error
 
 
 def run(args: argparse.Namespace) -> int:
     import jax
 
     config = load_contribution_transcoder_config(args.config)
-    if args.seed != 0 or args.phase != "mechanism_pilot":
+    try:
+        phase = config.phase(args.phase)
+    except Exception as error:
         raise Experiment3EvaluationWorkerError(
-            "Experiment 3 evaluator is frozen to mechanism_pilot seed 0"
+            "requested phase is absent from the transcoder config"
+        ) from error
+    if args.seed not in phase.seeds:
+        raise Experiment3EvaluationWorkerError(
+            "requested seed is absent from the transcoder phase"
         )
+    checkpoint_target = args.checkpoint_tokens
+    if checkpoint_target is not None:
+        allowed_curve_points = tuple(
+            getattr(
+                phase,
+                "evaluation_checkpoint_tokens",
+                phase.checkpoint_tokens,
+            )
+        )
+        if checkpoint_target not in allowed_curve_points:
+            raise Experiment3EvaluationWorkerError(
+                "requested checkpoint is not a configured evaluation curve point"
+            )
     if (
         not isinstance(args.source_revision, str)
         or _GIT_RE.fullmatch(args.source_revision) is None
@@ -869,7 +944,10 @@ def run(args: argparse.Namespace) -> int:
             "training source revision must be a full lowercase Git SHA"
         )
     initialize_jax_distributed()
-    require_v4_32_runtime()
+    require_accelerator_runtime(
+        args.accelerator_type,
+        peak_flops_per_second=args.peak_flops_per_second,
+    )
     if int(jax.process_index()) != args.process_index:
         raise Experiment3EvaluationWorkerError(
             "physical controller/JAX process mapping changed"
@@ -885,9 +963,20 @@ def run(args: argparse.Namespace) -> int:
     mesh = create_mesh(distributed)
     sidecar = _read_json(args.recomposition_sidecar, name="recomposition sidecar")
     decoded_sidecar = decode_recomposition_sidecar(sidecar)
+    object_store: Any = GCSObjectStore()
+    if args.regional_mirror_seal is not None:
+        from moe_sae.regional_execution import RegionalMirrorStore
+
+        object_store = RegionalMirrorStore(
+            _read_json(
+                args.regional_mirror_seal,
+                name="regional mirror seal",
+            ),
+            object_store,
+        )
     cache = ShardCache(
         Path(args.cache_root) / f"process-p{jax.process_index():05d}",
-        GCSObjectStore(),
+        object_store,
         max_bytes=args.cache_max_bytes,
     )
     train_target = ContributionDataset(
@@ -914,7 +1003,6 @@ def run(args: argparse.Namespace) -> int:
         cache=cache,
         target_manifest=eval_target.manifest,
     )
-    phase = config.phase(args.phase)
     _validate_phase_datasets(
         config,
         phase,
@@ -970,6 +1058,7 @@ def run(args: argparse.Namespace) -> int:
             run_root,
             plans[condition],
             args.checkpoint_payload_root,
+            checkpoint_target_tokens=checkpoint_target,
         )
         contract = _validate_run_contract(
             run_root,
@@ -983,6 +1072,7 @@ def run(args: argparse.Namespace) -> int:
         )
         runs[condition] = (result, pointer, run_root)
 
+    checkpoint_metadata_by_condition: dict[str, Mapping[str, Any]] = {}
     for condition in CONDITIONS:
         plan = plans[condition]
         layout = _layout(config, plan)
@@ -1073,8 +1163,8 @@ def run(args: argparse.Namespace) -> int:
             optimizer,
             distributed,
         )
-        state, _ = restore_distributed_checkpoint(
-            pointer_path(run_root / "checkpoints", "final"),
+        state, checkpoint_metadata = restore_distributed_checkpoint(
+            _selected_checkpoint_path(run_root, checkpoint_target),
             state,
             mesh,
             _training_config(
@@ -1093,6 +1183,11 @@ def run(args: argparse.Namespace) -> int:
                 ]
             },
         )
+        if not isinstance(checkpoint_metadata, Mapping):
+            raise Experiment3EvaluationWorkerError(
+                "restored checkpoint lacks timing metadata"
+            )
+        checkpoint_metadata_by_condition[condition] = checkpoint_metadata
         evaluator = ContributionTranscoderDistributedEvaluator(
             mesh,
             layout,
@@ -1334,6 +1429,16 @@ def run(args: argparse.Namespace) -> int:
                     summary["evaluation_wall_seconds"]
                 ),
                 peak_flops_per_second=args.peak_flops_per_second,
+                checkpoint_pointer=(
+                    runs[condition][1]
+                    if checkpoint_target is not None
+                    else None
+                ),
+                checkpoint_metadata=(
+                    checkpoint_metadata_by_condition[condition]
+                    if checkpoint_target is not None
+                    else None
+                ),
             )
         harvest_receipt_sha = args.shared_harvest_receipt_sha256
         if harvest_receipt_sha is None:
@@ -1366,6 +1471,27 @@ def run(args: argparse.Namespace) -> int:
             shared_harvest_receipt_sha256=harvest_receipt_sha,
             shared_harvest_chip_seconds=args.shared_harvest_chip_seconds,
             bootstrap_replicates=args.bootstrap_replicates,
+            protocol_id=config.protocol_id,
+            checkpoint_target_tokens=(
+                (
+                    phase.train_tokens
+                    if checkpoint_target is None
+                    else checkpoint_target
+                )
+                if config.protocol_id == LEARNING_HORIZON_PROTOCOL_ID
+                else None
+            ),
+            checkpoint_actual_tokens=(
+                {
+                    condition: int(runs[condition][1]["tokens_seen"])
+                    for condition in CONDITIONS
+                }
+                if config.protocol_id == LEARNING_HORIZON_PROTOCOL_ID
+                else None
+            ),
+            enforce_relative_quality_gates=(
+                config.protocol_id != LEARNING_HORIZON_PROTOCOL_ID
+            ),
         )
         validate_transcoder_scientific_result(result, scores=paired)
         write_transcoder_result(
@@ -1382,8 +1508,21 @@ def run(args: argparse.Namespace) -> int:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
+    parser.add_argument(
+        "--accelerator-type",
+        choices=("v4-32", "v6e-16"),
+        default="v4-32",
+    )
     parser.add_argument("--phase", default="mechanism_pilot")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--checkpoint-tokens",
+        type=int,
+        help=(
+            "configured nominal learning-curve checkpoint; omit to evaluate "
+            "the final checkpoint"
+        ),
+    )
     parser.add_argument("--source-revision", required=True)
     parser.add_argument("--training-source-revision", required=True)
     parser.add_argument("--train-target-root", required=True)
@@ -1396,6 +1535,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval-source-object-prefix", required=True)
     parser.add_argument("--cache-root", required=True)
     parser.add_argument("--cache-max-bytes", type=int, required=True)
+    parser.add_argument("--regional-mirror-seal")
     parser.add_argument("--sae-control-root", required=True)
     parser.add_argument("--checkpoint-payload-root", required=True)
     parser.add_argument("--recomposition-sidecar", required=True)

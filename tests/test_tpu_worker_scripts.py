@@ -62,6 +62,17 @@ def test_bootstrap_contains_no_disk_mutation_or_secret_inputs() -> None:
     assert "PASSWORD" not in deploy
 
 
+def test_deploy_requires_explicit_internal_ip_for_v6e() -> None:
+    deploy = (SCRIPT_ROOT / "deploy_workers.sh").read_text()
+    assert "TPU_USE_INTERNAL_IP=${TPU_USE_INTERNAL_IP:-0}" in deploy
+    assert "v6e-16 deployment requires explicit TPU_USE_INTERNAL_IP=1" in deploy
+    assert "gcloud_common+=(--internal-ip)" in deploy
+    assert "ssh_command+=(--internal-ip)" in deploy
+    inspect = (SCRIPT_ROOT / "inspect_workers.sh").read_text()
+    assert "TPU_USE_INTERNAL_IP=${TPU_USE_INTERNAL_IP:-0}" in inspect
+    assert "command+=(--internal-ip)" in inspect
+
+
 def test_bootstrap_gates_activation_capacity_before_and_after_dependencies() -> None:
     bootstrap = (SCRIPT_ROOT / "bootstrap_worker.sh").read_text()
     assert "readonly MIN_LOCAL_FREE_BYTES=25769803776" in bootstrap

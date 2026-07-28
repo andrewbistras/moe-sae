@@ -335,8 +335,24 @@ class ContributionProcessInput:
         )
 
     def iter_updates(self) -> Iterator[tuple[ContributionHostMicrobatch, ...]]:
+        yield from self.iter_updates_from(0)
+
+    def iter_updates_from(
+        self,
+        start_update: int,
+    ) -> Iterator[tuple[ContributionHostMicrobatch, ...]]:
+        """Seek directly to an exact optimizer boundary after restore."""
+
+        if (
+            isinstance(start_update, bool)
+            or not isinstance(start_update, int)
+            or not 0 <= start_update <= self.planned_updates
+        ):
+            raise ContributionInputError(
+                "start_update must lie in the fixed update plan"
+            )
         microbatch_count = self.planned_updates * self.microbatches_per_update
-        for update in range(self.planned_updates):
+        for update in range(start_update, self.planned_updates):
             start = update * self.microbatches_per_update
             yield tuple(
                 self._microbatch(index)

@@ -519,7 +519,7 @@ def _validate_document(value: Any) -> Experiment3Config:
 
 def load_contribution_transcoder_config(
     path: str | Path,
-) -> Experiment3Config:
+) -> Any:
     selected = Path(path).expanduser().resolve()
     try:
         raw = yaml.safe_load(selected.read_text(encoding="utf-8"))
@@ -527,6 +527,19 @@ def load_contribution_transcoder_config(
         raise ContributionTranscoderConfigError(
             f"cannot load transcoder config {selected}"
         ) from error
+    if (
+        isinstance(raw, Mapping)
+        and raw.get("schema_version")
+        == "gemma4-pilot-learning-horizon-run-config-v1"
+    ):
+        from moe_sae.learning_horizon_config import (
+            learning_horizon_config_from_mapping,
+        )
+
+        return learning_horizon_config_from_mapping(
+            raw,
+            expected_scientific_model="transcoder",
+        )
     return _validate_document(raw)
 
 
