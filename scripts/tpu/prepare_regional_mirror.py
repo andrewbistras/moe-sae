@@ -198,12 +198,37 @@ def _identity_from_describe(
     value: Mapping[str, Any],
 ) -> ObjectIdentity:
     try:
-        metadata = value["metadata"]
+        # ``gcloud storage objects describe --format=json`` has emitted two
+        # field layouts across SDK releases.  The JSON-API-shaped layout uses
+        # ``crc32c``/``metadata``; current SDKs use
+        # ``crc32c_hash``/``custom_fields``.  Accept either representation,
+        # but fail closed if a response supplies contradictory aliases.
+        api_crc32c = value.get("crc32c")
+        cli_crc32c = value.get("crc32c_hash")
+        if (
+            api_crc32c is not None
+            and cli_crc32c is not None
+            and str(api_crc32c) != str(cli_crc32c)
+        ):
+            raise ValueError("conflicting crc32c aliases")
+        crc32c = api_crc32c if api_crc32c is not None else cli_crc32c
+
+        api_metadata = value.get("metadata")
+        cli_metadata = value.get("custom_fields")
+        if (
+            api_metadata is not None
+            and cli_metadata is not None
+            and api_metadata != cli_metadata
+        ):
+            raise ValueError("conflicting metadata aliases")
+        metadata = api_metadata if api_metadata is not None else cli_metadata
+        if not isinstance(metadata, Mapping) or crc32c is None:
+            raise ValueError("missing object identity fields")
         result = ObjectIdentity(
             uri=destination,
             generation=int(value["generation"]),
             size_bytes=int(value["size"]),
-            crc32c=str(value["crc32c"]),
+            crc32c=str(crc32c),
             sha256=str(metadata["sha256"]),
         )
     except (KeyError, TypeError, ValueError) as error:

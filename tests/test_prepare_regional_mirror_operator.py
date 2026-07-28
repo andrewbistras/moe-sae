@@ -75,6 +75,37 @@ def test_describe_identity_requires_exact_sha_metadata(operator):
         )
 
 
+def test_describe_identity_accepts_current_gcloud_storage_field_names(operator):
+    source = identity()
+    destination = "gs://regional/run/objects/shard.safetensors"
+    observed = operator._identity_from_describe(
+        destination,
+        source,
+        {
+            "generation": "999",
+            "size": 456,
+            "crc32c_hash": "AAAAAA==",
+            "custom_fields": {"sha256": "a" * 64},
+        },
+    )
+    assert observed.generation == 999
+    assert observed.crc32c == source.crc32c
+    assert observed.sha256 == source.sha256
+
+    with pytest.raises(operator.MirrorOperatorError, match="incomplete"):
+        operator._identity_from_describe(
+            destination,
+            source,
+            {
+                "generation": "999",
+                "size": 456,
+                "crc32c": "AAAAAA==",
+                "crc32c_hash": "BBBBBB==",
+                "metadata": {"sha256": "a" * 64},
+            },
+        )
+
+
 def test_copy_and_seal_requires_explicit_apply(operator, tmp_path: Path):
     args = operator._parser().parse_args(
         [
