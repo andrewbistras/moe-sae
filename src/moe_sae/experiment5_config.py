@@ -456,6 +456,11 @@ def _validate_document(value: Any, *, expected_panel: str | None) -> Experiment5
 
     execution = _mapping(top["execution"], name="execution")
     _exact(
+        execution.get("accelerator_mfu_gate_enforced"),
+        False,
+        name="execution.accelerator_mfu_gate_enforced",
+    )
+    _exact(
         tuple(execution.get("restart_checkpoint_tokens", ())),
         _RESTART_TOKENS,
         name="execution.restart_checkpoint_tokens",

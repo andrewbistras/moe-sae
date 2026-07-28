@@ -289,11 +289,19 @@ host cache. Experiment 5 may not create a new bulk capture, duplicate a sealed
 capture into another region solely for convenience, or repeatedly read the
 canonical cross-region GCS object on every step.
 
-Any accelerator invocation expected to run longer than ten minutes requires a
-same-binary observation with useful MFU at least 10%. The observation may be
-the bounded 2M seed-0 canary, which becomes the prefix of the production
-trajectory. Failing the gate stops that layout; it does not authorize a
-scientific change.
+Useful MFU of 10% is an optimization target and diagnostic, not a launch gate.
+Every trajectory records useful MFU, tokens/s, chip-seconds, compilation, and
+input/preprocessing time. Obvious regressions should be investigated and
+low-risk execution improvements applied, but measured MFU below 10% does not
+block, truncate, or invalidate an otherwise correct scientific trajectory.
+The direct resident campaign therefore requires no standalone qualification
+run. Correctness, finiteness, exact L0, data identity, resumability, and the
+cash ceiling remain fail-closed.
+
+This experiment intentionally retains general sharded XLA primitives rather
+than introducing a new hand-written routed grouped kernel. The measured bank
+traffic and winning routed/shared geometry from this and the immediately
+following confirmatory experiments will define that kernel's contract.
 
 The user-authorized incremental billable cost ceiling is **USD 50.00**. TPU
 time covered by the existing TRC allocation is recorded as quota-funded but

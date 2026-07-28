@@ -159,6 +159,7 @@ randomized_control:
   training_evaluation_mapping_identical: true
 
 execution:
+  accelerator_mfu_gate_enforced: false
   accelerator_min_useful_mfu: 0.10
   accelerator_qualification_max_seconds: 600
   direct_runtime_max_seconds: 43200

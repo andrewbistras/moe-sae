@@ -121,6 +121,7 @@ def test_checked_in_configs_load_as_strict_worker_views():
     assert transcoder.phase("routed_shared_hybrid_10m").seeds == (0, 1, 2)
     assert tuple(item.condition for item in sae.layouts) == ("H", "R", "B", "F")
     assert sae.layouts[0].total_features == sae.layouts[-1].total_features
+    assert sae.raw["execution"]["accelerator_mfu_gate_enforced"] is False
     plan = TrainingWorkerPlan.from_config(
         transcoder,
         phase="routed_shared_hybrid_10m",
