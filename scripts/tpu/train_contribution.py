@@ -80,7 +80,7 @@ _COORDINATOR_BUNDLE_FIELDS = {
     "coordinator_bundle_sha256",
 }
 
-CONDITIONS = ("A", "R", "B", "F", "Q")
+CONDITIONS = ("A", "H", "R", "B", "F", "Q")
 SCIENTIFIC_MODELS = ("sae", "transcoder")
 ACTIONS = ("qualify", "train")
 DIRECT_BOUNDED_ADMISSION = "bounded_direct_resident"
@@ -327,7 +327,7 @@ def _is_horizon_direct(
     return (
         action == "train"
         and accelerator_type in HORIZON_DIRECT_ACCELERATOR_TYPES
-        and phase == "learning_horizon_10m"
+        and phase in {"learning_horizon_10m", "routed_shared_hybrid_10m"}
         and direct_limit > DIRECT_EXPERIMENT_SECONDS
         and maximum_runtime_seconds <= direct_limit
     )
@@ -361,7 +361,7 @@ def _settings(
     if args.condition not in CONDITIONS:
         raise OperatorError("--condition is invalid")
     if args.scientific_model == "transcoder" and args.condition == "Q":
-        raise OperatorError("transcoder mode supports routed A/R/B/F only")
+        raise OperatorError("transcoder mode excludes shared-Q condition Q")
     if _SAFE_PHASE_RE.fullmatch(args.phase) is None:
         raise OperatorError("--phase is invalid")
     if _SAFE_ID_RE.fullmatch(args.run_id) is None:

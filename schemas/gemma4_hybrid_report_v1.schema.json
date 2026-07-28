@@ -1,0 +1,599 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://moe-sae.invalid/schemas/gemma4_hybrid_report_v1.schema.json",
+  "title": "Gemma 4 routed/shared hybrid Experiment-5 report",
+  "description": "The immutable two-panel, three-seed, three-milestone Experiment-5 report.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "protocol_id",
+    "status",
+    "source_revision",
+    "generated_at",
+    "parents",
+    "panels",
+    "budget",
+    "headline",
+    "report_sha256"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "gemma4-routed-shared-hybrid-report-v1"
+    },
+    "protocol_id": {
+      "const": "gemma4-routed-shared-hybrid-v1-20260728"
+    },
+    "status": {
+      "enum": [
+        "headline_ready",
+        "mechanism_only",
+        "not_established",
+        "incomplete",
+        "budget_stopped"
+      ]
+    },
+    "source_revision": {
+      "$ref": "#/$defs/gitSha"
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "parents": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sae_result_sha256s",
+        "transcoder_result_sha256s",
+        "sae_paired_score_sha256s",
+        "transcoder_paired_score_sha256s",
+        "sae_config_sha256",
+        "transcoder_config_sha256"
+      ],
+      "properties": {
+        "sae_result_sha256s": {
+          "$ref": "#/$defs/nineHashes"
+        },
+        "transcoder_result_sha256s": {
+          "$ref": "#/$defs/nineHashes"
+        },
+        "sae_paired_score_sha256s": {
+          "$ref": "#/$defs/nineHashes"
+        },
+        "transcoder_paired_score_sha256s": {
+          "$ref": "#/$defs/nineHashes"
+        },
+        "sae_config_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "transcoder_config_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "panels": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sae",
+        "transcoder"
+      ],
+      "properties": {
+        "sae": {
+          "$ref": "#/$defs/panelReport"
+        },
+        "transcoder": {
+          "$ref": "#/$defs/panelReport"
+        }
+      }
+    },
+    "budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "currency",
+        "hard_limit",
+        "incremental_cash_spent",
+        "quota_funded_tpu_chip_seconds",
+        "within_limit",
+        "ledger_sha256"
+      ],
+      "properties": {
+        "currency": {
+          "const": "USD"
+        },
+        "hard_limit": {
+          "const": 50
+        },
+        "incremental_cash_spent": {
+          "type": "number",
+          "minimum": 0
+        },
+        "quota_funded_tpu_chip_seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "within_limit": {
+          "type": "boolean"
+        },
+        "ledger_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "headline": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "primary_panel",
+        "text",
+        "q5_percent",
+        "nominal_candidate_exposure_percent"
+      ],
+      "properties": {
+        "primary_panel": {
+          "const": "transcoder"
+        },
+        "text": {
+          "type": "string"
+        },
+        "q5_percent": {
+          "oneOf": [
+            {
+              "type": "number",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "nominal_candidate_exposure_percent": {
+          "const": 11.764705882352942
+        }
+      }
+    },
+    "report_sha256": {
+      "$ref": "#/$defs/sha256"
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "gitSha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "nineHashes": {
+      "type": "array",
+      "minItems": 9,
+      "maxItems": 9,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/sha256"
+      }
+    },
+    "scoreSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mean_ev",
+        "mean_nmse",
+        "per_seed_ev"
+      ],
+      "properties": {
+        "mean_ev": {
+          "type": "number"
+        },
+        "mean_nmse": {
+          "type": "number",
+          "minimum": 0
+        },
+        "per_seed_ev": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "items": {
+            "type": "number"
+          }
+        }
+      }
+    },
+    "conditionSummaries": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "H",
+        "R",
+        "B",
+        "F"
+      ],
+      "properties": {
+        "H": {
+          "$ref": "#/$defs/scoreSummary"
+        },
+        "R": {
+          "$ref": "#/$defs/scoreSummary"
+        },
+        "B": {
+          "$ref": "#/$defs/scoreSummary"
+        },
+        "F": {
+          "$ref": "#/$defs/scoreSummary"
+        }
+      }
+    },
+    "milestoneSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "checkpoint_tokens",
+        "conditions"
+      ],
+      "properties": {
+        "checkpoint_tokens": {
+          "enum": [
+            2000000,
+            5000000,
+            10000000
+          ]
+        },
+        "conditions": {
+          "$ref": "#/$defs/conditionSummaries"
+        }
+      }
+    },
+    "hierarchicalEffect": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mean",
+        "lower",
+        "upper",
+        "positive_seed_count",
+        "confidence_level",
+        "bootstrap_replicates",
+        "passes_headline_rule"
+      ],
+      "properties": {
+        "mean": {
+          "type": "number"
+        },
+        "lower": {
+          "type": "number"
+        },
+        "upper": {
+          "type": "number"
+        },
+        "positive_seed_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 3
+        },
+        "confidence_level": {
+          "const": 0.95
+        },
+        "bootstrap_replicates": {
+          "const": 20000
+        },
+        "passes_headline_rule": {
+          "type": "boolean"
+        }
+      }
+    },
+    "contrastSet": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "H-R",
+        "H-B",
+        "H-F",
+        "F-B"
+      ],
+      "properties": {
+        "H-R": {
+          "$ref": "#/$defs/hierarchicalEffect"
+        },
+        "H-B": {
+          "$ref": "#/$defs/hierarchicalEffect"
+        },
+        "H-F": {
+          "$ref": "#/$defs/hierarchicalEffect"
+        },
+        "F-B": {
+          "$ref": "#/$defs/hierarchicalEffect"
+        }
+      }
+    },
+    "gainRecovery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "g5_percent",
+        "numerator_mean",
+        "denominator_mean",
+        "denominator_interval_includes_zero"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "defined",
+            "unstable",
+            "undefined_nonpositive_denominator"
+          ]
+        },
+        "g5_percent": {
+          "oneOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "numerator_mean": {
+          "type": "number"
+        },
+        "denominator_mean": {
+          "type": "number"
+        },
+        "denominator_interval_includes_zero": {
+          "type": "boolean"
+        }
+      }
+    },
+    "seedFixedQuality": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "seed",
+        "reference_f_10m_ev",
+        "earliest_h_checkpoint_tokens",
+        "q5_percent",
+        "same_accelerator_generation"
+      ],
+      "properties": {
+        "seed": {
+          "enum": [
+            0,
+            1,
+            2
+          ]
+        },
+        "reference_f_10m_ev": {
+          "type": "number"
+        },
+        "earliest_h_checkpoint_tokens": {
+          "oneOf": [
+            {
+              "enum": [
+                2000000,
+                5000000,
+                10000000
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "q5_percent": {
+          "oneOf": [
+            {
+              "type": "number",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "same_accelerator_generation": {
+          "type": "boolean"
+        }
+      }
+    },
+    "fixedQuality": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "reaching_seed_count",
+        "per_seed",
+        "median_q5_percent",
+        "interpolation_used"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "defined",
+            "not_reached_all_seeds",
+            "hardware_incomparable"
+          ]
+        },
+        "reaching_seed_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 3
+        },
+        "per_seed": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "items": {
+            "$ref": "#/$defs/seedFixedQuality"
+          }
+        },
+        "median_q5_percent": {
+          "oneOf": [
+            {
+              "type": "number",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "interpolation_used": {
+          "const": false
+        }
+      }
+    },
+    "costRatio": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "checkpoint_tokens",
+        "per_seed_h_over_f_percent",
+        "median_h_over_f_percent",
+        "all_same_generation"
+      ],
+      "properties": {
+        "checkpoint_tokens": {
+          "enum": [
+            2000000,
+            5000000,
+            10000000
+          ]
+        },
+        "per_seed_h_over_f_percent": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "items": {
+            "oneOf": [
+              {
+                "type": "number",
+                "minimum": 0
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "median_h_over_f_percent": {
+          "oneOf": [
+            {
+              "type": "number",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "all_same_generation": {
+          "type": "boolean"
+        }
+      }
+    },
+    "coverageSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cumulative_training_firing_fraction",
+        "heldout_nonfiring_fraction"
+      ],
+      "properties": {
+        "cumulative_training_firing_fraction": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "heldout_nonfiring_fraction": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        }
+      }
+    },
+    "conditionCoverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "H",
+        "R",
+        "B",
+        "F"
+      ],
+      "properties": {
+        "H": {
+          "$ref": "#/$defs/coverageSummary"
+        },
+        "R": {
+          "$ref": "#/$defs/coverageSummary"
+        },
+        "B": {
+          "$ref": "#/$defs/coverageSummary"
+        },
+        "F": {
+          "$ref": "#/$defs/coverageSummary"
+        }
+      }
+    },
+    "panelReport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "panel",
+        "complete",
+        "milestones",
+        "ten_million_contrasts",
+        "gain_recovery",
+        "fixed_quality_cost",
+        "equal_token_cost",
+        "ten_million_coverage",
+        "headline_ready"
+      ],
+      "properties": {
+        "panel": {
+          "enum": [
+            "sae",
+            "transcoder"
+          ]
+        },
+        "complete": {
+          "type": "boolean"
+        },
+        "milestones": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "items": {
+            "$ref": "#/$defs/milestoneSummary"
+          }
+        },
+        "ten_million_contrasts": {
+          "$ref": "#/$defs/contrastSet"
+        },
+        "gain_recovery": {
+          "$ref": "#/$defs/gainRecovery"
+        },
+        "fixed_quality_cost": {
+          "$ref": "#/$defs/fixedQuality"
+        },
+        "equal_token_cost": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "items": {
+            "$ref": "#/$defs/costRatio"
+          }
+        },
+        "ten_million_coverage": {
+          "$ref": "#/$defs/conditionCoverage"
+        },
+        "headline_ready": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}

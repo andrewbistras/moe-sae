@@ -91,7 +91,7 @@ CHIP_SECONDS_EXCLUDES = (
 
 
 def _finalized_horizon_config(config_path: str | Path) -> Any | None:
-    """Return a strict finalized horizon config, or ``None`` for another schema."""
+    """Return a strict long-horizon config, or ``None`` for another schema."""
 
     selected = Path(config_path).expanduser().resolve()
     try:
@@ -100,11 +100,23 @@ def _finalized_horizon_config(config_path: str | Path) -> Any | None:
         raise ContributionTrainingWorkerError(
             "cannot inspect the selected config for its execution policy"
         ) from error
-    if not (
-        isinstance(raw, Mapping)
-        and raw.get("schema_version")
-        == "gemma4-pilot-learning-horizon-run-config-v1"
-    ):
+    if not isinstance(raw, Mapping):
+        return None
+
+    schema = raw.get("schema_version")
+    if schema == "gemma4-routed-shared-hybrid-run-config-v1":
+        from moe_sae.experiment5_config import (
+            Experiment5ConfigError,
+            load_experiment5_config,
+        )
+
+        try:
+            return load_experiment5_config(selected)
+        except Experiment5ConfigError as error:
+            raise ContributionTrainingWorkerError(
+                "Experiment-5 execution requires its strict finalized config"
+            ) from error
+    if schema != "gemma4-pilot-learning-horizon-run-config-v1":
         return None
 
     # A filename is not an execution identity. Re-load the whole document
@@ -132,7 +144,7 @@ def prefetch_runtime_limit_seconds(
 
     if (
         accelerator_type in HORIZON_DIRECT_ACCELERATOR_TYPES
-        and phase == "learning_horizon_10m"
+        and phase in {"learning_horizon_10m", "routed_shared_hybrid_10m"}
         and _finalized_horizon_config(config_path) is not None
     ):
         return HORIZON_PREFETCH_MAX_SECONDS
@@ -155,7 +167,7 @@ def direct_resident_runtime_limit_seconds(
 
     if (
         accelerator_type not in HORIZON_DIRECT_ACCELERATOR_TYPES
-        or phase != "learning_horizon_10m"
+        or phase not in {"learning_horizon_10m", "routed_shared_hybrid_10m"}
     ):
         return MAX_UNGATED_ACCELERATOR_SECONDS
     config = _finalized_horizon_config(config_path)
@@ -177,7 +189,7 @@ InputMode = Literal["resident", "rematerialized"]
 INPUT_MODES: tuple[InputMode, ...] = ("resident", "rematerialized")
 ScientificModel = Literal["sae", "transcoder"]
 SCIENTIFIC_MODELS: tuple[ScientificModel, ...] = ("sae", "transcoder")
-CONDITIONS = ("A", "R", "B", "F", "Q")
+CONDITIONS = ("A", "H", "R", "B", "F", "Q")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -348,6 +360,14 @@ class TrainingWorkerPlan:
             )
         assert selected.planned_updates is not None
         assert selected.warmup_updates is not None
+        randomization_key = seed
+        from moe_sae.experiment5_config import (
+            Experiment5Config,
+            experiment5_randomization_key,
+        )
+
+        if isinstance(config, Experiment5Config):
+            randomization_key = experiment5_randomization_key(seed)
         return cls(
             phase_name=selected.name,
             condition=condition,
@@ -361,7 +381,7 @@ class TrainingWorkerPlan:
                 // config.runtime.microbatch_tokens
             ),
             checkpoint_tokens=selected.checkpoint_tokens,
-            randomization_key=seed,
+            randomization_key=randomization_key,
         )
 
 
@@ -945,10 +965,12 @@ def run_qualified_training(
         )
     if (
         direct_maximum == MAX_LEARNING_HORIZON_ACCELERATOR_SECONDS
-        and plan.phase_name != "learning_horizon_10m"
+        and plan.phase_name
+        not in {"learning_horizon_10m", "routed_shared_hybrid_10m"}
     ):
         raise ContributionTrainingWorkerError(
-            "the twelve-hour direct policy is restricted to learning_horizon_10m"
+            "the twelve-hour direct policy is restricted to finalized "
+            "10M learning-horizon protocols"
         )
     if direct_bounded_resident:
         if maximum > direct_maximum:
@@ -2113,6 +2135,7 @@ class _PreparedHandle:
     device_batch: Any
     mean: Any
     process_local: bool
+    experiment5_recomposition: Any | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -2130,6 +2153,7 @@ class _ProductionWorkload:
     workload_context: Mapping[str, Any]
     checkpoint_training_config: Any
     preprocessing_wall_seconds: float
+    experiment5_recomposition: Any | None
 
     @property
     def expected_l0(self) -> int:
@@ -2437,6 +2461,19 @@ class _ProductionEngine:
     def initialize_state(self) -> Any:
         import jax
 
+        if self.workload.experiment5_recomposition is not None:
+            from moe_sae.experiment5_distributed import (
+                init_experiment5_distributed_state,
+            )
+
+            assert self.workload.routed_layout is not None
+            return init_experiment5_distributed_state(
+                jax.random.key(self.plan.seed),
+                self.workload.mesh,
+                self.workload.routed_layout,
+                self.workload.optimizer,
+                self.workload.distributed,
+            )
         if self.workload.scientific_model == "transcoder":
             from moe_sae.contribution_transcoder_distributed import (
                 init_contribution_transcoder_distributed_state,
@@ -2481,7 +2518,28 @@ class _ProductionEngine:
     ) -> PreparedTrainingExecutable:
         rematerialize = mode == "rematerialized"
         process_local = int(self.workload.source.process_count) > 1
-        if self.workload.scientific_model == "transcoder":
+        if self.workload.experiment5_recomposition is not None:
+            from moe_sae.experiment5_distributed import (
+                Experiment5DistributedTrainer,
+            )
+
+            assert self.workload.routed_layout is not None
+            trainer = Experiment5DistributedTrainer(
+                self.workload.mesh,
+                self.workload.routed_layout,
+                self.workload.optimizer,
+                self.workload.distributed,
+                encoder_kind=self.workload.scientific_model,
+                bank_capacity=self.workload.bank_capacity,
+                rmsnorm_epsilon=float(
+                    self.workload.experiment5_recomposition.epsilon
+                ),
+                rematerialize_microbatch=rematerialize,
+                expected_physical_layout_sha256=self.workload.workload_context[
+                    "physical_feature_layout_identity"
+                ]["identity_sha256"],
+            )
+        elif self.workload.scientific_model == "transcoder":
             from moe_sae.contribution_transcoder_distributed import (
                 ContributionTranscoderDistributedTrainer,
             )
@@ -2518,19 +2576,34 @@ class _ProductionEngine:
                 self.workload.distributed,
                 rematerialize_microbatch=rematerialize,
             )
-        device_batch, device_mean = trainer._prepare(
-            batch,
-            mean,
-            process_local=process_local,
-        )
-        if self.workload.scientific_model == "transcoder":
+        if self.workload.experiment5_recomposition is not None:
+            device_batch, device_constants = trainer._prepare(
+                batch,
+                mean,
+                self.workload.experiment5_recomposition,
+                process_local=process_local,
+            )
+            lowered = trainer._compiled.lower(
+                state,
+                device_batch,
+                *device_constants,
+            )
+        else:
+            device_batch, device_mean = trainer._prepare(
+                batch,
+                mean,
+                process_local=process_local,
+            )
+        if self.workload.experiment5_recomposition is None and (
+            self.workload.scientific_model == "transcoder"
+        ):
             lowered = trainer._compiled.lower(
                 state,
                 device_batch,
                 device_mean.source_mean,
                 device_mean.target_mean,
             )
-        else:
+        elif self.workload.experiment5_recomposition is None:
             lowered = trainer._compiled.lower(state, device_batch, device_mean)
         graph = _stablehlo_manifest(
             lowered,
@@ -2560,8 +2633,13 @@ class _ProductionEngine:
                 trainer=trainer,
                 lowered=lowered,
                 device_batch=device_batch,
-                mean=device_mean,
+                mean=(
+                    mean
+                    if self.workload.experiment5_recomposition is not None
+                    else device_mean
+                ),
                 process_local=process_local,
+                experiment5_recomposition=self.workload.experiment5_recomposition,
             ),
             identity=identity,
             graph_manifest=graph,
@@ -2584,12 +2662,21 @@ class _ProductionEngine:
         mean: Any,
     ) -> tuple[Any, Mapping[str, Any]]:
         handle: _PreparedHandle = prepared.handle
-        updated, metrics = handle.trainer.step(
-            state,
-            batch,
-            mean,
-            process_local=handle.process_local,
-        )
+        if handle.experiment5_recomposition is not None:
+            updated, metrics = handle.trainer.step(
+                state,
+                batch,
+                mean,
+                handle.experiment5_recomposition,
+                process_local=handle.process_local,
+            )
+        else:
+            updated, metrics = handle.trainer.step(
+                state,
+                batch,
+                mean,
+                process_local=handle.process_local,
+            )
         import jax
 
         host = jax.device_get(metrics)
@@ -2612,12 +2699,21 @@ class _ProductionEngine:
         """Qualifier-only step over the already device-resident static batch."""
 
         handle: _PreparedHandle = prepared.handle
-        updated, metrics = handle.trainer.step(
-            state,
-            handle.device_batch,
-            handle.mean,
-            process_local=False,
-        )
+        if handle.experiment5_recomposition is not None:
+            updated, metrics = handle.trainer.step(
+                state,
+                handle.device_batch,
+                handle.mean,
+                handle.experiment5_recomposition,
+                process_local=False,
+            )
+        else:
+            updated, metrics = handle.trainer.step(
+                state,
+                handle.device_batch,
+                handle.mean,
+                process_local=False,
+            )
         import jax
 
         host = jax.device_get(metrics)
@@ -2872,6 +2968,350 @@ def _phase_layout(config: Experiment2Config, plan: TrainingWorkerPlan) -> Any:
     return matches[0]
 
 
+def _build_experiment5_workload(
+    config: Any,
+    plan: TrainingWorkerPlan,
+    *,
+    scientific_model: ScientificModel,
+    capture_control_root: str | Path,
+    object_prefix: str,
+    source_overlay_control_root: str | Path | None,
+    source_overlay_object_prefix: str | None,
+    resident_cache_root: str | Path,
+    resident_cache_max_bytes: int,
+    recomposition_sidecar: Mapping[str, Any] | None,
+    prefetch_receipt: Mapping[str, Any],
+    expected_context: Mapping[str, Any] | None,
+) -> _ProductionWorkload:
+    """Build the Experiment-5 full-FFN workload on the sealed parent data."""
+
+    import jax
+
+    from moe_sae.contribution_shared import build_shared_q_centering
+    from moe_sae.contribution_storage import ContributionDataset
+    from moe_sae.contribution_training import ContributionOptimizerConfig
+    from moe_sae.distributed import DistributedConfig, create_mesh
+    from moe_sae.experiment5_config import Experiment5Config
+    from moe_sae.experiment5_hybrid import (
+        Experiment5Centering,
+        Experiment5Recomposition,
+        experiment5_optimizer_sae_config,
+        production_experiment5_layout,
+    )
+    from moe_sae.experiment5_distributed import experiment5_physical_layout
+    from moe_sae.experiment5_input import (
+        Experiment5PreprocessingReceipt,
+        Experiment5ProcessInput,
+        merge_experiment5_preprocessing,
+    )
+    from moe_sae.object_store import ShardCache
+    from moe_sae.pipeline import TrainingConfig
+
+    if not isinstance(config, Experiment5Config):
+        raise ContributionTrainingWorkerError(
+            "internal Experiment-5 workload dispatch received another config"
+        )
+    if recomposition_sidecar is None:
+        raise ContributionTrainingWorkerError(
+            "Experiment 5 requires the exact recomposition sidecar"
+        )
+    cache = ShardCache(
+        resident_cache_root,
+        _ResidentOnlyObjectStore(),
+        max_bytes=_positive_int(
+            "resident_cache_max_bytes",
+            resident_cache_max_bytes,
+        ),
+        resident_only=True,
+    )
+    target = ContributionDataset(
+        capture_control_root,
+        object_prefix=object_prefix,
+        cache=cache,
+        recomposition_sidecar=recomposition_sidecar,
+    )
+    if (
+        int(target.total_tokens) != plan.total_tokens
+        or target.manifest_sha256
+        != config.parents["train_target_manifest_sha256"]
+    ):
+        raise ContributionTrainingWorkerError(
+            "Experiment-5 target differs from its config-pinned 10M capture"
+        )
+    source_dataset: Any | None = None
+    if scientific_model == "transcoder":
+        if source_overlay_control_root is None or source_overlay_object_prefix is None:
+            raise ContributionTrainingWorkerError(
+                "Experiment-5 transcoder requires its routed-input overlay"
+            )
+        from moe_sae.contribution_transcoder_input import (
+            require_overlay_capture_contract,
+            routed_input_mean,
+        )
+        from moe_sae.contribution_transcoder_storage import RoutedInputDataset
+
+        source_dataset = RoutedInputDataset(
+            source_overlay_control_root,
+            object_prefix=source_overlay_object_prefix,
+            cache=cache,
+            target_manifest=target.manifest,
+        )
+        require_overlay_capture_contract(
+            source_dataset,
+            config.parents["source_overlay_capture_contract_sha256"],
+        )
+        if (
+            int(source_dataset.total_tokens) != plan.total_tokens
+            or source_dataset.manifest_sha256
+            != config.parents["train_source_overlay_manifest_sha256"]
+        ):
+            raise ContributionTrainingWorkerError(
+                "Experiment-5 source differs from its config-pinned overlay"
+            )
+
+    distributed = DistributedConfig(
+        data_axis_size=int(jax.process_count()),
+        feature_axis_size=int(jax.local_device_count()),
+        microbatches_per_update=plan.microbatches_per_update,
+    )
+    mesh = create_mesh(distributed)
+    layout = production_experiment5_layout(
+        plan.condition,
+        randomization_key=plan.randomization_key,
+    )
+    config_layout = _phase_layout(config, plan)
+    if (
+        layout.total_features != config_layout.total_features
+        or layout.candidates_per_token != config_layout.candidates_per_token
+        or layout.total_l0 != config_layout.total_l0
+    ):
+        raise ContributionTrainingWorkerError(
+            "Experiment-5 executable layout differs from the frozen config"
+        )
+    input_source = Experiment5ProcessInput(
+        target,
+        recomposition_sidecar,
+        layout,
+        panel=scientific_model,
+        total_tokens=plan.total_tokens,
+        source_dataset=source_dataset,
+        global_microbatch_tokens=plan.global_microbatch_tokens,
+        microbatches_per_update=plan.microbatches_per_update,
+        process_count=int(jax.process_count()),
+        process_index=int(jax.process_index()),
+    )
+    checked_prefetch = (
+        validate_transcoder_prefetch_receipt(prefetch_receipt)
+        if scientific_model == "transcoder"
+        else validate_prefetch_receipt(prefetch_receipt)
+    )
+    expected_partition = {
+        "strategy": input_source.process_partition_strategy,
+        "process_count": input_source.process_count,
+        "process_index": input_source.process_index,
+        "range_start": input_source.process_range_start,
+        "range_end": input_source.process_range_end,
+        "tokens": (
+            input_source.process_range_end - input_source.process_range_start
+        ),
+    }
+    if checked_prefetch["process_partition"] != expected_partition:
+        raise ContributionTrainingWorkerError(
+            "Experiment-5 input and resident prefetch partitions differ"
+        )
+    input_records = _collective_records(asdict(input_source.receipt))
+    prefetch_records = _collective_records(checked_prefetch)
+    for name, records in (
+        ("input", input_records),
+        ("prefetch", prefetch_records),
+    ):
+        observed = [
+            int(
+                item["process_index"]
+                if name == "input"
+                else item["process_partition"]["process_index"]
+            )
+            for item in records
+        ]
+        if observed != list(range(jax.process_count())):
+            raise ContributionTrainingWorkerError(
+                f"Experiment-5 {name} receipts are not process ordered"
+            )
+
+    preprocessing_started = time.perf_counter()
+    local_preprocessing = input_source.scan_local_preprocessing()
+    preprocessing_records = _collective_records(asdict(local_preprocessing))
+    merged = merge_experiment5_preprocessing(
+        tuple(
+            Experiment5PreprocessingReceipt(**item)
+            for item in preprocessing_records
+        ),
+        margin_fraction=config.runtime.capacity_margin_fraction,
+    )
+    preprocessing_wall_seconds = time.perf_counter() - preprocessing_started
+
+    routed_mean, routed_mean_sha = _pooled_routed_mean(target)
+    shared_centering = build_shared_q_centering(
+        target,
+        recomposition_sidecar,
+    )
+    shared_mean = shared_centering.mean
+    if scientific_model == "transcoder":
+        assert source_dataset is not None
+        source_mean, source_mean_sha = routed_input_mean(source_dataset)
+    else:
+        source_mean = merged["full_target_mean"]
+        source_mean_sha = merged["full_target_mean_sha256"]
+    centering = Experiment5Centering(
+        source_mean=np.ascontiguousarray(source_mean, dtype=np.float32),
+        routed_target_mean=np.ascontiguousarray(routed_mean, dtype=np.float32),
+        shared_target_mean=np.ascontiguousarray(shared_mean, dtype=np.float32),
+        full_target_mean=np.ascontiguousarray(
+            merged["full_target_mean"],
+            dtype=np.float32,
+        ),
+    )
+    from moe_sae.contribution_artifacts import bf16_bits_to_float32
+    from moe_sae.contribution_recomposition import decode_recomposition_sidecar
+
+    decoded_sidecar = decode_recomposition_sidecar(recomposition_sidecar)
+    if decoded_sidecar.sidecar_sha256 != config.recomposition_sidecar_sha256:
+        raise ContributionTrainingWorkerError(
+            "Experiment-5 recomposition sidecar identity differs from config"
+        )
+    recomposition = Experiment5Recomposition(
+        routed_scale=bf16_bits_to_float32(
+            decoded_sidecar.routed_rmsnorm_scale_bf16_bits
+        ),
+        outer_scale=bf16_bits_to_float32(
+            decoded_sidecar.outer_ffn_rmsnorm_scale_bf16_bits
+        ),
+        epsilon=float(decoded_sidecar.epsilon),
+    )
+    optimizer = ContributionOptimizerConfig(
+        parameter_dtype=config.optimizer.parameter_dtype,
+        adam_beta1=config.optimizer.adam_beta1,
+        adam_beta2=config.optimizer.adam_beta2,
+        adam_eps=config.optimizer.adam_epsilon,
+        grad_clip=config.optimizer.global_gradient_clip,
+        peak_lr=config.optimizer.peak_learning_rate,
+        min_lr=config.optimizer.minimum_learning_rate,
+        warmup_steps=plan.warmup_updates,
+        total_steps=plan.planned_updates,
+    )
+    checkpoint_sae = experiment5_optimizer_sae_config(layout, optimizer)
+    bank_capacity = (
+        int(merged["bank_capacity"]) if layout.is_hybrid else None
+    )
+    centering_identity = {
+        "source_mean_sha256": source_mean_sha,
+        "routed_target_mean_sha256": routed_mean_sha,
+        "shared_target_mean_sha256": shared_centering.mean_sha256,
+        "full_target_mean_sha256": merged["full_target_mean_sha256"],
+        "full_target_sst": merged["full_target_sst"],
+        "recomposition_sidecar_sha256": decoded_sidecar.sidecar_sha256,
+    }
+    centering_values = {
+        "source_mean": [
+            float(item) for item in np.asarray(centering.source_mean, np.float32)
+        ],
+        "routed_target_mean": [
+            float(item)
+            for item in np.asarray(centering.routed_target_mean, np.float32)
+        ],
+        "shared_target_mean": [
+            float(item)
+            for item in np.asarray(centering.shared_target_mean, np.float32)
+        ],
+        "full_target_mean": [
+            float(item)
+            for item in np.asarray(centering.full_target_mean, np.float32)
+        ],
+    }
+    feature_axis_size = int(mesh.shape[distributed.feature_axis])
+    physical_layout = experiment5_physical_layout(layout, feature_axis_size)
+    workload_context = {
+        "experiment": 5,
+        "panel": scientific_model,
+        "target_manifest_sha256": target.manifest_sha256,
+        "source_manifest_sha256": (
+            source_dataset.manifest_sha256 if source_dataset is not None else None
+        ),
+        "input_receipts": list(input_records),
+        "input_receipt_set_sha256": canonical_sha256(input_records),
+        "prefetch_receipts": list(prefetch_records),
+        "prefetch_receipt_set_sha256": canonical_sha256(prefetch_records),
+        "preprocessing_receipts": list(preprocessing_records),
+        "preprocessing_receipt_set_sha256": canonical_sha256(
+            preprocessing_records
+        ),
+        "centering": centering_identity,
+        "centering_values": centering_values,
+        "bank_capacity": bank_capacity,
+        "routed_bank_component_counts": (
+            list(merged["routed_bank_component_counts"])
+            if merged["routed_bank_component_counts"] is not None
+            else None
+        ),
+        "routed_bank_component_counts_by_training_tokens": (
+            [
+                [tokens, list(counts)]
+                for tokens, counts in merged[
+                    "routed_bank_component_counts_by_training_tokens"
+                ]
+            ]
+            if merged["routed_bank_component_counts_by_training_tokens"]
+            is not None
+            else None
+        ),
+        "physical_feature_layout": (
+            "balanced_routed_banks_then_shared_slice_per_feature_shard_v1"
+            if layout.is_hybrid
+            else "contiguous_global_features_v1"
+        ),
+        "physical_feature_axis_size": feature_axis_size,
+        "physical_feature_layout_identity": physical_layout.to_dict(),
+        "resident_cache_policy": "resident_only_no_refill",
+    }
+    if expected_context is not None and workload_context != dict(expected_context):
+        raise ContributionTrainingWorkerError(
+            "Experiment-5 resident input or preprocessing context drifted"
+        )
+    arithmetic = SAEArithmetic(
+        workload="routed" if layout.is_hybrid else "shared_q",
+        condition=layout.condition,
+        hidden_dim=layout.hidden_dim,
+        candidates_per_token=layout.candidates_per_token,
+        selected_features_per_token=layout.total_l0,
+    )
+    training_config = TrainingConfig(
+        sae=checkpoint_sae,
+        seed=plan.seed,
+        total_tokens=plan.total_tokens,
+        effective_batch_tokens=plan.effective_batch_tokens,
+        microbatch_tokens=plan.global_microbatch_tokens,
+        checkpoint_every_tokens=plan.total_tokens,
+        health_gate_tokens=plan.total_tokens,
+        a_capacity=bank_capacity,
+    )
+    return _ProductionWorkload(
+        scientific_model=scientific_model,
+        source=input_source,
+        mean=centering,
+        routed_layout=layout,
+        q_config=None,
+        optimizer=optimizer,
+        distributed=distributed,
+        mesh=mesh,
+        bank_capacity=bank_capacity,
+        arithmetic=arithmetic,
+        workload_context=workload_context,
+        checkpoint_training_config=training_config,
+        preprocessing_wall_seconds=preprocessing_wall_seconds,
+        experiment5_recomposition=recomposition,
+    )
+
+
 def _build_production_workload(
     config: Any,
     plan: TrainingWorkerPlan,
@@ -2888,6 +3328,24 @@ def _build_production_workload(
     expected_context: Mapping[str, Any] | None = None,
 ) -> _ProductionWorkload:
     """Build a no-refill process-local source and its collective identity."""
+
+    from moe_sae.experiment5_config import Experiment5Config
+
+    if isinstance(config, Experiment5Config):
+        return _build_experiment5_workload(
+            config,
+            plan,
+            scientific_model=scientific_model,
+            capture_control_root=capture_control_root,
+            object_prefix=object_prefix,
+            source_overlay_control_root=source_overlay_control_root,
+            source_overlay_object_prefix=source_overlay_object_prefix,
+            resident_cache_root=resident_cache_root,
+            resident_cache_max_bytes=resident_cache_max_bytes,
+            recomposition_sidecar=recomposition_sidecar,
+            prefetch_receipt=prefetch_receipt,
+            expected_context=expected_context,
+        )
 
     import jax
 
@@ -3238,6 +3696,7 @@ def _build_production_workload(
         workload_context=workload_context,
         checkpoint_training_config=training_config,
         preprocessing_wall_seconds=preprocessing_wall_seconds,
+        experiment5_recomposition=None,
     )
 
 
@@ -3373,7 +3832,7 @@ def _run_production_qualification(
 
 
 def _run_production_training(
-    config: Experiment2Config,
+    config: Any,
     plan: TrainingWorkerPlan,
     workload: _ProductionWorkload,
     selection: Mapping[str, Any] | None,
@@ -3441,7 +3900,7 @@ def _run_production_training(
         save=checkpoint.save,
         canonicalize_seconds=_collective_max_seconds,
     )
-    return run_qualified_training(
+    result = run_qualified_training(
         plan,
         workload.source,
         workload.mean,
@@ -3455,6 +3914,25 @@ def _run_production_training(
         preprocessing_wall_seconds=workload.preprocessing_wall_seconds,
         global_chip_count=int(np.asarray(workload.mesh.devices, dtype=object).size),
     )
+    if workload.experiment5_recomposition is None:
+        return result
+    unsigned = dict(result)
+    unsigned.pop("result_sha256")
+    unsigned["experiment5_context"] = dict(workload.workload_context)
+    unsigned["experiment5_execution"] = {
+        "accelerator_type": accelerator_type,
+        "peak_flops_per_second": int(peak_flops_per_second),
+        "global_chip_count": int(
+            np.asarray(workload.mesh.devices, dtype=object).size
+        ),
+        "physical_feature_layout_identity": dict(
+            workload.workload_context["physical_feature_layout_identity"]
+        ),
+    }
+    return {
+        **unsigned,
+        "result_sha256": canonical_sha256(unsigned),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -3484,13 +3962,31 @@ def _load_worker_config(
     path: str | Path,
     scientific_model: ScientificModel,
 ) -> Any:
+    selected = Path(path).expanduser().resolve()
+    try:
+        raw = yaml.safe_load(selected.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as error:
+        raise ContributionTrainingWorkerError(
+            "cannot inspect the selected worker config"
+        ) from error
+    if (
+        isinstance(raw, Mapping)
+        and raw.get("schema_version")
+        == "gemma4-routed-shared-hybrid-run-config-v1"
+    ):
+        from moe_sae.experiment5_config import load_experiment5_config
+
+        return load_experiment5_config(
+            selected,
+            expected_panel=scientific_model,
+        )
     if scientific_model == "transcoder":
         from moe_sae.contribution_transcoder_config import (
             load_contribution_transcoder_config,
         )
 
-        return load_contribution_transcoder_config(path)
-    return load_contribution_config(path)
+        return load_contribution_transcoder_config(selected)
+    return load_contribution_config(selected)
 
 
 def _require_transcoder_source_arguments(args: argparse.Namespace) -> None:

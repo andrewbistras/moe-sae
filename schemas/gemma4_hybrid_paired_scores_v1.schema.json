@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://moe-sae.invalid/schemas/gemma4_hybrid_paired_scores_v1.schema.json",
+  "title": "Gemma 4 routed/shared hybrid packed-sequence scores",
+  "description": "Additive full-FFN SSE/SST rows used for Experiment-5 paired and hierarchical inference.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "protocol_id",
+    "panel",
+    "seed",
+    "checkpoint_target_tokens",
+    "packed_sequence_ids",
+    "valid_tokens",
+    "sequence_sst",
+    "sequence_sse",
+    "artifact_sha256"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "gemma4-routed-shared-hybrid-paired-scores-v1"
+    },
+    "protocol_id": {
+      "const": "gemma4-routed-shared-hybrid-v1-20260728"
+    },
+    "panel": {
+      "enum": [
+        "sae",
+        "transcoder"
+      ]
+    },
+    "seed": {
+      "enum": [
+        0,
+        1,
+        2
+      ]
+    },
+    "checkpoint_target_tokens": {
+      "enum": [
+        2000000,
+        5000000,
+        10000000
+      ]
+    },
+    "packed_sequence_ids": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "integer",
+        "minimum": 0
+      }
+    },
+    "valid_tokens": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "integer",
+        "minimum": 1
+      }
+    },
+    "sequence_sst": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "number",
+        "minimum": 0
+      }
+    },
+    "sequence_sse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "H",
+        "R",
+        "B",
+        "F"
+      ],
+      "properties": {
+        "H": {
+          "$ref": "#/$defs/nonnegativeNumbers"
+        },
+        "R": {
+          "$ref": "#/$defs/nonnegativeNumbers"
+        },
+        "B": {
+          "$ref": "#/$defs/nonnegativeNumbers"
+        },
+        "F": {
+          "$ref": "#/$defs/nonnegativeNumbers"
+        }
+      }
+    },
+    "artifact_sha256": {
+      "$ref": "#/$defs/sha256"
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "nonnegativeNumbers": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "number",
+        "minimum": 0
+      }
+    }
+  }
+}

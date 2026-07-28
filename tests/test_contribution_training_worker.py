@@ -47,6 +47,9 @@ TRANSCODER_HORIZON_TEMPLATE = (
     / "configs"
     / "gemma4_transcoder_horizon_v1.yaml"
 )
+EXPERIMENT5_SAE_CONFIG = (
+    Path(__file__).parents[1] / "configs" / "gemma4_hybrid_sae_v1.yaml"
+)
 
 
 def test_stablehlo_manifest_explicitly_binds_scientific_model() -> None:
@@ -384,6 +387,22 @@ def test_prefetch_and_runtime_extensions_require_final_horizon_and_audited_tpu(
             phase="learning_horizon_10m",
         )
         == 1_800
+    )
+    assert (
+        training_worker_module.prefetch_runtime_limit_seconds(
+            config_path=EXPERIMENT5_SAE_CONFIG,
+            accelerator_type="v6e-16",
+            phase="routed_shared_hybrid_10m",
+        )
+        == 1_800
+    )
+    assert (
+        training_worker_module.direct_resident_runtime_limit_seconds(
+            config_path=EXPERIMENT5_SAE_CONFIG,
+            phase="routed_shared_hybrid_10m",
+            accelerator_type="v6e-16",
+        )
+        == 43_200
     )
     assert (
         training_worker_module.direct_resident_runtime_limit_seconds(
@@ -1081,6 +1100,23 @@ def test_learning_horizon_direct_training_accepts_one_continuous_twelve_hour_win
         result["authorization_basis"]
         == "bounded_learning_horizon_workload"
     )
+
+
+def test_experiment5_direct_training_uses_same_bounded_twelve_hour_policy() -> None:
+    result = run_qualified_training(
+        replace(plan(), phase_name="routed_shared_hybrid_10m"),
+        Source(),
+        mean=None,
+        selection=None,
+        dependencies=dependencies(Checkpoints()),
+        expected_l0=2,
+        maximum_runtime_seconds=43_200,
+        direct_bounded_resident=True,
+        direct_runtime_max_seconds=43_200,
+    )
+
+    assert result["status"] == "completed"
+    assert result["authorization_basis"] == "bounded_learning_horizon_workload"
 
 
 def test_bounded_direct_training_resumes_from_exact_lowered_identity() -> None:
