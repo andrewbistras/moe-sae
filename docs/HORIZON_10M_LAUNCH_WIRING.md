@@ -3,7 +3,14 @@
 This is the concrete controller-side handoff for the 10M SAE/transcoder
 learning-horizon study. It deliberately contains no qualification command.
 Every accelerator training invocation is the direct, checkpoint-resumable
-path with a bound of at most 3,600 seconds.
+path with a 43,200-second crash boundary. Normal behavior is one continuous
+invocation through all 611 updates; the hourly teardown/recompile boundary is
+gone.
+
+The strict horizon override is admitted on the two audited runtime types,
+`v4-32` and `v6e-16`. Historical phases still stop using the one-hour direct
+policy. `v5litepod-16` remains fail-closed until its topology, peak-FLOP
+ledger, deploy path, and evaluators receive a separate audited support patch.
 
 The currently safe fallback is one already-READY private `v6e-16`:
 
@@ -88,6 +95,18 @@ uv run python -m moe_sae.contribution_transcoder_capture_config finalize \
   --template configs/gemma4_transcoder_horizon_v1.yaml \
   --output "$CENTRAL_PROD/horizon-10m/contracts/transcoder-overlay-capture.yaml" \
   --train-target-manifest-sha256 "$TARGET_MANIFEST_SHA256"
+```
+
+If the controller mounts the central control tree at `$CENTRAL_PROD` while
+TPU workers see it at `$TPU_PROD`, pass the two paths explicitly to the
+overlay operator. `--config` is read and hashed on the controller;
+`--remote-config` is the same immutable file at the TPU-side mountpoint:
+
+```zsh
+uv run python scripts/tpu/harvest_transcoder_overlay.py \
+  ... \
+  --config "$CENTRAL_PROD/horizon-10m/contracts/transcoder-overlay-capture.yaml" \
+  --remote-config "$TPU_PROD/horizon-10m/contracts/transcoder-overlay-capture.yaml"
 ```
 
 After the overlay seals, finalize both training configs:
@@ -249,12 +268,13 @@ export CACHE_INVENTORY="$TOPOLOGY_REMOTE/probes/$PROBE_ID/cache-inventory.json"
 export MIRROR_SEAL="$TPU_PROD/horizon-10m/regional/europe-west4/mirror-seal.json"
 ```
 
-## Direct segmented training
+## Direct continuous training
 
-Every segment uses the same scientific `run-id` and a new monotonic
-`attempt-id`. It resumes only through
-`runs/<run-id>/checkpoints/latest.json`. A controller should accept a segment
-boundary only if that pointer changed. `training-result.json` is the sole
+Every trajectory uses one scientific `run-id`. It receives a new monotonic
+`attempt-id` only after Spot preemption or another genuine retry and resumes
+only through `runs/<run-id>/checkpoints/latest.json`. A twelve-hour deadline
+boundary requires that pointer to have advanced; Spot preemption may resume
+the latest already-sealed checkpoint. `training-result.json` is the sole
 completion.
 
 The common environment is:
@@ -286,13 +306,13 @@ COMMON_ENV=(
 )
 ```
 
-The exact per-segment SAE invocation is:
+The exact SAE invocation is:
 
 ```zsh
 export MODEL='sae'
 export CONDITION='A'  # then R, B, F
 export RUN_ID="horizon10m-$MODEL-${(L)CONDITION}-seed0"
-export ATTEMPT_ID="segment-$(date -u +%Y%m%dT%H%M%SZ)-$RANDOM"
+export ATTEMPT_ID="run-$(date -u +%Y%m%dT%H%M%SZ)-$RANDOM"
 env "${COMMON_ENV[@]}" \
   "CONTRIBUTION_SAE_CONTROL_ROOT=$TPU_PROD/horizon-10m/runs/$MODEL" \
   'CONTRIBUTION_SAE_CHECKPOINT_ROOT=gs://moe-sae-horizon-ew4-neural-dragnet/horizon-10m/checkpoints/sae' \
@@ -305,7 +325,7 @@ env "${COMMON_ENV[@]}" \
     --seed 0 \
     --run-id "$RUN_ID" \
     --attempt-id "$ATTEMPT_ID" \
-    --maximum-runtime-seconds 3500
+    --maximum-runtime-seconds 43200
 ```
 
 The exact transcoder invocation adds the sealed overlay:
@@ -314,7 +334,7 @@ The exact transcoder invocation adds the sealed overlay:
 export MODEL='transcoder'
 export CONDITION='A'  # then R, B, F
 export RUN_ID="horizon10m-$MODEL-${(L)CONDITION}-seed0"
-export ATTEMPT_ID="segment-$(date -u +%Y%m%dT%H%M%SZ)-$RANDOM"
+export ATTEMPT_ID="run-$(date -u +%Y%m%dT%H%M%SZ)-$RANDOM"
 env "${COMMON_ENV[@]}" \
   "CONTRIBUTION_SOURCE_OVERLAY_ROOT=$TPU_PROD/$OVERLAY_TRAIN_REL" \
   "CONTRIBUTION_SOURCE_OVERLAY_PREFIX=$OVERLAY_TRAIN_PREFIX" \
@@ -329,12 +349,12 @@ env "${COMMON_ENV[@]}" \
     --seed 0 \
     --run-id "$RUN_ID" \
     --attempt-id "$ATTEMPT_ID" \
-    --maximum-runtime-seconds 3500
+    --maximum-runtime-seconds 43200
 ```
 
 There is intentionally no `qualify` action and no qualification bundle. A
-cloud-resident supervisor repeats a segment only for a witnessed checkpoint
-boundary, Spot preemption/resource loss, or SSH transport loss. Numerical,
+cloud-resident supervisor retries only after a witnessed checkpoint boundary,
+Spot preemption/resource loss, or SSH transport loss. Numerical,
 manifest, identity, schema, token-drop, and overflow failures are terminal.
 
 ## Evaluate 2M, 5M, and 10M

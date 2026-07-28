@@ -58,6 +58,9 @@ training:
 execution:
   accelerator_min_useful_mfu: 0.10
   accelerator_qualification_max_seconds: 600
+  # One invocation normally finishes all 611 updates. The deadline remains a
+  # crash boundary; rolling checkpoints make Spot preemption resumable.
+  direct_runtime_max_seconds: 43200
   # Rolling restart saves are operational only. Held-out curve evaluation is
   # separately pinned below and must not run at every restart point.
   restart_checkpoint_tokens:

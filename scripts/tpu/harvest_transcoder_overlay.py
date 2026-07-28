@@ -57,9 +57,16 @@ def _parser() -> argparse.ArgumentParser:
         "--config",
         default=DEFAULT_CONFIG,
         help=(
-            "absolute path shared by the operator and TPU workers, or a path "
-            "relative to both checkouts; the 10M path requires its strict "
-            "target-bound capture contract"
+            "local operator path used to validate and hash the capture "
+            "contract; defaults to the same path sent to TPU workers"
+        ),
+    )
+    parser.add_argument(
+        "--remote-config",
+        help=(
+            "optional absolute TPU-side path, or path relative to "
+            "PROJECT_ROOT, for the same config bytes; use when controller "
+            "and TPU NFS mountpoints differ"
         ),
     )
     parser.add_argument("--remote-uv", default="uv")
@@ -104,13 +111,17 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _remote_config_path(args: argparse.Namespace) -> str:
-    value = str(getattr(args, "config", DEFAULT_CONFIG))
+    value = str(
+        getattr(args, "remote_config", None)
+        or getattr(args, "config", DEFAULT_CONFIG)
+    )
     selected = PurePosixPath(value)
     if selected.is_absolute():
         return str(selected)
     if not value or ".." in selected.parts:
         raise OperatorError(
-            "--config must be absolute or a safe project-relative path"
+            "--remote-config/--config must be absolute or a safe "
+            "project-relative path"
         )
     return str(PurePosixPath(args.project_root) / selected)
 

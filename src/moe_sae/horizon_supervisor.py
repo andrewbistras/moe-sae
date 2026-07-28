@@ -6,7 +6,8 @@ module supplies only the cloud-resident control loop around them:
 * validate and bind one explicit launch DAG;
 * reserve globally increasing, create-only attempt identities;
 * recognize terminal work only through immutable completion files;
-* rotate bounded training segments through already-existing checkpoints;
+* run each trajectory continuously, resuming its rolling checkpoints after
+  Spot preemption or a genuine twelve-hour crash boundary;
 * retry only classified Spot/resource/SSH transport losses; and
 * reconcile private ``v6e-16`` Spot TPU resources without list polling.
 
@@ -53,7 +54,8 @@ SCIENTIFIC_MODELS = ("sae", "transcoder")
 MILESTONES = (2_000_000, 5_000_000, 10_000_000)
 TASK_KINDS = ("capture", "overlay", "mirror", "train", "eval", "report")
 ALLOCATION_MODES = ("queued_spot", "direct_spot")
-MAX_SEGMENT_SECONDS = 3_600
+DEFAULT_TASK_TIMEOUT_SECONDS = 3_600
+MAX_TRAIN_INVOCATION_SECONDS = 43_200
 
 _SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}")
 _SAFE_CLOUD_NAME = re.compile(r"[a-z](?:[-a-z0-9]{0,61}[a-z0-9])?")
@@ -366,7 +368,9 @@ class SegmentSpec:
             )
         return cls(
             seconds=_positive_int(
-                selected["seconds"], f"{name}.seconds", maximum=MAX_SEGMENT_SECONDS
+                selected["seconds"],
+                f"{name}.seconds",
+                maximum=MAX_TRAIN_INVOCATION_SECONDS,
             ),
             max_segments=_positive_int(
                 selected["max_segments"], f"{name}.max_segments", maximum=256
@@ -648,7 +652,9 @@ class TaskSpec:
         )
         if kind == "train":
             if segment is None:
-                raise HorizonPlanError(f"{name} training must be segmented")
+                raise HorizonPlanError(
+                    f"{name} training must declare its invocation boundary"
+                )
             placeholders = {
                 match.group(1)
                 for argument in command
@@ -2124,7 +2130,9 @@ class HorizonSupervisor:
             "campaign_id": self.plan.campaign_id,
             "plan_sha256": self.plan.plan_sha256,
             "segment_seconds": str(
-                task.segment.seconds if task.segment is not None else MAX_SEGMENT_SECONDS
+                task.segment.seconds
+                if task.segment is not None
+                else DEFAULT_TASK_TIMEOUT_SECONDS
             ),
             "task_id": task.task_id,
             "resource_id": "",
@@ -2313,7 +2321,7 @@ class HorizonSupervisor:
                     outcome = self._run_one_command(
                         prepare_command,
                         environment=environment,
-                        timeout_seconds=MAX_SEGMENT_SECONDS,
+                        timeout_seconds=DEFAULT_TASK_TIMEOUT_SECONDS,
                         root=attempt.root,
                         stem=f"prepare-{index:02d}",
                     )
@@ -2326,7 +2334,7 @@ class HorizonSupervisor:
                         timeout_seconds=(
                             task.segment.seconds
                             if task.segment is not None
-                            else MAX_SEGMENT_SECONDS
+                            else DEFAULT_TASK_TIMEOUT_SECONDS
                         )
                         + self.plan.retry_policy.transport_grace_seconds,
                         root=attempt.root,

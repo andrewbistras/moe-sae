@@ -11,6 +11,7 @@ import pytest
 
 from moe_sae.contribution_artifacts import canonical_sha256
 from moe_sae.contribution_performance import (
+    MAX_LEARNING_HORIZON_ACCELERATOR_SECONDS,
     ExactPerformanceIdentity,
     authorize_accelerator_run,
 )
@@ -191,6 +192,30 @@ def test_execution_record_binds_command_environment_paths_and_deadlines(tmp_path
         **destinations,
     )
     assert changed["execution_sha256"] != record["execution_sha256"]
+
+
+def test_execution_record_accepts_explicit_learning_horizon_deadline(tmp_path):
+    horizon = authorize_accelerator_run(
+        identity=identity(),
+        maximum_runtime_seconds=MAX_LEARNING_HORIZON_ACCELERATOR_SECONDS,
+        purpose="workload",
+        workload_profile="learning_horizon_10m",
+    )
+    record = build_execution_record(
+        authorization=horizon,
+        command=("worker", "--phase", "learning_horizon_10m"),
+        environment={"LANG": "C"},
+        working_directory=tmp_path,
+        termination_grace_seconds=15.0,
+        **paths(tmp_path),
+    )
+
+    checked = validate_execution_record(record)
+    assert checked["hard_deadline_seconds"] == 43_200
+    assert (
+        checked["authorization"]["basis"]
+        == "bounded_learning_horizon_workload"
+    )
 
 
 def test_completed_fake_process_is_reaped_and_records_log(tmp_path):

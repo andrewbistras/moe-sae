@@ -150,3 +150,25 @@ def test_target_bound_horizon_gets_explicit_train_only_one_hour_bound(
                 split="eval",
             )
         )
+
+
+def test_local_and_remote_capture_config_paths_may_use_different_mountpoints(
+    operator,
+    tmp_path: Path,
+    capsys,
+):
+    local = _horizon_capture_config(tmp_path)
+    remote = (
+        "/home/abistras/moe-sae/artifacts/gemma4_v1/production/"
+        "horizon-10m/contracts/transcoder-overlay-capture.yaml"
+    )
+    args = _operator_args(
+        config=str(local),
+        remote_config=remote,
+        maximum_runtime_seconds=3_600,
+    )
+
+    assert operator.run(args) == 0
+    rendered = capsys.readouterr().out
+    assert f"--config {remote}" in rendered
+    assert f"--config {local}" not in rendered

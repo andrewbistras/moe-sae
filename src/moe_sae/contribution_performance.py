@@ -5,7 +5,8 @@ inventory, and complete runtime configuration it observed.  This module
 derives the performance gates, seals a self-hashed receipt, and admits only:
 
 * a qualification run bounded to at most ten minutes;
-* any direct Experiment-2 workload bounded to at most one hour; or
+* any direct historical Experiment-2 workload bounded to at most one hour;
+* the explicit 10M learning-horizon workload bounded to at most twelve hours; or
 * a longer run whose exact graph/hardware/configuration has a passing receipt.
 
 This is an admission seam, not a process supervisor.  The launcher must still
@@ -40,6 +41,7 @@ MINIMUM_USEFUL_PREFIX_MFU = 0.03
 # directly for one hour without first spending accelerator time on a separate
 # qualifier. Qualification remains independently bounded to ten minutes.
 MAX_UNGATED_ACCELERATOR_SECONDS = 3_600
+MAX_LEARNING_HORIZON_ACCELERATOR_SECONDS = 43_200
 MAX_QUALIFICATION_SECONDS = 600
 MINIMUM_PERSISTED_GOODPUT_FRACTION = 0.60
 MINIMUM_AUXILIARY_THROUGHPUT_FRACTION = 0.85
@@ -284,6 +286,7 @@ class AcceleratorRunAuthorization:
     basis: Literal[
         "bounded_qualification",
         "bounded_ungated_workload",
+        "bounded_learning_horizon_workload",
         "qualified_exact_identity",
     ]
     qualification_receipt_sha256: str | None
@@ -696,6 +699,10 @@ def authorize_accelerator_run(
     minimum_useful_mfu: float = MINIMUM_USEFUL_PREFIX_MFU,
     ungated_max_seconds: int = MAX_UNGATED_ACCELERATOR_SECONDS,
     qualification_max_seconds: int = MAX_QUALIFICATION_SECONDS,
+    workload_profile: Literal[
+        "historical",
+        "learning_horizon_10m",
+    ] = "historical",
 ) -> AcceleratorRunAuthorization:
     """Authorize a bounded direct experiment or an exactly qualified longer run."""
 
@@ -709,6 +716,12 @@ def authorize_accelerator_run(
         ungated_max_seconds=ungated_max_seconds,
         qualification_max_seconds=qualification_max_seconds,
     )
+    if workload_profile not in {"historical", "learning_horizon_10m"}:
+        raise ContributionPerformanceError("workload_profile is unsupported")
+    if workload_profile == "learning_horizon_10m" and purpose != "workload":
+        raise ContributionPerformanceError(
+            "the learning-horizon profile applies only to workloads"
+        )
 
     if purpose == "qualification":
         if runtime > qualification:
@@ -722,18 +735,27 @@ def authorize_accelerator_run(
             basis="bounded_qualification",
             qualification_receipt_sha256=None,
         )
-    if runtime <= ungated and qualification_receipt is None:
+    direct_limit = (
+        MAX_LEARNING_HORIZON_ACCELERATOR_SECONDS
+        if workload_profile == "learning_horizon_10m"
+        else ungated
+    )
+    if runtime <= direct_limit and qualification_receipt is None:
         return AcceleratorRunAuthorization(
             purpose=purpose,
             maximum_runtime_seconds=runtime,
             identity_sha256=identity.identity_sha256,
-            basis="bounded_ungated_workload",
+            basis=(
+                "bounded_learning_horizon_workload"
+                if workload_profile == "learning_horizon_10m"
+                else "bounded_ungated_workload"
+            ),
             qualification_receipt_sha256=None,
         )
     if qualification_receipt is None:
         raise ContributionPerformanceError(
-            "accelerator work beyond one hour requires an exact "
-            "qualification receipt"
+            "accelerator work beyond the direct workload profile limit "
+            "requires an exact qualification receipt"
         )
     validated = validate_qualification_receipt(
         qualification_receipt,
@@ -765,6 +787,7 @@ def authorization_to_dict(
 __all__ = [
     "AUXILIARY_THROUGHPUT_ADMISSION_MESSAGE",
     "MAX_QUALIFICATION_SECONDS",
+    "MAX_LEARNING_HORIZON_ACCELERATOR_SECONDS",
     "MAX_UNGATED_ACCELERATOR_SECONDS",
     "MINIMUM_AUXILIARY_THROUGHPUT_FRACTION",
     "MINIMUM_PERSISTED_GOODPUT_FRACTION",

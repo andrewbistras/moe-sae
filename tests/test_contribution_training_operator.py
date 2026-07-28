@@ -389,7 +389,7 @@ def test_explicit_tpu_ssh_user_is_validated_and_rendered(
         operator._settings(environment, args)
 
 
-def test_horizon_v6e_prefetch_has_bounded_30_minute_window(
+def test_horizon_prefetch_and_direct_limits_cover_audited_v4_v6_only(
     operator,
     tmp_path: Path,
 ) -> None:
@@ -405,6 +405,7 @@ def test_horizon_v6e_prefetch_has_bounded_30_minute_window(
         _settings(operator, tmp_path),
         accelerator_type="v6e-16",
         selected_config_path=str(finalized),
+        phase="learning_horizon_10m",
     )
     assert settings.prefetch_hard_deadline_seconds == 1_800
     command = operator._prefetch_command(
@@ -422,10 +423,49 @@ def test_horizon_v6e_prefetch_has_bounded_30_minute_window(
     )
     assert historical.prefetch_hard_deadline_seconds == 600
 
+    v4 = replace(
+        settings,
+        accelerator_type="v4-32",
+        action="train",
+        phase="learning_horizon_10m",
+        maximum_runtime_seconds=43_200,
+    )
+    assert v4.prefetch_hard_deadline_seconds == 1_800
+    assert v4.direct_runtime_limit_seconds == 43_200
+    assert v4.admission_mode == operator.DIRECT_BOUNDED_ADMISSION
+    assert operator._is_horizon_direct(
+        action="train",
+        maximum_runtime_seconds=43_200,
+        accelerator_type="v4-32",
+        config_path=str(finalized),
+        phase="learning_horizon_10m",
+    )
 
-def test_horizon_v6e_direct_segment_uses_no_qualification_receipt(
+    v5 = replace(v4, accelerator_type="v5litepod-16")
+    assert v5.prefetch_hard_deadline_seconds == 600
+    assert v5.direct_runtime_limit_seconds == 3_600
+    assert v5.admission_mode == operator.QUALIFIED_ADMISSION
+    assert not operator._is_horizon_direct(
+        action="train",
+        maximum_runtime_seconds=43_200,
+        accelerator_type="v5litepod-16",
+        config_path=str(finalized),
+        phase="learning_horizon_10m",
+    )
+
+
+@pytest.mark.parametrize(
+    ("accelerator_type", "device_kind"),
+    [
+        ("v4-32", "TPU v4"),
+        ("v6e-16", "TPU v6 lite"),
+    ],
+)
+def test_audited_horizon_runtime_continuous_direct_run_uses_no_qualification(
     operator,
     tmp_path: Path,
+    accelerator_type: str,
+    device_kind: str,
 ) -> None:
     sidecar_path = tmp_path / "sidecar.json"
     sidecar_path.write_text(json.dumps(_sidecar()), encoding="utf-8")
@@ -438,6 +478,7 @@ def test_horizon_v6e_direct_segment_uses_no_qualification_receipt(
         resource_create_time="2026-07-28T10:11:12.123Z",
         region="europe-west4",
         zone="europe-west4-a",
+        accelerator_type=accelerator_type,
     )
     observations = [
         build_controller_observation(
@@ -449,7 +490,7 @@ def test_horizon_v6e_direct_segment_uses_no_qualification_receipt(
             global_device_count=16,
             local_device_count=4,
             platforms=("tpu",),
-            device_kinds=("TPU v6 lite",),
+            device_kinds=(device_kind,),
             boot_id=f"00000000-0000-0000-0000-{index + 1:012d}",
             hostname=f"worker-{index}",
         )
@@ -471,6 +512,7 @@ def test_horizon_v6e_direct_segment_uses_no_qualification_receipt(
         fresh_controller_mapping_path=mapping_path,
         expected_tpu_name="experiment4-sae-f",
         expected_tpu_zone="europe-west4-a",
+        expected_accelerator_type=accelerator_type,
     )
     assert lineage["qualification_bundle_sha256"] is None
     assert lineage["qualification_receipt_sha256"] is None
@@ -491,12 +533,13 @@ def test_horizon_v6e_direct_segment_uses_no_qualification_receipt(
             operator,
             tmp_path,
             action="train",
-            maximum_runtime_seconds=3_600,
+            maximum_runtime_seconds=43_200,
         ),
         tpu_name="experiment4-sae-f",
         tpu_zone="europe-west4-a",
-        accelerator_type="v6e-16",
+        accelerator_type=accelerator_type,
         selected_config_path=str(finalized),
+        phase="learning_horizon_10m",
         qualification_bundle=None,
         fresh_controller_mapping=str(mapping_path),
         regional_mirror_seal="/regional/control/mirror-seal.json",
@@ -509,6 +552,17 @@ def test_horizon_v6e_direct_segment_uses_no_qualification_receipt(
     )
     assert "--qualification-bundle" not in remote
     assert settings.prefetch_hard_deadline_seconds == 1_800
+    assert settings.direct_runtime_limit_seconds == 43_200
+    assert settings.admission_mode == operator.DIRECT_BOUNDED_ADMISSION
+    action = " ".join(
+        operator._action_command(
+            settings,
+            controller_index=0,
+            process_index=0,
+        )
+    )
+    assert "--maximum-runtime-seconds 43200" in action
+    assert "--direct-bounded-resident" in action
 
 
 def test_v6e_action_child_receives_exact_accelerator_type(

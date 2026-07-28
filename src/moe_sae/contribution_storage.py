@@ -389,10 +389,15 @@ def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def _write_once_json(path: Path, value: Mapping[str, Any]) -> None:
+def _write_once_json(
+    path: Path,
+    value: Mapping[str, Any],
+    *,
+    manifest: bool = False,
+) -> None:
     expected = _canonical_copy(value)
     if path.exists():
-        if _read_json(path) != expected:
+        if _read_json(path, manifest=manifest) != expected:
             raise ContributionStorageError(
                 f"immutable control record differs from replay: {path}"
             )
@@ -418,7 +423,7 @@ def _write_once_json(path: Path, value: Mapping[str, Any]) -> None:
             _fsync_directory(path.parent)
     finally:
         temporary.unlink(missing_ok=True)
-    if _read_json(path) != expected:
+    if _read_json(path, manifest=manifest) != expected:
         raise ContributionStorageError(
             f"immutable control record failed read-after-write: {path}"
         )
@@ -1679,7 +1684,7 @@ def publish_contribution_manifest(
                 f"captured {validated['total_tokens']} contribution tokens, "
                 f"expected {expected_tokens}"
             )
-        _write_once_json(manifest_path, validated)
+        _write_once_json(manifest_path, validated, manifest=True)
         persisted = load_contribution_manifest(
             selected_root, recomposition_sidecar=recomposition_sidecar
         )

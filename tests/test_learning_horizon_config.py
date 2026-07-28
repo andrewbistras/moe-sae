@@ -90,6 +90,7 @@ def test_template_freezes_exact_10m_pilot_horizon(template: Path, model: str):
         EVAL_TARGET_MANIFEST_SHA256
     )
     assert config.runtime.accelerator_min_useful_mfu == 0.10
+    assert config.runtime.direct_runtime_max_seconds == 43_200
 
 
 def test_finalized_configs_dispatch_through_existing_worker_loaders(tmp_path: Path):

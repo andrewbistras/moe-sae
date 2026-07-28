@@ -31,6 +31,8 @@ from pathlib import Path, PurePosixPath
 from typing import BinaryIO
 
 from moe_sae.contribution_training_worker import (
+    HORIZON_DIRECT_ACCELERATOR_TYPES,
+    direct_resident_runtime_limit_seconds,
     prefetch_runtime_limit_seconds,
 )
 
@@ -184,6 +186,23 @@ class Settings:
         return prefetch_runtime_limit_seconds(
             config_path=self.config_path,
             accelerator_type=self.accelerator_type,
+            phase=self.phase,
+        )
+
+    @property
+    def direct_runtime_limit_seconds(self) -> int:
+        return direct_resident_runtime_limit_seconds(
+            config_path=self.config_path,
+            phase=self.phase,
+            accelerator_type=self.accelerator_type,
+        )
+
+    @property
+    def admission_mode(self) -> str:
+        return _admission_mode(
+            self.action,
+            self.maximum_runtime_seconds,
+            direct_runtime_limit_seconds=self.direct_runtime_limit_seconds,
         )
 
     def qualified_prefetch_receipt(
@@ -287,23 +306,25 @@ def _internal_ip_mode(
     return enabled
 
 
-def _is_horizon_v6_direct(
+def _is_horizon_direct(
     *,
     action: str,
     maximum_runtime_seconds: int,
     accelerator_type: str,
     config_path: str,
+    phase: str,
 ) -> bool:
+    direct_limit = direct_resident_runtime_limit_seconds(
+        config_path=config_path,
+        phase=phase,
+        accelerator_type=accelerator_type,
+    )
     return (
         action == "train"
-        and _admission_mode(action, maximum_runtime_seconds)
-        == DIRECT_BOUNDED_ADMISSION
-        and accelerator_type == "v6e-16"
-        and prefetch_runtime_limit_seconds(
-            config_path=config_path,
-            accelerator_type=accelerator_type,
-        )
-        == 1_800
+        and accelerator_type in HORIZON_DIRECT_ACCELERATOR_TYPES
+        and phase == "learning_horizon_10m"
+        and direct_limit > DIRECT_EXPERIMENT_SECONDS
+        and maximum_runtime_seconds <= direct_limit
     )
 
 
@@ -398,13 +419,19 @@ def _settings(
     explicit_config = getattr(args, "config", None)
     direct_fresh_only = (
         explicit_config is not None
-        and _is_horizon_v6_direct(
+        and _is_horizon_direct(
             action=args.action,
             maximum_runtime_seconds=maximum,
             accelerator_type=accelerator_type,
             config_path=explicit_config,
+            phase=args.phase,
         )
     )
+    if direct_fresh_only and not fresh_mapping:
+        raise OperatorError(
+            "direct horizon training requires "
+            "CONTRIBUTION_FRESH_CONTROLLER_MAPPING"
+        )
     qualification_bundle = (
         None
         if direct_fresh_only
@@ -513,15 +540,23 @@ def _settings(
     )
 
 
-def _admission_mode(action: str, maximum_runtime_seconds: int) -> str:
+def _admission_mode(
+    action: str,
+    maximum_runtime_seconds: int,
+    *,
+    direct_runtime_limit_seconds: int = DIRECT_EXPERIMENT_SECONDS,
+) -> str:
     """Select the explicit training admission path.
 
-    A bounded train is itself the at-most-one-hour experiment and therefore
-    lowers the fixed resident graph directly.  Longer runs preserve the
-    existing two-mode qualification contract.
+    Historical configs lower directly for at most one hour. The strict
+    learning-horizon config supplies its explicit twelve-hour limit. Other
+    longer runs preserve the existing two-mode qualification contract.
     """
 
-    if action == "train" and maximum_runtime_seconds <= DIRECT_EXPERIMENT_SECONDS:
+    if (
+        action == "train"
+        and maximum_runtime_seconds <= direct_runtime_limit_seconds
+    ):
         return DIRECT_BOUNDED_ADMISSION
     return QUALIFIED_ADMISSION
 
@@ -738,8 +773,9 @@ def _fresh_direct_lineage(
     fresh_controller_mapping_path: Path,
     expected_tpu_name: str,
     expected_tpu_zone: str,
+    expected_accelerator_type: str,
 ) -> dict[str, object]:
-    """Build bounded-v6 lineage without reading any qualification receipt."""
+    """Build strict-horizon lineage without a qualification receipt."""
 
     sidecar = _read_json(sidecar_path, name="recomposition sidecar")
     try:
@@ -760,12 +796,13 @@ def _fresh_direct_lineage(
         )
     except (RegionalExecutionError, TypeError, ValueError) as error:
         raise OperatorError(
-            "fresh bounded-v6 lineage evidence is invalid"
+            "fresh direct-horizon lineage evidence is invalid"
         ) from error
     if (
         fresh["tpu_name"] != expected_tpu_name
         or fresh["zone"] != expected_tpu_zone
-        or fresh["accelerator_type"] != "v6e-16"
+        or fresh["accelerator_type"] != expected_accelerator_type
+        or expected_accelerator_type not in HORIZON_DIRECT_ACCELERATOR_TYPES
         or fresh["process_count"] != PROCESS_COUNT
         or fresh["global_device_count"] != 16
         or fresh["local_device_count"] != 4
@@ -777,7 +814,7 @@ def _fresh_direct_lineage(
         "qualification_bundle_sha256": None,
         "qualification_receipt_sha256": None,
         "admission_evidence_policy": (
-            "fresh-v6e-incarnation-direct-bounded-no-qualification"
+            "fresh-attested-incarnation-direct-horizon-no-qualification"
         ),
         "recomposition_sidecar_sha256": _sha256(
             "recomposition sidecar semantic SHA-256",
@@ -880,20 +917,28 @@ def initialize_attempt(args: argparse.Namespace) -> dict[str, object]:
     if sae_control_root.is_symlink() or run_root.is_symlink():
         raise OperatorError("SAE control paths must not be symbolic links")
     accelerator_type = getattr(args, "accelerator_type", "v4-32")
+    direct_runtime_limit = direct_resident_runtime_limit_seconds(
+        config_path=config,
+        phase=args.phase,
+        accelerator_type=accelerator_type,
+    )
     admission_mode = _admission_mode(
         args.action,
         args.maximum_runtime_seconds,
+        direct_runtime_limit_seconds=direct_runtime_limit,
     )
     direct_bounded = admission_mode == DIRECT_BOUNDED_ADMISSION
-    direct_fresh_only = _is_horizon_v6_direct(
+    direct_fresh_only = _is_horizon_direct(
         action=args.action,
         maximum_runtime_seconds=args.maximum_runtime_seconds,
         accelerator_type=accelerator_type,
         config_path=str(config),
+        phase=args.phase,
     )
     prefetch_deadline = prefetch_runtime_limit_seconds(
         config_path=config,
         accelerator_type=accelerator_type,
+        phase=args.phase,
     )
     fresh_mapping_argument = getattr(args, "fresh_controller_mapping", None)
     regional_mirror_argument = getattr(args, "regional_mirror_seal", None)
@@ -919,13 +964,14 @@ def initialize_attempt(args: argparse.Namespace) -> dict[str, object]:
     if direct_fresh_only:
         if fresh_mapping_path is None:
             raise OperatorError(
-                "bounded v6e horizon training requires a fresh mapping"
+                "direct horizon training requires a fresh controller mapping"
             )
         lineage = _fresh_direct_lineage(
             sidecar,
             fresh_controller_mapping_path=fresh_mapping_path,
             expected_tpu_name=str(getattr(args, "tpu_name", "")),
             expected_tpu_zone=str(getattr(args, "tpu_zone", "")),
+            expected_accelerator_type=accelerator_type,
         )
         bundle: Path | None = None
     else:
@@ -1319,10 +1365,7 @@ def _validate_attempt_plan(
         or unsigned.get("maximum_runtime_seconds")
         != settings.maximum_runtime_seconds
         or unsigned.get("admission_mode")
-        != _admission_mode(
-            settings.action,
-            settings.maximum_runtime_seconds,
-        )
+        != settings.admission_mode
         or unsigned.get("qualification_hard_deadline_seconds")
         != QUALIFICATION_SECONDS
         or unsigned.get("prefetch_hard_deadline_seconds")
@@ -1712,11 +1755,7 @@ def _action_command(
             )
         )
         if (
-            _admission_mode(
-                settings.action,
-                settings.maximum_runtime_seconds,
-            )
-            == DIRECT_BOUNDED_ADMISSION
+            settings.admission_mode == DIRECT_BOUNDED_ADMISSION
         ):
             command.append("--direct-bounded-resident")
         terminal_path = settings.result_path
@@ -2003,10 +2042,7 @@ def _dry_run(settings: Settings) -> int:
         "seed": settings.seed,
         "config": settings.config_path,
         "qualification_hard_deadline_seconds": QUALIFICATION_SECONDS,
-        "admission_mode": _admission_mode(
-            settings.action,
-            settings.maximum_runtime_seconds,
-        ),
+        "admission_mode": settings.admission_mode,
         "prefetch_hard_deadline_seconds": (
             settings.prefetch_hard_deadline_seconds
         ),

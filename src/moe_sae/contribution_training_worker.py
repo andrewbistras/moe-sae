@@ -3,10 +3,11 @@
 This module is intentionally independent of :mod:`moe_sae.cli`.  It owns the
 small operational boundary which the scientific trainers do not:
 
-* run the fixed resident executable directly under a <=3600-second deadline;
+* run historical fixed resident executables directly under a <=3600-second
+  deadline and the strict 10M horizon executable under a <=12-hour deadline;
 * optionally qualify resident and rematerialized executables for longer runs;
 * bind the faster passing executable to an exact graph/hardware/config receipt;
-* refuse accelerator work beyond 3600 seconds without that >=3% receipt; and
+* refuse other accelerator work beyond 3600 seconds without that >=3% receipt;
 * advance a sealed v2 input stream and immutable checkpoint pointers in exact
   update order.
 
@@ -42,6 +43,7 @@ from moe_sae.contribution_config import (
     load_contribution_config,
 )
 from moe_sae.contribution_performance import (
+    MAX_LEARNING_HORIZON_ACCELERATOR_SECONDS,
     MAX_QUALIFICATION_SECONDS,
     MAX_UNGATED_ACCELERATOR_SECONDS,
     MINIMUM_USEFUL_PREFIX_MFU,
@@ -70,7 +72,8 @@ TRANSCODER_PREFETCH_RECEIPT_SCHEMA_VERSION = (
     "gemma4-contribution-transcoder-paired-process-lane-prefetch-v1"
 )
 HISTORICAL_PREFETCH_MAX_SECONDS = 600
-HORIZON_V6E_PREFETCH_MAX_SECONDS = 1_800
+HORIZON_PREFETCH_MAX_SECONDS = 1_800
+HORIZON_DIRECT_ACCELERATOR_TYPES = frozenset({"v4-32", "v6e-16"})
 CHIP_SECONDS_SCOPE = (
     "fixed_capacity_scan_in_training_invocation_plus_synchronized_"
     "optimizer_loop_including_input_wait"
@@ -85,47 +88,88 @@ CHIP_SECONDS_EXCLUDES = (
 )
 
 
+def _finalized_horizon_config(config_path: str | Path) -> Any | None:
+    """Return a strict finalized horizon config, or ``None`` for another schema."""
+
+    selected = Path(config_path).expanduser().resolve()
+    try:
+        raw = yaml.safe_load(selected.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError, yaml.YAMLError) as error:
+        raise ContributionTrainingWorkerError(
+            "cannot inspect the selected config for its execution policy"
+        ) from error
+    if not (
+        isinstance(raw, Mapping)
+        and raw.get("schema_version")
+        == "gemma4-pilot-learning-horizon-run-config-v1"
+    ):
+        return None
+
+    # A filename is not an execution identity. Re-load the whole document
+    # through the strict finalized boundary before granting either extension.
+    from moe_sae.learning_horizon_config import (
+        LearningHorizonConfigError,
+        load_learning_horizon_config,
+    )
+
+    try:
+        return load_learning_horizon_config(selected, require_finalized=True)
+    except LearningHorizonConfigError as error:
+        raise ContributionTrainingWorkerError(
+            "learning-horizon execution requires a finalized strict config"
+        ) from error
+
+
 def prefetch_runtime_limit_seconds(
     *,
     config_path: str | Path,
     accelerator_type: str,
+    phase: str | None = None,
 ) -> int:
-    """Return the exact host-prefetch cap for one immutable run shape.
+    """Return the exact host-prefetch cap for one immutable run shape."""
 
-    Historical v4 experiments retain their 600-second bound.  Only the
-    finalized 10M horizon configs on v6e-16 receive the larger transfer/hash
-    window needed for a 133--148 GB process lane.
+    if (
+        accelerator_type in HORIZON_DIRECT_ACCELERATOR_TYPES
+        and phase == "learning_horizon_10m"
+        and _finalized_horizon_config(config_path) is not None
+    ):
+        return HORIZON_PREFETCH_MAX_SECONDS
+    return HISTORICAL_PREFETCH_MAX_SECONDS
+
+
+def direct_resident_runtime_limit_seconds(
+    *,
+    config_path: str | Path,
+    phase: str,
+    accelerator_type: str,
+) -> int:
+    """Return the direct resident cap without weakening historical protocols.
+
+    Only the exact finalized ``learning_horizon_10m`` contract on an audited
+    ``v4-32`` or ``v6e-16`` runtime receives the twelve-hour run-to-completion
+    window. Historical phases and unsupported generations retain the one-hour
+    direct bound.
     """
 
-    if accelerator_type == "v6e-16":
-        selected = Path(config_path).expanduser().resolve()
-        try:
-            raw = yaml.safe_load(selected.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, ValueError, yaml.YAMLError) as error:
-            raise ContributionTrainingWorkerError(
-                "cannot inspect the selected config for its prefetch deadline"
-            ) from error
-        if (
-            isinstance(raw, Mapping)
-            and raw.get("schema_version")
-            == "gemma4-pilot-learning-horizon-run-config-v1"
-        ):
-            # A filename is not an execution identity.  Re-load the whole
-            # document through the strict finalized horizon boundary before
-            # granting the longer regional transfer/hash window.
-            from moe_sae.learning_horizon_config import (
-                LearningHorizonConfigError,
-                load_learning_horizon_config,
-            )
-
-            try:
-                load_learning_horizon_config(selected, require_finalized=True)
-            except LearningHorizonConfigError as error:
-                raise ContributionTrainingWorkerError(
-                    "v6e horizon prefetch requires a finalized strict config"
-                ) from error
-            return HORIZON_V6E_PREFETCH_MAX_SECONDS
-    return HISTORICAL_PREFETCH_MAX_SECONDS
+    if (
+        accelerator_type not in HORIZON_DIRECT_ACCELERATOR_TYPES
+        or phase != "learning_horizon_10m"
+    ):
+        return MAX_UNGATED_ACCELERATOR_SECONDS
+    config = _finalized_horizon_config(config_path)
+    if config is None:
+        raise ContributionTrainingWorkerError(
+            "learning_horizon_10m requires its strict finalized config"
+        )
+    maximum = _positive_int(
+        "execution.direct_runtime_max_seconds",
+        config.runtime.direct_runtime_max_seconds,
+    )
+    if maximum != MAX_LEARNING_HORIZON_ACCELERATOR_SECONDS:
+        raise ContributionTrainingWorkerError(
+            "learning-horizon direct runtime policy drifted"
+        )
+    return maximum
 
 InputMode = Literal["resident", "rematerialized"]
 INPUT_MODES: tuple[InputMode, ...] = ("resident", "rematerialized")
@@ -859,6 +903,7 @@ def run_qualified_training(
     maximum_runtime_seconds: int,
     metric_sink: Callable[[Mapping[str, Any]], None] | None = None,
     direct_bounded_resident: bool = False,
+    direct_runtime_max_seconds: int = MAX_UNGATED_ACCELERATOR_SECONDS,
     preprocessing_wall_seconds: float = 0.0,
     global_chip_count: int | None = None,
 ) -> dict[str, Any]:
@@ -869,9 +914,10 @@ def run_qualified_training(
     ``latest`` pointer.  The core never infers progress from payload listings.
 
     ``direct_bounded_resident`` deliberately bypasses mode benchmarking and
-    receipt admission only while the complete child is hard-limited to at
-    most 3600 seconds.  It still derives the checkpoint identity from the
-    actually lowered resident StableHLO/hardware/config tuple.
+    receipt admission only while the complete child is hard-limited by its
+    explicit direct policy. Historical plans retain 3600 seconds; only the
+    strict 10M horizon may pass 43200. The run still derives its checkpoint
+    identity from the actually lowered StableHLO/hardware/config tuple.
     """
 
     if source.total_tokens != plan.total_tokens:
@@ -884,10 +930,28 @@ def run_qualified_training(
         )
     _positive_int("expected_l0", expected_l0)
     maximum = _positive_int("maximum_runtime_seconds", maximum_runtime_seconds)
+    direct_maximum = _positive_int(
+        "direct_runtime_max_seconds",
+        direct_runtime_max_seconds,
+    )
+    if direct_maximum not in {
+        MAX_UNGATED_ACCELERATOR_SECONDS,
+        MAX_LEARNING_HORIZON_ACCELERATOR_SECONDS,
+    }:
+        raise ContributionTrainingWorkerError(
+            "direct resident runtime policy is unsupported"
+        )
+    if (
+        direct_maximum == MAX_LEARNING_HORIZON_ACCELERATOR_SECONDS
+        and plan.phase_name != "learning_horizon_10m"
+    ):
+        raise ContributionTrainingWorkerError(
+            "the twelve-hour direct policy is restricted to learning_horizon_10m"
+        )
     if direct_bounded_resident:
-        if maximum > MAX_UNGATED_ACCELERATOR_SECONDS:
+        if maximum > direct_maximum:
             raise ContributionTrainingWorkerError(
-                "direct resident training cannot exceed 3600 seconds"
+                "direct resident training exceeds its explicit runtime policy"
             )
         if selection is not None:
             raise ContributionTrainingWorkerError(
@@ -1062,6 +1126,12 @@ def run_qualified_training(
             receipt
             if not direct_bounded_resident and maximum > MAX_QUALIFICATION_SECONDS
             else None
+        ),
+        workload_profile=(
+            "learning_horizon_10m"
+            if direct_bounded_resident
+            and direct_maximum == MAX_LEARNING_HORIZON_ACCELERATOR_SECONDS
+            else "historical"
         ),
     )
     compile_seconds += _canonical_elapsed_seconds(
@@ -3314,6 +3384,7 @@ def _run_production_training(
     maximum_runtime_seconds: int,
     metric_path: str | Path | None,
     direct_bounded_resident: bool = False,
+    direct_runtime_max_seconds: int = MAX_UNGATED_ACCELERATOR_SECONDS,
 ) -> dict[str, Any]:
     engine = _ProductionEngine(
         config,
@@ -3378,6 +3449,7 @@ def _run_production_training(
         maximum_runtime_seconds=maximum_runtime_seconds,
         metric_sink=metric_sink,
         direct_bounded_resident=direct_bounded_resident,
+        direct_runtime_max_seconds=direct_runtime_max_seconds,
         preprocessing_wall_seconds=workload.preprocessing_wall_seconds,
         global_chip_count=int(np.asarray(workload.mesh.devices, dtype=object).size),
     )
@@ -3682,8 +3754,9 @@ def _parser() -> argparse.ArgumentParser:
         "--direct-bounded-resident",
         action="store_true",
         help=(
-            "run the resident graph directly under the <=3600-second hard "
-            "deadline without a mode-selection receipt"
+            "run the resident graph directly without a mode-selection "
+            "receipt; historical configs allow <=3600 seconds and the strict "
+            "learning_horizon_10m v6e config allows <=43200 seconds"
         ),
     )
 
@@ -3824,6 +3897,10 @@ def _supervise(
     maximum_seconds: int,
     qualification_receipt: Mapping[str, Any] | None,
     operation: str,
+    workload_profile: Literal[
+        "historical",
+        "learning_horizon_10m",
+    ] = "historical",
 ) -> dict[str, Any]:
     from moe_sae.contribution_supervisor import supervise_authorized_process
 
@@ -3833,6 +3910,7 @@ def _supervise(
         maximum_runtime_seconds=maximum_seconds,
         purpose=purpose,
         qualification_receipt=qualification_receipt,
+        workload_profile=workload_profile,
     )
     paths = _supervision_paths(args, operation=operation)
     result = supervise_authorized_process(
@@ -3909,6 +3987,7 @@ def _prefetch_command(args: argparse.Namespace) -> int:
     maximum_allowed = prefetch_runtime_limit_seconds(
         config_path=args.config,
         accelerator_type=args.accelerator_type,
+        phase=args.phase,
     )
     if maximum > maximum_allowed:
         raise ContributionTrainingWorkerError(
@@ -4183,12 +4262,14 @@ def _qualify_child_command(args: argparse.Namespace) -> int:
 
 
 def _train_command(args: argparse.Namespace) -> int:
-    if (
-        args.direct_bounded_resident
-        and args.maximum_runtime_seconds > MAX_UNGATED_ACCELERATOR_SECONDS
-    ):
+    direct_maximum = direct_resident_runtime_limit_seconds(
+        config_path=args.config,
+        phase=args.phase,
+        accelerator_type=args.accelerator_type,
+    )
+    if args.direct_bounded_resident and args.maximum_runtime_seconds > direct_maximum:
         raise ContributionTrainingWorkerError(
-            "direct resident training cannot exceed 3600 seconds"
+            "direct resident training exceeds its explicit runtime policy"
         )
     if args.direct_bounded_resident:
         selection = None
@@ -4236,6 +4317,12 @@ def _train_command(args: argparse.Namespace) -> int:
             else None
         ),
         operation="train",
+        workload_profile=(
+            "learning_horizon_10m"
+            if args.direct_bounded_resident
+            and direct_maximum == MAX_LEARNING_HORIZON_ACCELERATOR_SECONDS
+            else "historical"
+        ),
     )
     training = _read_json(args.result_path, name="training result")
     print(
@@ -4259,12 +4346,14 @@ def _train_child_command(args: argparse.Namespace) -> int:
     )
 
     _verify_repository_revision(args.source_revision)
-    if (
-        args.direct_bounded_resident
-        and args.maximum_runtime_seconds > MAX_UNGATED_ACCELERATOR_SECONDS
-    ):
+    direct_maximum = direct_resident_runtime_limit_seconds(
+        config_path=args.config,
+        phase=args.phase,
+        accelerator_type=args.accelerator_type,
+    )
+    if args.direct_bounded_resident and args.maximum_runtime_seconds > direct_maximum:
         raise ContributionTrainingWorkerError(
-            "direct resident training cannot exceed 3600 seconds"
+            "direct resident training exceeds its explicit runtime policy"
         )
     if args.direct_bounded_resident:
         selection = None
@@ -4345,6 +4434,7 @@ def _train_child_command(args: argparse.Namespace) -> int:
         maximum_runtime_seconds=args.maximum_runtime_seconds,
         metric_path=args.metric_path,
         direct_bounded_resident=args.direct_bounded_resident,
+        direct_runtime_max_seconds=direct_maximum,
     )
     import jax
 

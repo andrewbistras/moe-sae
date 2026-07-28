@@ -8,6 +8,7 @@ import pytest
 from moe_sae.contribution_artifacts import canonical_sha256
 from moe_sae.contribution_performance import (
     AUXILIARY_THROUGHPUT_ADMISSION_MESSAGE,
+    MAX_LEARNING_HORIZON_ACCELERATOR_SECONDS,
     MAX_QUALIFICATION_SECONDS,
     MAX_UNGATED_ACCELERATOR_SECONDS,
     MINIMUM_AUXILIARY_THROUGHPUT_FRACTION,
@@ -299,6 +300,32 @@ def test_direct_hour_boundary_and_exact_receipt_authorization():
     assert production.basis == "qualified_exact_identity"
     assert production.qualification_receipt_sha256 == receipt["receipt_sha256"]
     assert authorization_to_dict(production)["maximum_runtime_seconds"] == 28_800
+
+
+def test_learning_horizon_has_explicit_twelve_hour_direct_profile():
+    selected_identity = identity()
+
+    horizon = authorize_accelerator_run(
+        identity=selected_identity,
+        maximum_runtime_seconds=MAX_LEARNING_HORIZON_ACCELERATOR_SECONDS,
+        purpose="workload",
+        workload_profile="learning_horizon_10m",
+    )
+
+    assert horizon.basis == "bounded_learning_horizon_workload"
+    assert horizon.qualification_receipt_sha256 is None
+    with pytest.raises(
+        ContributionPerformanceError,
+        match="direct workload profile limit",
+    ):
+        authorize_accelerator_run(
+            identity=selected_identity,
+            maximum_runtime_seconds=(
+                MAX_LEARNING_HORIZON_ACCELERATOR_SECONDS + 1
+            ),
+            purpose="workload",
+            workload_profile="learning_horizon_10m",
+        )
 
 
 def test_no_path_authorizes_an_overlong_qualification_or_unreceipted_workload():

@@ -59,6 +59,23 @@ FORK_COMMIT = "6" * 40
 OBJECT_PREFIX = "gs://test-bucket/experiment-2/run-001"
 
 
+def test_write_once_manifest_uses_manifest_size_cap_for_write_and_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(contribution_storage_module, "_MAX_CONTROL_JSON_BYTES", 64)
+    monkeypatch.setattr(contribution_storage_module, "_MAX_MANIFEST_JSON_BYTES", 4096)
+    value = {"shards": ["x" * 256]}
+    path = tmp_path / "manifest.json"
+
+    contribution_storage_module._write_once_json(path, value, manifest=True)
+    contribution_storage_module._write_once_json(path, value, manifest=True)
+
+    assert contribution_storage_module._read_json(path, manifest=True) == value
+    with pytest.raises(ContributionStorageError, match="unexpectedly large"):
+        contribution_storage_module._read_json(path)
+
+
 def contribution_batch(tokens: int, *, offset: int = 0) -> ContributionBatch:
     expert = np.arange(tokens * TOP_K_EXPERTS * HIDDEN_SIZE, dtype=np.float32).reshape(
         tokens, TOP_K_EXPERTS, HIDDEN_SIZE

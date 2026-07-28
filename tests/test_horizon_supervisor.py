@@ -140,7 +140,7 @@ def _plan(tmp_path: Path) -> dict:
                 },
                 "resource_id": resource,
                 "segment": {
-                    "seconds": 3500,
+                    "seconds": 43_200,
                     "max_segments": 8,
                     "checkpoint": _completion(artifacts / f"{train_id}-checkpoint"),
                     "boundary_exit_codes": [0, 124, 137, 143],
@@ -236,7 +236,7 @@ def test_plan_rejects_a_missing_milestone(tmp_path):
         parse_horizon_plan(raw)
 
 
-def test_plan_rejects_secret_values_and_unbounded_training(tmp_path):
+def test_plan_rejects_secret_values_and_training_beyond_twelve_hours(tmp_path):
     raw = _plan(tmp_path)
     raw["environment"]["HF_TOKEN"] = "must-not-be-persisted"
     with pytest.raises(HorizonPlanError, match="secret-like"):
@@ -244,8 +244,8 @@ def test_plan_rejects_secret_values_and_unbounded_training(tmp_path):
 
     raw = _plan(tmp_path / "second")
     train = next(task for task in raw["tasks"] if task["kind"] == "train")
-    train["segment"]["seconds"] = 3601
-    with pytest.raises(HorizonPlanError, match="must not exceed 3600"):
+    train["segment"]["seconds"] = 43_201
+    with pytest.raises(HorizonPlanError, match="must not exceed 43200"):
         parse_horizon_plan(raw)
 
 

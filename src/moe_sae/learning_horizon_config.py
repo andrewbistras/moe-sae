@@ -56,6 +56,7 @@ _MICROBATCH_TOKENS = 4_096
 _PLANNED_UPDATES = 611
 _WARMUP_UPDATES = 61
 _TAIL_MASK_TOKENS = 10_624
+_DIRECT_RUNTIME_MAX_SECONDS = 43_200
 _RESTART_TOKENS = tuple(range(1_000_000, 10_000_001, 1_000_000))
 _EVALUATION_TOKENS = (2_000_000, 5_000_000, 10_000_000)
 
@@ -113,6 +114,7 @@ class HorizonRuntime:
     capacity_margin_fraction: float
     accelerator_min_useful_mfu: float
     accelerator_qualification_max_seconds: int
+    direct_runtime_max_seconds: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -504,6 +506,7 @@ def _validate_document(
         keys={
             "accelerator_min_useful_mfu",
             "accelerator_qualification_max_seconds",
+            "direct_runtime_max_seconds",
             "restart_checkpoint_tokens",
         },
     )
@@ -516,6 +519,11 @@ def _validate_document(
         execution["accelerator_qualification_max_seconds"],
         600,
         name="execution.accelerator_qualification_max_seconds",
+    )
+    _exact(
+        execution["direct_runtime_max_seconds"],
+        _DIRECT_RUNTIME_MAX_SECONDS,
+        name="execution.direct_runtime_max_seconds",
     )
     _exact(
         execution["restart_checkpoint_tokens"],
@@ -689,6 +697,9 @@ def _validate_document(
             ),
             accelerator_qualification_max_seconds=int(
                 execution["accelerator_qualification_max_seconds"]
+            ),
+            direct_runtime_max_seconds=int(
+                execution["direct_runtime_max_seconds"]
             ),
         ),
         optimizer=HorizonOptimizer(

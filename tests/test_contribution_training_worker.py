@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -355,7 +355,7 @@ def test_prefetch_parent_is_hard_bounded_and_launches_only_its_hidden_child(
     assert json.loads(capsys.readouterr().out)["receipt_sha256"] == "c" * 64
 
 
-def test_prefetch_deadline_expands_only_for_final_horizon_config_on_v6e(
+def test_prefetch_and_runtime_extensions_require_final_horizon_and_audited_tpu(
     tmp_path: Path,
 ) -> None:
     sae = tmp_path / "renamed-final-sae.yaml"
@@ -381,13 +381,23 @@ def test_prefetch_deadline_expands_only_for_final_horizon_config_on_v6e(
         training_worker_module.prefetch_runtime_limit_seconds(
             config_path=sae,
             accelerator_type="v6e-16",
+            phase="learning_horizon_10m",
         )
         == 1_800
+    )
+    assert (
+        training_worker_module.direct_resident_runtime_limit_seconds(
+            config_path=sae,
+            phase="learning_horizon_10m",
+            accelerator_type="v6e-16",
+        )
+        == 43_200
     )
     assert (
         training_worker_module.prefetch_runtime_limit_seconds(
             config_path=transcoder,
             accelerator_type="v6e-16",
+            phase="learning_horizon_10m",
         )
         == 1_800
     )
@@ -395,7 +405,6 @@ def test_prefetch_deadline_expands_only_for_final_horizon_config_on_v6e(
     unrelated.write_text("schema_version: unrelated-v1\n", encoding="utf-8")
     for config_path, accelerator_type in (
         (CONFIG, "v6e-16"),
-        (sae, "v4-32"),
         (unrelated, "v6e-16"),
     ):
         assert (
@@ -405,6 +414,30 @@ def test_prefetch_deadline_expands_only_for_final_horizon_config_on_v6e(
             )
             == 600
         )
+    assert (
+        training_worker_module.prefetch_runtime_limit_seconds(
+            config_path=sae,
+            accelerator_type="v4-32",
+            phase="learning_horizon_10m",
+        )
+        == 1_800
+    )
+    assert (
+        training_worker_module.direct_resident_runtime_limit_seconds(
+            config_path=sae,
+            phase="learning_horizon_10m",
+            accelerator_type="v4-32",
+        )
+        == 43_200
+    )
+    assert (
+        training_worker_module.direct_resident_runtime_limit_seconds(
+            config_path=sae,
+            phase="learning_horizon_10m",
+            accelerator_type="v5litepod-16",
+        )
+        == 3_600
+    )
 
     with pytest.raises(
         ContributionTrainingWorkerError,
@@ -413,6 +446,7 @@ def test_prefetch_deadline_expands_only_for_final_horizon_config_on_v6e(
         training_worker_module.prefetch_runtime_limit_seconds(
             config_path=SAE_HORIZON_TEMPLATE,
             accelerator_type="v6e-16",
+            phase="learning_horizon_10m",
         )
 
 
@@ -1003,10 +1037,10 @@ def test_orbax_restore_binds_full_pointer_and_hash_only_payload_identity(
     }
 
 
-def test_bounded_direct_training_rejects_more_than_one_hour() -> None:
+def test_historical_direct_training_rejects_more_than_one_hour() -> None:
     with pytest.raises(
         ContributionTrainingWorkerError,
-        match="cannot exceed 3600 seconds",
+        match="exceeds its explicit runtime policy",
     ):
         run_qualified_training(
             plan(),
@@ -1018,6 +1052,27 @@ def test_bounded_direct_training_rejects_more_than_one_hour() -> None:
             maximum_runtime_seconds=3_601,
             direct_bounded_resident=True,
         )
+
+
+def test_learning_horizon_direct_training_accepts_one_continuous_twelve_hour_window() -> None:
+    result = run_qualified_training(
+        replace(plan(), phase_name="learning_horizon_10m"),
+        Source(),
+        mean=None,
+        selection=None,
+        dependencies=dependencies(Checkpoints()),
+        expected_l0=2,
+        maximum_runtime_seconds=43_200,
+        direct_bounded_resident=True,
+        direct_runtime_max_seconds=43_200,
+    )
+
+    assert result["status"] == "completed"
+    assert result["tokens"] == 10
+    assert (
+        result["authorization_basis"]
+        == "bounded_learning_horizon_workload"
+    )
 
 
 def test_bounded_direct_training_resumes_from_exact_lowered_identity() -> None:

@@ -15,11 +15,17 @@ The v1 plan is deliberately exact:
 - one report for each scientific model.
 
 Every train command must contain `{attempt_id}` and `{segment_seconds}`.
-`segment.seconds` cannot exceed 3,600. A segment may continue only when its
-declared checkpoint pointer changes; a completed trajectory is recognized
-only from its declared immutable completion file. Numerics, identity/hash,
-schema, range, overflow, and token-drop failures are terminal. Only classified
-Spot preemption, resource unavailability, and SSH transport loss are retried.
+For this campaign, set `segment.seconds` to 43,200: one continuous invocation
+can finish all 611 updates without hourly teardown/recompile cycles. The name
+`segment` remains an operational compatibility surface, not a recommendation
+to chop the run up. The strict plan rejects values above twelve hours. A
+twelve-hour boundary may continue only when the declared rolling checkpoint
+pointer changed. Spot preemption resumes from the latest already-sealed
+checkpoint even if no newer checkpoint was reached. A completed trajectory is
+recognized only from its immutable completion file. Numerics,
+identity/hash, schema, range, overflow, and token-drop failures are terminal.
+Only classified Spot preemption, resource unavailability, and SSH transport
+loss are retried.
 
 Private v6e resources use `queued_spot` or `direct_spot`. The controller
 derives a new TPU name from the globally increasing attempt ID, passes both
@@ -78,8 +84,8 @@ also contains:
 
 ```yaml
 segment:
-  seconds: 3500
-  max_segments: 16
+  seconds: 43200
+  max_segments: 8
   boundary_exit_codes: [0, 124, 137, 143]
   checkpoint:
     path: /mnt/control/checkpoints/latest.json

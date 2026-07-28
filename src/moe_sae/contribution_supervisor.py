@@ -34,6 +34,7 @@ from moe_sae.contribution_artifacts import (
     canonical_sha256,
 )
 from moe_sae.contribution_performance import (
+    MAX_LEARNING_HORIZON_ACCELERATOR_SECONDS,
     MAX_QUALIFICATION_SECONDS,
     MAX_UNGATED_ACCELERATOR_SECONDS,
     AcceleratorRunAuthorization,
@@ -219,6 +220,14 @@ def _validate_authorization(
             if maximum > MAX_UNGATED_ACCELERATOR_SECONDS or receipt is not None:
                 raise ContributionSupervisorError(
                     "bounded workload authorization is inconsistent"
+                )
+        elif basis == "bounded_learning_horizon_workload":
+            if (
+                maximum > MAX_LEARNING_HORIZON_ACCELERATOR_SECONDS
+                or receipt is not None
+            ):
+                raise ContributionSupervisorError(
+                    "learning-horizon workload authorization is inconsistent"
                 )
         elif basis == "qualified_exact_identity":
             if receipt is None:
