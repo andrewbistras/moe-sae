@@ -73,6 +73,17 @@ def test_deploy_requires_explicit_internal_ip_for_v6e() -> None:
     assert "command+=(--internal-ip)" in inspect
 
 
+def test_worker_operators_use_one_validated_explicit_remote_username() -> None:
+    deploy = (SCRIPT_ROOT / "deploy_workers.sh").read_text()
+    inspect = (SCRIPT_ROOT / "inspect_workers.sh").read_text()
+    for source in (deploy, inspect):
+        assert "TPU_SSH_USER=${TPU_SSH_USER:-}" in source
+        assert "TPU_SSH_USER must be a safe lowercase Linux username" in source
+        assert 'TPU_SSH_TARGET="$TPU_SSH_USER@$TPU_NAME"' in source
+        assert 'tpu-vm ssh "$TPU_SSH_TARGET"' in source
+    assert '"$TPU_SSH_TARGET:~/.cache/moe-sae-deploy/$deployment_id/"' in deploy
+
+
 def test_bootstrap_gates_activation_capacity_before_and_after_dependencies() -> None:
     bootstrap = (SCRIPT_ROOT / "bootstrap_worker.sh").read_text()
     assert "readonly MIN_LOCAL_FREE_BYTES=25769803776" in bootstrap

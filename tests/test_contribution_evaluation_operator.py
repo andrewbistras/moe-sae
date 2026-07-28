@@ -83,6 +83,15 @@ def test_internal_ip_transport_is_explicit(
     assert "--internal-ip" in internal
 
 
+def test_explicit_tpu_ssh_user_is_rendered(
+    operator,
+    tmp_path: Path,
+) -> None:
+    settings = replace(_settings(operator, tmp_path), ssh_user="abistras")
+    command = operator._command(settings, 0, 2)
+    assert command[command.index("ssh") + 1] == "abistras@gemma4-v4-32"
+
+
 def test_main_accepts_remote_success_after_transport_teardown(
     operator,
     tmp_path: Path,

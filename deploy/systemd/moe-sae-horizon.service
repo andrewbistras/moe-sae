@@ -7,6 +7,7 @@ Wants=network-online.target
 Type=simple
 User=tpuops
 Group=tpuops
+Environment=TPU_SSH_USER=abistras
 EnvironmentFile=/etc/moe-sae/horizon.env
 ExecStart=/usr/bin/bash -lc 'cd "$HORIZON_REPO" && exec "$HORIZON_PYTHON" scripts/tpu/run_horizon.py run --plan "$HORIZON_PLAN"'
 Restart=on-failure

@@ -26,6 +26,7 @@ PROBE_TIMEOUT_SECONDS = 420
 MINIMUM_CACHE_FREE_BYTES = 192 * 1024**3
 _GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_SAFE_SSH_USER = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 
 
 class ProbeOperatorError(RuntimeError):
@@ -45,13 +46,18 @@ def _gcloud(
     worker: int,
     remote_command: str,
 ) -> list[str]:
+    target = (
+        f"{args.ssh_user}@{args.tpu_name}"
+        if args.ssh_user is not None
+        else args.tpu_name
+    )
     command = [
         "gcloud",
         "compute",
         "tpus",
         "tpu-vm",
         "ssh",
-        args.tpu_name,
+        target,
         f"--project={args.project}",
         f"--zone={args.zone}",
         f"--worker={worker}",
@@ -272,6 +278,13 @@ def _validate_args(args: argparse.Namespace) -> None:
         if not key.is_file():
             raise ProbeOperatorError("ssh_key_file is not a regular file")
         args.ssh_key_file = str(key)
+    if (
+        args.ssh_user is not None
+        and _SAFE_SSH_USER.fullmatch(args.ssh_user) is None
+    ):
+        raise ProbeOperatorError(
+            "TPU_SSH_USER/--ssh-user must be a safe lowercase Linux username"
+        )
 
 
 def _run_probe(args: argparse.Namespace) -> dict[str, object]:
@@ -429,6 +442,13 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--ssh-key-file")
     parser.add_argument(
+        "--ssh-user",
+        help=(
+            "explicit remote TPU VM Linux username; defaults to "
+            "TPU_SSH_USER, otherwise gcloud's normal default"
+        ),
+    )
+    parser.add_argument(
         "--internal-ip",
         action="store_true",
         help=(
@@ -449,8 +469,10 @@ def main(
     *,
     environment: Mapping[str, str] | None = None,
 ) -> int:
-    del environment
+    selected_environment = os.environ if environment is None else environment
     args = _parser().parse_args(argv)
+    if args.ssh_user is None:
+        args.ssh_user = selected_environment.get("TPU_SSH_USER") or None
     try:
         _validate_args(args)
         if args.dry_run:

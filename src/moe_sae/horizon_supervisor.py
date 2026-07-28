@@ -2093,6 +2093,7 @@ class HorizonSupervisor:
             "LC_ALL",
             "CLOUDSDK_CONFIG",
             "SSH_AUTH_SOCK",
+            "TPU_SSH_USER",
         )
         result = {
             key: os.environ[key]

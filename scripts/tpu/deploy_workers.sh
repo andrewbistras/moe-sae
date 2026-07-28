@@ -28,6 +28,8 @@ Required environment variables (none are secrets):
 Optional environment variables:
   UV_VERSION                  pinned uv version (default: 0.11.14)
   SSH_KEY_FILE                gcloud SSH key (default: ~/.ssh/google_compute_engine)
+  TPU_SSH_USER                explicit remote Linux username (default: gcloud
+                              account-derived username)
   TPU_ACCELERATOR_TYPE        exact expected type (default: v4-32)
   TPU_USE_INTERNAL_IP         1 to use private TPU VM addresses (default: 0);
                               required for v6e-16
@@ -110,7 +112,7 @@ ensure_gcloud_ssh_key() {
   local key_file=$1
   local -a ssh_command
   ssh_command=(
-    gcloud compute tpus tpu-vm ssh "$TPU_NAME"
+    gcloud compute tpus tpu-vm ssh "$TPU_SSH_TARGET"
     --project="$GCP_PROJECT"
     --zone="$TPU_ZONE"
     --worker=0
@@ -169,6 +171,14 @@ main() {
   SSH_KEY_FILE=${SSH_KEY_FILE:-$HOME/.ssh/google_compute_engine}
   TPU_ACCELERATOR_TYPE=${TPU_ACCELERATOR_TYPE:-v4-32}
   TPU_USE_INTERNAL_IP=${TPU_USE_INTERNAL_IP:-0}
+  TPU_SSH_USER=${TPU_SSH_USER:-}
+  if [[ -n "$TPU_SSH_USER" ]]; then
+    [[ "$TPU_SSH_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || \
+      die "TPU_SSH_USER must be a safe lowercase Linux username"
+    TPU_SSH_TARGET="$TPU_SSH_USER@$TPU_NAME"
+  else
+    TPU_SSH_TARGET="$TPU_NAME"
+  fi
   validate_inputs
 
   require_command git
@@ -261,7 +271,7 @@ main() {
     gcloud_common+=(--internal-ip)
   fi
   log "creating deployment directory on every worker"
-  gcloud compute tpus tpu-vm ssh "$TPU_NAME" \
+  gcloud compute tpus tpu-vm ssh "$TPU_SSH_TARGET" \
     "${gcloud_common[@]}" \
     --worker=all \
     --command="install -d -m 0700 $remote_dir"
@@ -269,13 +279,13 @@ main() {
   log "copying bundle, config, and bootstrap helper to every worker"
   gcloud compute tpus tpu-vm scp \
     "$bundle_file" "$bootstrap_file" "$config_file" \
-    "$TPU_NAME:~/.cache/moe-sae-deploy/$deployment_id/" \
+    "$TPU_SSH_TARGET:~/.cache/moe-sae-deploy/$deployment_id/" \
     "${gcloud_common[@]}" \
     --worker=all
 
   remote_command="bash $remote_dir/bootstrap_worker.sh --config $remote_dir/worker.conf --bundle $remote_dir/repository.bundle"
   log "bootstrapping every worker concurrently; any worker failure fails this deployment"
-  gcloud compute tpus tpu-vm ssh "$TPU_NAME" \
+  gcloud compute tpus tpu-vm ssh "$TPU_SSH_TARGET" \
     "${gcloud_common[@]}" \
     --worker=all \
     --command="$remote_command"

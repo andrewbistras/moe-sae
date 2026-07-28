@@ -122,6 +122,20 @@ def test_internal_ip_transport_is_explicit(
     assert "--internal-ip" in internal
 
 
+def test_explicit_tpu_ssh_user_is_rendered(
+    operator,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    environment = _environment(tmp_path)
+    environment["TPU_SSH_USER"] = "abistras"
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+    settings = operator.Settings.from_environment()
+    command = operator._command(settings, 0, 3)
+    assert command[command.index("ssh") + 1] == "abistras@gemma4-exp3"
+
+
 def test_training_revision_is_required(
     operator,
     monkeypatch: pytest.MonkeyPatch,

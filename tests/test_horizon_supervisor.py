@@ -206,6 +206,21 @@ def test_exact_plan_covers_eight_trajectories_and_24_evaluations(tmp_path):
     assert len(plan.plan_sha256) == 64
 
 
+def test_controller_forwards_explicit_tpu_ssh_user(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("TPU_SSH_USER", "abistras")
+    plan = parse_horizon_plan(_plan(tmp_path))
+    supervisor = HorizonSupervisor(
+        plan,
+        resource_manager=FakeResources(tmp_path / "resource-state"),
+    )
+    assert supervisor._base_environment(plan.tasks[0])["TPU_SSH_USER"] == (
+        "abistras"
+    )
+
+
 def test_plan_rejects_a_missing_milestone(tmp_path):
     raw = _plan(tmp_path)
     raw["tasks"] = [

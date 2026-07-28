@@ -63,6 +63,14 @@ def test_new_overlay_command_rejects_an_already_sealed_control_root(operator):
     assert "/nfs/new-overlay/manifest.json" in joined
 
 
+def test_explicit_tpu_ssh_user_is_validated_and_rendered(operator):
+    args = _operator_args(ssh_user="abistras")
+    command = operator._worker_command(args, 0)
+    assert command[command.index("ssh") + 1] == "abistras@gemma4"
+    with pytest.raises(operator.OperatorError, match="safe lowercase"):
+        operator.run(_operator_args(ssh_user="bad;user"))
+
+
 def _operator_args(**overrides):
     values = {
         "remote_uv": "uv",

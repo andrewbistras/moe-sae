@@ -497,6 +497,8 @@ def test_fresh_controller_probe_dry_run_declares_identity_and_cache_fanout():
             "/dev/shm/moe-sae",
             "--required-lane-bytes",
             "147000000000",
+            "--ssh-user",
+            "abistras",
             "--internal-ip",
             "--dry-run",
         ],
@@ -513,6 +515,11 @@ def test_fresh_controller_probe_dry_run_declares_identity_and_cache_fanout():
     assert payload["cloud_mutation"] is False
     assert all(
         "--internal-ip" in command for command in payload["commands"]
+    )
+    assert all(
+        command[command.index("ssh") + 1]
+        == "abistras@experiment4-sae-a"
+        for command in payload["commands"]
     )
     assert all(
         "observe-controller" in " ".join(command)

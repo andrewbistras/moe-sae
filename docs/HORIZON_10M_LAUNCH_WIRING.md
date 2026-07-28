@@ -50,6 +50,7 @@ The expected source paths and prefixes are:
 ```zsh
 export REPO='/home/tpuops/src/moe-sae'
 export CENTRAL_PROD='/mnt/moe-sae-control'
+export TPU_SSH_USER='abistras'
 export TPU_REPO='/home/abistras/moe-sae'
 export TPU_PROD="$TPU_REPO/artifacts/gemma4_v1/production"
 export REMOTE_UV='/home/abistras/.local/bin/uv'
@@ -162,6 +163,8 @@ export NFS_SERVER='10.253.33.106'
 export NFS_EXPORT='/moe_sae_control'
 export TPU_ACCELERATOR_TYPE='v6e-16'
 export TPU_USE_INTERNAL_IP='1'
+export TPU_SSH_USER='abistras'
+export TPU_SSH_TARGET="$TPU_SSH_USER@$TPU_NAME"
 
 bash scripts/tpu/deploy_workers.sh
 ```
@@ -183,14 +186,14 @@ uv run python scripts/tpu/stage_regional_control.py build \
   --output "$CONTROL_BUNDLE"
 
 gcloud compute tpus tpu-vm scp "$CONTROL_BUNDLE" \
-  "$TPU_NAME:/tmp/horizon-control.tar" \
+  "$TPU_SSH_TARGET:/tmp/horizon-control.tar" \
   --project="$GCP_PROJECT" \
   --zone="$TPU_ZONE" \
   --worker=0 \
   --internal-ip \
   --quiet
 
-gcloud compute tpus tpu-vm ssh "$TPU_NAME" \
+gcloud compute tpus tpu-vm ssh "$TPU_SSH_TARGET" \
   --project="$GCP_PROJECT" \
   --zone="$TPU_ZONE" \
   --worker=0 \
@@ -213,7 +216,7 @@ export TOPOLOGY_REL="horizon-10m/topology/$TPU_NAME"
 export TOPOLOGY_REMOTE="$TPU_PROD/$TOPOLOGY_REL"
 export PROBE_ID="horizon10m-${PROJECT_COMMIT[1,12]}-$(date -u +%Y%m%dT%H%M%SZ)"
 
-gcloud compute tpus tpu-vm ssh "$TPU_NAME" \
+gcloud compute tpus tpu-vm ssh "$TPU_SSH_TARGET" \
   --project="$GCP_PROJECT" \
   --zone="$TPU_ZONE" \
   --worker=0 \
@@ -267,6 +270,7 @@ COMMON_ENV=(
   "REMOTE_UV=$REMOTE_UV"
   'TPU_ACCELERATOR_TYPE=v6e-16'
   'TPU_USE_INTERNAL_IP=1'
+  'TPU_SSH_USER=abistras'
   "ARTIFACT_ROOT=$TPU_PROD"
   "BULK_GCS_ROOT=$BULK_GCS_ROOT"
   "CONTRIBUTION_TRAIN_CAPTURE_ROOT=$TPU_PROD/$TARGET_TRAIN_REL"

@@ -360,6 +360,35 @@ def test_internal_ip_transport_is_explicit_and_v6e_requires_it(
     )
 
 
+def test_explicit_tpu_ssh_user_is_validated_and_rendered(
+    operator,
+    tmp_path: Path,
+) -> None:
+    settings = replace(_settings(operator, tmp_path), ssh_user="abistras")
+    command = operator._gcloud(settings, worker=0, remote_command="true")
+    assert command[command.index("ssh") + 1] == "abistras@gemma4-v4-32"
+    args = argparse.Namespace(
+        action="train",
+        scientific_model="sae",
+        condition="A",
+        phase="learning_horizon_10m",
+        run_id="horizon-a",
+        attempt_id="segment-1",
+        seed=0,
+        maximum_runtime_seconds=3_600,
+        config="/nfs/contracts/sae.yaml",
+    )
+    environment = {
+        "GCP_PROJECT": "neural-dragnet",
+        "TPU_NAME": "gemma4-v4-32",
+        "TPU_ZONE": "us-central2-b",
+        "PROJECT_COMMIT": "a" * 40,
+        "TPU_SSH_USER": "bad;user",
+    }
+    with pytest.raises(operator.OperatorError, match="TPU_SSH_USER"):
+        operator._settings(environment, args)
+
+
 def test_horizon_v6e_prefetch_has_bounded_30_minute_window(
     operator,
     tmp_path: Path,
@@ -706,6 +735,7 @@ def test_v6e_replacement_slice_reuses_one_scientific_run_contract(
         args.accelerator_type = "v6e-16"
         args.tpu_name = tpu_name
         args.tpu_zone = "us-east1-d"
+        args.tpu_ssh_user = "abistras"
         args.config = str(finalized)
         args.phase = "learning_horizon_10m"
         args.cache_max_bytes = 160 * 1024**3
@@ -773,6 +803,7 @@ def test_v6e_replacement_slice_reuses_one_scientific_run_contract(
             attestation["controller_to_jax_process_index"]
             == plan["controller_to_jax_process_index"]
         )
+        assert attestation["tpu_ssh_user"] == "abistras"
 
     for args, plan in (
         (first_args, first_plan),
@@ -802,6 +833,7 @@ def test_v6e_replacement_slice_reuses_one_scientific_run_contract(
             fresh_controller_mapping=args.fresh_controller_mapping,
             local_cache_inventory=args.local_cache_inventory,
             internal_ip=True,
+            ssh_user=args.tpu_ssh_user,
         )
         validated, mapping = operator._validate_attempt_plan(plan, settings)
         assert validated == plan

@@ -49,11 +49,15 @@ For systemd, install `deploy/systemd/moe-sae-horizon.service`, then create
 HORIZON_REPO=/home/tpuops/src/moe-sae
 HORIZON_PYTHON=/home/tpuops/src/moe-sae/.venv/bin/python
 HORIZON_PLAN=/mnt/moe-sae-control/horizon-10m/launch-plan.yaml
+TPU_SSH_USER=abistras
 ```
 
 The supplied unit runs as `tpuops` (UID/GID 2001), matching ownership of the
-shared control tree. Keep the checkout, virtual environment, gcloud
-configuration, and SSH key material readable by that account.
+shared control tree. Its TPU transports explicitly target the existing
+`abistras` Linux account on each worker via `TPU_SSH_USER`; this prevents the
+controller account name from silently creating/using a different remote user.
+Keep the checkout, virtual environment, gcloud configuration, and SSH key
+material readable by `tpuops`.
 
 Use `KillMode=control-group`, as in the supplied unit. The state root must be a
 small POSIX control volume, not GCS. Attempt intents/results, completion

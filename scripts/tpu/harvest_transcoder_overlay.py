@@ -18,7 +18,9 @@ explicit acknowledgement and cannot target a sealed control root.
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path, PurePosixPath
+import re
 import shlex
 import shutil
 import subprocess
@@ -35,6 +37,7 @@ from moe_sae.contribution_transcoder_capture_config import (
 PROCESS_COUNT = 4
 TRANSPORT_GRACE_SECONDS = 180
 DEFAULT_CONFIG = "configs/gemma4_transcoder_v2.yaml"
+_SAFE_SSH_USER = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 
 
 class OperatorError(RuntimeError):
@@ -80,6 +83,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--maximum-runtime-seconds", type=int, default=600)
     parser.add_argument("--local-log-root", required=True)
     parser.add_argument("--ssh-key-file")
+    parser.add_argument(
+        "--ssh-user",
+        default=os.environ.get("TPU_SSH_USER") or None,
+        help=(
+            "explicit remote TPU VM Linux username; defaults to "
+            "TPU_SSH_USER, otherwise gcloud's normal default"
+        ),
+    )
     parser.add_argument(
         "--new-overlay",
         action="store_true",
@@ -215,13 +226,15 @@ def _worker_command(args: argparse.Namespace, controller: int) -> list[str]:
         ),
     ]
     remote = "bash -lc " + shlex.quote("\n".join(lines))
+    ssh_user = getattr(args, "ssh_user", None)
+    target = f"{ssh_user}@{args.tpu_name}" if ssh_user else args.tpu_name
     result = [
         "gcloud",
         "compute",
         "tpus",
         "tpu-vm",
         "ssh",
-        args.tpu_name,
+        target,
         f"--project={args.gcp_project}",
         f"--zone={args.tpu_zone}",
         f"--worker={controller}",
@@ -243,6 +256,11 @@ def run(args: argparse.Namespace) -> int:
         raise OperatorError(
             "frozen v2 reuses its sealed overlay-v1 manifests; a new capture "
             "requires --new-overlay and a fresh --control-root"
+        )
+    ssh_user = getattr(args, "ssh_user", None)
+    if ssh_user is not None and _SAFE_SSH_USER.fullmatch(ssh_user) is None:
+        raise OperatorError(
+            "TPU_SSH_USER/--ssh-user must be a safe lowercase Linux username"
         )
     try:
         capture_config = load_transcoder_overlay_capture_config(

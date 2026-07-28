@@ -54,7 +54,7 @@ QUALIFICATION_RECEIPT_SCHEMA_VERSION = (
 RUN_CONTRACT_SCHEMA_VERSION = "gemma4-contribution-sae-operator-run-v1"
 ATTEMPT_PLAN_SCHEMA_VERSION = "gemma4-contribution-sae-operator-attempt-v1"
 ATTEMPT_EXECUTION_ATTESTATION_SCHEMA_VERSION = (
-    "gemma4-contribution-sae-attempt-execution-attestation-v1"
+    "gemma4-contribution-sae-attempt-execution-attestation-v2"
 )
 
 _COORDINATOR_BUNDLE_FIELDS = {
@@ -81,6 +81,7 @@ _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
 _SAFE_PHASE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_SAFE_SSH_USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 
 
 class OperatorError(RuntimeError):
@@ -123,6 +124,7 @@ class Settings:
     local_cache_inventory: str | None = None
     selected_config_path: str | None = None
     internal_ip: bool = False
+    ssh_user: str | None = None
 
     @property
     def config_path(self) -> str:
@@ -321,6 +323,11 @@ def _settings(
         raise OperatorError("TPU_ZONE is invalid")
     if _GIT_SHA_RE.fullmatch(commit) is None:
         raise OperatorError("PROJECT_COMMIT must be a full lowercase Git SHA")
+    ssh_user = environment.get("TPU_SSH_USER") or None
+    if ssh_user is not None and _SAFE_SSH_USER_RE.fullmatch(ssh_user) is None:
+        raise OperatorError(
+            "TPU_SSH_USER must be a safe lowercase Linux username"
+        )
     if args.action not in ACTIONS:
         raise OperatorError("--action is invalid")
     if args.scientific_model not in SCIENTIFIC_MODELS:
@@ -502,6 +509,7 @@ def _settings(
             else None
         ),
         internal_ip=internal_ip,
+        ssh_user=ssh_user,
     )
 
 
@@ -941,6 +949,12 @@ def initialize_attempt(args: argparse.Namespace) -> dict[str, object]:
     operational_evidence: dict[str, object] = {}
     stable_lineage = dict(lineage)
     if accelerator_type == "v6e-16":
+        ssh_user = getattr(args, "tpu_ssh_user", None)
+        if (
+            ssh_user is not None
+            and _SAFE_SSH_USER_RE.fullmatch(ssh_user) is None
+        ):
+            raise OperatorError("tpu_ssh_user is invalid")
         for name in (
             "controller_to_jax_process_index",
             "fresh_controller_mapping_sha256",
@@ -953,6 +967,7 @@ def initialize_attempt(args: argparse.Namespace) -> dict[str, object]:
         operational_evidence["fresh_controller_mapping"] = str(
             fresh_mapping_path
         )
+        operational_evidence["tpu_ssh_user"] = ssh_user
     contract_body: dict[str, object] = {
         "schema_version": RUN_CONTRACT_SCHEMA_VERSION,
         "run_id": args.run_id,
@@ -1206,6 +1221,7 @@ def _validate_execution_attestation(
         "local_cache_inventory",
         "local_cache_inventory_sha256",
         "local_cache_kind",
+        "tpu_ssh_user",
     }
     expected_fields = (
         required | {"source_overlay_control_root"}
@@ -1244,6 +1260,7 @@ def _validate_execution_attestation(
         != "fresh-slice-incarnation-identity-probe"
         or unsigned.get("local_cache_kind")
         not in {"host-ram-tmpfs", "attached-zonal-disk"}
+        or unsigned.get("tpu_ssh_user") != settings.ssh_user
     ):
         raise OperatorError(
             "v6e execution attestation differs from this slice attempt"
@@ -1328,13 +1345,18 @@ def _validate_attempt_plan(
 
 
 def _gcloud(settings: Settings, *, worker: int, remote_command: str) -> list[str]:
+    target = (
+        f"{settings.ssh_user}@{settings.tpu_name}"
+        if settings.ssh_user is not None
+        else settings.tpu_name
+    )
     command = [
         "gcloud",
         "compute",
         "tpus",
         "tpu-vm",
         "ssh",
-        settings.tpu_name,
+        target,
         f"--project={settings.gcp_project}",
         f"--zone={settings.tpu_zone}",
         f"--worker={worker}",
@@ -1421,6 +1443,8 @@ def _init_command(settings: Settings) -> list[str]:
         "--maximum-runtime-seconds",
         str(settings.maximum_runtime_seconds),
     ]
+    if settings.ssh_user is not None:
+        command.extend(("--tpu-ssh-user", settings.ssh_user))
     if settings.qualification_bundle is not None:
         command.extend(
             ("--qualification-bundle", settings.qualification_bundle)
@@ -2183,6 +2207,7 @@ def _init_parser() -> argparse.ArgumentParser:
     parser.add_argument("--project-commit", required=True)
     parser.add_argument("--tpu-name", default="")
     parser.add_argument("--tpu-zone", default="")
+    parser.add_argument("--tpu-ssh-user")
     parser.add_argument("--accelerator-type", default="v4-32")
     parser.add_argument(
         "--scientific-model",

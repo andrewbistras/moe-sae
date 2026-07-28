@@ -29,6 +29,7 @@ LEARNING_HORIZON_RESULT_SCHEMA_VERSION = (
 LEARNING_HORIZON_PROTOCOL_ID = "gemma4-pilot-learning-horizon-v1-20260728"
 _GIT = re.compile(r"^[0-9a-f]{40}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_SAFE_SSH_USER = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 
 
 class OperatorError(RuntimeError):
@@ -101,6 +102,7 @@ class Settings:
     phase: str = "mechanism_pilot"
     seed: int = 0
     checkpoint_tokens: int | None = None
+    ssh_user: str | None = None
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -173,6 +175,11 @@ class Settings:
             raise OperatorError(
                 "v6e-16 evaluation requires explicit TPU_USE_INTERNAL_IP=1"
             )
+        ssh_user = os.environ.get("TPU_SSH_USER") or None
+        if ssh_user is not None and _SAFE_SSH_USER.fullmatch(ssh_user) is None:
+            raise OperatorError(
+                "TPU_SSH_USER must be a safe lowercase Linux username"
+            )
         return cls(
             project=_required("GCP_PROJECT"),
             tpu=_required("TPU_NAME"),
@@ -227,6 +234,7 @@ class Settings:
             accelerator_type=accelerator_type,
             regional_mirror_seal=regional_mirror or None,
             internal_ip=internal_ip,
+            ssh_user=ssh_user,
         )
 
 
@@ -280,13 +288,18 @@ def _remote_bytes(
 ) -> bytes:
     """Read one remote control artifact from the Mac through gcloud."""
 
+    target = (
+        f"{settings.ssh_user}@{settings.tpu}"
+        if settings.ssh_user is not None
+        else settings.tpu
+    )
     command = [
         "gcloud",
         "compute",
         "tpus",
         "tpu-vm",
         "ssh",
-        settings.tpu,
+        target,
         f"--project={settings.project}",
         f"--zone={settings.zone}",
         f"--worker={controller}",
@@ -441,13 +454,18 @@ def _command(
             'exit "$evaluation_status"',
         )
     )
+    target = (
+        f"{settings.ssh_user}@{settings.tpu}"
+        if settings.ssh_user is not None
+        else settings.tpu
+    )
     command = [
         "gcloud",
         "compute",
         "tpus",
         "tpu-vm",
         "ssh",
-        settings.tpu,
+        target,
         f"--project={settings.project}",
         f"--zone={settings.zone}",
         f"--worker={controller}",

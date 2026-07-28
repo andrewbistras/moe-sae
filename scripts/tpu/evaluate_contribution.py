@@ -23,6 +23,7 @@ V6E_16_PEAK_FLOPS_PER_SECOND = 14_688_000_000_000_000
 V6E_PROCESS_CACHE_MAX_BYTES = 160 * 1024**3
 _SHA = re.compile(r"^[0-9a-f]{40}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_SAFE_SSH_USER = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 RESULT_SCHEMA_VERSION = "gemma4-contribution-phase2-scientific-result-v2"
 LEARNING_HORIZON_RESULT_SCHEMA_VERSION = (
     "gemma4-contribution-learning-horizon-curve-point-v1"
@@ -71,6 +72,7 @@ class Settings:
     seed: int = 0
     checkpoint_tokens: int | None = None
     run_roots: dict[str, str] | None = None
+    ssh_user: str | None = None
 
     @classmethod
     def from_environment(cls) -> Settings:
@@ -106,6 +108,11 @@ class Settings:
         if accelerator_type == "v6e-16" and not internal_ip:
             raise OperatorError(
                 "v6e-16 evaluation requires explicit TPU_USE_INTERNAL_IP=1"
+            )
+        ssh_user = os.environ.get("TPU_SSH_USER") or None
+        if ssh_user is not None and _SAFE_SSH_USER.fullmatch(ssh_user) is None:
+            raise OperatorError(
+                "TPU_SSH_USER must be a safe lowercase Linux username"
             )
         return cls(
             project=_required("GCP_PROJECT"),
@@ -155,6 +162,7 @@ class Settings:
             ),
             regional_mirror_seal=regional_mirror or None,
             internal_ip=internal_ip,
+            ssh_user=ssh_user,
         )
 
 
@@ -277,13 +285,18 @@ def _command(settings: Settings, controller: int, process: int) -> list[str]:
             'exit "$evaluation_status"',
         )
     )
+    target = (
+        f"{settings.ssh_user}@{settings.tpu}"
+        if settings.ssh_user is not None
+        else settings.tpu
+    )
     command = [
         "gcloud",
         "compute",
         "tpus",
         "tpu-vm",
         "ssh",
-        settings.tpu,
+        target,
         f"--project={settings.project}",
         f"--zone={settings.zone}",
         f"--worker={controller}",
