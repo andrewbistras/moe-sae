@@ -23,7 +23,8 @@ import sys
 
 PROCESS_COUNT = 4
 PROBE_TIMEOUT_SECONDS = 420
-MINIMUM_CACHE_FREE_BYTES = 192 * 1024**3
+# Exact 160-GiB resident-cache cap plus ten-percent capacity headroom.
+MINIMUM_CACHE_FREE_BYTES = 176 * 1024**3
 _GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SAFE_SSH_USER = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
@@ -249,7 +250,7 @@ def _cat_receipt_command(args: argparse.Namespace, name: str) -> list[str]:
 def _validate_args(args: argparse.Namespace) -> None:
     if not args.internal_ip:
         raise ProbeOperatorError(
-            "--internal-ip is required for the private v6e-16 identity probe"
+            "--internal-ip is required for the private regional identity probe"
         )
     if (
         re.fullmatch(r"[a-z][a-z0-9-]{4,61}[a-z0-9]", args.project) is None
@@ -271,7 +272,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         < (args.required_lane_bytes * 11 + 9) // 10
     ):
         raise ProbeOperatorError(
-            "cache requires its lane plus 10% and at least 192GiB free"
+            "cache requires its lane plus 10% and at least 176GiB free; "
+            "v5litepod requires a 180GiB /dev/shm remount before probing"
         )
     if args.ssh_key_file:
         key = Path(args.ssh_key_file).expanduser().resolve()
@@ -421,7 +423,7 @@ def _parser() -> argparse.ArgumentParser:
         prog="scripts/tpu/probe_controller_identity.py",
         description=(
             "Read-only fresh physical-controller/JAX identity probe for one "
-            "already-created v6e-16 slice."
+            "already-created regional 16-chip slice."
         ),
     )
     parser.add_argument("--project", required=True)
@@ -453,7 +455,7 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "explicitly connect through TPU VM internal addresses; required "
-            "for the private v6e-16 regional slices"
+            "for private v6e-16 and v5litepod-16 regional slices"
         ),
     )
     parser.add_argument(

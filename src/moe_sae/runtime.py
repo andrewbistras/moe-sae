@@ -33,6 +33,13 @@ V4_32_CHIPS = 16
 V4_32_BF16_PEAK_FLOPS = 4.4e15
 V6E_16_CHIPS = 16
 V6E_16_BF16_PEAK_FLOPS = 14.688e15
+V5LITEPOD_16_CHIPS = 16
+V5LITEPOD_16_BF16_PEAK_FLOPS = 3.152e15
+V5LITEPOD_DEVICE_KIND_ENV = "MOE_SAE_V5LITEPOD_DEVICE_KIND"
+SUPPORTED_TRAINING_ACCELERATOR_TYPES = frozenset(
+    {"v4-32", "v6e-16", "v5litepod-16"}
+)
+REGIONAL_ACCELERATOR_TYPES = frozenset({"v6e-16", "v5litepod-16"})
 TARGET_SEQUENCE_LENGTH = 1_024
 TARGET_LAYER_ONE_INDEXED = 15
 TARGET_TRAIN_TOKENS = 50_000_000
@@ -214,17 +221,57 @@ def require_v4_32_runtime() -> None:
         )
 
 
-def accelerator_runtime_status(accelerator_type: str) -> tuple[bool, str]:
+def accelerator_peak_flops_per_second(accelerator_type: str) -> int:
+    """Return the exact published aggregate BF16 peak for one slice."""
+
+    expected_peaks = {
+        "v4-32": int(V4_32_BF16_PEAK_FLOPS),
+        "v6e-16": int(V6E_16_BF16_PEAK_FLOPS),
+        "v5litepod-16": int(V5LITEPOD_16_BF16_PEAK_FLOPS),
+    }
+    try:
+        return expected_peaks[accelerator_type]
+    except KeyError as error:
+        raise RuntimeDependencyError(
+            f"unsupported accelerator type: {accelerator_type!r}"
+        ) from error
+
+
+def v5litepod_device_kind_from_environment(
+    environment: Mapping[str, str] | None = None,
+) -> str:
+    """Return the operator-supplied exact JAX v5litepod device kind."""
+
+    source = os.environ if environment is None else environment
+    expected_kind = source.get(V5LITEPOD_DEVICE_KIND_ENV, "")
+    if (
+        not expected_kind
+        or len(expected_kind) > 128
+        or any(ord(character) < 32 for character in expected_kind)
+    ):
+        raise RuntimeDependencyError(
+            f"{V5LITEPOD_DEVICE_KIND_ENV} must be set to the exact "
+            "device_kind observed by the fresh controller identity probe"
+        )
+    return expected_kind
+
+
+def accelerator_runtime_status(
+    accelerator_type: str,
+    *,
+    environment: Mapping[str, str] | None = None,
+) -> tuple[bool, str]:
     """Return exact training topology status for supported 16-chip slices.
 
     Historical v4 callers retain :func:`require_v4_32_runtime` unchanged.
     New regional training/evaluation paths additionally require the observed
-    four-process by four-local-device topology used by one ``v6e-16`` slice.
+    four-process by four-local-device topology used by regional 16-chip
+    ``v6e-16`` and ``v5litepod-16`` slices.
     """
 
     if accelerator_type == "v4-32":
         return v4_32_runtime_status()
-    if accelerator_type != "v6e-16":
+    if accelerator_type not in REGIONAL_ACCELERATOR_TYPES:
         return False, f"unsupported accelerator_type={accelerator_type!r}"
     try:
         import jax
@@ -233,13 +280,24 @@ def accelerator_runtime_status(accelerator_type: str) -> tuple[bool, str]:
     devices = tuple(jax.devices())
     platforms = sorted({str(device.platform) for device in devices})
     kinds = sorted({str(device.device_kind) for device in devices})
-    kind_matches = all(
-        "v6e" in str(device.device_kind).lower()
-        or "v6 lite" in str(device.device_kind).lower()
-        for device in devices
-    )
+    if accelerator_type == "v6e-16":
+        kind_matches = all(
+            "v6e" in str(device.device_kind).lower()
+            or "v6 lite" in str(device.device_kind).lower()
+            for device in devices
+        )
+        expected_chips = V6E_16_CHIPS
+    else:
+        try:
+            expected_kind = v5litepod_device_kind_from_environment(environment)
+        except RuntimeDependencyError as error:
+            return False, str(error)
+        kind_matches = all(
+            str(device.device_kind) == expected_kind for device in devices
+        )
+        expected_chips = V5LITEPOD_16_CHIPS
     correct = (
-        len(devices) == V6E_16_CHIPS
+        len(devices) == expected_chips
         and int(jax.process_count()) == 4
         and int(jax.local_device_count()) == 4
         and all(device.platform == "tpu" for device in devices)
@@ -261,15 +319,7 @@ def require_accelerator_runtime(
     """Require one exact supported runtime and, when supplied, its peak."""
 
     initialize_jax_distributed()
-    expected_peaks = {
-        "v4-32": int(V4_32_BF16_PEAK_FLOPS),
-        "v6e-16": int(V6E_16_BF16_PEAK_FLOPS),
-    }
-    expected_peak = expected_peaks.get(accelerator_type)
-    if expected_peak is None:
-        raise RuntimeDependencyError(
-            f"unsupported accelerator type: {accelerator_type!r}"
-        )
+    expected_peak = accelerator_peak_flops_per_second(accelerator_type)
     if (
         peak_flops_per_second is not None
         and peak_flops_per_second != expected_peak

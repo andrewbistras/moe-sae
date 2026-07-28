@@ -27,11 +27,27 @@ identity/hash, schema, range, overflow, and token-drop failures are terminal.
 Only classified Spot preemption, resource unavailability, and SSH transport
 loss are retried.
 
-Private v6e resources use `queued_spot` or `direct_spot`. The controller
+Private `v6e-16` and `v5litepod-16` resources use `queued_spot` or
+`direct_spot`. The controller
 derives a new TPU name from the globally increasing attempt ID, passes both
-`--spot` and `--internal-ips`, validates a four-endpoint `v6e-16`, and polls
-only exact `describe` operations. It never lists a TPU collection or a GCS
-prefix to infer state.
+`--spot` and `--internal-ips`, validates the resource's declared accelerator
+type and four endpoints, and polls only exact `describe` operations. It never
+lists a TPU collection or a GCS prefix to infer state. It also injects the
+current incarnation's `GCP_PROJECT`, `TPU_NAME`, `TPU_ZONE`,
+`TPU_ACCELERATOR_TYPE`, and `TPU_USE_INTERNAL_IP=1` into resource-bound task
+environments, so a retry cannot inherit a stale preempted TPU name.
+
+For `v5litepod-16`, use runtime `v2-alpha-tpuv5-lite` in the resource spec and
+put the exact probe-observed `MOE_SAE_V5LITEPOD_DEVICE_KIND` in the plan
+environment (or declare it in `inherit_environment`). The worker rejects a
+missing or mismatched value. Cache inventory and free-space proof are
+read/write and incarnation-bound. For every newly created v5 incarnation, a
+prepare command must remount the existing `/dev/shm` tmpfs at 180 GiB before
+the identity/cache probe and prefetch. The validator requires at least
+176 GiB free and available as memory backing, plus at least the measured
+process lane plus 10%. TPU Pods do not support the read/write persistent-disk
+attachment assumed by the retired path; no disk attachment or formatting is
+part of this workflow.
 
 Validate before installing the service:
 

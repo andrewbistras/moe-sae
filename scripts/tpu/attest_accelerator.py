@@ -5,8 +5,8 @@ from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
 import subprocess
+from pathlib import Path
 from typing import Sequence
 
 from moe_sae.contribution_artifacts import canonical_json_bytes
@@ -89,7 +89,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--project", required=True)
     parser.add_argument("--tpu-name", required=True)
     parser.add_argument("--zone", required=True)
-    parser.add_argument("--accelerator-type", default="v6e-16")
+    parser.add_argument(
+        "--accelerator-type",
+        choices=("v6e-16", "v5litepod-16"),
+        default="v6e-16",
+    )
     parser.add_argument("--output-root", required=True)
     return parser
 

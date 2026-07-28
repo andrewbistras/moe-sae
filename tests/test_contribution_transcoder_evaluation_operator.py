@@ -187,6 +187,30 @@ def test_public_horizon_selection_reaches_worker(
     assert settings.result_root == "/nfs/evaluation/transcoder-2m"
 
 
+def test_v5litepod_worker_receives_exact_observed_device_kind(
+    operator,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    for name, value in _environment(tmp_path).items():
+        monkeypatch.setenv(name, value)
+    settings = replace(
+        operator.Settings.from_environment(),
+        accelerator_type="v5litepod-16",
+        peak_flops_per_second=3_152_000_000_000_000,
+        v5litepod_device_kind="TPU v5 observed",
+    )
+    worker = operator._worker(settings, 1)
+    assert worker[:2] == [
+        "env",
+        "MOE_SAE_V5LITEPOD_DEVICE_KIND=TPU v5 observed",
+    ]
+    assert worker[worker.index("--accelerator-type") + 1] == "v5litepod-16"
+    assert worker[worker.index("--peak-flops-per-second") + 1] == (
+        "3152000000000000"
+    )
+
+
 def test_mapping_and_terminal_marker_are_exact(
     operator,
     tmp_path: Path,

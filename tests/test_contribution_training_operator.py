@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import replace
 import hashlib
 import importlib.util
 import json
@@ -9,6 +8,7 @@ import os
 import py_compile
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -389,7 +389,7 @@ def test_explicit_tpu_ssh_user_is_validated_and_rendered(
         operator._settings(environment, args)
 
 
-def test_horizon_prefetch_and_direct_limits_cover_audited_v4_v6_only(
+def test_horizon_prefetch_and_direct_limits_cover_supported_accelerators(
     operator,
     tmp_path: Path,
 ) -> None:
@@ -442,10 +442,10 @@ def test_horizon_prefetch_and_direct_limits_cover_audited_v4_v6_only(
     )
 
     v5 = replace(v4, accelerator_type="v5litepod-16")
-    assert v5.prefetch_hard_deadline_seconds == 600
-    assert v5.direct_runtime_limit_seconds == 3_600
-    assert v5.admission_mode == operator.QUALIFIED_ADMISSION
-    assert not operator._is_horizon_direct(
+    assert v5.prefetch_hard_deadline_seconds == 1_800
+    assert v5.direct_runtime_limit_seconds == 43_200
+    assert v5.admission_mode == operator.DIRECT_BOUNDED_ADMISSION
+    assert operator._is_horizon_direct(
         action="train",
         maximum_runtime_seconds=43_200,
         accelerator_type="v5litepod-16",
@@ -459,6 +459,7 @@ def test_horizon_prefetch_and_direct_limits_cover_audited_v4_v6_only(
     [
         ("v4-32", "TPU v4"),
         ("v6e-16", "TPU v6 lite"),
+        ("v5litepod-16", "TPU v5 observed"),
     ],
 )
 def test_audited_horizon_runtime_continuous_direct_run_uses_no_qualification(
@@ -545,12 +546,18 @@ def test_audited_horizon_runtime_continuous_direct_run_uses_no_qualification(
         regional_mirror_seal="/regional/control/mirror-seal.json",
         local_cache_inventory="/regional/control/cache-inventory.json",
         internal_ip=True,
+        v5litepod_device_kind=(
+            device_kind if accelerator_type == "v5litepod-16" else None
+        ),
     )
     command = operator._init_command(settings)
     remote = next(
         item for item in command if item.startswith("--command=")
     )
     assert "--qualification-bundle" not in remote
+    if accelerator_type == "v5litepod-16":
+        assert "MOE_SAE_V5LITEPOD_DEVICE_KIND" in remote
+        assert "TPU v5 observed" in remote
     assert settings.prefetch_hard_deadline_seconds == 1_800
     assert settings.direct_runtime_limit_seconds == 43_200
     assert settings.admission_mode == operator.DIRECT_BOUNDED_ADMISSION

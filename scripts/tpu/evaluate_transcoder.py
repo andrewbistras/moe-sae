@@ -17,10 +17,17 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Sequence
 
+from moe_sae.runtime import (
+    REGIONAL_ACCELERATOR_TYPES,
+    SUPPORTED_TRAINING_ACCELERATOR_TYPES,
+    V5LITEPOD_DEVICE_KIND_ENV,
+    RuntimeDependencyError,
+    accelerator_peak_flops_per_second,
+    v5litepod_device_kind_from_environment,
+)
+
 PROCESS_COUNT = 4
-V4_32_PEAK_FLOPS_PER_SECOND = 4_400_000_000_000_000
-V6E_16_PEAK_FLOPS_PER_SECOND = 14_688_000_000_000_000
-V6E_PROCESS_CACHE_MAX_BYTES = 160 * 1024**3
+REGIONAL_PROCESS_CACHE_MAX_BYTES = 160 * 1024**3
 RESULT_SCHEMA_VERSION = "gemma4-contribution-transcoder-scientific-result-v2"
 PROTOCOL_ID = "gemma4-contribution-transcoder-v2-20260727"
 LEARNING_HORIZON_RESULT_SCHEMA_VERSION = (
@@ -103,6 +110,7 @@ class Settings:
     seed: int = 0
     checkpoint_tokens: int | None = None
     ssh_user: str | None = None
+    v5litepod_device_kind: str | None = None
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -132,30 +140,38 @@ class Settings:
             for condition in ("A", "R", "B", "F")
         }
         accelerator_type = os.environ.get("TPU_ACCELERATOR_TYPE", "v4-32")
-        if accelerator_type not in {"v4-32", "v6e-16"}:
+        if accelerator_type not in SUPPORTED_TRAINING_ACCELERATOR_TYPES:
             raise OperatorError("TPU_ACCELERATOR_TYPE is unsupported")
+        try:
+            v5litepod_device_kind = (
+                v5litepod_device_kind_from_environment()
+                if accelerator_type == "v5litepod-16"
+                else None
+            )
+        except RuntimeDependencyError as error:
+            raise OperatorError(str(error)) from error
         mapping_receipt = (
             _required("CONTRIBUTION_FRESH_CONTROLLER_MAPPING")
-            if accelerator_type == "v6e-16"
+            if accelerator_type in REGIONAL_ACCELERATOR_TYPES
             else _required("CONTRIBUTION_QUALIFICATION_BUNDLE")
         )
         regional_mirror = os.environ.get("CONTRIBUTION_REGIONAL_MIRROR_SEAL")
-        if accelerator_type == "v6e-16" and not regional_mirror:
-            raise OperatorError("v6e-16 evaluation requires a regional mirror seal")
-        expected_peak = (
-            V6E_16_PEAK_FLOPS_PER_SECOND
-            if accelerator_type == "v6e-16"
-            else V4_32_PEAK_FLOPS_PER_SECOND
-        )
+        if accelerator_type in REGIONAL_ACCELERATOR_TYPES and not regional_mirror:
+            raise OperatorError(
+                f"{accelerator_type} evaluation requires a regional mirror seal"
+            )
+        expected_peak = accelerator_peak_flops_per_second(accelerator_type)
         cache_bytes = _positive_int(
             "CONTRIBUTION_SAE_CACHE_MAX_BYTES",
             _required("CONTRIBUTION_SAE_CACHE_MAX_BYTES"),
         )
         if (
-            accelerator_type == "v6e-16"
-            and cache_bytes != V6E_PROCESS_CACHE_MAX_BYTES
+            accelerator_type in REGIONAL_ACCELERATOR_TYPES
+            and cache_bytes != REGIONAL_PROCESS_CACHE_MAX_BYTES
         ):
-            raise OperatorError("v6e-16 cache bound is fixed at 160GiB")
+            raise OperatorError(
+                f"{accelerator_type} cache bound is fixed at 160GiB"
+            )
         supplied_peak = _positive_int(
             "TRANSCODER_PEAK_FLOPS_PER_SECOND",
             os.environ.get(
@@ -171,9 +187,10 @@ class Settings:
         if internal_ip_raw not in {"0", "1"}:
             raise OperatorError("TPU_USE_INTERNAL_IP must be exactly 0 or 1")
         internal_ip = internal_ip_raw == "1"
-        if accelerator_type == "v6e-16" and not internal_ip:
+        if accelerator_type in REGIONAL_ACCELERATOR_TYPES and not internal_ip:
             raise OperatorError(
-                "v6e-16 evaluation requires explicit TPU_USE_INTERNAL_IP=1"
+                f"{accelerator_type} evaluation requires explicit "
+                "TPU_USE_INTERNAL_IP=1"
             )
         ssh_user = os.environ.get("TPU_SSH_USER") or None
         if ssh_user is not None and _SAFE_SSH_USER.fullmatch(ssh_user) is None:
@@ -235,6 +252,7 @@ class Settings:
             regional_mirror_seal=regional_mirror or None,
             internal_ip=internal_ip,
             ssh_user=ssh_user,
+            v5litepod_device_kind=v5litepod_device_kind,
         )
 
 
@@ -245,20 +263,20 @@ def _mapping_payload(
 ) -> dict[int, int]:
     try:
         bundle = json.loads(payload)
-        if accelerator_type == "v6e-16":
+        if accelerator_type in REGIONAL_ACCELERATOR_TYPES:
             from moe_sae.regional_execution import (
                 validate_controller_mapping_receipt,
             )
 
             bundle = validate_controller_mapping_receipt(bundle)
             if (
-                bundle["accelerator_type"] != "v6e-16"
+                bundle["accelerator_type"] != accelerator_type
                 or bundle["process_count"] != PROCESS_COUNT
                 or bundle["global_device_count"] != 16
                 or bundle["local_device_count"] != 4
             ):
                 raise OperatorError(
-                    "fresh v6e controller mapping topology changed"
+                    f"fresh {accelerator_type} controller mapping topology changed"
                 )
         rows = bundle["controller_to_jax_process_index"]
         result = {
@@ -400,6 +418,14 @@ def _worker(settings: Settings, process: int) -> list[str]:
         "--shared-harvest-chip-seconds",
         str(settings.harvest_chip_seconds),
     ]
+    if settings.v5litepod_device_kind is not None:
+        command[:0] = [
+            "env",
+            (
+                f"{V5LITEPOD_DEVICE_KIND_ENV}="
+                f"{settings.v5litepod_device_kind}"
+            ),
+        ]
     if settings.checkpoint_tokens is not None:
         command.extend(
             ("--checkpoint-tokens", str(settings.checkpoint_tokens))

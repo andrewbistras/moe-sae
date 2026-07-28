@@ -436,7 +436,15 @@ def test_prefetch_and_runtime_extensions_require_final_horizon_and_audited_tpu(
             phase="learning_horizon_10m",
             accelerator_type="v5litepod-16",
         )
-        == 3_600
+        == 43_200
+    )
+    assert (
+        training_worker_module.prefetch_runtime_limit_seconds(
+            config_path=sae,
+            accelerator_type="v5litepod-16",
+            phase="learning_horizon_10m",
+        )
+        == 1_800
     )
 
     with pytest.raises(

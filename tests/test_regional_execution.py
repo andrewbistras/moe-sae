@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import copy
 import json
-from pathlib import Path
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
 from moe_sae.object_store import ObjectIdentity, ObjectStoreError
 from moe_sae.regional_execution import (
+    MINIMUM_10M_PROCESS_CACHE_FREE_BYTES,
+    MINIMUM_10M_TMPFS_MEM_AVAILABLE_BYTES,
     MirrorDataset,
     RegionalExecutionError,
     RegionalMirrorStore,
@@ -31,7 +33,6 @@ from moe_sae.regional_execution import (
     validate_regional_mirror_specification,
     validate_sealed_regional_mirror,
 )
-
 
 CRC32C = "AAAAAA=="
 
@@ -116,6 +117,7 @@ def accelerator_contract(
     condition: str = "A",
     region: str = "us-east1",
     zone: str = "us-east1-d",
+    accelerator_type: str = "v6e-16",
 ):
     return build_accelerator_contract(
         run_id="experiment4",
@@ -126,10 +128,11 @@ def accelerator_contract(
         resource_create_time="2026-07-28T10:11:12.123Z",
         region=region,
         zone=zone,
+        accelerator_type=accelerator_type,
     )
 
 
-def controller_receipts(contract):
+def controller_receipts(contract, *, device_kind: str = "TPU v6 lite"):
     process_order = (2, 0, 3, 1)
     observations = [
         build_controller_observation(
@@ -141,7 +144,7 @@ def controller_receipts(contract):
             global_device_count=16,
             local_device_count=4,
             platforms=("tpu",),
-            device_kinds=("TPU v6 lite",),
+            device_kinds=(device_kind,),
             boot_id=f"00000000-0000-0000-0000-{controller + 1:012d}",
             hostname=f"worker-{controller}",
         )
@@ -153,6 +156,21 @@ def controller_receipts(contract):
         observations=observations,
     )
     return observations, mapping
+
+
+def test_v5litepod_controller_evidence_preserves_dynamic_accelerator_type():
+    contract = accelerator_contract(
+        region="europe-west4",
+        zone="europe-west4-b",
+        accelerator_type="v5litepod-16",
+    )
+    _observations, mapping = controller_receipts(
+        contract,
+        device_kind="TPU v5 observed",
+    )
+    validated = validate_controller_mapping_receipt(mapping)
+    assert validated["accelerator_type"] == "v5litepod-16"
+    assert validated["device_kinds"] == ["TPU v5 observed"]
 
 
 def test_mirror_plan_counts_each_exact_source_generation_once() -> None:
@@ -358,16 +376,21 @@ def test_cache_inventory_requires_10m_lane_headroom_on_every_worker() -> None:
     contract = accelerator_contract()
     _observations, mapping = controller_receipts(contract)
     process_by_controller = [2, 0, 3, 1]
+    required_free = 176 * 1024**3
+    remounted_tmpfs = 180 * 1024**3
+    assert MINIMUM_10M_PROCESS_CACHE_FREE_BYTES == required_free
+    assert MINIMUM_10M_TMPFS_MEM_AVAILABLE_BYTES == required_free
+    assert required_free == (160 * 1024**3 * 11 + 9) // 10
     caches = [
         build_local_cache_observation(
             contract=contract,
             controller_mapping=mapping,
             controller_index=controller,
             cache_root="/dev/shm/moe-sae",
-            required_lane_bytes=147_000_000_000,
-            required_free_bytes=210_000_000_000,
-            available_bytes=300_000_000_000,
-            mem_available_bytes=600_000_000_000,
+            required_lane_bytes=159_000_000_000,
+            required_free_bytes=required_free,
+            available_bytes=remounted_tmpfs,
+            mem_available_bytes=202_592_694_272,
             mount_target="/dev/shm",
             mount_source="tmpfs",
             filesystem_type="tmpfs",
@@ -398,14 +421,48 @@ def test_cache_inventory_requires_10m_lane_headroom_on_every_worker() -> None:
             controller_index=0,
             cache_root="/dev/shm/moe-sae",
             required_lane_bytes=147_000_000_000,
-            required_free_bytes=161_700_000_000,
-            available_bytes=300_000_000_000,
-            mem_available_bytes=600_000_000_000,
+            required_free_bytes=required_free - 1,
+            available_bytes=remounted_tmpfs,
+            mem_available_bytes=202_592_694_272,
             mount_target="/dev/shm",
             mount_source="tmpfs",
             filesystem_type="tmpfs",
             mount_options=("rw", "nodev"),
             boot_id="20000000-0000-0000-0000-000000000001",
+        )
+
+    with pytest.raises(RegionalExecutionError, match="10M process lane"):
+        build_local_cache_observation(
+            contract=contract,
+            controller_mapping=mapping,
+            controller_index=0,
+            cache_root="/dev/shm/moe-sae",
+            required_lane_bytes=172 * 1024**3,
+            required_free_bytes=required_free,
+            available_bytes=remounted_tmpfs,
+            mem_available_bytes=202_592_694_272,
+            mount_target="/dev/shm",
+            mount_source="tmpfs",
+            filesystem_type="tmpfs",
+            mount_options=("rw", "nodev"),
+            boot_id="30000000-0000-0000-0000-000000000001",
+        )
+
+    with pytest.raises(RegionalExecutionError, match="180GiB /dev/shm remount"):
+        build_local_cache_observation(
+            contract=contract,
+            controller_mapping=mapping,
+            controller_index=0,
+            cache_root="/dev/shm/moe-sae",
+            required_lane_bytes=159_000_000_000,
+            required_free_bytes=required_free,
+            available_bytes=remounted_tmpfs,
+            mem_available_bytes=required_free - 1,
+            mount_target="/dev/shm",
+            mount_source="tmpfs",
+            filesystem_type="tmpfs",
+            mount_options=("rw", "nodev"),
+            boot_id="40000000-0000-0000-0000-000000000001",
         )
 
 
@@ -527,5 +584,9 @@ def test_fresh_controller_probe_dry_run_declares_identity_and_cache_fanout():
     )
     assert all(
         "observe-cache" in " ".join(command)
+        for command in payload["cache_commands"]
+    )
+    assert all(
+        "188978561024" in " ".join(command)
         for command in payload["cache_commands"]
     )

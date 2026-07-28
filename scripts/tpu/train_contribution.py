@@ -35,11 +35,17 @@ from moe_sae.contribution_training_worker import (
     direct_resident_runtime_limit_seconds,
     prefetch_runtime_limit_seconds,
 )
+from moe_sae.runtime import (
+    REGIONAL_ACCELERATOR_TYPES,
+    SUPPORTED_TRAINING_ACCELERATOR_TYPES,
+    V5LITEPOD_DEVICE_KIND_ENV,
+    RuntimeDependencyError,
+    accelerator_peak_flops_per_second,
+    v5litepod_device_kind_from_environment,
+)
 
 PROCESS_COUNT = 4
-V4_32_PEAK_FLOPS_PER_SECOND = 4_400_000_000_000_000
-V6E_16_PEAK_FLOPS_PER_SECOND = 14_688_000_000_000_000
-V6E_PROCESS_CACHE_MAX_BYTES = 160 * 1024**3
+REGIONAL_PROCESS_CACHE_MAX_BYTES = 160 * 1024**3
 QUALIFICATION_SECONDS = 600
 DIRECT_EXPERIMENT_SECONDS = 3_600
 QUALIFICATION_TRANSPORT_WAIT_SECONDS = 720
@@ -127,6 +133,7 @@ class Settings:
     selected_config_path: str | None = None
     internal_ip: bool = False
     ssh_user: str | None = None
+    v5litepod_device_kind: str | None = None
 
     @property
     def config_path(self) -> str:
@@ -173,13 +180,10 @@ class Settings:
 
     @property
     def peak_flops_per_second(self) -> int:
-        if self.accelerator_type == "v6e-16":
-            return V6E_16_PEAK_FLOPS_PER_SECOND
-        if self.accelerator_type == "v4-32":
-            return V4_32_PEAK_FLOPS_PER_SECOND
-        raise OperatorError(
-            f"no audited peak FLOP rate for {self.accelerator_type}"
-        )
+        try:
+            return accelerator_peak_flops_per_second(self.accelerator_type)
+        except RuntimeDependencyError as error:
+            raise OperatorError(str(error)) from error
 
     @property
     def prefetch_hard_deadline_seconds(self) -> int:
@@ -299,9 +303,10 @@ def _internal_ip_mode(
     if raw not in {"0", "1"}:
         raise OperatorError("TPU_USE_INTERNAL_IP must be exactly 0 or 1")
     enabled = raw == "1"
-    if accelerator_type == "v6e-16" and not enabled:
+    if accelerator_type in REGIONAL_ACCELERATOR_TYPES and not enabled:
         raise OperatorError(
-            "v6e-16 training requires explicit TPU_USE_INTERNAL_IP=1"
+            f"{accelerator_type} training requires explicit "
+            "TPU_USE_INTERNAL_IP=1"
         )
     return enabled
 
@@ -391,6 +396,18 @@ def _settings(
     accelerator_type = environment.get("TPU_ACCELERATOR_TYPE", "v4-32")
     if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", accelerator_type) is None:
         raise OperatorError("TPU_ACCELERATOR_TYPE is invalid")
+    if accelerator_type not in SUPPORTED_TRAINING_ACCELERATOR_TYPES:
+        raise OperatorError(
+            f"unsupported TPU_ACCELERATOR_TYPE={accelerator_type!r}"
+        )
+    try:
+        v5litepod_device_kind = (
+            v5litepod_device_kind_from_environment(environment)
+            if accelerator_type == "v5litepod-16"
+            else None
+        )
+    except RuntimeDependencyError as error:
+        raise OperatorError(str(error)) from error
     regional_mirror = environment.get("CONTRIBUTION_REGIONAL_MIRROR_SEAL")
     fresh_mapping = environment.get("CONTRIBUTION_FRESH_CONTROLLER_MAPPING")
     cache_inventory = environment.get("CONTRIBUTION_LOCAL_CACHE_INVENTORY")
@@ -398,19 +415,19 @@ def _settings(
         "CONTRIBUTION_SAE_CACHE_MAX_BYTES",
         _required(environment, "CONTRIBUTION_SAE_CACHE_MAX_BYTES"),
     )
-    if accelerator_type == "v6e-16" and (
+    if accelerator_type in REGIONAL_ACCELERATOR_TYPES and (
         not regional_mirror or not fresh_mapping or not cache_inventory
     ):
         raise OperatorError(
-            "v6e-16 training requires a regional mirror seal, fresh "
-            "controller/JAX mapping receipt, and local-cache inventory"
+            f"{accelerator_type} training requires a regional mirror seal, "
+            "fresh controller/JAX mapping receipt, and local-cache inventory"
         )
     if (
-        accelerator_type == "v6e-16"
-        and cache_max_bytes != V6E_PROCESS_CACHE_MAX_BYTES
+        accelerator_type in REGIONAL_ACCELERATOR_TYPES
+        and cache_max_bytes != REGIONAL_PROCESS_CACHE_MAX_BYTES
     ):
         raise OperatorError(
-            "v6e-16 process cache bound is fixed at 160GiB"
+            f"{accelerator_type} process cache bound is fixed at 160GiB"
         )
     internal_ip = _internal_ip_mode(
         environment,
@@ -537,6 +554,7 @@ def _settings(
         ),
         internal_ip=internal_ip,
         ssh_user=ssh_user,
+        v5litepod_device_kind=v5litepod_device_kind,
     )
 
 
@@ -943,14 +961,14 @@ def initialize_attempt(args: argparse.Namespace) -> dict[str, object]:
     fresh_mapping_argument = getattr(args, "fresh_controller_mapping", None)
     regional_mirror_argument = getattr(args, "regional_mirror_seal", None)
     cache_inventory_argument = getattr(args, "local_cache_inventory", None)
-    if accelerator_type == "v6e-16" and (
+    if accelerator_type in REGIONAL_ACCELERATOR_TYPES and (
         fresh_mapping_argument is None
         or regional_mirror_argument is None
         or cache_inventory_argument is None
     ):
         raise OperatorError(
-            "v6e-16 attempts require fresh controller mapping, regional "
-            "mirror evidence, and local-cache capacity evidence"
+            f"{accelerator_type} attempts require fresh controller mapping, "
+            "regional mirror evidence, and local-cache capacity evidence"
         )
     fresh_mapping_path = (
         Path(fresh_mapping_argument).expanduser().resolve()
@@ -994,7 +1012,7 @@ def initialize_attempt(args: argparse.Namespace) -> dict[str, object]:
     }
     operational_evidence: dict[str, object] = {}
     stable_lineage = dict(lineage)
-    if accelerator_type == "v6e-16":
+    if accelerator_type in REGIONAL_ACCELERATOR_TYPES:
         ssh_user = getattr(args, "tpu_ssh_user", None)
         if (
             ssh_user is not None
@@ -1059,7 +1077,7 @@ def initialize_attempt(args: argparse.Namespace) -> dict[str, object]:
             "regional_mirror_seal": str(mirror_path),
             "regional_mirror_sha256": mirror["mirror_sha256"],
         }
-        if accelerator_type == "v6e-16":
+        if accelerator_type in REGIONAL_ACCELERATOR_TYPES:
             operational_evidence.update(mirror_evidence)
         else:
             contract_body.update(mirror_evidence)
@@ -1095,7 +1113,7 @@ def initialize_attempt(args: argparse.Namespace) -> dict[str, object]:
             ],
             "local_cache_kind": inventory["cache_kind"],
         }
-        if accelerator_type == "v6e-16":
+        if accelerator_type in REGIONAL_ACCELERATOR_TYPES:
             operational_evidence.update(cache_evidence)
         else:
             contract_body.update(cache_evidence)
@@ -1112,7 +1130,7 @@ def initialize_attempt(args: argparse.Namespace) -> dict[str, object]:
                 ),
             }
         )
-    if accelerator_type == "v6e-16":
+    if accelerator_type in REGIONAL_ACCELERATOR_TYPES:
         contract_body.update(
             {
                 "scientific_model": scientific_model,
@@ -1179,7 +1197,7 @@ def initialize_attempt(args: argparse.Namespace) -> dict[str, object]:
             f"immutable operator attempt already exists: {attempt_root}"
         ) from error
     execution_attestation: dict[str, object] = {}
-    if accelerator_type == "v6e-16":
+    if accelerator_type in REGIONAL_ACCELERATOR_TYPES:
         attestation_body = {
             "schema_version": ATTEMPT_EXECUTION_ATTESTATION_SCHEMA_VERSION,
             "run_id": args.run_id,
@@ -1235,11 +1253,11 @@ def _validate_execution_attestation(
     expected_mapping: Mapping[int, int],
 ) -> dict[str, object]:
     if not isinstance(value, Mapping):
-        raise OperatorError("v6e attempt lacks its execution attestation")
+        raise OperatorError("regional attempt lacks its execution attestation")
     unsigned, _claimed = _validate_self_hash(
         value,
         hash_field="execution_attestation_sha256",
-        name="v6e attempt execution attestation",
+        name="regional attempt execution attestation",
     )
     required = {
         "schema_version",
@@ -1275,7 +1293,7 @@ def _validate_execution_attestation(
         else required
     )
     if set(unsigned) != expected_fields:
-        raise OperatorError("v6e execution attestation fields changed")
+        raise OperatorError("regional execution attestation fields changed")
     if (
         unsigned.get("schema_version")
         != ATTEMPT_EXECUTION_ATTESTATION_SCHEMA_VERSION
@@ -1285,7 +1303,7 @@ def _validate_execution_attestation(
         or unsigned.get("run_contract_sha256") != run_contract_sha256
         or unsigned.get("tpu_name") != settings.tpu_name
         or unsigned.get("tpu_zone") != settings.tpu_zone
-        or unsigned.get("accelerator_type") != "v6e-16"
+        or unsigned.get("accelerator_type") != settings.accelerator_type
         or unsigned.get("scientific_model") != settings.scientific_model
         or unsigned.get("config") != settings.config_path
         or unsigned.get("capture_control_root")
@@ -1309,7 +1327,7 @@ def _validate_execution_attestation(
         or unsigned.get("tpu_ssh_user") != settings.ssh_user
     ):
         raise OperatorError(
-            "v6e execution attestation differs from this slice attempt"
+            "regional execution attestation differs from this slice attempt"
         )
     expected_source_root = settings.source_overlay_control_root
     if settings.scientific_model == "transcoder":
@@ -1333,7 +1351,7 @@ def _validate_execution_attestation(
         _sha256(name, unsigned.get(name))
     if _controller_mapping(unsigned) != dict(expected_mapping):
         raise OperatorError(
-            "v6e execution attestation mapping differs from the attempt plan"
+            "regional execution attestation mapping differs from the attempt plan"
         )
     return dict(value)
 
@@ -1373,7 +1391,7 @@ def _validate_attempt_plan(
     ):
         raise OperatorError("remote SAE attempt plan differs from this request")
     mapping = _controller_mapping(unsigned)
-    if settings.accelerator_type == "v6e-16":
+    if settings.accelerator_type in REGIONAL_ACCELERATOR_TYPES:
         _validate_execution_attestation(
             unsigned.get("operational_evidence"),
             settings=settings,
@@ -1382,7 +1400,7 @@ def _validate_attempt_plan(
         )
     elif unsigned.get("operational_evidence") not in ({}, None):
         raise OperatorError(
-            "v4 attempt unexpectedly contains v6e execution evidence"
+            "non-regional attempt unexpectedly contains regional execution evidence"
         )
     return dict(value), mapping
 
@@ -1423,11 +1441,17 @@ def _bash_payload(lines: Sequence[str]) -> str:
 
 
 def _clean_checkout_lines(settings: Settings) -> list[str]:
-    return [
+    lines = [
         f"cd {shlex.quote(settings.project_root)}",
         ('test "$(git rev-parse HEAD)" = ' f"{shlex.quote(settings.project_commit)}"),
         'test -z "$(git status --porcelain=v1 --untracked-files=all)"',
     ]
+    if settings.v5litepod_device_kind is not None:
+        lines.append(
+            f"export {V5LITEPOD_DEVICE_KIND_ENV}="
+            f"{shlex.quote(settings.v5litepod_device_kind)}"
+        )
+    return lines
 
 
 def _init_command(settings: Settings) -> list[str]:

@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-from pathlib import Path
+import subprocess
 import threading
+from pathlib import Path
 
 import pytest
 
@@ -12,6 +13,7 @@ from moe_sae.horizon_supervisor import (
     CommandOutcome,
     CompletionSpec,
     FileFingerprint,
+    GCloudResourceManager,
     HorizonPlanError,
     HorizonStateError,
     HorizonSupervisor,
@@ -20,7 +22,6 @@ from moe_sae.horizon_supervisor import (
     inspect_completion,
     parse_horizon_plan,
 )
-
 
 MODELS = ("sae", "transcoder")
 CONDITIONS = ("A", "R", "B", "F")
@@ -206,6 +207,33 @@ def test_exact_plan_covers_eight_trajectories_and_24_evaluations(tmp_path):
     assert len(plan.plan_sha256) == 64
 
 
+def test_plan_and_resource_creation_preserve_v5litepod_generation(
+    tmp_path,
+) -> None:
+    raw = _plan(tmp_path)
+    raw["resources"][0]["accelerator_type"] = "v5litepod-16"
+    raw["resources"][0]["runtime_version"] = "v2-alpha-tpuv5-lite"
+    plan = parse_horizon_plan(raw)
+    spec = plan.resources[0]
+    assert spec.accelerator_type == "v5litepod-16"
+
+    calls: list[list[str]] = []
+
+    def runner(command, **_kwargs):
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    manager = GCloudResourceManager(
+        tmp_path / "manager",
+        command_runner=runner,
+    )
+    binding = manager._create_binding(spec, attempt_id="a00000001")
+    assert "--accelerator-type=v5litepod-16" in calls[0]
+    assert "--runtime-version=v2-alpha-tpuv5-lite" in calls[0]
+    record = json.loads(binding.binding_path.read_text(encoding="ascii"))
+    assert record["accelerator_type"] == "v5litepod-16"
+
+
 def test_controller_forwards_explicit_tpu_ssh_user(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
@@ -363,6 +391,7 @@ class FakeCommands:
     def __init__(self, plan) -> None:
         self.tasks = plan.task_by_id
         self.calls: dict[str, int] = {}
+        self.environments: dict[str, list[dict[str, str]]] = {}
 
     def __call__(
         self,
@@ -379,6 +408,7 @@ class FakeCommands:
         task = self.tasks[task_id]
         count = self.calls.get(task_id, 0) + 1
         self.calls[task_id] = count
+        self.environments.setdefault(task_id, []).append(dict(environment))
         stdout_path.parent.mkdir(parents=True, exist_ok=True)
         stdout_path.write_text(f"{task_id} call {count}\n")
         stderr_path.write_text("")
@@ -428,6 +458,14 @@ def test_full_dag_runs_concurrently_and_rotates_training_segments(tmp_path):
         if task.kind == "train"
     )
     assert resources.cleaned
+    for task in plan.tasks:
+        if task.resource_id is None:
+            continue
+        spec = plan.resource_by_id[task.resource_id]
+        observed = commands.environments[task.task_id][-1]
+        assert observed["TPU_ACCELERATOR_TYPE"] == spec.accelerator_type
+        assert observed["TPU_ZONE"] == spec.zone
+        assert observed["TPU_USE_INTERNAL_IP"] == "1"
     attempts = list((plan.state_root / "attempts").iterdir())
     numbers = sorted(int(path.name.split("-")[1]) for path in attempts)
     assert numbers == list(range(1, len(numbers) + 1))

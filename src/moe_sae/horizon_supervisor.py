@@ -9,7 +9,7 @@ module supplies only the cloud-resident control loop around them:
 * run each trajectory continuously, resuming its rolling checkpoints after
   Spot preemption or a genuine twelve-hour crash boundary;
 * retry only classified Spot/resource/SSH transport losses; and
-* reconcile private ``v6e-16`` Spot TPU resources without list polling.
+* reconcile private regional 16-chip Spot TPU resources without list polling.
 
 The controller is intentionally POSIX-local.  Its state root must be on the
 small strongly-consistent control filesystem, while captures, mirrors, and
@@ -18,27 +18,27 @@ checkpoint payloads stay in the bulk object-store data plane.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from dataclasses import dataclass
 import datetime as dt
 import fcntl
 import hashlib
 import json
 import math
 import os
-from pathlib import Path
 import re
 import signal
 import subprocess
 import threading
 import time
+from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol
 
 import yaml
 
 from moe_sae.contribution_artifacts import canonical_json_bytes, canonical_sha256
-
+from moe_sae.runtime import REGIONAL_ACCELERATOR_TYPES
 
 PLAN_SCHEMA_VERSION = "gemma4-horizon-launch-plan-v1"
 ATTEMPT_INTENT_SCHEMA_VERSION = "gemma4-horizon-attempt-intent-v1"
@@ -465,8 +465,14 @@ class ResourceSpec:
             raise HorizonPlanError(
                 f"{name}.queued_resource_prefix is only valid for queued Spot"
             )
-        if selected["accelerator_type"] != "v6e-16":
-            raise HorizonPlanError(f"{name} is restricted to exact v6e-16 slices")
+        accelerator_type = _text(
+            selected["accelerator_type"], f"{name}.accelerator_type"
+        )
+        if accelerator_type not in REGIONAL_ACCELERATOR_TYPES:
+            raise HorizonPlanError(
+                f"{name}.accelerator_type must be one of "
+                f"{tuple(sorted(REGIONAL_ACCELERATOR_TYPES))}"
+            )
         email = _text(selected["service_account"], f"{name}.service_account")
         if _EMAIL.fullmatch(email) is None:
             raise HorizonPlanError(f"{name}.service_account is invalid")
@@ -493,7 +499,7 @@ class ResourceSpec:
             zone=zone,
             node_name_prefix=node_prefix,
             queued_resource_prefix=queue_prefix,
-            accelerator_type="v6e-16",
+            accelerator_type=accelerator_type,
             runtime_version=_text(
                 selected["runtime_version"], f"{name}.runtime_version"
             ),
@@ -1344,7 +1350,7 @@ class ResourceManager(Protocol):
 
 
 class GCloudResourceManager:
-    """Exact ``describe``/create/delete adapter for private Spot v6e-16 nodes."""
+    """Exact ``describe``/create/delete adapter for private regional Spot nodes."""
 
     def __init__(
         self,
@@ -1390,7 +1396,7 @@ class GCloudResourceManager:
                 or value.get("project") != spec.project
                 or value.get("zone") != spec.zone
                 or value.get("internal_ips") is not True
-                or value.get("accelerator_type") != "v6e-16"
+                or value.get("accelerator_type") != spec.accelerator_type
             ):
                 raise HorizonStateError("persisted resource binding changed")
             active.append(
@@ -1561,7 +1567,9 @@ class GCloudResourceManager:
                     if isinstance(item, Mapping)
                 )
             ):
-                raise HorizonStateError("private v6e-16 endpoint topology changed")
+                raise HorizonStateError(
+                    f"private {spec.accelerator_type} endpoint topology changed"
+                )
         return state
 
     def _create_binding(
@@ -1591,7 +1599,7 @@ class GCloudResourceManager:
                 "tpu_name": node,
                 "queued_resource": queue,
                 "internal_ips": True,
-                "accelerator_type": "v6e-16",
+                "accelerator_type": spec.accelerator_type,
                 "created_at": _utc_now(),
             },
             "binding_sha256",
@@ -1601,7 +1609,7 @@ class GCloudResourceManager:
         common = [
             f"--project={spec.project}",
             f"--zone={spec.zone}",
-            "--accelerator-type=v6e-16",
+            f"--accelerator-type={spec.accelerator_type}",
             "--spot",
             "--internal-ips",
             f"--network={spec.network}",
@@ -2288,13 +2296,31 @@ class HorizonSupervisor:
                 )
             attempt = self._reserve_attempt(task, segment_number=segment_number)
             try:
+                resource_spec: ResourceSpec | None = None
                 if task.resource_id is not None:
+                    resource_spec = self.plan.resource_by_id[task.resource_id]
                     binding = self._resources.ensure(
-                        self.plan.resource_by_id[task.resource_id],
+                        resource_spec,
                         attempt_id=attempt.attempt_id,
                         stop_event=self._stop,
                     )
                 environment = self._base_environment(task)
+                if resource_spec is not None:
+                    assert binding is not None
+                    # The current incarnation is authoritative. Do not leave
+                    # preemption-created names or accelerator generations to a
+                    # stale literal in the launch plan.
+                    environment.update(
+                        {
+                            "GCP_PROJECT": resource_spec.project,
+                            "TPU_NAME": binding.tpu_name,
+                            "TPU_ZONE": resource_spec.zone,
+                            "TPU_ACCELERATOR_TYPE": (
+                                resource_spec.accelerator_type
+                            ),
+                            "TPU_USE_INTERNAL_IP": "1",
+                        }
+                    )
                 command = self._render(
                     task.command, task=task, attempt=attempt, binding=binding
                 )

@@ -173,6 +173,27 @@ def test_public_horizon_selection_reaches_worker(
     assert settings.result_root == "/nfs/evaluation/contribution-5m"
 
 
+def test_v5litepod_worker_receives_exact_observed_device_kind(
+    operator,
+    tmp_path: Path,
+) -> None:
+    settings = replace(
+        _settings(operator, tmp_path),
+        accelerator_type="v5litepod-16",
+        peak_flops_per_second=3_152_000_000_000_000,
+        v5litepod_device_kind="TPU v5 observed",
+    )
+    worker = operator._worker(settings, 2)
+    assert worker[:2] == [
+        "env",
+        "MOE_SAE_V5LITEPOD_DEVICE_KIND=TPU v5 observed",
+    ]
+    assert worker[worker.index("--accelerator-type") + 1] == "v5litepod-16"
+    assert worker[worker.index("--peak-flops-per-second") + 1] == (
+        "3152000000000000"
+    )
+
+
 def test_nonzero_remote_evaluation_status_is_preserved(
     operator,
     tmp_path: Path,

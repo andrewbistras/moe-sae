@@ -32,7 +32,7 @@ Optional environment variables:
                               account-derived username)
   TPU_ACCELERATOR_TYPE        exact expected type (default: v4-32)
   TPU_USE_INTERNAL_IP         1 to use private TPU VM addresses (default: 0);
-                              required for v6e-16
+                              required for v6e-16 and v5litepod-16
 
 Before setting LOCAL_BUFFER_ROOT, run scripts/tpu/inspect_workers.sh. This
 script never creates a TPU, chooses a device, partitions a disk, or formats a
@@ -98,13 +98,15 @@ validate_inputs() {
   [[ "$NFS_EXPORT" != */ ]] || die "NFS_EXPORT must not end with '/'"
   [[ "$UV_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "invalid UV_VERSION"
   [[ "$TPU_ACCELERATOR_TYPE" == "v4-32" || \
-     "$TPU_ACCELERATOR_TYPE" == "v6e-16" ]] || \
-    die "TPU_ACCELERATOR_TYPE must be exactly v4-32 or v6e-16"
+     "$TPU_ACCELERATOR_TYPE" == "v6e-16" || \
+     "$TPU_ACCELERATOR_TYPE" == "v5litepod-16" ]] || \
+    die "TPU_ACCELERATOR_TYPE must be exactly v4-32, v6e-16, or v5litepod-16"
   [[ "$TPU_USE_INTERNAL_IP" == "0" || "$TPU_USE_INTERNAL_IP" == "1" ]] || \
     die "TPU_USE_INTERNAL_IP must be exactly 0 or 1"
-  if [[ "$TPU_ACCELERATOR_TYPE" == "v6e-16" ]]; then
+  if [[ "$TPU_ACCELERATOR_TYPE" == "v6e-16" || \
+        "$TPU_ACCELERATOR_TYPE" == "v5litepod-16" ]]; then
     [[ "$TPU_USE_INTERNAL_IP" == "1" ]] || \
-      die "v6e-16 deployment requires explicit TPU_USE_INTERNAL_IP=1"
+      die "$TPU_ACCELERATOR_TYPE deployment requires explicit TPU_USE_INTERNAL_IP=1"
   fi
 }
 

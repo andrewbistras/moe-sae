@@ -66,8 +66,10 @@ _CREATE_TIME = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T"
     r"[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?Z$"
 )
-MINIMUM_10M_PROCESS_CACHE_FREE_BYTES = 192 * 1024**3
-MINIMUM_10M_TMPFS_MEM_AVAILABLE_BYTES = 220 * 1024**3
+# A 180-GiB /dev/shm remount leaves a four-GiB operational margin above the
+# 160-GiB resident-cache cap plus its exact ten-percent capacity headroom.
+MINIMUM_10M_PROCESS_CACHE_FREE_BYTES = 176 * 1024**3
+MINIMUM_10M_TMPFS_MEM_AVAILABLE_BYTES = 176 * 1024**3
 
 
 class RegionalExecutionError(RuntimeError):
@@ -1241,7 +1243,9 @@ def build_local_cache_observation(
             )
         ):
             raise RegionalExecutionError(
-                "tmpfs cache is not the dedicated, sufficiently backed /dev/shm"
+                "tmpfs cache is not a read/write, sufficiently backed "
+                "/dev/shm; v5litepod requires a 180GiB /dev/shm remount "
+                "before the capacity probe"
             )
         cache_kind = "host-ram-tmpfs"
     elif filesystem_type in {"ext4", "xfs"}:

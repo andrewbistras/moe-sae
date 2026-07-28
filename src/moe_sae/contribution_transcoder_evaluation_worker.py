@@ -1510,7 +1510,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", required=True)
     parser.add_argument(
         "--accelerator-type",
-        choices=("v4-32", "v6e-16"),
+        choices=("v4-32", "v6e-16", "v5litepod-16"),
         default="v4-32",
     )
     parser.add_argument("--phase", default="mechanism_pilot")

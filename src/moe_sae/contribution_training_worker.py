@@ -73,7 +73,9 @@ TRANSCODER_PREFETCH_RECEIPT_SCHEMA_VERSION = (
 )
 HISTORICAL_PREFETCH_MAX_SECONDS = 600
 HORIZON_PREFETCH_MAX_SECONDS = 1_800
-HORIZON_DIRECT_ACCELERATOR_TYPES = frozenset({"v4-32", "v6e-16"})
+HORIZON_DIRECT_ACCELERATOR_TYPES = frozenset(
+    {"v4-32", "v6e-16", "v5litepod-16"}
+)
 CHIP_SECONDS_SCOPE = (
     "fixed_capacity_scan_in_training_invocation_plus_synchronized_"
     "optimizer_loop_including_input_wait"
@@ -146,9 +148,9 @@ def direct_resident_runtime_limit_seconds(
     """Return the direct resident cap without weakening historical protocols.
 
     Only the exact finalized ``learning_horizon_10m`` contract on an audited
-    ``v4-32`` or ``v6e-16`` runtime receives the twelve-hour run-to-completion
-    window. Historical phases and unsupported generations retain the one-hour
-    direct bound.
+    ``v4-32``, ``v6e-16``, or ``v5litepod-16`` runtime receives the twelve-hour
+    run-to-completion window. Historical phases and unsupported generations
+    retain the one-hour direct bound.
     """
 
     if (
@@ -3545,7 +3547,7 @@ def _add_workload_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--accelerator-type",
-        choices=("v4-32", "v6e-16"),
+        choices=("v4-32", "v6e-16", "v5litepod-16"),
         default="v4-32",
     )
     parser.add_argument(
@@ -3613,7 +3615,7 @@ def _add_prefetch_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--accelerator-type",
-        choices=("v4-32", "v6e-16"),
+        choices=("v4-32", "v6e-16", "v5litepod-16"),
         default="v4-32",
     )
     parser.add_argument(

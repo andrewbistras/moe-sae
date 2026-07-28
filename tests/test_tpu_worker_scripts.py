@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 import subprocess
+from pathlib import Path
 
 import pytest
-
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_ROOT = REPO_ROOT / "scripts" / "tpu"
@@ -62,10 +61,15 @@ def test_bootstrap_contains_no_disk_mutation_or_secret_inputs() -> None:
     assert "PASSWORD" not in deploy
 
 
-def test_deploy_requires_explicit_internal_ip_for_v6e() -> None:
+def test_deploy_requires_explicit_internal_ip_for_regional_slices() -> None:
     deploy = (SCRIPT_ROOT / "deploy_workers.sh").read_text()
     assert "TPU_USE_INTERNAL_IP=${TPU_USE_INTERNAL_IP:-0}" in deploy
-    assert "v6e-16 deployment requires explicit TPU_USE_INTERNAL_IP=1" in deploy
+    assert '"$TPU_ACCELERATOR_TYPE" == "v6e-16"' in deploy
+    assert '"$TPU_ACCELERATOR_TYPE" == "v5litepod-16"' in deploy
+    assert (
+        "$TPU_ACCELERATOR_TYPE deployment requires explicit "
+        "TPU_USE_INTERNAL_IP=1"
+    ) in deploy
     assert "gcloud_common+=(--internal-ip)" in deploy
     assert "ssh_command+=(--internal-ip)" in deploy
     inspect = (SCRIPT_ROOT / "inspect_workers.sh").read_text()

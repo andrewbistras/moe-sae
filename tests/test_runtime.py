@@ -9,7 +9,10 @@ import moe_sae.data as data_module
 from moe_sae.runtime import (
     HARVEST_MESHES,
     BenchmarkObservation,
+    RuntimeDependencyError,
     _staged_path_accessible,
+    accelerator_peak_flops_per_second,
+    accelerator_runtime_status,
     build_maxtext_argv,
     choose_harvest_benchmark,
     compact_capture,
@@ -17,13 +20,11 @@ from moe_sae.runtime import (
     environment_fingerprint,
     estimate_useful_prefix_flops,
     immutable_range_id,
+    require_accelerator_runtime,
     scan_token_shaped_secrets,
     scientific_token_mask,
     token_quota,
     updates_for_tokens,
-    accelerator_runtime_status,
-    require_accelerator_runtime,
-    RuntimeDependencyError,
 )
 
 
@@ -103,6 +104,58 @@ def test_v6e_runtime_rejects_v4_peak_before_authoritative_work(
             "v6e-16",
             peak_flops_per_second=4_400_000_000_000_000,
         )
+
+
+def test_v5litepod_runtime_requires_exact_observed_kind_and_peak(
+    monkeypatch,
+) -> None:
+    observed_kind = "TPU v5 lite observed by probe"
+    devices = [
+        SimpleNamespace(
+            platform="tpu",
+            device_kind=observed_kind,
+            process_index=index // 4,
+            id=index,
+        )
+        for index in range(16)
+    ]
+    jax = ModuleType("jax")
+    jax.devices = lambda: devices
+    jax.process_count = lambda: 4
+    jax.local_device_count = lambda: 4
+    jax.distributed = SimpleNamespace(
+        is_initialized=lambda: True,
+        initialize=lambda: None,
+    )
+    monkeypatch.setitem(sys.modules, "jax", jax)
+
+    passed, detail = accelerator_runtime_status(
+        "v5litepod-16",
+        environment={"MOE_SAE_V5LITEPOD_DEVICE_KIND": observed_kind},
+    )
+    assert passed is True
+    assert "local_device_count=4" in detail
+    monkeypatch.setenv("MOE_SAE_V5LITEPOD_DEVICE_KIND", observed_kind)
+    require_accelerator_runtime(
+        "v5litepod-16",
+        peak_flops_per_second=3_152_000_000_000_000,
+    )
+    assert (
+        accelerator_peak_flops_per_second("v5litepod-16")
+        == 3_152_000_000_000_000
+    )
+
+    passed, detail = accelerator_runtime_status(
+        "v5litepod-16",
+        environment={},
+    )
+    assert passed is False
+    assert "fresh controller identity probe" in detail
+    passed, _ = accelerator_runtime_status(
+        "v5litepod-16",
+        environment={"MOE_SAE_V5LITEPOD_DEVICE_KIND": "guessed kind"},
+    )
+    assert passed is False
 
 
 def test_benchmark_uses_device_time_for_mfu_and_total_time_for_persistence():

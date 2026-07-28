@@ -7,10 +7,26 @@ path with a 43,200-second crash boundary. Normal behavior is one continuous
 invocation through all 611 updates; the hourly teardown/recompile boundary is
 gone.
 
-The strict horizon override is admitted on the two audited runtime types,
-`v4-32` and `v6e-16`. Historical phases still stop using the one-hour direct
-policy. `v5litepod-16` remains fail-closed until its topology, peak-FLOP
-ledger, deploy path, and evaluators receive a separate audited support patch.
+The strict horizon override is admitted on `v4-32`, `v6e-16`, and
+`v5litepod-16`. Historical phases still use the one-hour direct policy. The
+harvester remains v4-only; v5litepod support applies only to resident
+training and evaluation.
+
+One v5litepod-16 is a four-controller, 16-chip slice. Use runtime
+`v2-alpha-tpuv5-lite`; the exact aggregate BF16 peak ledger is
+3,152,000,000,000,000 FLOP/s. The code deliberately does not guess JAX's v5
+`device_kind`. First run the fresh controller identity probe, require its
+`device_kinds` array to contain exactly one value, and pass that exact value
+as `MOE_SAE_V5LITEPOD_DEVICE_KIND` to the operator/supervisor. The exact
+post-probe command appears below.
+
+This is a fail-closed observed identity, not a portable literal. A v5 host
+reports 202,592,694,272 bytes of RAM, while its default `/dev/shm` is only
+about 101 GB. Read/write persistent-disk attachment is not available for TPU
+Pods. Remount each fresh worker's existing tmpfs `/dev/shm` at 180 GiB before
+the capacity probe. The absolute free-space and memory-backing floor is
+176 GiB: exactly the 160-GiB resident-cache cap plus 10%. The regional
+validator independently retains the stricter process-lane-plus-10% test.
 
 The currently safe fallback is one already-READY private `v6e-16`:
 
@@ -188,6 +204,32 @@ export TPU_SSH_TARGET="$TPU_SSH_USER@$TPU_NAME"
 bash scripts/tpu/deploy_workers.sh
 ```
 
+For the Europe v5litepod allocation, change the zone/type/runtime-facing
+inputs to `europe-west4-b`, `v5litepod-16`, and
+`v2-alpha-tpuv5-lite`, and retain `TPU_USE_INTERNAL_IP=1`. The same Europe
+regional mirror can be reused; shard objects stay generation-pinned and are
+not recopied per accelerator.
+
+After every fresh v5litepod slice reaches `READY`, including every replacement
+after preemption, remount and inspect all four workers:
+
+```zsh
+for WORKER in 0 1 2 3
+do
+  gcloud compute tpus tpu-vm ssh "$TPU_SSH_TARGET" \
+    --project="$GCP_PROJECT" \
+    --zone="$TPU_ZONE" \
+    --worker="$WORKER" \
+    --internal-ip \
+    --quiet \
+    --command='sudo mount -o remount,rw,nosuid,nodev,noexec,size=180G tmpfs /dev/shm && findmnt -rn -o TARGET,SOURCE,FSTYPE,OPTIONS --target /dev/shm && df -B1 --output=avail /dev/shm'
+done
+```
+
+This changes only the fresh VM's volatile tmpfs mount. It does not attach,
+partition, or format storage, and it must be repeated for a new incarnation.
+Set both local cache roots below `/dev/shm`.
+
 Build a create-only bundle containing only required control files:
 
 ```zsh
@@ -241,7 +283,7 @@ gcloud compute tpus tpu-vm ssh "$TPU_SSH_TARGET" \
   --worker=0 \
   --internal-ip \
   --quiet \
-  --command="$REMOTE_UV run --frozen --extra tpu python $TPU_REPO/scripts/tpu/attest_accelerator.py --run-id gemma4-horizon-10m --scientific-model sae --condition F --project $GCP_PROJECT --tpu-name $TPU_NAME --zone $TPU_ZONE --accelerator-type v6e-16 --output-root $TOPOLOGY_REMOTE"
+  --command="$REMOTE_UV run --frozen --extra tpu python $TPU_REPO/scripts/tpu/attest_accelerator.py --run-id gemma4-horizon-10m --scientific-model sae --condition F --project $GCP_PROJECT --tpu-name $TPU_NAME --zone $TPU_ZONE --accelerator-type $TPU_ACCELERATOR_TYPE --output-root $TOPOLOGY_REMOTE"
 
 uv run python scripts/tpu/probe_controller_identity.py \
   --project "$GCP_PROJECT" \
@@ -255,7 +297,7 @@ uv run python scripts/tpu/probe_controller_identity.py \
   --probe-root "$TOPOLOGY_REMOTE/probes/$PROBE_ID" \
   --cache-root '/dev/shm/moe-sae-local/horizon-10m/cache' \
   --required-lane-bytes 159000000000 \
-  --required-free-bytes 206158430208 \
+  --required-free-bytes 188978561024 \
   --internal-ip
 ```
 
@@ -266,6 +308,17 @@ The two paths consumed by every direct attempt are:
 export CONTROLLER_MAP="$TOPOLOGY_REMOTE/probes/$PROBE_ID/controller-mapping.json"
 export CACHE_INVENTORY="$TOPOLOGY_REMOTE/probes/$PROBE_ID/cache-inventory.json"
 export MIRROR_SEAL="$TPU_PROD/horizon-10m/regional/europe-west4/mirror-seal.json"
+```
+
+For v5litepod, read the same sealed mapping through the controller-side mount
+and export its one observed device kind:
+
+```zsh
+export CONTROLLER_MAP_LOCAL="$CENTRAL_PROD/$TOPOLOGY_REL/probes/$PROBE_ID/controller-mapping.json"
+export MOE_SAE_V5LITEPOD_DEVICE_KIND="$(
+  jq -er 'if (.device_kinds | length) == 1 then .device_kinds[0] else error("non-unique device_kind") end' \
+    "$CONTROLLER_MAP_LOCAL"
+)"
 ```
 
 ## Direct continuous training
@@ -305,6 +358,14 @@ COMMON_ENV=(
   "CONTRIBUTION_LOCAL_CACHE_INVENTORY=$CACHE_INVENTORY"
 )
 ```
+
+For a v5 trajectory, replace the accelerator value with
+`v5litepod-16`, add
+`"MOE_SAE_V5LITEPOD_DEVICE_KIND=$MOE_SAE_V5LITEPOD_DEVICE_KIND"`, and retain
+the probe-validated cache root under the 180-GiB `/dev/shm` remount. Keep one
+trajectory on one accelerator generation: its immutable run contract binds
+`accelerator_type`, so a v6 checkpoint is not resumed as a v5 trajectory (or
+vice versa).
 
 The exact SAE invocation is:
 
