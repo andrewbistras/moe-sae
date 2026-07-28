@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+import moe_sae.direct_horizon_campaign as direct_campaign_module
 from moe_sae.contribution_artifacts import canonical_sha256
 from moe_sae.direct_horizon_campaign import (
     CONDITIONS,
@@ -506,6 +507,76 @@ def test_transient_ssh_failure_retries_with_new_attempt_without_duplication(
         (attempts / "attempt-000001" / "result.json").read_text(encoding="ascii")
     )
     assert first["classification"] == "ssh_transport"
+
+
+def test_successful_attempt_waits_for_delayed_completion_visibility(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    plan = parse_direct_campaign_plan(_raw_plan(tmp_path))
+    delayed_task = "train-sae-a"
+    inspections = 0
+    lock = threading.Lock()
+    original_inspector = direct_campaign_module.inspect_training_completion
+
+    def delayed_inspector(task):
+        nonlocal inspections
+        if task.task_id != delayed_task:
+            return original_inspector(task)
+        with lock:
+            inspections += 1
+            selected = inspections
+        if selected == 3:
+            _write_training_completion(plan, delayed_task)
+        return original_inspector(task)
+
+    def runner(task_id, _command, _environment, _cwd, stdout, _stop):
+        stdout.parent.mkdir(parents=True, exist_ok=True)
+        stdout.write_text("ok\n", encoding="ascii")
+        if task_id.startswith("train-"):
+            if task_id != delayed_task:
+                _write_training_completion(plan, task_id)
+        else:
+            _write_evaluation_completion(plan, task_id)
+        return AttemptExecution(0)
+
+    monkeypatch.setattr(
+        direct_campaign_module,
+        "inspect_training_completion",
+        delayed_inspector,
+    )
+    monkeypatch.setattr(
+        direct_campaign_module,
+        "COMPLETION_VISIBILITY_RETRIES",
+        3,
+    )
+    monkeypatch.setattr(
+        direct_campaign_module,
+        "COMPLETION_VISIBILITY_POLL_SECONDS",
+        0.0,
+    )
+
+    result = DirectCampaign(
+        plan,
+        attempt_runner=runner,
+        verify_checkout=False,
+    ).run()
+
+    assert result["status"] == "completed"
+    attempt = (
+        plan.state_root
+        / "training"
+        / delayed_task
+        / "attempts"
+        / "attempt-000001"
+        / "result.json"
+    )
+    assert json.loads(attempt.read_text(encoding="ascii"))["classification"] == (
+        "completed"
+    )
+    assert not (
+        plan.state_root / "training" / delayed_task / "failure.json"
+    ).exists()
 
 
 def test_scientific_failure_is_terminal_and_is_not_retried(

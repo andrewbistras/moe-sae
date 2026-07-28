@@ -564,6 +564,135 @@ def test_restore_uses_full_pointer_identity_and_explicit_payload_subset(
     assert pointer_identities == [run_identity]
 
 
+def test_restore_loads_exact_immutable_milestone_pointer_collectively(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    payload_root = "gs://bucket/checkpoints"
+    run_identity = {
+        "condition": "A",
+        "run_identity_sha256": "a" * 64,
+    }
+    payload_uri = checkpoint_payload_uri(
+        payload_root,
+        run_identity,
+        step=2,
+        tokens_seen=8,
+        attempt_id="b" * 32,
+    )
+    pointer = make_pointer(
+        kind="latest",
+        payload_uri=payload_uri,
+        step=2,
+        tokens_seen=8,
+        attempt_id="b" * 32,
+        run_identity=run_identity,
+    )
+    milestone = (
+        tmp_path
+        / "checkpoints"
+        / "milestones"
+        / "target-tokens-000000000007.json"
+    )
+    reads: list[tuple[Path, str]] = []
+    state = SimpleNamespace(tokens_seen=jnp.asarray(8), step=jnp.asarray(2))
+
+    def read(path: Path, *, operation: str):
+        reads.append((path, operation))
+        return pointer
+
+    def decide(_operation: str, error: Exception | None) -> None:
+        if error is not None:
+            raise error
+
+    monkeypatch.setattr(
+        distributed_module,
+        "_coordinator_read_checkpoint_json_if_exists",
+        read,
+    )
+    monkeypatch.setattr(
+        distributed_module,
+        "_collectively_require_finalized_checkpoint",
+        lambda uri: uri == payload_uri or pytest.fail("wrong payload URI"),
+    )
+    monkeypatch.setattr(
+        distributed_module,
+        "_restore_distributed_payload",
+        lambda *_args: (
+            state,
+            {
+                **run_identity,
+                "checkpoint_payload_uri": payload_uri,
+                "tokens_seen": 8,
+                "steps": 2,
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        distributed_module,
+        "_checkpoint_phase_decision",
+        decide,
+    )
+
+    restored, _ = restore_distributed_checkpoint(
+        milestone,
+        object(),  # type: ignore[arg-type]
+        object(),  # type: ignore[arg-type]
+        object(),  # type: ignore[arg-type]
+        checkpoint_payload_root=payload_root,
+        checkpoint_identity=run_identity,
+    )
+
+    assert restored is state
+    assert reads == [(milestone, "latest pointer")]
+
+
+def test_restore_rejects_final_pointer_body_at_milestone_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    payload_root = "gs://bucket/checkpoints"
+    run_identity = {"run_identity_sha256": "a" * 64}
+    latest = make_pointer(
+        kind="latest",
+        payload_uri=checkpoint_payload_uri(
+            payload_root,
+            run_identity,
+            step=2,
+            tokens_seen=8,
+            attempt_id="c" * 32,
+        ),
+        step=2,
+        tokens_seen=8,
+        attempt_id="c" * 32,
+        run_identity=run_identity,
+    )
+
+    monkeypatch.setattr(
+        distributed_module,
+        "_coordinator_read_checkpoint_json_if_exists",
+        lambda *_args, **_kwargs: final_pointer_from_latest(latest),
+    )
+    monkeypatch.setattr(
+        distributed_module,
+        "_checkpoint_phase_decision",
+        lambda _operation, error: (_ for _ in ()).throw(error)
+        if error is not None
+        else None,
+    )
+
+    with pytest.raises(RuntimeError, match="kind mismatch"):
+        restore_distributed_checkpoint(
+            tmp_path
+            / "checkpoints"
+            / "milestones"
+            / "target-tokens-000000000007.json",
+            object(),  # type: ignore[arg-type]
+            object(),  # type: ignore[arg-type]
+            object(),  # type: ignore[arg-type]
+            checkpoint_payload_root=payload_root,
+            checkpoint_identity=run_identity,
+        )
+
+
 def test_restore_rejects_wrong_payload_identity_hash(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

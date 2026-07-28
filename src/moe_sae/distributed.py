@@ -33,6 +33,7 @@ from moe_sae.checkpointing import (
     checkpoint_payload_uri,
     final_pointer_from_latest,
     make_pointer,
+    milestone_pointer_path,
     new_attempt_id,
     normalize_payload_root,
     pointer_path,
@@ -1075,6 +1076,39 @@ def _collective_load_pointer(
         prepare_error = error
     _checkpoint_phase_decision("pointer load preparation", prepare_error)
     assert path is not None
+    raw = _coordinator_read_checkpoint_json_if_exists(
+        path, operation=f"{kind} pointer"
+    )
+    if raw is None:
+        return None
+
+    pointer: dict[str, Any] | None = None
+    validation_error: Exception | None = None
+    try:
+        if not isinstance(raw, Mapping):
+            raise RuntimeError("checkpoint pointer must be a JSON object")
+        pointer = validate_pointer(
+            raw,
+            expected_kind=kind,  # type: ignore[arg-type]
+            payload_root=payload_root,
+            run_identity=run_identity,
+        )
+    except Exception as error:
+        validation_error = error
+    _checkpoint_phase_decision("pointer validation", validation_error)
+    assert pointer is not None
+    return pointer
+
+
+def _collective_load_exact_pointer(
+    path: Path,
+    *,
+    kind: str,
+    payload_root: str | Path,
+    run_identity: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Collectively load and validate one caller-selected pointer pathname."""
+
     raw = _coordinator_read_checkpoint_json_if_exists(
         path, operation=f"{kind} pointer"
     )
@@ -2290,7 +2324,7 @@ def restore_distributed_checkpoint(
     checkpoint_identity: Mapping[str, Any] | None = None,
     checkpoint_metadata_identity: Mapping[str, Any] | None = None,
 ) -> tuple[TrainState, dict[str, Any]]:
-    """Restore only through a validated ``latest.json`` or ``final.json`` pointer.
+    """Restore through a validated mutable or immutable control pointer.
 
     ``checkpoint_identity`` always binds the complete control pointer and its
     payload namespace.  Payload metadata defaults to that same identity.
@@ -2301,11 +2335,34 @@ def restore_distributed_checkpoint(
     if "://" in str(path):
         raise ValueError("checkpoint control pointer must be a POSIX path")
     pointer_file = Path(path)
-    if pointer_file.name not in {"latest.json", "final.json"}:
-        raise ValueError(
-            "distributed checkpoint restore requires latest.json or final.json"
+    milestone = False
+    if pointer_file.name in {"latest.json", "final.json"}:
+        kind = "latest" if pointer_file.name == "latest.json" else "final"
+        checkpoint_dir = pointer_file.parent
+    else:
+        name = pointer_file.name
+        prefix = "target-tokens-"
+        suffix = ".json"
+        token_field = (
+            name[len(prefix) : -len(suffix)]
+            if name.startswith(prefix) and name.endswith(suffix)
+            else ""
         )
-    kind = "latest" if pointer_file.name == "latest.json" else "final"
+        if (
+            pointer_file.parent.name != "milestones"
+            or len(token_field) != 12
+            or any(character not in "0123456789" for character in token_field)
+        ):
+            raise ValueError(
+                "distributed checkpoint restore requires latest.json or final.json, "
+                "or milestones/target-tokens-XXXXXXXXXXXX.json"
+            )
+        checkpoint_dir = pointer_file.parent.parent
+        expected_path = milestone_pointer_path(checkpoint_dir, int(token_field))
+        if pointer_file != expected_path:
+            raise ValueError("checkpoint milestone pointer path is not canonical")
+        kind = "latest"
+        milestone = True
     identity = dict(checkpoint_identity or {})
     if checkpoint_metadata_identity is None:
         metadata_identity = identity
@@ -2327,14 +2384,22 @@ def restore_distributed_checkpoint(
                 + ", ".join(sorted(invalid_metadata_identity))
             )
     payload_root = _effective_checkpoint_payload_root(
-        pointer_file.parent, checkpoint_payload_root
+        checkpoint_dir, checkpoint_payload_root
     )
-    pointer = _collective_load_pointer(
-        pointer_file.parent,
-        kind=kind,
-        payload_root=payload_root,
-        run_identity=identity,
-    )
+    if milestone:
+        pointer = _collective_load_exact_pointer(
+            pointer_file,
+            kind="latest",
+            payload_root=payload_root,
+            run_identity=identity,
+        )
+    else:
+        pointer = _collective_load_pointer(
+            checkpoint_dir,
+            kind=kind,
+            payload_root=payload_root,
+            run_identity=identity,
+        )
     if pointer is None:
         raise RuntimeError(f"checkpoint pointer is missing: {pointer_file}")
     _collectively_require_finalized_checkpoint(str(pointer["payload_uri"]))

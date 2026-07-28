@@ -57,6 +57,8 @@ CONDITIONS = ("A", "R", "B", "F")
 MILESTONES = (2_000_000, 5_000_000, 10_000_000)
 TRAIN_TOKENS = 10_000_000
 CONTINUOUS_RUNTIME_SECONDS = 43_200
+COMPLETION_VISIBILITY_RETRIES = 45
+COMPLETION_VISIBILITY_POLL_SECONDS = 2.0
 SUPPORTED_ACCELERATOR_TYPES = ("v4-32", "v6e-16", "v5litepod-16")
 TRANSIENT_FAILURES = frozenset({"ssh_transport", "resource_unavailable"})
 RESUMABLE_FAILURES = TRANSIENT_FAILURES | {"controller_stop"}
@@ -1490,6 +1492,23 @@ class DirectCampaign:
                 self.stop_event,
             )
             completion = inspector(task)
+            if (
+                completion is None
+                and execution.returncode == 0
+                and not self.stop_event.is_set()
+            ):
+                # NFS clients may retain a negative directory lookup briefly
+                # after a remote worker has atomically published its terminal
+                # result.  A successful child must therefore receive one
+                # bounded visibility window before it is classified as
+                # missing_completion.  Invalid visible results still raise
+                # immediately through the strict inspector.
+                for _ in range(COMPLETION_VISIBILITY_RETRIES):
+                    if self.stop_event.wait(COMPLETION_VISIBILITY_POLL_SECONDS):
+                        break
+                    completion = inspector(task)
+                    if completion is not None:
+                        break
             output = _log_evidence(attempt_root)
             classification = classify_failure(
                 returncode=execution.returncode,
