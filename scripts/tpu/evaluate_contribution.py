@@ -11,11 +11,11 @@ import re
 import shlex
 import subprocess
 import sys
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
-from typing import Sequence
 
 from moe_sae.runtime import (
     REGIONAL_ACCELERATOR_TYPES,
@@ -93,7 +93,7 @@ class Settings:
             raise OperatorError("CONTRIBUTION_SAE_CACHE_MAX_BYTES must be positive")
         artifact_root = _required("ARTIFACT_ROOT")
         bulk_root = _required("BULK_GCS_ROOT").rstrip("/")
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
         accelerator_type = os.environ.get("TPU_ACCELERATOR_TYPE", "v4-32")
         if accelerator_type not in SUPPORTED_TRAINING_ACCELERATOR_TYPES:
             raise OperatorError("TPU_ACCELERATOR_TYPE is unsupported")
@@ -363,6 +363,54 @@ def _run(command: list[str], log: Path) -> int:
             return 124
 
 
+def _remote_bytes(
+    settings: Settings,
+    *,
+    controller: int,
+    remote_path: str,
+) -> bytes:
+    """Read one remote control artifact from the Mac through gcloud."""
+
+    target = (
+        f"{settings.ssh_user}@{settings.tpu}"
+        if settings.ssh_user is not None
+        else settings.tpu
+    )
+    command = [
+        "gcloud",
+        "compute",
+        "tpus",
+        "tpu-vm",
+        "ssh",
+        target,
+        f"--project={settings.project}",
+        f"--zone={settings.zone}",
+        f"--worker={controller}",
+        "--quiet",
+        "--command",
+        "cat " + shlex.quote(remote_path),
+    ]
+    if settings.ssh_key:
+        command.insert(-2, f"--ssh-key-file={settings.ssh_key}")
+    if settings.internal_ip:
+        command.insert(-2, "--internal-ip")
+    environment = os.environ.copy()
+    for name in ("LD_PRELOAD", "GLIBCXX_FORCE_NEW", "GLIBCPP_FORCE_NEW"):
+        environment.pop(name, None)
+    completed = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        env=environment,
+    )
+    if completed.returncode != 0:
+        raise OperatorError(
+            f"cannot read remote control artifact {remote_path}: "
+            + completed.stderr.decode("utf-8", errors="replace")[-2_000:]
+        )
+    return completed.stdout
+
+
 def _terminal_evaluation_status(
     log: Path,
     *,
@@ -438,6 +486,24 @@ def _validate_scientific_result(path: Path) -> dict[str, object]:
     ):
         raise OperatorError("scientific result identity or self-hash is invalid")
     return value
+
+
+def _fetch_result(
+    settings: Settings,
+    *,
+    controller: int,
+) -> Path:
+    """Fetch the process-zero result without assuming the Mac mounts NFS."""
+
+    remote = settings.result_root.rstrip("/") + "/scientific-result.json"
+    payload = _remote_bytes(
+        settings,
+        controller=controller,
+        remote_path=remote,
+    )
+    local = settings.log_root / "scientific-result.json"
+    local.write_bytes(payload)
+    return local
 
 
 def _absolute_remote_path(name: str, value: str) -> str:
@@ -573,7 +639,13 @@ def main(argv: Sequence[str] = ()) -> int:
             f"one or more evaluation workers failed: {statuses}; "
             f"inspect {settings.log_root}"
         )
-    result = Path(settings.result_root) / "scientific-result.json"
+    process_zero_controller = next(
+        controller for controller, process in mapping.items() if process == 0
+    )
+    result = _fetch_result(
+        settings,
+        controller=process_zero_controller,
+    )
     _validate_scientific_result(result)
     print(result)
     return 0

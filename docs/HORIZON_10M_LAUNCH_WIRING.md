@@ -479,6 +479,48 @@ The six output directories each contain the immutable scientific JSON; the
 transcoder evaluator also renders `REPORT.md`. Preserve them before deleting
 the TPU or regional Filestore.
 
+## Seal the joint Experiment 4 curve
+
+After all six joint evaluations exist, build one create-only JSON and Markdown
+handoff. The eight run contracts are required because the scientific results
+contain measured costs but do not all embed the accelerator generation that
+produced them.
+
+```zsh
+REPORT_ARGS=()
+for TOKENS in 2000000 5000000 10000000
+do
+  REPORT_ARGS+=(
+    --sae-result
+    "$TPU_PROD/horizon-10m/evaluation/sae/$TOKENS/scientific-result.json"
+    --transcoder-result
+    "$TPU_PROD/horizon-10m/evaluation/transcoder/$TOKENS/scientific-result.json"
+  )
+done
+
+for MODEL in sae transcoder
+do
+  for CONDITION in A R B F
+  do
+    CONDITION_LOWER=${(L)CONDITION}
+    REPORT_ARGS+=(
+      --run-contract
+      "$MODEL:$CONDITION=$TPU_PROD/horizon-10m/runs/$MODEL/runs/horizon10m-$MODEL-$CONDITION_LOWER-seed0/run-contract.json"
+    )
+  done
+done
+
+uv run python -m moe_sae.horizon_curve_report \
+  "${REPORT_ARGS[@]}" \
+  --output-root "$TPU_PROD/horizon-10m/experiment4-report"
+```
+
+The command validates every source self-hash, exact 2M/5M/10M coverage,
+monotonic checkpoint/cost ledgers, and run-contract provenance. It always
+retains raw chip-seconds and hardware labels. An A/F cost ratio is interpreted
+only when A and F used the same accelerator generation; mixed v4/v5e/v6e
+ratios remain visible but are explicitly marked non-comparable.
+
 ## Parallel capacity policy
 
 The fallback above is scientifically complete with one slice. If additional

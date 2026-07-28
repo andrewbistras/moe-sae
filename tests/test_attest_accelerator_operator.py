@@ -120,3 +120,32 @@ def test_attestation_accepts_exact_v5litepod_type(
     args.zone = "europe-west4-b"
     result = operator.attest(args)
     assert result["contract"]["accelerator_type"] == "v5litepod-16"
+
+
+def test_attestation_accepts_exact_on_demand_v4(
+    operator,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    description = {
+        "name": (
+            "projects/neural-dragnet/locations/us-central2-b/nodes/"
+            "experiment4-sae-f"
+        ),
+        "acceleratorType": "v4-32",
+        "state": "READY",
+        "createTime": "2026-07-28T12:00:00.000Z",
+        "schedulingConfig": {},
+    }
+
+    class Completed:
+        returncode = 0
+        stdout = json.dumps(description)
+        stderr = ""
+
+    monkeypatch.setattr(operator.subprocess, "run", lambda *_a, **_k: Completed())
+    args = arguments(operator, tmp_path, accelerator_type="v4-32")
+    args.zone = "us-central2-b"
+    result = operator.attest(args)
+    assert result["contract"]["provisioning_model"] == "ON_DEMAND"
+    assert result["attestation"]["spot"] is False

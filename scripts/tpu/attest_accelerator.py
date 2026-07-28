@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Freeze and attest one already-created Spot TPU slice incarnation."""
+"""Freeze and attest one already-created TPU slice incarnation."""
 
 from __future__ import annotations
 
 import argparse
 import json
 import subprocess
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Sequence
 
 from moe_sae.contribution_artifacts import canonical_json_bytes
 from moe_sae.regional_execution import (
@@ -66,6 +66,9 @@ def attest(args: argparse.Namespace) -> dict[str, object]:
         region=args.zone.rsplit("-", 1)[0],
         zone=args.zone,
         accelerator_type=args.accelerator_type,
+        provisioning_model=(
+            "ON_DEMAND" if args.accelerator_type == "v4-32" else "SPOT"
+        ),
     )
     attestation = assert_spot_tpu_description(description, contract)
     output = Path(args.output_root).expanduser().resolve()
@@ -81,7 +84,7 @@ def attest(args: argparse.Namespace) -> dict[str, object]:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Read-only exact Spot TPU incarnation attestation"
+        description="Read-only exact TPU incarnation attestation"
     )
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--scientific-model", required=True)
@@ -91,7 +94,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--zone", required=True)
     parser.add_argument(
         "--accelerator-type",
-        choices=("v6e-16", "v5litepod-16"),
+        choices=("v4-32", "v6e-16", "v5litepod-16"),
         default="v6e-16",
     )
     parser.add_argument("--output-root", required=True)

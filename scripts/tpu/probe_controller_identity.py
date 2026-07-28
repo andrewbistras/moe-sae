@@ -11,15 +11,15 @@ qualification and no cloud mutation occur here.
 from __future__ import annotations
 
 import argparse
-from collections.abc import Mapping, Sequence
 import json
 import os
-from pathlib import Path, PurePosixPath
 import re
 import shlex
 import subprocess
 import sys
-
+import time
+from collections.abc import Mapping, Sequence
+from pathlib import Path, PurePosixPath
 
 PROCESS_COUNT = 4
 PROBE_TIMEOUT_SECONDS = 420
@@ -96,6 +96,8 @@ def _clean_checkout(args: argparse.Namespace) -> list[str]:
 def _observation_command(
     args: argparse.Namespace,
     controller_index: int,
+    *,
+    start_epoch: int,
 ) -> list[str]:
     observation_root = f"{args.probe_root}/observations"
     output = f"{observation_root}/controller-{controller_index:05d}.json"
@@ -125,6 +127,10 @@ def _observation_command(
             [
                 *_clean_checkout(args),
                 f"install -d -m 0700 {shlex.quote(observation_root)}",
+                (
+                    f'while [ "$(date +%s)" -lt {start_epoch} ]; '
+                    "do sleep 0.1; done"
+                ),
                 shlex.join(command),
             ]
         ),
@@ -290,9 +296,18 @@ def _validate_args(args: argparse.Namespace) -> None:
 
 
 def _run_probe(args: argparse.Namespace) -> dict[str, object]:
+    # TPU PJRT slice formation is intolerant of the several-second skew that
+    # four independent gcloud SSH handshakes can introduce.  Establish every
+    # session first, then release all controllers on one shared wall-clock
+    # second.  GCE guest clocks are synchronized and the barrier is read-only.
+    start_epoch = int(time.time()) + args.barrier_delay_seconds
     processes = [
         subprocess.Popen(
-            _observation_command(args, controller),
+            _observation_command(
+                args,
+                controller,
+                start_epoch=start_epoch,
+            ),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -463,6 +478,15 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="print the exact four observation commands without invoking gcloud",
     )
+    parser.add_argument(
+        "--barrier-delay-seconds",
+        type=int,
+        default=30,
+        help=(
+            "seconds allowed for all four SSH sessions to reach the common "
+            "PJRT initialization barrier"
+        ),
+    )
     return parser
 
 
@@ -477,13 +501,22 @@ def main(
         args.ssh_user = selected_environment.get("TPU_SSH_USER") or None
     try:
         _validate_args(args)
+        if not 5 <= args.barrier_delay_seconds <= 120:
+            raise ProbeOperatorError(
+                "barrier_delay_seconds must be between 5 and 120"
+            )
         if args.dry_run:
+            start_epoch = int(time.time()) + args.barrier_delay_seconds
             print(
                 json.dumps(
                     {
                         "process_count": PROCESS_COUNT,
                         "commands": [
-                            _observation_command(args, controller)
+                            _observation_command(
+                                args,
+                                controller,
+                                start_epoch=start_epoch,
+                            )
                             for controller in range(PROCESS_COUNT)
                         ],
                         "seal_command": _seal_command(args),

@@ -56,7 +56,7 @@ def _write_result(operator, root: Path) -> None:
         "schema_version": operator.RESULT_SCHEMA_VERSION,
         "status": "complete",
     }
-    root.mkdir(parents=True)
+    root.mkdir(parents=True, exist_ok=True)
     (root / "scientific-result.json").write_text(
         json.dumps(
             {
@@ -99,13 +99,21 @@ def test_main_accepts_remote_success_after_transport_teardown(
 ) -> None:
     settings = _settings(operator, tmp_path)
     mapping = {0: 2, 1: 0, 2: 3, 3: 1}
-    _write_result(operator, Path(settings.result_root))
     monkeypatch.setattr(
         operator.Settings,
         "from_environment",
         classmethod(lambda cls: settings),
     )
     monkeypatch.setattr(operator, "_mapping", lambda _path: mapping)
+    fetched_from: list[int] = []
+
+    def fetch_result(selected, *, controller):
+        assert selected == settings
+        fetched_from.append(controller)
+        _write_result(operator, settings.log_root)
+        return settings.log_root / "scientific-result.json"
+
+    monkeypatch.setattr(operator, "_fetch_result", fetch_result)
 
     def run(_command, log):
         controller = int(log.name.split("-c", 1)[1].split("-", 1)[0])
@@ -120,6 +128,41 @@ def test_main_accepts_remote_success_after_transport_teardown(
 
     monkeypatch.setattr(operator, "_run", run)
     assert operator.main() == 0
+    assert fetched_from == [1]
+
+
+def test_result_is_fetched_to_controller_local_log_root(
+    operator,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(operator, tmp_path)
+    body = {
+        "schema_version": operator.RESULT_SCHEMA_VERSION,
+        "status": "complete",
+    }
+    payload = json.dumps(
+        {
+            **body,
+            "result_sha256": operator._canonical_sha256(body),
+        }
+    ).encode("ascii")
+    calls: list[tuple[int, str]] = []
+
+    def remote_bytes(selected, *, controller, remote_path):
+        assert selected == settings
+        calls.append((controller, remote_path))
+        return payload
+
+    settings.log_root.mkdir()
+    monkeypatch.setattr(operator, "_remote_bytes", remote_bytes)
+    result = operator._fetch_result(settings, controller=3)
+
+    assert calls == [
+        (3, f"{settings.result_root}/scientific-result.json")
+    ]
+    assert result == settings.log_root / "scientific-result.json"
+    assert result.read_bytes() == payload
 
 
 def test_zero_transport_without_marker_fails_closed(

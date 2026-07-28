@@ -21,17 +21,17 @@ the content-addressed local cache changes.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
 import argparse
-from dataclasses import dataclass
 import json
 import os
-from pathlib import Path
 import re
 import shutil
 import socket
 import subprocess
 import tempfile
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from moe_sae.contribution_artifacts import canonical_json_bytes, canonical_sha256
@@ -44,7 +44,6 @@ from moe_sae.object_store import (
     object_identity_from_mapping,
     parse_gcs_uri,
 )
-
 
 MIRROR_SPEC_SCHEMA_VERSION = "gemma4-regional-mirror-spec-v1"
 SEALED_MIRROR_SCHEMA_VERSION = "gemma4-regional-mirror-seal-v1"
@@ -732,8 +731,18 @@ def build_accelerator_contract(
     local_devices = _positive_int("local_device_count", local_device_count)
     if processes * local_devices != global_devices:
         raise RegionalExecutionError("accelerator topology does not multiply exactly")
-    if provisioning_model != "SPOT":
-        raise RegionalExecutionError("approved accelerator contract requires Spot")
+    if accelerator_type == "v4-32":
+        if provisioning_model not in {"ON_DEMAND", "SPOT"}:
+            raise RegionalExecutionError(
+                "approved v4-32 accelerator contract requires ON_DEMAND or Spot"
+            )
+    elif accelerator_type in {"v6e-16", "v5litepod-16"}:
+        if provisioning_model != "SPOT":
+            raise RegionalExecutionError(
+                "approved regional accelerator contract requires Spot"
+            )
+    else:
+        raise RegionalExecutionError("accelerator type is unsupported")
     body = {
         "schema_version": ACCELERATOR_CONTRACT_SCHEMA_VERSION,
         "run_id": _safe_name("run_id", run_id),
@@ -808,7 +817,12 @@ def assert_spot_tpu_description(
     description: Mapping[str, Any],
     contract: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Validate saved ``gcloud ... describe --format=json`` evidence."""
+    """Validate saved ``gcloud ... describe --format=json`` evidence.
+
+    The historical name is retained for callers.  Regional v5/v6 slices are
+    required to be Spot, while the already-allocated central v4-32 horizon
+    slice is required to be on-demand.
+    """
 
     expected = validate_accelerator_contract(contract)
     if not isinstance(description, Mapping):
@@ -816,20 +830,33 @@ def assert_spot_tpu_description(
     name = str(description.get("name", "")).rstrip("/").split("/")[-1]
     scheduling = description.get("schedulingConfig")
     create_time = description.get("createTime")
+    expected_spot = expected["provisioning_model"] == "SPOT"
+    scheduling_matches = (
+        isinstance(scheduling, Mapping)
+        and (
+            (
+                scheduling.get("spot") is True
+                and (
+                    "preemptible" not in scheduling
+                    or scheduling.get("preemptible") is True
+                )
+            )
+            if expected_spot
+            else (
+                scheduling.get("spot") is not True
+                and scheduling.get("preemptible") is not True
+            )
+        )
+    )
     if (
         name != expected["tpu_name"]
         or description.get("acceleratorType") != expected["accelerator_type"]
         or description.get("state") != "READY"
         or create_time != expected["resource_create_time"]
-        or not isinstance(scheduling, Mapping)
-        or scheduling.get("spot") is not True
-        or (
-            "preemptible" in scheduling
-            and scheduling.get("preemptible") is not True
-        )
+        or not scheduling_matches
     ):
         raise RegionalExecutionError(
-            "TPU description is not the exact ready Spot slice incarnation"
+            "TPU description is not the exact ready provisioned slice incarnation"
         )
     full_name = str(description.get("name", ""))
     if (
@@ -848,7 +875,7 @@ def assert_spot_tpu_description(
     if location != expected["zone"]:
         raise RegionalExecutionError("TPU description zone changed")
     body = {
-        "schema_version": "gemma4-spot-description-attestation-v1",
+        "schema_version": "gemma4-accelerator-description-attestation-v1",
         "contract_sha256": expected["contract_sha256"],
         "description_sha256": canonical_sha256(description),
         "tpu_name": expected["tpu_name"],
@@ -856,7 +883,8 @@ def assert_spot_tpu_description(
         "zone": expected["zone"],
         "accelerator_type": expected["accelerator_type"],
         "state": "READY",
-        "spot": True,
+        "provisioning_model": expected["provisioning_model"],
+        "spot": expected_spot,
     }
     return _seal(body, "attestation_sha256")
 
@@ -1887,26 +1915,26 @@ __all__ = [
     "DELIVERY_LEDGER_SCHEMA_VERSION",
     "LOCAL_CACHE_INVENTORY_SCHEMA_VERSION",
     "LOCAL_CACHE_OBSERVATION_SCHEMA_VERSION",
-    "MIRROR_SPEC_SCHEMA_VERSION",
     "MINIMUM_10M_PROCESS_CACHE_FREE_BYTES",
     "MINIMUM_10M_TMPFS_MEM_AVAILABLE_BYTES",
-    "MirrorDataset",
+    "MIRROR_SPEC_SCHEMA_VERSION",
     "PREWARM_RECEIPT_SCHEMA_VERSION",
     "REGIONAL_PLACEMENT_SCHEMA_VERSION",
+    "SEALED_MIRROR_SCHEMA_VERSION",
+    "MirrorDataset",
     "RegionalExecutionError",
     "RegionalMirrorStore",
-    "SEALED_MIRROR_SCHEMA_VERSION",
     "assert_spot_tpu_description",
     "atomic_write_evidence",
     "build_accelerator_contract",
     "build_cleanup_plan",
     "build_controller_observation",
-    "build_local_cache_observation",
     "build_delivery_ledger",
+    "build_local_cache_observation",
     "build_regional_mirror_specification",
     "build_regional_placement",
-    "observe_local_jax_controller",
     "observe_local_cache_capacity",
+    "observe_local_jax_controller",
     "prewarm_regional_cache",
     "seal_controller_mapping",
     "seal_local_cache_inventory",

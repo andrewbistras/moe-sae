@@ -338,8 +338,41 @@ def test_spot_attestation_rejects_on_demand_wrong_shape_and_old_incarnation():
     ):
         changed = copy.deepcopy(description)
         mutation(changed)
-        with pytest.raises(RegionalExecutionError, match="exact ready Spot"):
+        with pytest.raises(RegionalExecutionError, match="exact ready provisioned"):
             assert_spot_tpu_description(changed, contract)
+
+
+def test_on_demand_v4_attestation_is_explicit_and_incarnation_bound():
+    contract = build_accelerator_contract(
+        run_id="experiment4",
+        scientific_model="sae",
+        condition="A",
+        project="neural-dragnet",
+        tpu_name="experiment4-sae-a",
+        resource_create_time="2026-07-28T10:11:12.123Z",
+        region="us-central2",
+        zone="us-central2-b",
+        accelerator_type="v4-32",
+        provisioning_model="ON_DEMAND",
+    )
+    description = {
+        "name": (
+            "projects/neural-dragnet/locations/us-central2-b/nodes/"
+            "experiment4-sae-a"
+        ),
+        "acceleratorType": "v4-32",
+        "state": "READY",
+        "createTime": "2026-07-28T10:11:12.123Z",
+        "schedulingConfig": {},
+    }
+    attestation = assert_spot_tpu_description(description, contract)
+    assert attestation["spot"] is False
+    assert attestation["provisioning_model"] == "ON_DEMAND"
+
+    changed = copy.deepcopy(description)
+    changed["schedulingConfig"] = {"spot": True, "preemptible": True}
+    with pytest.raises(RegionalExecutionError, match="exact ready provisioned"):
+        assert_spot_tpu_description(changed, contract)
 
 
 def test_fresh_controller_mapping_is_exact_permutation_and_incarnation_bound():
@@ -580,6 +613,10 @@ def test_fresh_controller_probe_dry_run_declares_identity_and_cache_fanout():
     )
     assert all(
         "observe-controller" in " ".join(command)
+        for command in payload["commands"]
+    )
+    assert all(
+        'while [ "$(date +%s)" -lt' in " ".join(command)
         for command in payload["commands"]
     )
     assert all(
