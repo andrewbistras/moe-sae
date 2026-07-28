@@ -81,6 +81,7 @@ _RESERVED_ENVIRONMENT = frozenset(
         "TPU_SSH_USER",
         "CONTRIBUTION_FRESH_CONTROLLER_MAPPING",
         "CONTRIBUTION_LOCAL_CACHE_INVENTORY",
+        "CONTRIBUTION_QUALIFICATION_BUNDLE",
         "CONTRIBUTION_REGIONAL_MIRROR_SEAL",
         "CONTRIBUTION_SAE_CONTROL_ROOT",
         "CONTRIBUTION_SAE_CHECKPOINT_ROOT",
@@ -1111,13 +1112,23 @@ def _task_environment(
             }
         )
     else:
-        audited["CONTRIBUTION_FRESH_CONTROLLER_MAPPING"] = str(
-            resource.controller_mapping.controller_path
-        )
         if task.scientific_model == "sae":
+            # The SAE evaluator parses the mapping on the controller before
+            # fanning out its workers.
+            mapping_path = str(resource.controller_mapping.controller_path)
+            audited["CONTRIBUTION_FRESH_CONTROLLER_MAPPING"] = mapping_path
             audited["CONTRIBUTION_EVALUATION_LOG_ROOT"] = str(operator_log_root)
         else:
+            # The transcoder evaluator fetches the mapping through TPU SSH, so
+            # it must receive the worker-visible NFS path.
+            mapping_path = resource.controller_mapping.remote_path
+            audited["CONTRIBUTION_FRESH_CONTROLLER_MAPPING"] = mapping_path
             audited["TRANSCODER_EVALUATION_LOG_ROOT"] = str(operator_log_root)
+        if resource.accelerator_type == "v4-32":
+            # Legacy v4 evaluator settings still name this permutation a
+            # qualification bundle. The fresh mapping has the exact field
+            # they consume and remains independently hash-verified.
+            audited["CONTRIBUTION_QUALIFICATION_BUNDLE"] = mapping_path
     executable = os.environ.copy()
     executable.update(audited)
     return executable, audited

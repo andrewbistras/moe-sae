@@ -231,6 +231,86 @@ def test_train_commands_are_continuous_and_evaluators_are_joint(
     assert "--condition" not in evaluation
 
 
+def test_evaluators_receive_mapping_in_the_namespace_they_read(
+    tmp_path: Path,
+) -> None:
+    plan = parse_direct_campaign_plan(_raw_plan(tmp_path))
+    observed: dict[str, dict[str, str]] = {}
+
+    def runner(task_id, _command, environment, _cwd, stdout, _stop):
+        stdout.parent.mkdir(parents=True, exist_ok=True)
+        stdout.write_text("ok\n", encoding="ascii")
+        if task_id.startswith("train-"):
+            _write_training_completion(plan, task_id)
+        else:
+            observed[task_id] = environment
+            _write_evaluation_completion(plan, task_id)
+        return AttemptExecution(0)
+
+    DirectCampaign(
+        plan,
+        attempt_runner=runner,
+        verify_checkout=False,
+    ).run()
+
+    sae_resource = plan.resource("slice-sae-a")
+    transcoder_resource = plan.resource("slice-transcoder-a")
+    assert observed["eval-sae-2000000"][
+        "CONTRIBUTION_FRESH_CONTROLLER_MAPPING"
+    ] == str(sae_resource.controller_mapping.controller_path)
+    assert (
+        observed["eval-transcoder-2000000"][
+            "CONTRIBUTION_FRESH_CONTROLLER_MAPPING"
+        ]
+        == transcoder_resource.controller_mapping.remote_path
+    )
+
+
+@pytest.mark.parametrize(
+    ("model", "expected_namespace"),
+    (("sae", "controller"), ("transcoder", "remote")),
+)
+def test_v4_evaluator_receives_fresh_mapping_as_legacy_bundle(
+    tmp_path: Path,
+    model: str,
+    expected_namespace: str,
+) -> None:
+    raw = _raw_plan(tmp_path)
+    resource = next(item for item in raw["resources"] if item["id"] == f"slice-{model}-a")
+    resource["accelerator_type"] = "v4-32"
+    resource["internal_ip"] = False
+    resource["evidence"]["mirror_seal"] = None
+    plan = parse_direct_campaign_plan(raw)
+    observed: dict[str, str] = {}
+
+    def runner(task_id, _command, environment, _cwd, stdout, _stop):
+        stdout.parent.mkdir(parents=True, exist_ok=True)
+        stdout.write_text("ok\n", encoding="ascii")
+        if task_id.startswith("train-"):
+            _write_training_completion(plan, task_id)
+        else:
+            if task_id == f"eval-{model}-2000000":
+                observed.update(environment)
+            _write_evaluation_completion(plan, task_id)
+        return AttemptExecution(0)
+
+    DirectCampaign(
+        plan,
+        attempt_runner=runner,
+        verify_checkout=False,
+    ).run()
+
+    selected = plan.resource(f"slice-{model}-a").controller_mapping
+    expected = (
+        str(selected.controller_path)
+        if expected_namespace == "controller"
+        else selected.remote_path
+    )
+    assert observed["CONTRIBUTION_FRESH_CONTROLLER_MAPPING"] == expected
+    assert observed["CONTRIBUTION_QUALIFICATION_BUNDLE"] == expected
+    assert "CONTRIBUTION_LOCAL_CACHE_INVENTORY" not in observed
+
+
 def test_plan_rejects_duplicate_resource_ownership(tmp_path: Path) -> None:
     raw = _raw_plan(tmp_path)
     raw["trajectories"][1]["resource_id"] = raw["trajectories"][0]["resource_id"]
