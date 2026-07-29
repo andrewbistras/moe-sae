@@ -799,11 +799,14 @@ def _load_datasets(
         cache=cache,
         target_manifest=eval_target.manifest,
     )
-    for source in (train_source, eval_source):
-        require_overlay_capture_contract(
-            source,
-            config.parents["source_overlay_capture_contract_sha256"],
-        )
+    # The singular capture contract is the frozen training-overlay producer.
+    # The held-out overlay is independently bound by its exact manifest below;
+    # it was captured from the paired evaluation target under a distinct
+    # config, so requiring the training producer hash for it is incorrect.
+    require_overlay_capture_contract(
+        train_source,
+        config.parents["source_overlay_capture_contract_sha256"],
+    )
     if (
         train_source.manifest_sha256
         != config.parents["train_source_overlay_manifest_sha256"]

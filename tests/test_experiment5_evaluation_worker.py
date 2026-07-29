@@ -7,6 +7,9 @@ import numpy as np
 import pytest
 
 from moe_sae.contribution_artifacts import canonical_sha256
+from moe_sae.contribution_transcoder_input import (
+    ContributionTranscoderInputError,
+)
 from moe_sae.contribution_training_worker import TrainingWorkerPlan
 from moe_sae.experiment5_config import PHASE_NAME, load_experiment5_config
 from moe_sae.experiment5_distributed import experiment5_physical_layout
@@ -14,6 +17,7 @@ from moe_sae.experiment5_evaluation_worker import (
     Experiment5EvaluationWorkerError,
     _existing_completion,
     _gather_physical_firing_mask,
+    _load_datasets,
     _mean_sha256,
     _milestone_routed_counts,
     _parser,
@@ -130,6 +134,105 @@ def test_cli_requires_exactly_four_overlay_arguments_for_transcoder() -> None:
     )
     with pytest.raises(Experiment5EvaluationWorkerError, match="forbids"):
         _require_source_arguments(sae_with_source)
+
+
+def test_transcoder_dataset_contract_binds_only_frozen_training_overlay(
+    monkeypatch,
+) -> None:
+    config = _config("transcoder")
+    train_contract = config.parents[
+        "source_overlay_capture_contract_sha256"
+    ]
+    eval_tokens = config.phase(PHASE_NAME).eval_tokens
+    different_eval_contract = "0" * 64
+    assert different_eval_contract != train_contract
+
+    datasets = {
+        "/train-target": SimpleNamespace(
+            total_tokens=10_000_000,
+            manifest_sha256=config.parents["train_target_manifest_sha256"],
+            manifest={},
+        ),
+        "/eval-target": SimpleNamespace(
+            total_tokens=eval_tokens,
+            manifest_sha256=config.parents["eval_target_manifest_sha256"],
+            manifest={},
+        ),
+        "/train-source": SimpleNamespace(
+            total_tokens=10_000_000,
+            manifest_sha256=config.parents[
+                "train_source_overlay_manifest_sha256"
+            ],
+            manifest={"metadata": {"config_sha256": train_contract}},
+        ),
+        "/eval-source": SimpleNamespace(
+            total_tokens=eval_tokens,
+            manifest_sha256=config.parents[
+                "eval_source_overlay_manifest_sha256"
+            ],
+            manifest={
+                "metadata": {"config_sha256": different_eval_contract}
+            },
+        ),
+    }
+
+    monkeypatch.setattr(
+        "moe_sae.object_store.GCSObjectStore",
+        lambda: object(),
+    )
+    monkeypatch.setattr(
+        "moe_sae.object_store.ShardCache",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        "moe_sae.contribution_storage.ContributionDataset",
+        lambda root, **_kwargs: datasets[str(root)],
+    )
+    monkeypatch.setattr(
+        "moe_sae.contribution_transcoder_storage.RoutedInputDataset",
+        lambda root, **_kwargs: datasets[str(root)],
+    )
+    args = SimpleNamespace(
+        regional_mirror_seal=None,
+        cache_root="/cache",
+        cache_max_bytes=1,
+        panel="transcoder",
+        train_target_root="/train-target",
+        train_target_object_prefix="gs://bucket/train-target",
+        eval_target_root="/eval-target",
+        eval_target_object_prefix="gs://bucket/eval-target",
+        train_source_root="/train-source",
+        train_source_object_prefix="gs://bucket/train-source",
+        eval_source_root="/eval-source",
+        eval_source_object_prefix="gs://bucket/eval-source",
+    )
+
+    opened = _load_datasets(args, config, {})
+    assert opened == (
+        datasets["/train-target"],
+        datasets["/eval-target"],
+        datasets["/train-source"],
+        datasets["/eval-source"],
+    )
+
+    datasets["/train-source"].manifest["metadata"]["config_sha256"] = (
+        different_eval_contract
+    )
+    with pytest.raises(
+        ContributionTranscoderInputError,
+        match="config-pinned capture contract",
+    ):
+        _load_datasets(args, config, {})
+
+    datasets["/train-source"].manifest["metadata"]["config_sha256"] = (
+        train_contract
+    )
+    datasets["/eval-source"].manifest_sha256 = "f" * 64
+    with pytest.raises(
+        Experiment5EvaluationWorkerError,
+        match="source overlays differ",
+    ):
+        _load_datasets(args, config, {})
 
 
 def test_orphaned_paired_sidecar_is_replayable_but_result_only_is_not(
