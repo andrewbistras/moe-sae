@@ -350,3 +350,40 @@ def test_joint_finalizer_emits_valid_result_and_paired_scores(
     assert result["evaluation_tokens"] == 2
     assert result["conditions"]["H"]["full_ffn"]["sse"] == 0
     assert result["predictions_artifact_sha256"] == paired["artifact_sha256"]
+
+
+def test_joint_finalizer_requires_bitwise_common_target_sst(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(evaluation_module, "EVAL_TOKENS", 2)
+    monkeypatch.setattr(report_module, "EVAL_TOKENS", 2)
+    accumulators = {}
+    for condition in ("H", "R", "B", "F"):
+        layout = Experiment5Layout(condition=condition, hidden_dim=2)
+        accumulator = Experiment5EvaluationAccumulator(
+            panel="sae",
+            layout=layout,
+            seed=0,
+            milestone=2_000_000,
+            training_receipt=_receipt(condition),
+            checkpoint_firing_shards=[_mask(layout)],
+            expected_evaluation_tokens=2,
+        )
+        rows = _score(condition)
+        if condition == "B":
+            altered = rows.full_sst.copy()
+            altered[0] = np.nextafter(altered[0], np.inf)
+            rows = dataclasses.replace(rows, full_sst=altered)
+        accumulator.add(rows)
+        accumulators[condition] = accumulator
+
+    with pytest.raises(
+        Experiment5EvaluationError,
+        match="B does not share the packed-sequence target basis",
+    ):
+        build_experiment5_evaluation_result(
+            accumulators=accumulators,
+            source_revision="a" * 40,
+            config_sha256="b" * 64,
+            completed_at="2026-07-28T12:00:00Z",
+        )

@@ -2142,12 +2142,7 @@ def build_experiment5_evaluation_result(
             not np.array_equal(row.sequence_id, canonical.sequence_id)
             or not np.array_equal(row.valid_tokens, canonical.valid_tokens)
             or row.sequence_position_bits != canonical.sequence_position_bits
-            or not np.allclose(
-                row.sequence_sst,
-                canonical.sequence_sst,
-                rtol=1e-10,
-                atol=1e-7,
-            )
+            or not np.array_equal(row.sequence_sst, canonical.sequence_sst)
         ):
             raise Experiment5EvaluationError(
                 f"{condition} does not share the packed-sequence target basis"

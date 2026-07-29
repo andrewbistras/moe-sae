@@ -918,14 +918,26 @@ def _jax_global_source_and_mean(
     centering: Experiment5Centering,
     recomposition: Experiment5Recomposition,
     encoder_kind: Experiment5EncoderKind,
+    canonical_full_target: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     if encoder_kind == "sae":
-        target = jax_recompose_experiment5_full_ffn(
-            jnp.asarray(batch.expert_output),
-            jnp.asarray(batch.shared_normalized),
-            jnp.asarray(batch.router_weights),
-            recomposition,
+        target = (
+            jax_recompose_experiment5_full_ffn(
+                jnp.asarray(batch.expert_output),
+                jnp.asarray(batch.shared_normalized),
+                jnp.asarray(batch.router_weights),
+                recomposition,
+            )
+            if canonical_full_target is None
+            else jnp.asarray(canonical_full_target)
         )
+        if target.shape != (
+            jnp.asarray(batch.routed_input).shape[0],
+            jnp.asarray(batch.routed_input).shape[1],
+        ):
+            raise Experiment5Error(
+                "canonical full target must match the token/hidden axes"
+            )
         return target, jnp.asarray(centering.full_target_mean)
     return (
         jnp.asarray(batch.routed_input),
@@ -941,6 +953,7 @@ def forward_experiment5_global(
     layout: Experiment5Layout,
     *,
     encoder_kind: Experiment5EncoderKind,
+    canonical_full_target: jax.Array | None = None,
 ) -> Experiment5Forward:
     """Forward B/F global dictionary on full target (SAE) or common x (TC)."""
 
@@ -954,6 +967,7 @@ def forward_experiment5_global(
         centering,
         recomposition,
         selected_kind,
+        canonical_full_target,
     )
     compute_dtype = params.encoder.dtype
     centered = (
@@ -995,6 +1009,7 @@ def forward_experiment5(
     layout: Experiment5Layout,
     *,
     encoder_kind: Experiment5EncoderKind,
+    canonical_full_target: jax.Array | None = None,
 ) -> Experiment5Forward:
     """Dispatch the frozen H/R hybrid or B/F global scientific graph."""
 
@@ -1014,6 +1029,7 @@ def forward_experiment5(
         recomposition,
         layout,
         encoder_kind=encoder_kind,
+        canonical_full_target=canonical_full_target,
     )
 
 

@@ -82,6 +82,13 @@ class Experiment5DeviceScores(NamedTuple):
     shared_target_squared_norm_sum: Any | None
 
 
+class Experiment5CanonicalTargetScores(NamedTuple):
+    """Condition-independent full target and its per-token common SST."""
+
+    full_target: Any
+    full_sst: Any
+
+
 class Experiment5DeviceEvaluationHealth(NamedTuple):
     """Small replicated fail-closed health record for one evaluation chunk."""
 
@@ -153,6 +160,8 @@ def _build_experiment5_mapped_evaluator(
         bank_ids: jax.Array,
         router_weights: jax.Array,
         valid_mask: jax.Array,
+        canonical_full_target: jax.Array,
+        canonical_full_sst: jax.Array,
         source_mean: jax.Array,
         routed_target_mean: jax.Array,
         shared_target_mean: jax.Array,
@@ -168,24 +177,16 @@ def _build_experiment5_mapped_evaluator(
         parameter_dtype = params.encoder.dtype
 
         def one_micro(inputs):
-            source, expert, shared, banks, weights, valid = inputs
-            target = jax_recompose_experiment5_full_ffn(
+            (
+                source,
                 expert,
                 shared,
+                banks,
                 weights,
-                recomposition,
-            )
-            target32 = target.astype(jnp.float32)
-            full_mean32 = full_target_mean.astype(jnp.float32)
-            full_sst = jnp.where(
                 valid,
-                jnp.sum(
-                    jax.lax.square(target32 - full_mean32[None, :]),
-                    axis=1,
-                    dtype=jnp.float32,
-                ),
-                jnp.asarray(0.0, jnp.float32),
-            )
+                target,
+                full_sst,
+            ) = inputs
 
             if layout.is_hybrid:
                 if encoder_kind == "sae":
@@ -461,6 +462,8 @@ def _build_experiment5_mapped_evaluator(
                 bank_ids,
                 router_weights,
                 valid_mask,
+                canonical_full_target,
+                canonical_full_sst,
             ),
         )
         (
@@ -611,6 +614,8 @@ def _build_experiment5_mapped_evaluator(
             P(None, data_axis, None),
             P(None, data_axis, None),
             P(None, data_axis),
+            P(None, data_axis, None),
+            P(None, data_axis),
             P(None),
             P(None),
             P(None),
@@ -622,6 +627,231 @@ def _build_experiment5_mapped_evaluator(
         axis_names={data_axis, feature_axis},
         check_vma=False,
     )
+
+
+def _build_canonical_target_program(
+    mesh: Mesh,
+    distributed: DistributedConfig,
+    *,
+    epsilon: float,
+):
+    """Build the sole target graph used by every Experiment-5 condition.
+
+    This program is intentionally compiled and executed separately from the
+    condition scorer. Keeping the BF16 routed contraction and the FP32 SST
+    reduction outside the H/R/B/F graphs prevents XLA layout-specific fusion
+    and reassociation from manufacturing multiple numerical target bases.
+    """
+
+    data_axis = distributed.data_axis
+
+    def canonical_target(
+        expert_output: jax.Array,
+        shared_normalized: jax.Array,
+        router_weights: jax.Array,
+        valid_mask: jax.Array,
+        full_target_mean: jax.Array,
+        routed_scale: jax.Array,
+        outer_scale: jax.Array,
+    ) -> Experiment5CanonicalTargetScores:
+        recomposition = Experiment5Recomposition(
+            routed_scale=routed_scale,
+            outer_scale=outer_scale,
+            epsilon=epsilon,
+        )
+
+        def one_micro(inputs):
+            expert, shared, weights, valid = inputs
+            target = jax_recompose_experiment5_full_ffn(
+                expert,
+                shared,
+                weights,
+                recomposition,
+            )
+            target32 = target.astype(jnp.float32)
+            mean32 = full_target_mean.astype(jnp.float32)
+            sst = jnp.where(
+                valid,
+                jnp.sum(
+                    jax.lax.square(target32 - mean32[None, :]),
+                    axis=1,
+                    dtype=jnp.float32,
+                ),
+                jnp.asarray(0.0, jnp.float32),
+            )
+            return target, sst
+
+        target, sst = jax.lax.map(
+            one_micro,
+            (
+                expert_output,
+                shared_normalized,
+                router_weights,
+                valid_mask,
+            ),
+        )
+        return Experiment5CanonicalTargetScores(target, sst)
+
+    replicated = NamedSharding(mesh, P())
+    return jax.jit(
+        canonical_target,
+        in_shardings=(
+            NamedSharding(mesh, P(None, data_axis, None, None)),
+            NamedSharding(mesh, P(None, data_axis, None)),
+            NamedSharding(mesh, P(None, data_axis, None)),
+            NamedSharding(mesh, P(None, data_axis)),
+            replicated,
+            replicated,
+            replicated,
+        ),
+        out_shardings=Experiment5CanonicalTargetScores(
+            NamedSharding(mesh, P(None, data_axis, None)),
+            NamedSharding(mesh, P(None, data_axis)),
+        ),
+    )
+
+
+class Experiment5CanonicalTargetEvaluator:
+    """One reusable, separately materialized target program per evaluation."""
+
+    def __init__(
+        self,
+        mesh: Mesh,
+        distributed: DistributedConfig | None = None,
+        *,
+        hidden_dim: int,
+        top_routed: int,
+        rmsnorm_epsilon: float = 1e-6,
+    ) -> None:
+        if (
+            isinstance(hidden_dim, bool)
+            or not isinstance(hidden_dim, int)
+            or hidden_dim <= 0
+            or isinstance(top_routed, bool)
+            or not isinstance(top_routed, int)
+            or top_routed <= 0
+        ):
+            raise ValueError("canonical target dimensions must be positive")
+        if (
+            isinstance(rmsnorm_epsilon, bool)
+            or not isinstance(rmsnorm_epsilon, (int, float))
+            or not np.isfinite(rmsnorm_epsilon)
+            or rmsnorm_epsilon <= 0
+        ):
+            raise ValueError("rmsnorm_epsilon must be finite and positive")
+        self.mesh = mesh
+        self.distributed = distributed or DistributedConfig()
+        self.hidden_dim = hidden_dim
+        self.top_routed = top_routed
+        self.rmsnorm_epsilon = float(rmsnorm_epsilon)
+        self._compiled = _build_canonical_target_program(
+            mesh,
+            self.distributed,
+            epsilon=self.rmsnorm_epsilon,
+        )
+        self._executable = None
+        self._input_signature: tuple[tuple[int, ...], ...] | None = None
+        self._compile_count = 0
+
+    @property
+    def compile_count(self) -> int:
+        return self._compile_count
+
+    def _arguments(
+        self,
+        batch: Experiment5DistributedBatch,
+        full_target_mean: jax.Array,
+        routed_scale: jax.Array,
+        outer_scale: jax.Array,
+    ) -> tuple[jax.Array, ...]:
+        if (
+            batch.expert_output.ndim != 4
+            or batch.expert_output.shape[2:] != (
+                self.top_routed,
+                self.hidden_dim,
+            )
+            or batch.shared_normalized.shape
+            != (
+                batch.expert_output.shape[0],
+                batch.expert_output.shape[1],
+                self.hidden_dim,
+            )
+            or batch.router_weights.shape != batch.expert_output.shape[:3]
+            or batch.valid_mask.shape != batch.expert_output.shape[:2]
+        ):
+            raise ValueError("canonical target batch shapes are incompatible")
+        for name, value in (
+            ("full_target_mean", full_target_mean),
+            ("routed_scale", routed_scale),
+            ("outer_scale", outer_scale),
+        ):
+            if value.shape != (self.hidden_dim,):
+                raise ValueError(
+                    f"{name} must have shape [{self.hidden_dim}]"
+                )
+        return (
+            batch.expert_output,
+            batch.shared_normalized,
+            batch.router_weights,
+            batch.valid_mask,
+            full_target_mean,
+            routed_scale,
+            outer_scale,
+        )
+
+    def compile(
+        self,
+        batch: Experiment5DistributedBatch,
+        full_target_mean: jax.Array,
+        routed_scale: jax.Array,
+        outer_scale: jax.Array,
+    ) -> float:
+        """Compile once for the static evaluation shape, then reuse exactly."""
+
+        arguments = self._arguments(
+            batch,
+            full_target_mean,
+            routed_scale,
+            outer_scale,
+        )
+        signature = tuple(tuple(value.shape) for value in arguments)
+        if self._executable is not None:
+            if signature != self._input_signature:
+                raise ValueError(
+                    "canonical target executable input shape changed"
+                )
+            return 0.0
+        started = time.perf_counter()
+        self._executable = self._compiled.lower(*arguments).compile()
+        elapsed = time.perf_counter() - started
+        self._input_signature = signature
+        self._compile_count += 1
+        return elapsed
+
+    def score(
+        self,
+        batch: Experiment5DistributedBatch,
+        full_target_mean: jax.Array,
+        routed_scale: jax.Array,
+        outer_scale: jax.Array,
+    ) -> Experiment5CanonicalTargetScores:
+        """Execute and materialize the common target before condition scoring."""
+
+        arguments = self._arguments(
+            batch,
+            full_target_mean,
+            routed_scale,
+            outer_scale,
+        )
+        executable = (
+            self._compiled if self._executable is None else self._executable
+        )
+        scores = executable(*arguments)
+        # These explicit synchronization boundaries prevent the condition JIT
+        # from inlining or fusing the canonical target computation.
+        jax.block_until_ready(scores.full_target)
+        jax.block_until_ready(scores.full_sst)
+        return scores
 
 
 def _addressable_concat(value: jax.Array, *, axis: int) -> np.ndarray:
@@ -712,6 +942,9 @@ class Experiment5DistributedEvaluator:
         rmsnorm_epsilon: float = 1e-6,
         expected_physical_layout_sha256: str | None = None,
         require_pre_sharded_params: bool = True,
+        canonical_target_evaluator: (
+            Experiment5CanonicalTargetEvaluator | None
+        ) = None,
     ) -> None:
         if encoder_kind not in {"sae", "transcoder"}:
             raise ValueError("encoder_kind must be 'sae' or 'transcoder'")
@@ -741,6 +974,26 @@ class Experiment5DistributedEvaluator:
                 expected_physical_layout_sha256,
                 self.physical_layout,
             )
+        if canonical_target_evaluator is None:
+            canonical_target_evaluator = Experiment5CanonicalTargetEvaluator(
+                mesh,
+                self.distributed,
+                hidden_dim=layout.hidden_dim,
+                top_routed=layout.top_routed,
+                rmsnorm_epsilon=self.rmsnorm_epsilon,
+            )
+        elif (
+            canonical_target_evaluator.mesh is not mesh
+            or canonical_target_evaluator.distributed != self.distributed
+            or canonical_target_evaluator.hidden_dim != layout.hidden_dim
+            or canonical_target_evaluator.top_routed != layout.top_routed
+            or canonical_target_evaluator.rmsnorm_epsilon
+            != self.rmsnorm_epsilon
+        ):
+            raise ValueError(
+                "canonical target evaluator differs from condition geometry"
+            )
+        self.canonical_target_evaluator = canonical_target_evaluator
         mapped = _build_experiment5_mapped_evaluator(
             mesh,
             layout,
@@ -754,6 +1007,7 @@ class Experiment5DistributedEvaluator:
         def complete(
             params: SAEParams,
             batch: Experiment5DistributedBatch,
+            canonical_target: Experiment5CanonicalTargetScores,
             source_mean: jax.Array,
             routed_target_mean: jax.Array,
             shared_target_mean: jax.Array,
@@ -769,6 +1023,8 @@ class Experiment5DistributedEvaluator:
                 batch.bank_ids,
                 batch.router_weights,
                 batch.valid_mask,
+                canonical_target.full_target,
+                canonical_target.full_sst,
                 source_mean,
                 routed_target_mean,
                 shared_target_mean,
@@ -787,6 +1043,10 @@ class Experiment5DistributedEvaluator:
             in_shardings=(
                 self._param_shardings,
                 experiment5_batch_shardings(mesh, self.distributed),
+                Experiment5CanonicalTargetScores(
+                    NamedSharding(mesh, P(None, self.distributed.data_axis, None)),
+                    NamedSharding(mesh, P(None, self.distributed.data_axis)),
+                ),
                 replicated,
                 replicated,
                 replicated,
@@ -910,12 +1170,54 @@ class Experiment5DistributedEvaluator:
             process_local=process_local,
         )
         started = time.perf_counter()
+        self.canonical_target_evaluator.compile(
+            batch,
+            constants[3],
+            constants[4],
+            constants[5],
+        )
+        canonical_target = self.canonical_target_evaluator.score(
+            batch,
+            constants[3],
+            constants[4],
+            constants[5],
+        )
         self._executable = self._compiled.lower(
             params,
             batch,
+            canonical_target,
             *constants,
         ).compile()
         return time.perf_counter() - started
+
+    def canonical_target_scores(
+        self,
+        microbatches: Sequence[Any] | Experiment5DistributedBatch,
+        centering: Experiment5Centering,
+        recomposition: Experiment5Recomposition,
+        *,
+        process_local: bool = False,
+    ) -> Experiment5CanonicalTargetScores:
+        """Materialize the exact target/SST inputs consumed by this scorer."""
+
+        batch, constants = self._prepare(
+            microbatches,
+            centering,
+            recomposition,
+            process_local=process_local,
+        )
+        self.canonical_target_evaluator.compile(
+            batch,
+            constants[3],
+            constants[4],
+            constants[5],
+        )
+        return self.canonical_target_evaluator.score(
+            batch,
+            constants[3],
+            constants[4],
+            constants[5],
+        )
 
     def score(
         self,
@@ -940,8 +1242,19 @@ class Experiment5DistributedEvaluator:
             recomposition,
             process_local=process_local,
         )
+        canonical_target = self.canonical_target_evaluator.score(
+            batch,
+            constants[3],
+            constants[4],
+            constants[5],
+        )
         executable = self._compiled if self._executable is None else self._executable
-        scores, health = executable(params, batch, *constants)
+        scores, health = executable(
+            params,
+            batch,
+            canonical_target,
+            *constants,
+        )
         checked = jax.device_get(health)
         if bool(checked.capacity_overflow):
             raise RuntimeError(
@@ -967,6 +1280,8 @@ class Experiment5DistributedEvaluator:
 
 
 __all__ = [
+    "Experiment5CanonicalTargetEvaluator",
+    "Experiment5CanonicalTargetScores",
     "Experiment5DeviceEvaluationHealth",
     "Experiment5DeviceScores",
     "Experiment5DistributedEvaluator",

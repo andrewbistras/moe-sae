@@ -50,6 +50,7 @@ from moe_sae.experiment5_config import (
     load_experiment5_config,
 )
 from moe_sae.experiment5_device_evaluation import (
+    Experiment5CanonicalTargetEvaluator,
     Experiment5DistributedEvaluator,
     process_local_experiment5_device_scores,
 )
@@ -924,6 +925,13 @@ def run(args: argparse.Namespace) -> int:
         ),
         epsilon=float(decoded_sidecar.epsilon),
     )
+    canonical_target_evaluator = Experiment5CanonicalTargetEvaluator(
+        mesh,
+        distributed,
+        hidden_dim=2_816,
+        top_routed=8,
+        rmsnorm_epsilon=float(recomposition.epsilon),
+    )
 
     evidence: dict[str, dict[str, Any]] = {}
     common_centering_sha: str | None = None
@@ -1105,6 +1113,7 @@ def run(args: argparse.Namespace) -> int:
             expected_physical_layout_sha256=context[
                 "physical_feature_layout_identity"
             ]["identity_sha256"],
+            canonical_target_evaluator=canonical_target_evaluator,
         )
         iterator = iter(source.iter_updates())
         try:

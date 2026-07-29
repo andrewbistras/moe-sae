@@ -10,10 +10,14 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from moe_sae.contribution_training import ContributionOptimizerConfig
 from moe_sae.distributed import DistributedConfig, create_mesh
 from moe_sae.experiment5_device_evaluation import (
+    Experiment5CanonicalTargetEvaluator,
+    Experiment5CanonicalTargetScores,
     Experiment5DistributedEvaluator,
     process_local_experiment5_device_scores,
 )
@@ -143,6 +147,21 @@ def test_device_rows_match_scientific_forward(
     mesh = create_mesh(distributed, devices=np.asarray(jax.devices()[:1]))
     state = _state(layout)
     batch = _batch()
+    evaluator = Experiment5DistributedEvaluator(
+        mesh,
+        layout,
+        distributed,
+        encoder_kind=encoder_kind,  # type: ignore[arg-type]
+        bank_capacity=1 if layout.is_hybrid else None,
+    )
+    canonical = evaluator.canonical_target_scores(
+        [batch],
+        _centering(),
+        _recomposition(),
+    )
+    canonical_target = canonical.full_target[0]
+    canonical_sst = canonical.full_sst[0]
+
     def reference_objective(params):
         output = forward_experiment5(
             params,
@@ -151,13 +170,9 @@ def test_device_rows_match_scientific_forward(
             _recomposition(),
             layout,
             encoder_kind=encoder_kind,  # type: ignore[arg-type]
+            canonical_full_target=canonical_target,
         )
-        target_value = jax_recompose_experiment5_full_ffn(
-            batch.expert_output,
-            batch.shared_normalized,
-            batch.router_weights,
-            _recomposition(),
-        )
+        target_value = canonical_target
         full_rows = jnp.sum(
             jax.lax.square(
                 target_value.astype(jnp.float32)
@@ -166,13 +181,7 @@ def test_device_rows_match_scientific_forward(
             axis=1,
             dtype=jnp.float32,
         )
-        sst_rows = _sse_jax(
-            target_value,
-            jnp.broadcast_to(
-                jnp.asarray(_centering().full_target_mean)[None, :],
-                target_value.shape,
-            ),
-        )
+        sst_rows = canonical_sst
         if layout.is_hybrid:
             assert output.routed_reconstruction is not None
             assert output.shared_reconstruction is not None
@@ -228,13 +237,6 @@ def test_device_rows_match_scientific_forward(
         reference_full_sst,
         diagnostics,
     ) = reference_aux
-    evaluator = Experiment5DistributedEvaluator(
-        mesh,
-        layout,
-        distributed,
-        encoder_kind=encoder_kind,  # type: ignore[arg-type]
-        bank_capacity=1 if layout.is_hybrid else None,
-    )
     physical = shard_experiment5_train_state(
         state,
         mesh,
@@ -359,6 +361,190 @@ def test_device_rows_match_scientific_forward(
         assert compact.routed_target_squared_norm_sum is None
         assert compact.shared_target_sum is None
         assert compact.shared_target_squared_norm_sum is None
+
+
+def test_one_materialized_target_is_bitwise_common_across_layouts() -> None:
+    distributed = DistributedConfig(
+        data_axis_size=1,
+        feature_axis_size=1,
+        microbatches_per_update=1,
+    )
+    mesh = create_mesh(distributed, devices=np.asarray(jax.devices()[:1]))
+    common = Experiment5CanonicalTargetEvaluator(
+        mesh,
+        distributed,
+        hidden_dim=3,
+        top_routed=2,
+    )
+    target_rows: list[np.ndarray] = []
+    sst_rows: list[np.ndarray] = []
+    condition_sst_rows: list[np.ndarray] = []
+
+    for condition in ("H", "R", "B", "F"):
+        layout = _layout(condition)
+        evaluator = Experiment5DistributedEvaluator(
+            mesh,
+            layout,
+            distributed,
+            encoder_kind="sae",
+            bank_capacity=1 if layout.is_hybrid else None,
+            canonical_target_evaluator=common,
+        )
+        canonical = evaluator.canonical_target_scores(
+            [_batch()],
+            _centering(),
+            _recomposition(),
+        )
+        target_rows.append(np.asarray(canonical.full_target))
+        sst_rows.append(np.asarray(canonical.full_sst))
+        physical = shard_experiment5_train_state(
+            _state(layout),
+            mesh,
+            layout,
+            _optimizer(),
+            distributed,
+        )
+        condition_scores = process_local_experiment5_device_scores(
+            evaluator.score(
+                physical,
+                [_batch()],
+                _centering(),
+                _recomposition(),
+            )
+        )
+        condition_sst_rows.append(condition_scores.full_sst)
+
+    assert common.compile_count == 1
+    for target in target_rows[1:]:
+        np.testing.assert_array_equal(target, target_rows[0])
+    for sst in (*sst_rows[1:], *condition_sst_rows):
+        np.testing.assert_array_equal(
+            np.asarray(sst).reshape(-1),
+            sst_rows[0].reshape(-1),
+        )
+
+
+@pytest.mark.parametrize("condition", ["H", "R", "B", "F"])
+def test_condition_scorer_consumes_injected_canonical_basis(
+    condition: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    distributed = DistributedConfig(
+        data_axis_size=1,
+        feature_axis_size=1,
+        microbatches_per_update=1,
+    )
+    mesh = create_mesh(distributed, devices=np.asarray(jax.devices()[:1]))
+    layout = _layout(condition)
+    batch = _batch()
+    state = _state(layout)
+    state = state._replace(
+        params=state.params._replace(
+            decoder=jnp.zeros_like(state.params.decoder),
+        )
+    )
+    zero_centering = Experiment5Centering(
+        *(np.zeros((layout.hidden_dim,), dtype=np.float32) for _ in range(4))
+    )
+    common = Experiment5CanonicalTargetEvaluator(
+        mesh,
+        distributed,
+        hidden_dim=layout.hidden_dim,
+        top_routed=layout.top_routed,
+    )
+    target_sharding = NamedSharding(mesh, P(None, "data", None))
+    sst_sharding = NamedSharding(mesh, P(None, "data"))
+    injected_target_value = [-2.0]
+    injected_sst_value = [7.0]
+
+    def injected_scores(
+        placed_batch,
+        _full_target_mean,
+        _routed_scale,
+        _outer_scale,
+    ) -> Experiment5CanonicalTargetScores:
+        target = jax.device_put(
+            jnp.full(
+                (*placed_batch.expert_output.shape[:2], layout.hidden_dim),
+                injected_target_value[0],
+                dtype=jnp.bfloat16,
+            ),
+            target_sharding,
+        )
+        sst = jax.device_put(
+            jnp.full(
+                placed_batch.expert_output.shape[:2],
+                injected_sst_value[0],
+                dtype=jnp.float32,
+            ),
+            sst_sharding,
+        )
+        return Experiment5CanonicalTargetScores(target, sst)
+
+    monkeypatch.setattr(common, "score", injected_scores)
+    evaluator = Experiment5DistributedEvaluator(
+        mesh,
+        layout,
+        distributed,
+        # The transcoder reconstruction is independent of the full target,
+        # so changing only the injected target isolates its use in full SSE.
+        encoder_kind="transcoder",
+        bank_capacity=1 if layout.is_hybrid else None,
+        canonical_target_evaluator=common,
+    )
+    physical = shard_experiment5_train_state(
+        state,
+        mesh,
+        layout,
+        _optimizer(),
+        distributed,
+    )
+
+    first = process_local_experiment5_device_scores(
+        evaluator.score(
+            physical,
+            [batch],
+            zero_centering,
+            _recomposition(),
+        )
+    )
+    injected_target_value[0] = 3.0
+    injected_sst_value[0] = 11.0
+    second = process_local_experiment5_device_scores(
+        evaluator.score(
+            physical,
+            [batch],
+            zero_centering,
+            _recomposition(),
+        )
+    )
+
+    # A zero decoder and zero decoder means make every reconstruction exactly
+    # zero. The only possible full-SSE values are therefore ||target||².
+    np.testing.assert_array_equal(
+        first.full_sse,
+        np.full(
+            (batch.valid_mask.shape[0],),
+            layout.hidden_dim * 4.0,
+            dtype=np.float32,
+        ),
+    )
+    np.testing.assert_array_equal(
+        second.full_sse,
+        np.full(
+            (batch.valid_mask.shape[0],),
+            layout.hidden_dim * 9.0,
+            dtype=np.float32,
+        ),
+    )
+    np.testing.assert_array_equal(
+        first.full_sst,
+        np.full((batch.valid_mask.shape[0],), 7.0, dtype=np.float32),
+    )
+    np.testing.assert_array_equal(
+        second.full_sst,
+        np.full((batch.valid_mask.shape[0],), 11.0, dtype=np.float32),
+    )
 
 
 def test_padding_rows_are_zeroed_and_ids_are_negative_one() -> None:
@@ -521,6 +707,164 @@ assert rows.full_sse.dtype == np.float32
 """
     environment = dict(os.environ)
     environment["XLA_FLAGS"] = "--xla_force_host_platform_device_count=2"
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=180,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_canonical_target_preserves_exact_two_axis_sharding_and_dtype() -> None:
+    script = r"""
+import jax
+import jax.numpy as jnp
+import numpy as np
+from jax.sharding import PartitionSpec as P
+
+from moe_sae.contribution_training import ContributionOptimizerConfig
+from moe_sae.distributed import DistributedConfig, create_mesh
+from moe_sae.experiment5_device_evaluation import (
+    Experiment5CanonicalTargetEvaluator,
+    Experiment5DistributedEvaluator,
+    process_local_experiment5_device_scores,
+)
+from moe_sae.experiment5_distributed import shard_experiment5_train_state
+from moe_sae.experiment5_hybrid import (
+    Experiment5Batch,
+    Experiment5Centering,
+    Experiment5Layout,
+    Experiment5Recomposition,
+    init_experiment5_train_state,
+)
+
+assert jax.device_count() == 4
+distributed = DistributedConfig(
+    data_axis_size=2,
+    feature_axis_size=2,
+    microbatches_per_update=1,
+)
+mesh = create_mesh(distributed)
+optimizer = ContributionOptimizerConfig(
+    parameter_dtype="float32",
+    peak_lr=1e-3,
+    min_lr=1e-3,
+    warmup_steps=0,
+    total_steps=2,
+)
+batch = Experiment5Batch(
+    routed_input=np.asarray(
+        [[1.0, 0.2, -0.5], [0.3, -0.7, 0.1]],
+        np.float32,
+    ),
+    expert_output=(
+        np.arange(12, dtype=np.float32).reshape(2, 2, 3) / 10.0
+        + 0.1
+    ),
+    shared_normalized=np.asarray(
+        [[0.2, 0.3, -0.1], [0.3, -0.2, 0.4]],
+        np.float32,
+    ),
+    bank_ids=np.asarray([[0, 1], [2, 3]], np.int32),
+    router_weights=np.asarray(
+        [[0.6, 0.4], [0.25, 0.75]],
+        np.float32,
+    ),
+    valid_mask=np.ones((2,), np.bool_),
+)
+centering = Experiment5Centering(
+    source_mean=np.asarray([0.1, -0.2, 0.05], np.float32),
+    routed_target_mean=np.asarray([0.2, 0.1, -0.1], np.float32),
+    shared_target_mean=np.asarray([-0.1, 0.2, 0.05], np.float32),
+    full_target_mean=np.asarray([0.0, 0.1, -0.2], np.float32),
+)
+recomposition = Experiment5Recomposition(
+    routed_scale=np.asarray([0.75, 1.0, 1.25], np.float32),
+    outer_scale=np.asarray([1.125, 0.875, 1.0], np.float32),
+)
+common = Experiment5CanonicalTargetEvaluator(
+    mesh,
+    distributed,
+    hidden_dim=3,
+    top_routed=2,
+)
+targets = []
+canonical_ssts = []
+condition_ssts = []
+
+for condition in ("H", "R", "B", "F"):
+    layout = Experiment5Layout(
+        condition=condition,
+        hidden_dim=3,
+        num_experts=4,
+        top_routed=2,
+        routed_bank_width=2,
+        routed_k=1,
+        shared_width=4,
+        shared_k=2,
+        randomization_key=17,
+    )
+    evaluator = Experiment5DistributedEvaluator(
+        mesh,
+        layout,
+        distributed,
+        encoder_kind="sae",
+        bank_capacity=1 if layout.is_hybrid else None,
+        canonical_target_evaluator=common,
+    )
+    canonical = evaluator.canonical_target_scores(
+        [batch],
+        centering,
+        recomposition,
+    )
+    assert canonical.full_target.dtype == jnp.bfloat16
+    assert canonical.full_sst.dtype == jnp.float32
+    assert canonical.full_target.sharding.spec == P(None, "data", None)
+    assert canonical.full_sst.sharding.spec == P(None, "data")
+    targets.append(np.asarray(canonical.full_target))
+    canonical_ssts.append(np.asarray(canonical.full_sst))
+
+    state = init_experiment5_train_state(
+        jax.random.key(31),
+        layout,
+        optimizer,
+    )
+    state = state._replace(
+        params=state.params._replace(
+            bias=3.0 * jnp.ones_like(state.params.bias),
+        )
+    )
+    physical = shard_experiment5_train_state(
+        state,
+        mesh,
+        layout,
+        optimizer,
+        distributed,
+    )
+    scores = process_local_experiment5_device_scores(
+        evaluator.score(
+            physical,
+            [batch],
+            centering,
+            recomposition,
+        )
+    )
+    condition_ssts.append(scores.full_sst)
+
+assert common.compile_count == 1
+for target in targets[1:]:
+    np.testing.assert_array_equal(target, targets[0])
+for sst in (*canonical_ssts[1:], *condition_ssts):
+    np.testing.assert_array_equal(
+        np.asarray(sst).reshape(-1),
+        canonical_ssts[0].reshape(-1),
+    )
+"""
+    environment = dict(os.environ)
+    environment["XLA_FLAGS"] = "--xla_force_host_platform_device_count=4"
     completed = subprocess.run(
         [sys.executable, "-c", script],
         env=environment,
