@@ -131,14 +131,14 @@ def _expected_progress(
 ) -> tuple[int, int]:
     identity = result.get("run_identity")
     run_plan = identity.get("plan") if isinstance(identity, Mapping) else None
-    optimizer = run_plan.get("optimizer") if isinstance(run_plan, Mapping) else None
-    if not isinstance(run_plan, Mapping) or not isinstance(optimizer, Mapping):
+    if not isinstance(run_plan, Mapping):
         raise RoutedLadderCampaignStateError(
             "training result lacks immutable optimizer progress"
         )
     microbatch = run_plan.get("global_microbatch_tokens")
-    accumulation = optimizer.get("gradient_accumulation_steps")
+    accumulation = run_plan.get("microbatches_per_update")
     total = run_plan.get("total_tokens")
+    planned_updates = run_plan.get("planned_updates")
     if (
         isinstance(microbatch, bool)
         or not isinstance(microbatch, int)
@@ -147,6 +147,10 @@ def _expected_progress(
         or not isinstance(accumulation, int)
         or accumulation <= 0
         or total != 10_000_000
+        or isinstance(planned_updates, bool)
+        or not isinstance(planned_updates, int)
+        or planned_updates
+        != math.ceil(int(total) / (microbatch * accumulation))
     ):
         raise RoutedLadderCampaignStateError(
             "training result progress contract changed"

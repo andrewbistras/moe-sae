@@ -24,6 +24,7 @@ from moe_sae.experiment5_routed_ladder_v3_evaluation import (
     CONDITIONS,
     OPERATOR_MANIFEST_SCHEMA_VERSION,
     PLAN_SCHEMA_VERSION,
+    _expected_progress,
     validate_v3_primary_evaluation_plan,
 )
 
@@ -105,6 +106,22 @@ def test_v3_resident_bundle_accepts_only_exact_primary_pair(
         if row.reference_kind == "trained_v3"
     } == {"a" * 40}
     assert bundle.source_revision == "e" * 40
+
+
+def test_v3_milestone_progress_reads_the_real_worker_plan_shape() -> None:
+    result = {
+        "run_identity": {
+            "plan": {
+                "global_microbatch_tokens": 4096,
+                "microbatches_per_update": 4,
+                "planned_updates": 611,
+                "total_tokens": 10_000_000,
+            }
+        }
+    }
+
+    assert _expected_progress(result, 2_000_000) == (123, 2_015_232)
+    assert _expected_progress(result, 10_000_000) == (611, 10_000_000)
 
 
 def test_v3_import_requires_its_v2_config(tmp_path: Path) -> None:
