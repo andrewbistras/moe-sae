@@ -563,7 +563,7 @@ export TPUOPS_UID="$(id -u tpuops)"
 export TPUOPS_BUS="unix:path=/run/user/$TPUOPS_UID/bus"
 
 test "$(loginctl show-user tpuops -p Linger --value)" = yes
-test -S "/run/user/$TPUOPS_UID/bus"
+sudo -u tpuops test -S "/run/user/$TPUOPS_UID/bus"
 sha256sum "$HANDOFF"
 sudo -u tpuops env \
   HOME=/home/tpuops \
