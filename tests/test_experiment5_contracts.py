@@ -52,7 +52,7 @@ def _load_json(path: Path) -> dict:
 @pytest.mark.parametrize(
     ("path", "panel", "activation"),
     [
-        (SAE_CONFIG, "sae", "relu"),
+        (SAE_CONFIG, "sae", "softplus"),
         (TRANSCODER_CONFIG, "transcoder", "softplus"),
     ],
 )
@@ -78,6 +78,7 @@ def test_experiment5_configs_freeze_identity_schedule_and_budget(
     training = config["training"]
     assert training["seeds"] == [0, 1, 2]
     assert training["encoder_activation"] == activation
+    assert training["softplus_positive_floor"] == "smallest_normal_float32"
     assert training["train_tokens"] == 10_000_000
     assert training["eval_tokens"] == 250_000
     assert training["effective_batch_tokens"] == 16_384

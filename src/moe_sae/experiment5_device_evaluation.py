@@ -141,7 +141,9 @@ def _build_experiment5_mapped_evaluator(
     elif bank_capacity is not None:
         raise ValueError("B/F global evaluation does not accept bank capacity")
     capacity = int(bank_capacity or 1)
-    activation = "relu" if encoder_kind == "sae" else "softplus"
+    # Both panels use Softplus so exact positive TopK is guaranteed by the
+    # graph rather than assumed from a particular training state.
+    activation = "softplus"
 
     def local_evaluate(
         params: SAEParams,

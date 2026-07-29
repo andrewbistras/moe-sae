@@ -1,6 +1,6 @@
 # Experiment 5: Routed–Shared Hybrid Sparse Models
 
-Status: frozen implementation contract, 2026-07-28
+Status: frozen implementation contract, amended pre-result 2026-07-29
 
 Protocol ID: `gemma4-routed-shared-hybrid-v1-20260728`
 
@@ -38,6 +38,24 @@ learning-horizon result:
 The routed experiment has passed its launch condition. This experiment now
 tests that frozen 32/32 allocation without a width sweep, revival loss,
 pruning rule, or post-result repair.
+
+## Pre-result SAE activation reset
+
+The first SAE launch exposed an implementation-contract failure before a
+complete panel or scientific verdict existed. Under the originally specified
+ReLU encoder, H seed 0 accepted 73 updates (1,196,032 tokens) and H seed 1
+accepted 70 updates (1,146,880 tokens), then each failed closed because a
+bank-local selection had fewer than its required number of strictly positive
+candidates. This was positive-support collapse under exact-positive TopK, not
+a capacity overflow and not evidence about held-out reconstruction quality.
+
+The ReLU SAE protocol is therefore retired. Its partial artifacts remain
+audit evidence only and are excluded from every Experiment-5 metric, report,
+and resume path. The SAE panel restarts H/R/B/F from scratch in a disjoint run
+namespace. All four conditions use softplus with a smallest-normal positive
+FP32 floor, so the change repairs the strict-L0 numerical contract without
+giving the hybrid conditions a different encoder nonlinearity from their
+controls. ReLU and softplus trajectories must never be combined.
 
 ## Primary question
 
@@ -215,11 +233,11 @@ For H/R:
 
 For B/F, the encoder receives `y_t` and reconstructs `y_t` directly.
 
-The panel retains the parent SAE's ReLU encoder semantics, exact-positive
-TopK, initialization, optimizer, and decoder normalization. Routed source
-centering uses one pooled raw-expert-output mean; shared source centering uses
-one global `q_t` mean; and B/F use the one global `y_t` mean. There are no
-per-expert means.
+All H/R/B/F conditions use softplus with a smallest-normal positive FP32
+floor, exact-positive TopK, the frozen initialization and optimizer, and
+decoder normalization. Routed source centering uses one pooled raw-expert-
+output mean; shared source centering uses one global `q_t` mean; and B/F use
+the one global `y_t` mean. There are no per-expert means.
 
 Because H/R receive native decomposed operands while B/F receive the composed
 output, this panel is evidence about representation boundaries, not a
@@ -282,9 +300,11 @@ The optimizer contract is:
 - tangent-space decoder-gradient projection; and
 - decoder-column renormalization after every update.
 
-Every selection must contain exactly 64 strictly positive latents. Ties use
-ascending global latent ID. Nonfinite state, insufficient positive
-candidates, capacity overflow, token dropping, or L0 drift is a hard failure.
+Every selection must contain exactly 64 strictly positive latents. Both
+panels compute softplus in FP32 and floor its result at the smallest normal
+positive FP32 value before deterministic TopK. Ties use ascending global
+latent ID. Nonfinite state, insufficient positive candidates, capacity
+overflow, token dropping, or L0 drift is a hard failure.
 
 ## Execution, performance, and hard cost ceiling
 
@@ -501,7 +521,8 @@ reported independently and cannot rescue a failed transcoder claim.
 - independent NumPy/JAX parity for routed decode, shared decode, exact Gemma
   recomposition, and full-FFN normalized SSE;
 - sparse decode parity without dense latent materialization;
-- exact-positive deterministic TopK for all four layouts;
+- exact-positive deterministic TopK for all four layouts, including extreme
+  negative finite preactivations under the softplus FP32 floor;
 - common target SST equality across conditions;
 - interrupted-versus-uninterrupted checkpoint parity;
 - exact 2M/5M/10M milestone restoration;

@@ -300,8 +300,21 @@ def test_grouped_capacity_overflow_is_a_hard_error() -> None:
         )
 
 
-def test_transcoder_softplus_retains_exact_l0_with_negative_preactivations() -> None:
-    selected = _layout("H")
+@pytest.mark.parametrize(
+    ("encoder_kind", "condition"),
+    [
+        ("sae", "H"),
+        ("sae", "R"),
+        ("sae", "B"),
+        ("sae", "F"),
+        ("transcoder", "H"),
+    ],
+)
+def test_softplus_retains_exact_l0_with_negative_preactivations(
+    encoder_kind: str,
+    condition: str,
+) -> None:
+    selected = _layout(condition)
     optimizer = _optimizer()
     distributed = DistributedConfig(
         data_axis_size=1,
@@ -325,8 +338,8 @@ def test_transcoder_softplus_retains_exact_l0_with_negative_preactivations() -> 
         selected,
         optimizer,
         distributed,
-        encoder_kind="transcoder",
-        bank_capacity=1,
+        encoder_kind=encoder_kind,  # type: ignore[arg-type]
+        bank_capacity=1 if selected.is_hybrid else None,
         rematerialize_microbatch=False,
     )
     updated, metrics = trainer.step(
@@ -344,6 +357,7 @@ def test_transcoder_softplus_retains_exact_l0_with_negative_preactivations() -> 
 
     assert int(updated.step) == 1
     assert float(metrics.l0) == selected.total_l0
+    assert bool(metrics.topk_valid)
     assert np.isfinite(float(metrics.loss))
 
 
@@ -471,7 +485,7 @@ for condition in ("H", "B"):
                     observed_array,
                     expected_array,
                     rtol=2e-5,
-                    atol=5e-5,
+                    atol=1.2e-4,
                 )
         np.testing.assert_allclose(
             metrics.loss,

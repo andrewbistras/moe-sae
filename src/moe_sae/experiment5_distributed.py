@@ -353,6 +353,11 @@ class Experiment5DistributedLossAux(NamedTuple):
     l0_sum: jax.Array
     valid_tokens: jax.Array
     topk_valid: jax.Array
+    routed_topk_valid: jax.Array
+    shared_topk_valid: jax.Array
+    global_topk_valid: jax.Array
+    inputs_valid: jax.Array
+    constants_finite: jax.Array
     fired_mask: jax.Array
     capacity_overflow: jax.Array
 
@@ -987,7 +992,9 @@ def _build_experiment5_mapped_objective(
     compute_dtype = (
         jnp.bfloat16 if parameter_dtype == "bfloat16" else jnp.float32
     )
-    activation = "relu" if encoder_kind == "sae" else "softplus"
+    # Exact positive TopK is a protocol invariant for both panels. ReLU made
+    # that invariant probabilistic once learned SAE biases moved negative.
+    activation = "softplus"
 
     def local_objective(
         differentiable_params: SAEParams,
@@ -1010,6 +1017,11 @@ def _build_experiment5_mapped_objective(
             jnp.asarray(0, jnp.int32),
             jnp.asarray(0, jnp.int32),
             jnp.asarray(True),
+            jnp.asarray(True),
+            jnp.asarray(True),
+            jnp.asarray(True),
+            jnp.asarray(True),
+            jnp.asarray(True),
             jnp.zeros((physical.local_features,), jnp.bool_),
             jnp.asarray(False),
         )
@@ -1026,6 +1038,11 @@ def _build_experiment5_mapped_objective(
                 l0_sum,
                 token_count,
                 valid_topk,
+                valid_routed_topk,
+                valid_shared_topk,
+                valid_global_topk,
+                valid_inputs,
+                finite_constants,
                 fired,
                 overflow,
             ) = carry
@@ -1152,12 +1169,14 @@ def _build_experiment5_mapped_objective(
                     jnp.sum(routed_scientific, dtype=jnp.int32)
                     + jnp.sum(shared_scientific, dtype=jnp.int32)
                 )
-                topk_here = (
-                    jnp.all(
-                        routed_selection.valid | ~flat_component_valid
-                    )
-                    & jnp.all(shared_selection.valid | ~valid)
+                routed_topk_here = jnp.all(
+                    routed_selection.valid | ~flat_component_valid
                 )
+                shared_topk_here = jnp.all(
+                    shared_selection.valid | ~valid
+                )
+                global_topk_here = jnp.asarray(True)
+                topk_here = routed_topk_here & shared_topk_here
             else:
                 if encoder_kind == "sae":
                     global_source = target
@@ -1205,7 +1224,10 @@ def _build_experiment5_mapped_objective(
                     feature_axis=feature_axis,
                 )
                 l0_here = jnp.sum(scientific, dtype=jnp.int32)
-                topk_here = jnp.all(selection.valid | ~valid)
+                routed_topk_here = jnp.asarray(True)
+                shared_topk_here = jnp.asarray(True)
+                global_topk_here = jnp.all(selection.valid | ~valid)
+                topk_here = global_topk_here
                 overflow_here = jnp.asarray(False)
 
             target32 = target.astype(jnp.float32)
@@ -1254,6 +1276,11 @@ def _build_experiment5_mapped_objective(
                 & topk_here
                 & inputs_valid
                 & constants_finite,
+                valid_routed_topk & routed_topk_here,
+                valid_shared_topk & shared_topk_here,
+                valid_global_topk & global_topk_here,
+                valid_inputs & inputs_valid,
+                finite_constants & constants_finite,
                 fired | fired_here,
                 overflow | overflow_here,
             ), None
@@ -1281,6 +1308,11 @@ def _build_experiment5_mapped_objective(
             local_l0,
             local_tokens,
             topk_valid,
+            routed_topk_valid,
+            shared_topk_valid,
+            global_topk_valid,
+            inputs_valid,
+            constants_finite,
             fired,
             overflow,
         ) = scanned
@@ -1300,13 +1332,21 @@ def _build_experiment5_mapped_objective(
             jax.lax.psum(local_tokens.astype(jnp.float32), data_axis),
             feature_axis,
         ).astype(jnp.int32)
-        topk_valid = (
-            jax.lax.pmin(
-                topk_valid.astype(jnp.int32),
-                (data_axis, feature_axis),
+        def global_all(value: jax.Array) -> jax.Array:
+            return (
+                jax.lax.pmin(
+                    value.astype(jnp.int32),
+                    (data_axis, feature_axis),
+                )
+                > 0
             )
-            > 0
-        )
+
+        topk_valid = global_all(topk_valid)
+        routed_topk_valid = global_all(routed_topk_valid)
+        shared_topk_valid = global_all(shared_topk_valid)
+        global_topk_valid = global_all(global_topk_valid)
+        inputs_valid = global_all(inputs_valid)
+        constants_finite = global_all(constants_finite)
         overflow = (
             jax.lax.pmax(
                 overflow.astype(jnp.int32),
@@ -1321,6 +1361,11 @@ def _build_experiment5_mapped_objective(
             l0_sum=global_l0,
             valid_tokens=global_tokens,
             topk_valid=topk_valid,
+            routed_topk_valid=routed_topk_valid,
+            shared_topk_valid=shared_topk_valid,
+            global_topk_valid=global_topk_valid,
+            inputs_valid=inputs_valid,
+            constants_finite=constants_finite,
             fired_mask=fired,
             capacity_overflow=overflow,
         )
@@ -1333,6 +1378,11 @@ def _build_experiment5_mapped_objective(
         return loss, aux
 
     aux_specs = Experiment5DistributedLossAux(
+        P(),
+        P(),
+        P(),
+        P(),
+        P(),
         P(),
         P(),
         P(),
@@ -1648,6 +1698,11 @@ class Experiment5DistributedTrainer:
         (
             overflow,
             topk_valid,
+            routed_topk_valid,
+            shared_topk_valid,
+            global_topk_valid,
+            inputs_valid,
+            constants_finite,
             l0_sum,
             valid_tokens,
             metrics_finite,
@@ -1656,6 +1711,11 @@ class Experiment5DistributedTrainer:
             (
                 aux.capacity_overflow,
                 aux.topk_valid,
+                aux.routed_topk_valid,
+                aux.shared_topk_valid,
+                aux.global_topk_valid,
+                aux.inputs_valid,
+                aux.constants_finite,
                 aux.l0_sum,
                 aux.valid_tokens,
                 metrics_finite,
@@ -1667,10 +1727,32 @@ class Experiment5DistributedTrainer:
                 "H/R routed bank exceeded its precomputed grouped-GEMM "
                 "capacity; no update was accepted"
             )
+        if not bool(inputs_valid):
+            raise RuntimeError(
+                "invalid Experiment-5 scientific inputs; no update was accepted"
+            )
+        if not bool(constants_finite):
+            raise RuntimeError(
+                "non-finite Experiment-5 constants; no update was accepted"
+            )
+        if not bool(routed_topk_valid):
+            raise RuntimeError(
+                "a routed component had fewer than its exact positive TopK "
+                "budget; no update was accepted"
+            )
+        if not bool(shared_topk_valid):
+            raise RuntimeError(
+                "the shared component had fewer than its exact positive TopK "
+                "budget; no update was accepted"
+            )
+        if not bool(global_topk_valid):
+            raise RuntimeError(
+                "a global dictionary row had fewer than its exact positive "
+                "TopK budget; no update was accepted"
+            )
         if not bool(topk_valid):
             raise RuntimeError(
-                "invalid Experiment-5 inputs or fewer than the exact positive "
-                "TopK budget; no update was accepted"
+                "Experiment-5 TopK validation failed; no update was accepted"
             )
         token_count = int(valid_tokens)
         _validate_exact_distributed_l0(

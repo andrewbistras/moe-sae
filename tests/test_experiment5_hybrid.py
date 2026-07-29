@@ -447,7 +447,7 @@ def test_evaluation_scores_use_one_common_mean_and_mask_padding() -> None:
     assert scores.ev == pytest.approx(0.9)
 
 
-def test_sae_relu_fails_closed_if_exact_positive_budget_is_unavailable() -> None:
+def test_sae_softplus_preserves_exact_positive_budget_for_negative_bias() -> None:
     selected = layout("H")
     loss, sums = normalized_experiment5_loss(
         params(selected, seed=90, bias=-100.0),
@@ -458,5 +458,6 @@ def test_sae_relu_fails_closed_if_exact_positive_budget_is_unavailable() -> None
         encoder_kind="sae",
     )
 
-    assert not bool(sums.topk_valid)
-    assert np.isnan(float(loss))
+    assert bool(sums.topk_valid)
+    assert int(sums.l0_sum) == selected.total_l0 * 2
+    assert np.isfinite(float(loss))

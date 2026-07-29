@@ -473,9 +473,15 @@ def _validate_encoder_kind(kind: str) -> Experiment5EncoderKind:
 
 
 def _jax_activation(value: jax.Array, kind: Experiment5EncoderKind) -> jax.Array:
+    """Apply Experiment 5's strictly-positive encoder nonlinearity.
+
+    ``kind`` selects the encoder source (target activations for the SAE,
+    routed residual input for the transcoder). Both panels use Softplus so the
+    exact-TopK budget remains structurally available as learned biases move.
+    """
+
+    _validate_encoder_kind(kind)
     value32 = jnp.asarray(value, jnp.float32)
-    if kind == "sae":
-        return jax.nn.relu(value32)
     return jnp.maximum(
         jax.nn.softplus(value32),
         jnp.finfo(jnp.float32).tiny,
@@ -486,9 +492,8 @@ def _numpy_activation(
     value: np.ndarray,
     kind: Experiment5EncoderKind,
 ) -> np.ndarray:
+    _validate_encoder_kind(kind)
     value32 = np.asarray(value, np.float32)
-    if kind == "sae":
-        return np.maximum(value32, np.float32(0.0))
     return np.maximum(
         np.logaddexp(np.float32(0.0), value32).astype(np.float32, copy=False),
         np.finfo(np.float32).tiny,

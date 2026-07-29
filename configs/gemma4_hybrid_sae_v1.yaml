@@ -43,7 +43,8 @@ training:
     - 1
     - 2
   initialization: from_scratch
-  encoder_activation: relu
+  encoder_activation: softplus
+  softplus_positive_floor: smallest_normal_float32
   train_tokens: 10000000
   eval_tokens: 250000
   effective_batch_tokens: 16384
