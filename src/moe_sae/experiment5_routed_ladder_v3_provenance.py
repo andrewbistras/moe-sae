@@ -579,8 +579,15 @@ def validate_a256_addendum_panel(
         != "gemma4-contribution-sae-training-result-v1"
         or result.get("status") not in {"completed", "already_complete"}
         or result.get("tokens") != TRAIN_TOKENS
-        or result.get("source_revision")
-        != panel.training_source_revision
+        # The live Experiment-4 training-result-v1 schema predates an
+        # embedded source_revision field.  When present it must agree, but
+        # absence is bound through the self-hashed run contract's
+        # project_commit below.
+        or (
+            result.get("source_revision") is not None
+            and result.get("source_revision")
+            != panel.training_source_revision
+        )
         or not isinstance(identity, Mapping)
         or not isinstance(run_plan, Mapping)
         or run_plan.get("phase_name") != "learning_horizon_10m"

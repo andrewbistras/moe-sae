@@ -9,6 +9,7 @@ import pytest
 import moe_sae.experiment5_routed_ladder_v3_provenance as provenance_module
 from moe_sae.contribution_artifacts import canonical_sha256
 from moe_sae.direct_horizon_campaign import PROTOCOL_ID as EXPERIMENT4_PROTOCOL_ID
+from moe_sae.experiment5_campaign import EvidencePath
 from moe_sae.experiment5_routed_ladder_campaign import (
     RoutedLadderCampaignPlanError,
 )
@@ -20,9 +21,13 @@ from moe_sae.experiment5_routed_ladder_v3_provenance import (
     A256_PROVENANCE_ADDENDUM_ID,
     A256_PROVENANCE_ADDENDUM_SCHEMA_VERSION,
     MILESTONES,
+    A256AddendumCheckpoint,
+    A256AddendumCost,
+    A256AddendumPanel,
     build_a256_provenance_addendum,
     load_a256_provenance_addendum,
     parse_a256_provenance_addendum,
+    validate_a256_addendum_panel,
     write_a256_provenance_addendum,
 )
 
@@ -449,3 +454,166 @@ def test_builder_derives_full_observed_hashes_from_historical_bytes(
         != by_panel["transcoder"].observed_source_config_semantic_sha256
     )
     assert [panel.panel for panel in validated] == ["sae", "transcoder"]
+
+
+def test_live_v1_training_result_binds_revision_through_run_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The historical result predates an embedded source_revision field."""
+
+    revision = "a" * 40
+    config_path = tmp_path / "sae.yaml"
+    config_payload = b"historical-sae-config\n"
+    config_path.write_bytes(config_payload)
+    contract_path = tmp_path / "run-contract.json"
+    result_path = tmp_path / "training-result.json"
+    contract_payload = b"contract-payload"
+    result_payload = b"result-payload"
+    contract = {
+        "run_contract_sha256": "1" * 64,
+        "project_commit": revision,
+        "phase": "learning_horizon_10m",
+        "scientific_model": "sae",
+        "condition": "A",
+        "seed": 0,
+        "config_file_sha256": hashlib.sha256(config_payload).hexdigest(),
+        "checkpoint_payload_root": "gs://bucket/sae/a",
+    }
+    result = {
+        "result_sha256": "2" * 64,
+        "schema_version": "gemma4-contribution-sae-training-result-v1",
+        "status": "completed",
+        "tokens": 10_000_000,
+        # Deliberately no source_revision: this is the live v1 schema.
+        "marginal_wall_seconds": 100.0,
+        "chip_seconds": 1600.0,
+        "chip_seconds_scope": "optimizer_training",
+        "chip_seconds_excludes": ["compile", "checkpoint"],
+        "run_identity": {
+            "plan": {
+                "phase_name": "learning_horizon_10m",
+                "condition": "A",
+                "seed": 0,
+                "global_microbatch_tokens": 4096,
+                "microbatches_per_update": 4,
+                "total_tokens": 10_000_000,
+                "planned_updates": 611,
+            }
+        },
+    }
+    pointer_rows = {}
+    checkpoints = []
+    for index, milestone in enumerate(MILESTONES):
+        pointer_path = tmp_path / f"pointer-{milestone}.json"
+        batch = 4096 * 4
+        step = (milestone + batch - 1) // batch
+        tokens = min(step * batch, 10_000_000)
+        pointer = {
+            "pointer_sha256": f"{index + 3:x}" * 64,
+            "step": step,
+            "tokens_seen": tokens,
+        }
+        payload = f"pointer-{milestone}".encode()
+        pointer_rows[pointer_path] = (pointer, payload)
+        checkpoints.append(
+            A256AddendumCheckpoint(
+                checkpoint_tokens=milestone,
+                checkpoint_pointer=EvidencePath(
+                    controller_path=pointer_path,
+                    remote_path=f"/remote/pointer-{milestone}.json",
+                    sha256=hashlib.sha256(payload).hexdigest(),
+                ),
+                checkpoint_pointer_sha256=pointer["pointer_sha256"],
+            )
+        )
+    panel = A256AddendumPanel(
+        panel="sae",
+        source_label="A256ReLU",
+        seed=0,
+        encoder_activation="relu",
+        selection_policy="strict_positive_topk",
+        declared_source_config_semantic_sha256=(
+            A256_NATIVE_CONFIG_SHA256["sae"]
+        ),
+        observed_source_config_semantic_sha256=(
+            A256_NATIVE_CONFIG_SHA256["sae"]
+        ),
+        observed_source_config_file_sha256=hashlib.sha256(
+            config_payload
+        ).hexdigest(),
+        declaration_status="exact_match",
+        disposition="contextual_reference_verified",
+        training_source_revision=revision,
+        source_config=EvidencePath(
+            controller_path=config_path,
+            remote_path="/remote/sae.yaml",
+            sha256=hashlib.sha256(config_payload).hexdigest(),
+        ),
+        run_root_remote="/remote/runs/sae-a",
+        checkpoint_payload_root_gcs="gs://bucket/sae/a",
+        run_contract=EvidencePath(
+            controller_path=contract_path,
+            remote_path="/remote/run-contract.json",
+            sha256=hashlib.sha256(contract_payload).hexdigest(),
+        ),
+        run_contract_sha256=contract["run_contract_sha256"],
+        training_result=EvidencePath(
+            controller_path=result_path,
+            remote_path="/remote/training-result.json",
+            sha256=hashlib.sha256(result_payload).hexdigest(),
+        ),
+        training_result_sha256=result["result_sha256"],
+        cost=A256AddendumCost(
+            resource_id="slice-sae",
+            accelerator_type="v4-32",
+            chip_count=16,
+            marginal_wall_seconds=100.0,
+            chip_seconds=1600.0,
+            chip_seconds_scope="optimizer_training",
+            chip_seconds_excludes=("compile", "checkpoint"),
+        ),
+        checkpoints=tuple(checkpoints),
+    )
+
+    def _artifact(path: Path, *, hash_field: str) -> tuple[dict, bytes]:
+        if path == contract_path:
+            value, payload = contract, contract_payload
+        elif path == result_path:
+            value, payload = result, result_payload
+        else:
+            value, payload = pointer_rows[path]
+        assert hash_field in value
+        return value, payload
+
+    monkeypatch.setattr(
+        provenance_module,
+        "load_learning_horizon_config",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            config_hash=A256_NATIVE_CONFIG_SHA256["sae"],
+            encoder_activation="relu",
+            layouts=(
+                SimpleNamespace(
+                    condition="A",
+                    bank_identity="true_expert_id",
+                    bank_count=128,
+                    bank_width=256,
+                    components_per_token=8,
+                    topk_per_component=2,
+                    target="raw_selected_expert_output",
+                ),
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        provenance_module,
+        "_read_self_hashed_json",
+        _artifact,
+    )
+    monkeypatch.setattr(
+        provenance_module,
+        "validate_pointer",
+        lambda pointer, **_kwargs: pointer,
+    )
+
+    validate_a256_addendum_panel(panel)
