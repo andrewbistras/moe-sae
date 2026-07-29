@@ -3918,6 +3918,7 @@ def _run_production_training(
         return result
     unsigned = dict(result)
     unsigned.pop("result_sha256")
+    unsigned["source_revision"] = source_revision
     unsigned["experiment5_context"] = dict(workload.workload_context)
     unsigned["experiment5_execution"] = {
         "accelerator_type": accelerator_type,

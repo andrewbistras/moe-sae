@@ -4,6 +4,7 @@ import hashlib
 import json
 from dataclasses import dataclass, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -1117,6 +1118,135 @@ def test_experiment5_direct_training_uses_same_bounded_twelve_hour_policy() -> N
 
     assert result["status"] == "completed"
     assert result["authorization_basis"] == "bounded_learning_horizon_workload"
+
+
+def test_experiment5_training_result_seals_source_revision_for_campaign(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from moe_sae.experiment5_campaign import inspect_training_completion
+    from moe_sae.experiment5_config import load_experiment5_config
+
+    config = load_experiment5_config(EXPERIMENT5_SAE_CONFIG)
+    selected_plan = TrainingWorkerPlan.from_config(
+        config,
+        phase="routed_shared_hybrid_10m",
+        condition="H",
+        seed=0,
+    )
+    source_revision = "a" * 40
+    unsigned_result = {
+        "schema_version": "gemma4-contribution-sae-training-result-v1",
+        "status": "completed",
+        "tokens": 10_000_000,
+        "run_identity": {
+            "plan": {
+                "phase_name": selected_plan.phase_name,
+                "condition": selected_plan.condition,
+                "seed": selected_plan.seed,
+                "total_tokens": selected_plan.total_tokens,
+            }
+        },
+    }
+    base_result = {
+        **unsigned_result,
+        "result_sha256": training_worker_module.canonical_sha256(unsigned_result),
+    }
+    no_op = lambda *_args, **_kwargs: None
+    engine = SimpleNamespace(
+        initialize_state=no_op,
+        lower=no_op,
+        compile=no_op,
+        step=no_op,
+        synchronize=no_op,
+        progress=no_op,
+    )
+    checkpoint = SimpleNamespace(restore=no_op, save=no_op)
+    monkeypatch.setattr(
+        training_worker_module,
+        "_ProductionEngine",
+        lambda *_args, **_kwargs: engine,
+    )
+    monkeypatch.setattr(
+        training_worker_module,
+        "_OrbaxCheckpointBackend",
+        lambda **_kwargs: checkpoint,
+    )
+    monkeypatch.setattr(
+        training_worker_module,
+        "run_qualified_training",
+        lambda *_args, **_kwargs: dict(base_result),
+    )
+    context = {
+        "physical_feature_layout_identity": {
+            "layout_sha256": "b" * 64,
+        }
+    }
+    workload = SimpleNamespace(
+        source=object(),
+        mean=object(),
+        mesh=SimpleNamespace(devices=np.empty((1,), dtype=object)),
+        checkpoint_training_config=object(),
+        expected_l0=64,
+        preprocessing_wall_seconds=0.0,
+        workload_context=context,
+        experiment5_recomposition=object(),
+    )
+
+    result = training_worker_module._run_production_training(
+        config,
+        selected_plan,
+        workload,
+        None,
+        source_revision=source_revision,
+        peak_flops_per_second=1_000,
+        checkpoint_control_root=tmp_path / "checkpoints",
+        checkpoint_payload_root="gs://test-bucket/checkpoints",
+        maximum_runtime_seconds=43_200,
+        metric_path=None,
+        direct_bounded_resident=True,
+        direct_runtime_max_seconds=43_200,
+    )
+
+    assert result["source_revision"] == source_revision
+    result_body = dict(result)
+    claimed_sha256 = result_body.pop("result_sha256")
+    assert claimed_sha256 == training_worker_module.canonical_sha256(result_body)
+    result_path = tmp_path / "training-result.json"
+    result_path.write_text(json.dumps(result, sort_keys=True), encoding="ascii")
+    campaign_plan = SimpleNamespace(project_commit=source_revision)
+    task = SimpleNamespace(
+        task_id="train-sae-h-seed0",
+        condition="H",
+        seed=0,
+        completion_path_controller=result_path,
+    )
+    fingerprint = inspect_training_completion(campaign_plan, task)
+    assert fingerprint is not None
+    assert fingerprint.scientific_sha256 == claimed_sha256
+
+    generic_workload = SimpleNamespace(
+        **{
+            **vars(workload),
+            "experiment5_recomposition": None,
+        }
+    )
+    generic = training_worker_module._run_production_training(
+        config,
+        selected_plan,
+        generic_workload,
+        None,
+        source_revision=source_revision,
+        peak_flops_per_second=1_000,
+        checkpoint_control_root=tmp_path / "generic-checkpoints",
+        checkpoint_payload_root="gs://test-bucket/generic-checkpoints",
+        maximum_runtime_seconds=43_200,
+        metric_path=None,
+        direct_bounded_resident=True,
+        direct_runtime_max_seconds=43_200,
+    )
+    assert generic == base_result
+    assert "source_revision" not in generic
 
 
 def test_bounded_direct_training_resumes_from_exact_lowered_identity() -> None:
