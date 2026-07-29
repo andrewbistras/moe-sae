@@ -1258,6 +1258,7 @@ def _read_self_hashed_json(
 
 
 def inspect_training_completion(
+    plan: Experiment5CampaignPlan,
     task: TrainingTask,
 ) -> CompletionFingerprint | None:
     path = task.completion_path_controller
@@ -1265,16 +1266,17 @@ def inspect_training_completion(
         return None
     value, payload = _read_self_hashed_json(path, hash_field="result_sha256")
     identity = value.get("run_identity")
-    plan = identity.get("plan") if isinstance(identity, Mapping) else None
+    run_plan = identity.get("plan") if isinstance(identity, Mapping) else None
     if (
         value.get("schema_version") != TRAINING_RESULT_SCHEMA_VERSION
         or value.get("status") not in {"completed", "already_complete"}
         or value.get("tokens") != TRAIN_TOKENS
-        or not isinstance(plan, Mapping)
-        or plan.get("phase_name") != PHASE_NAME
-        or plan.get("condition") != task.condition
-        or plan.get("seed") != task.seed
-        or plan.get("total_tokens") != TRAIN_TOKENS
+        or value.get("source_revision") != plan.project_commit
+        or not isinstance(run_plan, Mapping)
+        or run_plan.get("phase_name") != PHASE_NAME
+        or run_plan.get("condition") != task.condition
+        or run_plan.get("seed") != task.seed
+        or run_plan.get("total_tokens") != TRAIN_TOKENS
     ):
         raise Experiment5CampaignStateError(
             f"training completion role changed: {task.task_id}"
@@ -2215,7 +2217,7 @@ class Experiment5Campaign:
 
     def _inspector(self, task: CampaignTask) -> CompletionFingerprint | None:
         if isinstance(task, TrainingTask):
-            return inspect_training_completion(task)
+            return inspect_training_completion(self.plan, task)
         return inspect_evaluation_completion(self.plan, task)
 
     def _completion_witness(
@@ -3269,7 +3271,7 @@ def experiment5_campaign_status(
     for task in (*plan.trajectories, *plan.evaluations):
         kind = "training" if isinstance(task, TrainingTask) else "evaluation"
         completion = (
-            inspect_training_completion(task)
+            inspect_training_completion(plan, task)
             if isinstance(task, TrainingTask)
             else inspect_evaluation_completion(plan, task)
         )

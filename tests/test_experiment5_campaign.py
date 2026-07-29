@@ -235,12 +235,20 @@ def _self_hashed(body: dict, field: str) -> dict:
     return {**body, field: canonical_sha256(body)}
 
 
-def _write_training_completion(plan, task_id: str) -> None:
+def _write_training_completion(
+    plan,
+    task_id: str,
+    *,
+    source_revision: str | None = None,
+) -> None:
     task = next(item for item in plan.trajectories if item.task_id == task_id)
     body = {
         "schema_version": "gemma4-contribution-sae-training-result-v1",
         "status": "completed",
         "tokens": 10_000_000,
+        "source_revision": (
+            plan.project_commit if source_revision is None else source_revision
+        ),
         "run_identity": {
             "plan": {
                 "phase_name": "routed_shared_hybrid_10m",
@@ -255,6 +263,22 @@ def _write_training_completion(plan, task_id: str) -> None:
         json.dumps(_self_hashed(body, "result_sha256"), sort_keys=True),
         encoding="ascii",
     )
+
+
+def test_training_completion_rejects_wrong_source_revision(tmp_path: Path) -> None:
+    plan = parse_experiment5_campaign_plan(_raw_plan(tmp_path))
+    task = plan.trajectories[0]
+    _write_training_completion(
+        plan,
+        task.task_id,
+        source_revision="1" * 40,
+    )
+
+    with pytest.raises(
+        Experiment5CampaignStateError,
+        match="training completion role changed",
+    ):
+        experiment5_campaign.inspect_training_completion(plan, task)
 
 
 def _write_evaluation_completion(plan, task_id: str) -> None:
