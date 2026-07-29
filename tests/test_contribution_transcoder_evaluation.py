@@ -338,6 +338,25 @@ def test_distributed_transcoder_evaluator_honors_relu_or_softplus() -> None:
     ):
         relu.step(state.params, microbatches, zeros, zeros)
 
+    inclusive_relu = ContributionTranscoderDistributedEvaluator(
+        mesh,
+        layout,
+        distributed,
+        bank_capacity=3,
+        encoder_activation="relu",
+        topk_requires_strictly_positive=False,
+    )
+    inclusive_aux, inclusive_chunk = inclusive_relu.step(
+        state.params,
+        microbatches,
+        zeros,
+        zeros,
+    )
+    assert bool(inclusive_aux.topk_valid)
+    assert int(inclusive_aux.l0_sum) == 0
+    assert not inclusive_relu.complete_feature_mask(inclusive_aux).any()
+    assert not inclusive_chunk.per_contribution_l0.any()
+
 
 def _token_scores(
     component_sse: np.ndarray,

@@ -50,6 +50,11 @@ REPORT_SCHEMA_VERSION = (
 PANELS = ("sae", "transcoder")
 CONDITIONS = ("A256ReLU", "A512ReLU", "A512Softplus", "H")
 SCORED_CONDITIONS = ("A256ReLU", "A512ReLU", "A512Softplus")
+TOKEN_SCORE_CONDITIONS = (
+    *SCORED_CONDITIONS,
+    "A256Native",
+    "A512ReLUInclusiveTopK",
+)
 PAIRED_CONTRASTS = (
     ("A256ReLU", "A512ReLU"),
     ("A512ReLU", "A512Softplus"),
@@ -430,7 +435,13 @@ def _endpoint_sst_sha256(
 class RoutedLadderTokenScores:
     """Per-token sufficient scores for one routed-only A condition."""
 
-    condition: Literal["A256ReLU", "A512ReLU", "A512Softplus"]
+    condition: Literal[
+        "A256ReLU",
+        "A512ReLU",
+        "A512Softplus",
+        "A256Native",
+        "A512ReLUInclusiveTopK",
+    ]
     panel: Literal["sae", "transcoder"]
     seed: int
     checkpoint_tokens: int
@@ -443,9 +454,9 @@ class RoutedLadderTokenScores:
     endpoint_sst: Mapping[str, np.ndarray]
 
     def __post_init__(self) -> None:
-        if self.condition not in SCORED_CONDITIONS:
+        if self.condition not in TOKEN_SCORE_CONDITIONS:
             raise Experiment5RoutedLadderError(
-                "token scores must be A256ReLU, A512ReLU, or A512Softplus"
+                "token-score condition is not a routed A evidence identity"
             )
         if self.panel not in PANELS:
             raise Experiment5RoutedLadderError("score panel is invalid")
@@ -3466,6 +3477,7 @@ __all__ = [
     "RoutedLadderWallCashAccounting",
     "SCORE_SCHEMA_VERSION",
     "SCORED_CONDITIONS",
+    "TOKEN_SCORE_CONDITIONS",
     "SEEDS",
     "build_experiment5_routed_ladder_report",
     "h_token_scores_to_existing_reference",

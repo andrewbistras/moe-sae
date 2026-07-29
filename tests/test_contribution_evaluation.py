@@ -563,6 +563,24 @@ def test_distributed_evaluator_softplus_matches_dense_grouped_scores() -> None:
     ):
         relu.step(state.params, microbatches, mean)
 
+    inclusive_relu = ContributionDistributedEvaluator(
+        mesh,
+        layout,
+        distributed,
+        bank_capacity=3,
+        encoder_activation="relu",
+        topk_requires_strictly_positive=False,
+    )
+    inclusive_aux, inclusive_chunk = inclusive_relu.step(
+        state.params,
+        microbatches,
+        mean,
+    )
+    assert bool(inclusive_aux.topk_valid)
+    assert int(inclusive_aux.l0_sum) == 0
+    assert not np.asarray(inclusive_aux.fired_mask).any()
+    assert not inclusive_chunk.per_contribution_l0.any()
+
 
 def test_two_axis_collectives_match_dense_oracle() -> None:
     script = r"""

@@ -45,6 +45,7 @@ from types import SimpleNamespace
 from typing import Any, Callable, Literal
 
 import numpy as np
+import yaml
 from safetensors.numpy import load as load_safetensors
 from safetensors.numpy import save as save_safetensors
 
@@ -64,18 +65,35 @@ from moe_sae.experiment5_routed_ladder import (
     RoutedLadderTokenScores,
 )
 from moe_sae.experiment5_routed_ladder_v2_config import (
-    CONDITIONS,
-    PHASE_NAME,
-    PROTOCOL_ID,
-    RoutedLadderV2Config as RoutedLadderConfig,
-    load_routed_ladder_v2_config as load_routed_ladder_config,
+    ANALYZED_CONDITIONS as V2_ANALYZED_CONDITIONS,
+    CONDITIONS as V2_CONDITIONS,
+    PHASE_NAME as V2_PHASE_NAME,
+    PROTOCOL_ID as V2_PROTOCOL_ID,
 )
+from moe_sae.experiment5_routed_ladder_v3_config import (
+    ANALYZED_CONDITIONS as V3_ANALYZED_CONDITIONS,
+    CONDITIONS as V3_CONDITIONS,
+    PHASE_NAME as V3_PHASE_NAME,
+    PROTOCOL_ID as V3_PROTOCOL_ID,
+)
+
+RoutedLadderConfig = Any
+CONDITIONS = tuple(dict.fromkeys((*V2_CONDITIONS, *V3_CONDITIONS)))
+PHASE_NAME = V2_PHASE_NAME
+PROTOCOL_ID = V2_PROTOCOL_ID
+PROTOCOL_IDS = (V2_PROTOCOL_ID, V3_PROTOCOL_ID)
 
 PROCESS_EVIDENCE_SCHEMA_VERSION = (
     "gemma4-experiment5-routed-activation-ladder-process-evidence-v2"
 )
+V3_PROCESS_EVIDENCE_SCHEMA_VERSION = (
+    "gemma4-experiment5-routed-activation-policy-process-evidence-v1"
+)
 RESULT_SCHEMA_VERSION = (
     "gemma4-experiment5-routed-activation-ladder-cell-evaluation-v2"
+)
+V3_RESULT_SCHEMA_VERSION = (
+    "gemma4-experiment5-routed-activation-policy-cell-evaluation-v1"
 )
 BUNDLE_SPEC_SCHEMA_VERSION = (
     "gemma4-experiment5-routed-activation-ladder-resident-bundle-spec-v2"
@@ -96,7 +114,9 @@ ENDPOINT_CENTERING_ALGORITHM_SCHEMA_VERSION = (
     "gemma4-contribution-transcoder-endpoint-centering-v1"
 )
 PANELS = ("sae", "transcoder")
-EVALUATED_CONDITIONS = (*CONDITIONS, "H")
+EVALUATED_CONDITIONS = tuple(
+    dict.fromkeys((*V2_ANALYZED_CONDITIONS, *V3_ANALYZED_CONDITIONS))
+)
 BUNDLE_CONDITIONS = (
     "A256ReLU",
     "A512ReLU",
@@ -120,7 +140,7 @@ _ROUTED_TENSORS = {
 
 
 def _tensor_names(condition: str) -> set[str]:
-    if condition in CONDITIONS:
+    if condition in EVALUATED_CONDITIONS and condition != "H":
         return set(_ROUTED_TENSORS)
     if condition == "H":
         return {
@@ -133,6 +153,103 @@ def _tensor_names(condition: str) -> set[str]:
 
 class RoutedLadderEvaluationError(RuntimeError):
     """One activation-ladder cell cannot produce valid evidence."""
+
+
+def _load_routed_ladder_config(
+    path: str | Path,
+    *,
+    expected_panel: str,
+) -> RoutedLadderConfig:
+    """Dispatch one ladder config through its exact immutable schema."""
+
+    selected = Path(path).expanduser().resolve()
+    try:
+        raw = yaml.safe_load(selected.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as error:
+        raise RoutedLadderEvaluationError(
+            "cannot inspect routed-ladder evaluation config"
+        ) from error
+    if not isinstance(raw, Mapping):
+        raise RoutedLadderEvaluationError(
+            "routed-ladder evaluation config must be a mapping"
+        )
+    schema = raw.get("schema_version")
+    if schema == "gemma4-experiment5-routed-activation-ladder-run-config-v3":
+        from moe_sae.experiment5_routed_ladder_v3_config import (
+            RoutedLadderV3ConfigError,
+            load_routed_ladder_v3_config,
+        )
+
+        try:
+            return load_routed_ladder_v3_config(
+                selected,
+                expected_panel=expected_panel,
+            )
+        except RoutedLadderV3ConfigError as error:
+            raise RoutedLadderEvaluationError(
+                "v3 evaluation requires its strict config"
+            ) from error
+    if schema == "gemma4-experiment5-routed-activation-ladder-run-config-v2":
+        from moe_sae.experiment5_routed_ladder_v2_config import (
+            RoutedLadderV2ConfigError,
+            load_routed_ladder_v2_config,
+        )
+
+        try:
+            return load_routed_ladder_v2_config(
+                selected,
+                expected_panel=expected_panel,
+            )
+        except RoutedLadderV2ConfigError as error:
+            raise RoutedLadderEvaluationError(
+                "v2 evaluation requires its strict config"
+            ) from error
+    raise RoutedLadderEvaluationError(
+        "evaluation config is not a routed-ladder v2/v3 schema"
+    )
+
+
+def _phase_name(config: RoutedLadderConfig) -> str:
+    phase = getattr(config, "ladder_phase", None)
+    name = getattr(phase, "name", None)
+    if name not in {V2_PHASE_NAME, V3_PHASE_NAME}:
+        raise RoutedLadderEvaluationError(
+            "routed-ladder phase identity is invalid"
+        )
+    return str(name)
+
+
+def _evaluated_conditions(config: RoutedLadderConfig) -> tuple[str, ...]:
+    value = config.raw["evaluation"]["ladder_conditions"]
+    selected = tuple(str(item) for item in value)
+    expected = (
+        V3_ANALYZED_CONDITIONS
+        if config.protocol_id == V3_PROTOCOL_ID
+        else V2_ANALYZED_CONDITIONS
+    )
+    if selected != expected:
+        raise RoutedLadderEvaluationError(
+            "routed-ladder evaluation conditions drifted"
+        )
+    return selected
+
+
+def _historical_a256_reference(
+    config: RoutedLadderConfig,
+    condition: str,
+    seed: int,
+) -> Any | None:
+    if seed != 0:
+        return None
+    if config.protocol_id == V3_PROTOCOL_ID and condition == "A256Native":
+        return config.existing_a256_native_reference
+    if (
+        config.protocol_id == V2_PROTOCOL_ID
+        and config.panel == "sae"
+        and condition == "A256ReLU"
+    ):
+        return config.existing_a256_reference
+    return None
 
 
 def _read_json(path: str | Path, *, name: str) -> dict[str, Any]:
@@ -393,13 +510,23 @@ def parse_resident_bundle_spec(
                 f"resident bundle cell {index} role is invalid"
             )
         reference_kind = cell["reference_kind"]
+        training_revision = _require_git_sha(
+            f"cell {index} training_source_revision",
+            cell["training_source_revision"],
+        )
         historical_a256 = (
             selected["panel"] == "sae"
             and condition == "A256ReLU"
             and selected["seed"] == 0
         )
         expected_reference = (
-            "a256" if historical_a256 else "h" if condition == "H" else "none"
+            "a256"
+            if historical_a256
+            else "h"
+            if condition == "H"
+            else "completed"
+            if training_revision != source_revision
+            else "none"
         )
         if reference_kind != expected_reference:
             raise RoutedLadderEvaluationError(
@@ -448,7 +575,7 @@ def parse_resident_bundle_spec(
                 f"cell {index} parent_run_contract_file_sha256",
                 parent_run_contract_file_sha,
             )
-        if reference_kind == "none":
+        if reference_kind in {"none", "completed"}:
             if reference_config is not None:
                 raise RoutedLadderEvaluationError(
                     f"resident bundle cell {index} has an unexpected parent config"
@@ -490,10 +617,6 @@ def parse_resident_bundle_spec(
                 f"resident bundle cell {index} parent run-contract presence "
                 "differs from its reference role"
             )
-        training_revision = _require_git_sha(
-            f"cell {index} training_source_revision",
-            cell["training_source_revision"],
-        )
         if reference_kind == "none" and training_revision != source_revision:
             raise RoutedLadderEvaluationError(
                 f"resident bundle cell {index} new training revision changed"
@@ -690,9 +813,16 @@ def seal_process_evidence(
     sequence_id: Any,
     position: Any,
     scores: Any,
+    protocol_id: str = V2_PROTOCOL_ID,
+    selected_slot_count: int | None = None,
+    positive_l0_sum: int | None = None,
 ) -> dict[str, Any]:
     """Seal one process-local, token-level sufficient-score artifact."""
 
+    if protocol_id not in PROTOCOL_IDS:
+        raise RoutedLadderEvaluationError(
+            "process evidence protocol is not a routed-ladder v2/v3 identity"
+        )
     destination = Path(root).expanduser().resolve()
     sequence = np.asarray(sequence_id)
     positions = np.asarray(position)
@@ -725,6 +855,33 @@ def seal_process_evidence(
             "process evidence contains duplicate token identities"
         )
     score_arrays = _score_arrays(scores, condition=condition)
+    sparsity_evidence: dict[str, Any] = {}
+    if protocol_id == V3_PROTOCOL_ID:
+        tokens = int(scientific_sequence.size)
+        if (
+            isinstance(selected_slot_count, bool)
+            or not isinstance(selected_slot_count, int)
+            or selected_slot_count <= 0
+            or isinstance(positive_l0_sum, bool)
+            or not isinstance(positive_l0_sum, int)
+            or not 0 <= positive_l0_sum <= tokens * selected_slot_count
+        ):
+            raise RoutedLadderEvaluationError(
+                "v3 process sparsity evidence is outside its selected-slot budget"
+            )
+        positive_l0 = positive_l0_sum / tokens
+        sparsity_evidence = {
+            "selected_slot_count": selected_slot_count,
+            "positive_l0_sum": positive_l0_sum,
+            "positive_l0": positive_l0,
+            "zero_selected_slot_fraction": (
+                1.0 - positive_l0 / selected_slot_count
+            ),
+        }
+    elif selected_slot_count is not None or positive_l0_sum is not None:
+        raise RoutedLadderEvaluationError(
+            "v3 sparsity evidence cannot be attached to a v2 process record"
+        )
     tensors = {
         "sequence_id": scientific_sequence,
         "position": scientific_position,
@@ -735,8 +892,12 @@ def seal_process_evidence(
     }
     data_sha, data_bytes, data_object = _artifact_file(destination, tensors)
     unsigned = {
-        "schema_version": PROCESS_EVIDENCE_SCHEMA_VERSION,
-        "protocol_id": PROTOCOL_ID,
+        "schema_version": (
+            V3_PROCESS_EVIDENCE_SCHEMA_VERSION
+            if protocol_id == V3_PROTOCOL_ID
+            else PROCESS_EVIDENCE_SCHEMA_VERSION
+        ),
+        "protocol_id": protocol_id,
         "score_schema_version": SCORE_SCHEMA_VERSION,
         "panel": panel,
         "condition": condition,
@@ -783,6 +944,7 @@ def seal_process_evidence(
         "data_object": data_object,
         "data_sha256": data_sha,
         "data_bytes": data_bytes,
+        **sparsity_evidence,
     }
     evidence = _self_hash(unsigned, field="evidence_sha256")
     _write_json(destination / "process-evidence.json", evidence)
@@ -807,8 +969,13 @@ def load_process_evidence(
     }
     if (
         canonical_sha256(unsigned) != claimed
-        or metadata.get("schema_version") != PROCESS_EVIDENCE_SCHEMA_VERSION
-        or metadata.get("protocol_id") != PROTOCOL_ID
+        or metadata.get("schema_version")
+        != (
+            V3_PROCESS_EVIDENCE_SCHEMA_VERSION
+            if metadata.get("protocol_id") == V3_PROTOCOL_ID
+            else PROCESS_EVIDENCE_SCHEMA_VERSION
+        )
+        or metadata.get("protocol_id") not in PROTOCOL_IDS
         or metadata.get("score_schema_version") != SCORE_SCHEMA_VERSION
     ):
         raise RoutedLadderEvaluationError(
@@ -841,6 +1008,46 @@ def load_process_evidence(
     ):
         raise RoutedLadderEvaluationError(
             "process evidence token identity proof is invalid"
+        )
+    if metadata.get("protocol_id") == V3_PROTOCOL_ID:
+        selected_slots = metadata.get("selected_slot_count")
+        positive_sum = metadata.get("positive_l0_sum")
+        positive_l0 = metadata.get("positive_l0")
+        zero_fraction = metadata.get("zero_selected_slot_fraction")
+        if (
+            isinstance(selected_slots, bool)
+            or not isinstance(selected_slots, int)
+            or selected_slots <= 0
+            or isinstance(positive_sum, bool)
+            or not isinstance(positive_sum, int)
+            or not 0 <= positive_sum <= tokens * selected_slots
+            or not isinstance(positive_l0, (int, float))
+            or not isinstance(zero_fraction, (int, float))
+            or not math.isclose(
+                float(positive_l0),
+                positive_sum / tokens,
+                abs_tol=1e-12,
+            )
+            or not math.isclose(
+                float(zero_fraction),
+                1.0 - positive_sum / (tokens * selected_slots),
+                abs_tol=1e-12,
+            )
+        ):
+            raise RoutedLadderEvaluationError(
+                "v3 process sparsity evidence is invalid"
+            )
+    elif any(
+        name in metadata
+        for name in (
+            "selected_slot_count",
+            "positive_l0_sum",
+            "positive_l0",
+            "zero_selected_slot_fraction",
+        )
+    ):
+        raise RoutedLadderEvaluationError(
+            "v2 process evidence contains v3 sparsity fields"
         )
     keys = np.rec.fromarrays(
         (sequence, position),
@@ -1041,6 +1248,33 @@ def merge_process_evidence(
             else None
         ),
     }
+    if ordered[0][0]["protocol_id"] == V3_PROTOCOL_ID:
+        selected_slots = {
+            int(item[0]["selected_slot_count"]) for item in ordered
+        }
+        if len(selected_slots) != 1:
+            raise RoutedLadderEvaluationError(
+                "v3 selected-slot count differs across process lanes"
+            )
+        selected_slot_count = next(iter(selected_slots))
+        positive_l0_sum = sum(
+            int(item[0]["positive_l0_sum"]) for item in ordered
+        )
+        total_slots = int(sequence.size) * selected_slot_count
+        if not 0 <= positive_l0_sum <= total_slots:
+            raise RoutedLadderEvaluationError(
+                "merged v3 positive L0 exceeds selected-slot budget"
+            )
+        summary.update(
+            {
+                "selected_slot_count": selected_slot_count,
+                "positive_l0_sum": positive_l0_sum,
+                "positive_l0": positive_l0_sum / int(sequence.size),
+                "zero_selected_slot_fraction": (
+                    1.0 - positive_l0_sum / total_slots
+                ),
+            }
+        )
     return summary, combined
 
 
@@ -1127,8 +1361,12 @@ def seal_merged_result(
     )
     body = {
         **dict(summary),
-        "schema_version": RESULT_SCHEMA_VERSION,
-        "protocol_id": PROTOCOL_ID,
+        "schema_version": (
+            V3_RESULT_SCHEMA_VERSION
+            if summary["protocol_id"] == V3_PROTOCOL_ID
+            else RESULT_SCHEMA_VERSION
+        ),
+        "protocol_id": summary["protocol_id"],
         "score_schema_version": SCORE_SCHEMA_VERSION,
         "status": "cell_evaluated",
         "milestone_name": (
@@ -1173,8 +1411,13 @@ def load_merged_scores(
     }
     if (
         canonical_sha256(unsigned) != claimed
-        or result.get("schema_version") != RESULT_SCHEMA_VERSION
-        or result.get("protocol_id") != PROTOCOL_ID
+        or result.get("schema_version")
+        != (
+            V3_RESULT_SCHEMA_VERSION
+            if result.get("protocol_id") == V3_PROTOCOL_ID
+            else RESULT_SCHEMA_VERSION
+        )
+        or result.get("protocol_id") not in PROTOCOL_IDS
         or result.get("score_schema_version") != SCORE_SCHEMA_VERSION
         or result.get("status") != "cell_evaluated"
     ):
@@ -1480,16 +1723,20 @@ def _layout(config: RoutedLadderConfig, condition: str, seed: int) -> Any:
     from moe_sae.contribution_sae import ContributionSAEConfig
 
     selected_condition = "A512Softplus" if condition == "H" else condition
-    matches = [
-        item
-        for item in config.layouts_for_phase(PHASE_NAME)
-        if item.condition == selected_condition
-    ]
-    if len(matches) != 1:
-        raise RoutedLadderEvaluationError(
-            "condition has no unique activation-ladder layout"
-        )
-    selected = matches[0]
+    reference = _historical_a256_reference(config, condition, seed)
+    if reference is not None:
+        selected = reference
+    else:
+        matches = [
+            item
+            for item in config.layouts_for_phase(_phase_name(config))
+            if item.condition == selected_condition
+        ]
+        if len(matches) != 1:
+            raise RoutedLadderEvaluationError(
+                "condition has no unique activation-ladder layout"
+            )
+        selected = matches[0]
     return ContributionSAEConfig(
         condition="A",
         hidden_dim=config.model.hidden_size,
@@ -1507,10 +1754,13 @@ def _encoder_activation(
 ) -> str:
     """Return the checkpoint's frozen encoder nonlinearity."""
 
+    reference = _historical_a256_reference(config, condition, 0)
+    if reference is not None:
+        return str(reference.encoder_activation)
     selected_condition = "A512Softplus" if condition == "H" else condition
     matches = [
         item
-        for item in config.layouts_for_phase(PHASE_NAME)
+        for item in config.layouts_for_phase(_phase_name(config))
         if item.condition == selected_condition
     ]
     if len(matches) != 1:
@@ -1523,6 +1773,37 @@ def _encoder_activation(
             "condition encoder activation is invalid"
         )
     return activation
+
+
+def _topk_requires_strictly_positive(
+    config: RoutedLadderConfig,
+    condition: str,
+) -> bool:
+    """Return the condition-specific activation eligibility contract."""
+
+    reference = _historical_a256_reference(config, condition, 0)
+    if reference is not None:
+        return True
+    selected_condition = "A512Softplus" if condition == "H" else condition
+    matches = [
+        item
+        for item in config.layouts_for_phase(_phase_name(config))
+        if item.condition == selected_condition
+    ]
+    if len(matches) != 1:
+        raise RoutedLadderEvaluationError(
+            "condition has no unique TopK eligibility policy"
+        )
+    value = getattr(
+        matches[0],
+        "topk_requires_strictly_positive",
+        True,
+    )
+    if type(value) is not bool:
+        raise RoutedLadderEvaluationError(
+            "condition TopK eligibility policy is invalid"
+        )
+    return value
 
 
 def _optimizer(config: RoutedLadderConfig, plan: Any) -> Any:
@@ -2104,14 +2385,14 @@ def _h_training_binding(
 
 
 def _validate_args(args: argparse.Namespace) -> RoutedLadderConfig:
-    config = load_routed_ladder_config(
+    config = _load_routed_ladder_config(
         args.config,
         expected_panel=args.panel,
     )
-    phase = config.phase(PHASE_NAME)
-    if args.condition not in EVALUATED_CONDITIONS:
+    phase = config.phase(_phase_name(config))
+    if args.condition not in _evaluated_conditions(config):
         raise RoutedLadderEvaluationError(
-            "condition must be A256ReLU, A512ReLU, A512Softplus, or read-only H"
+            "condition is not authorized by the selected ladder protocol"
         )
     if args.seed not in phase.seeds:
         raise RoutedLadderEvaluationError("seed must be 0, 1, or 2")
@@ -2141,9 +2422,12 @@ def _validate_args(args: argparse.Namespace) -> RoutedLadderConfig:
                     f"transcoder panel requires --{name.replace('_', '-')}"
                 )
     historical_a256 = (
-        config.panel == "sae"
-        and args.condition == "A256ReLU"
-        and args.seed == 0
+        _historical_a256_reference(
+            config,
+            args.condition,
+            args.seed,
+        )
+        is not None
     )
     h_config_arg = getattr(args, "h_config", None)
     a256_config_arg = getattr(args, "a256_config", None)
@@ -2237,11 +2521,11 @@ def _validate_args(args: argparse.Namespace) -> RoutedLadderConfig:
         )
     if historical_a256 and a256_config_arg is None:
         raise RoutedLadderEvaluationError(
-            "historical SAE A256ReLU seed 0 requires --a256-config"
+            "historical panel-native A256 seed 0 requires --a256-config"
         )
     if not historical_a256 and a256_config_arg is not None:
         raise RoutedLadderEvaluationError(
-            "--a256-config is valid only for historical SAE A256ReLU seed 0"
+            "--a256-config is valid only for historical panel-native A256 seed 0"
         )
     if historical_a256:
         _require_sha256(
@@ -2265,7 +2549,7 @@ def _validate_args(args: argparse.Namespace) -> RoutedLadderConfig:
         or reference_run_contract_file_sha is not None
     ):
         raise RoutedLadderEvaluationError(
-            "run-contract pins are valid only for historical SAE A256ReLU seed 0"
+            "reference run-contract pins are valid only for historical A256 seed 0"
         )
     return config
 
@@ -2696,7 +2980,7 @@ def run(
             cache=cache,
             recomposition_sidecar=sidecar,
         )
-        phase = config.phase(PHASE_NAME)
+        phase = config.phase(_phase_name(config))
         if (
             train_target.total_tokens != phase.train_tokens
             or eval_target.total_tokens != phase.eval_tokens
@@ -2758,11 +3042,12 @@ def run(
     h_config_file_sha: str | None = None
     training_optimizer_source: Any = config
     parent_run_contract: Mapping[str, Any] | None = None
-    historical_a256 = (
-        config.panel == "sae"
-        and args.condition == "A256ReLU"
-        and args.seed == 0
+    a256_reference = _historical_a256_reference(
+        config,
+        args.condition,
+        args.seed,
     )
+    historical_a256 = a256_reference is not None
     if args.condition == "H":
         h_config_path = Path(args.h_config).expanduser().resolve()
         h_config = load_experiment5_config(
@@ -2839,15 +3124,12 @@ def run(
         training_contract_sha = binding["training_contract_sha256"]
         training_optimizer_source = h_config
     elif historical_a256:
-        reference = config.existing_a256_reference
-        if reference is None:
-            raise RoutedLadderEvaluationError(
-                "SAE A256ReLU seed 0 lacks its frozen parent reference"
-            )
+        reference = a256_reference
+        assert reference is not None
         a256_config_path = Path(args.a256_config).expanduser().resolve()
         a256_config = load_learning_horizon_config(
             a256_config_path,
-            expected_scientific_model="sae",
+            expected_scientific_model=config.panel,
         )
         if (
             a256_config.config_hash != reference.source_config_sha256
@@ -2855,7 +3137,7 @@ def run(
             or a256_config.encoder_activation != reference.encoder_activation
         ):
             raise RoutedLadderEvaluationError(
-                "historical SAE A256 parent config differs from the v2 reference"
+                "historical panel-native A256 config differs from its reference"
             )
         plan = TrainingWorkerPlan.from_config(
             a256_config,
@@ -2868,7 +3150,7 @@ def run(
             or plan.condition != reference.source_condition
         ):
             raise RoutedLadderEvaluationError(
-                "historical SAE A256 parent plan differs from the v2 reference"
+                "historical panel-native A256 plan differs from its reference"
             )
         result, pointer = _load_run(
             run_root,
@@ -2884,7 +3166,7 @@ def run(
             seed=args.seed,
             training_source_revision=args.training_source_revision,
             target_manifest_sha256=train_target.manifest_sha256,
-            source_manifest_sha256=None,
+            source_manifest_sha256=source_manifest_sha,
             phase_name=reference.source_phase_name,
         )
         parent_run_contract = run_contract
@@ -2896,14 +3178,14 @@ def run(
             != args.reference_run_contract_file_sha256
         ):
             raise RoutedLadderEvaluationError(
-                "historical SAE A256 run contract differs from its manifest pins"
+                "historical panel-native A256 run contract differs from its pins"
             )
         training_contract_sha = run_contract["run_contract_sha256"]
         training_optimizer_source = a256_config
     else:
         plan = TrainingWorkerPlan.from_config(
             config,
-            phase=PHASE_NAME,
+            phase=_phase_name(config),
             condition=args.condition,
             seed=args.seed,
         )
@@ -3166,6 +3448,10 @@ def run(
         )
     evaluator: Any
     encoder_activation = _encoder_activation(config, args.condition)
+    topk_requires_strictly_positive = _topk_requires_strictly_positive(
+        config,
+        args.condition,
+    )
     evaluator_key = (
         config.panel,
         layout.bank_width,
@@ -3173,6 +3459,7 @@ def run(
         layout.randomization_key,
         int(capacity_roles.execution),
         encoder_activation,
+        topk_requires_strictly_positive,
     )
     evaluator = (
         resident_runtime.evaluators.get(evaluator_key)
@@ -3187,6 +3474,9 @@ def run(
                 distributed,
                 bank_capacity=int(capacity_roles.execution),
                 encoder_activation=encoder_activation,
+                topk_requires_strictly_positive=(
+                    topk_requires_strictly_positive
+                ),
             )
         else:
             evaluator = ContributionTranscoderDistributedEvaluator(
@@ -3195,6 +3485,9 @@ def run(
                 distributed,
                 bank_capacity=int(capacity_roles.execution),
                 encoder_activation=encoder_activation,
+                topk_requires_strictly_positive=(
+                    topk_requires_strictly_positive
+                ),
             )
         if resident_runtime is not None:
             resident_runtime.evaluators[evaluator_key] = evaluator
@@ -3203,6 +3496,7 @@ def run(
         name: [] for name in _ROUTED_TENSORS
     }
     fired = np.zeros((layout.total_features,), dtype=np.bool_)
+    positive_l0_sum = 0
     started = time.perf_counter()
     for update_index, microbatches in enumerate(source.iter_updates()):
         if config.panel == "sae":
@@ -3234,6 +3528,14 @@ def run(
             )
         fired |= _addressable_feature_mask(aux.fired_mask)
         flat_valid = np.asarray(chunk.valid_mask).reshape(-1)
+        positive_l0_sum += int(
+            np.sum(
+                np.asarray(chunk.per_contribution_l0)[
+                    np.asarray(chunk.valid_mask)
+                ],
+                dtype=np.int64,
+            )
+        )
         scored = score_transcoder_sufficient_rows(
             component_sse=np.asarray(
                 chunk.component_token_sse
@@ -3284,6 +3586,17 @@ def run(
     if combined["sequence_id"].size != expected_local:
         raise RoutedLadderEvaluationError(
             "evaluator did not retain its complete process token lane"
+        )
+    maximum_positive_l0_sum = expected_local * layout.total_l0
+    if (
+        not 0 <= positive_l0_sum <= maximum_positive_l0_sum
+        or (
+            topk_requires_strictly_positive
+            and positive_l0_sum != maximum_positive_l0_sum
+        )
+    ):
+        raise RoutedLadderEvaluationError(
+            "evaluation positive L0 differs from its activation-policy contract"
         )
     learned_input_receipt_sha: str | None = None
     if args.condition == "H":
@@ -3508,6 +3821,17 @@ def run(
         sequence_id=combined["sequence_id"],
         position=combined["position"],
         scores=local_scores,
+        protocol_id=config.protocol_id,
+        selected_slot_count=(
+            layout.total_l0
+            if config.protocol_id == V3_PROTOCOL_ID
+            else None
+        ),
+        positive_l0_sum=(
+            positive_l0_sum
+            if config.protocol_id == V3_PROTOCOL_ID
+            else None
+        ),
     )
     if args.condition == "H":
         del h_state
@@ -3530,6 +3854,23 @@ def run(
             for process_index in range(int(jax.process_count()))
         ]
         summary, merged = merge_process_evidence(rows)
+        sparsity_summary = (
+            {
+                "positive_l0_contract": (
+                    "exact_selected_slots"
+                    if topk_requires_strictly_positive
+                    else "bounded_zero_to_selected_slots"
+                )
+            }
+            if config.protocol_id == V3_PROTOCOL_ID
+            else {
+                "exact_l0": int(
+                    h_layout.total_l0
+                    if args.condition == "H"
+                    else layout.total_l0
+                )
+            }
+        )
         summary = {
             **summary,
             "dead_rate": float(1.0 - np.mean(fired)),
@@ -3543,11 +3884,7 @@ def run(
                 if args.condition == "H"
                 else layout.total_features
             ),
-            "exact_l0": int(
-                h_layout.total_l0
-                if args.condition == "H"
-                else layout.total_l0
-            ),
+            **sparsity_summary,
             "capacity_contract": {
                 "training_capacity": int(capacity_roles.checkpoint),
                 "evaluation_capacity": int(evaluation_capacity.capacity),
@@ -3616,7 +3953,7 @@ def run_resident_bundle(args: argparse.Namespace) -> int:
         raise RoutedLadderEvaluationError(
             "resident bundle CLI identity differs from its spec"
         )
-    if tuple(CONDITIONS) != BUNDLE_CONDITIONS[:-1]:
+    if tuple(V2_CONDITIONS) != BUNDLE_CONDITIONS[:-1]:
         raise RoutedLadderEvaluationError(
             "resident bundle requires the exact three-A v2 config"
         )
@@ -3929,6 +4266,8 @@ __all__ = [
     "CHECKPOINT_TOKENS",
     "PROCESS_EVIDENCE_SCHEMA_VERSION",
     "RESULT_SCHEMA_VERSION",
+    "V3_PROCESS_EVIDENCE_SCHEMA_VERSION",
+    "V3_RESULT_SCHEMA_VERSION",
     "RoutedLadderEvaluationError",
     "ResidentEvaluationBundle",
     "ResidentEvaluationCell",

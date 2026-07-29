@@ -1032,6 +1032,7 @@ def _build_transcoder_mapped_evaluator(
     distributed: DistributedConfig,
     bank_capacity: int | None,
     encoder_activation: str = ENCODER_ACTIVATION,
+    topk_requires_strictly_positive: bool = True,
 ):
     data_axis = distributed.data_axis
     feature_axis = distributed.feature_axis
@@ -1089,6 +1090,9 @@ def _build_transcoder_mapped_evaluator(
                     feature_axis=feature_axis,
                     capacity=capacity,
                     encoder_activation=encoder_activation,
+                    topk_requires_strictly_positive=(
+                        topk_requires_strictly_positive
+                    ),
                 )
             else:
                 local_values, local_ids = _local_rank_candidates(
@@ -1098,6 +1102,9 @@ def _build_transcoder_mapped_evaluator(
                     layout,
                     feature_axis=feature_axis,
                     encoder_activation=encoder_activation,
+                    topk_requires_strictly_positive=(
+                        topk_requires_strictly_positive
+                    ),
                 )
                 overflow = jnp.asarray(False)
             selection = _merge_local_candidates(
@@ -1105,6 +1112,7 @@ def _build_transcoder_mapped_evaluator(
                 local_ids,
                 layout.k_per_contribution,
                 feature_axis=feature_axis,
+                require_strictly_positive=topk_requires_strictly_positive,
             )
             reconstruction = _decode_selected_columns_default_precision(
                 params.decoder,
@@ -1366,6 +1374,7 @@ class ContributionTranscoderDistributedEvaluator:
         *,
         bank_capacity: int | None = None,
         encoder_activation: str = ENCODER_ACTIVATION,
+        topk_requires_strictly_positive: bool = True,
     ) -> None:
         self.mesh = mesh
         self.layout = layout
@@ -1375,7 +1384,19 @@ class ContributionTranscoderDistributedEvaluator:
             raise ValueError(
                 "encoder_activation must be 'relu' or 'softplus'"
             )
+        if type(topk_requires_strictly_positive) is not bool:
+            raise TypeError("topk_requires_strictly_positive must be boolean")
+        if (
+            encoder_activation == "softplus"
+            and not topk_requires_strictly_positive
+        ):
+            raise ValueError(
+                "softplus must retain the strict-positive TopK contract"
+            )
         self.encoder_activation = encoder_activation
+        self.topk_requires_strictly_positive = (
+            topk_requires_strictly_positive
+        )
         _validate_contribution_mesh(mesh, layout, self.distributed)
         mapped = _build_transcoder_mapped_evaluator(
             mesh,
@@ -1383,6 +1404,7 @@ class ContributionTranscoderDistributedEvaluator:
             self.distributed,
             bank_capacity,
             encoder_activation,
+            topk_requires_strictly_positive,
         )
         batch_shardings = contribution_transcoder_batch_shardings(
             mesh,
@@ -1549,10 +1571,16 @@ class ContributionTranscoderDistributedEvaluator:
                 "invalid inputs or fewer than two positive features"
             )
         token_count = int(tokens)
+        expected_l0 = token_count * self.layout.total_l0
+        invalid_l0 = (
+            int(l0_sum) != expected_l0
+            if self.topk_requires_strictly_positive
+            else not 0 <= int(l0_sum) <= expected_l0
+        )
         if (
             token_count <= 0
             or int(components) != token_count * self.layout.top_routed
-            or int(l0_sum) != token_count * self.layout.total_l0
+            or invalid_l0
         ):
             raise ContributionTranscoderEvaluationError(
                 "transcoder evaluation cardinality differs from exact L0"
@@ -1568,10 +1596,18 @@ class ContributionTranscoderDistributedEvaluator:
             )
         chunk = _host_chunk(rows)
         scientific_l0 = chunk.per_contribution_l0[chunk.valid_mask]
+        invalid_per_contribution_l0 = (
+            np.any(scientific_l0 != self.layout.k_per_contribution)
+            if self.topk_requires_strictly_positive
+            else np.any(
+                (scientific_l0 < 0)
+                | (scientific_l0 > self.layout.k_per_contribution)
+            )
+        )
         if (
             scientific_l0.shape
             != (chunk.tokens, self.layout.top_routed)
-            or np.any(scientific_l0 != self.layout.k_per_contribution)
+            or invalid_per_contribution_l0
         ):
             raise ContributionTranscoderEvaluationError(
                 "transcoder evaluation failed exact per-slot TopK"

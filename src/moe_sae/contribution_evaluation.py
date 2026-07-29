@@ -467,6 +467,7 @@ def _build_mapped_evaluator(
     distributed: DistributedConfig,
     bank_capacity: int | None,
     encoder_activation: str = "relu",
+    topk_requires_strictly_positive: bool = True,
 ):
     data_axis = distributed.data_axis
     feature_axis = distributed.feature_axis
@@ -510,6 +511,9 @@ def _build_mapped_evaluator(
                     feature_axis=feature_axis,
                     capacity=capacity,
                     encoder_activation=encoder_activation,
+                    topk_requires_strictly_positive=(
+                        topk_requires_strictly_positive
+                    ),
                 )
             else:
                 local_values, local_ids = _local_rank_candidates(
@@ -519,6 +523,9 @@ def _build_mapped_evaluator(
                     layout,
                     feature_axis=feature_axis,
                     encoder_activation=encoder_activation,
+                    topk_requires_strictly_positive=(
+                        topk_requires_strictly_positive
+                    ),
                 )
                 overflow = jnp.asarray(False)
             selection = _merge_local_candidates(
@@ -526,6 +533,7 @@ def _build_mapped_evaluator(
                 local_ids,
                 layout.k_per_contribution,
                 feature_axis=feature_axis,
+                require_strictly_positive=topk_requires_strictly_positive,
             )
             reconstruction = _decode_selected_columns_default_precision(
                 params.decoder,
@@ -832,6 +840,7 @@ class ContributionDistributedEvaluator:
         *,
         bank_capacity: int | None = None,
         encoder_activation: str = "relu",
+        topk_requires_strictly_positive: bool = True,
     ) -> None:
         self.mesh = mesh
         self.layout = layout
@@ -841,7 +850,19 @@ class ContributionDistributedEvaluator:
             raise ValueError(
                 "encoder_activation must be 'relu' or 'softplus'"
             )
+        if type(topk_requires_strictly_positive) is not bool:
+            raise TypeError("topk_requires_strictly_positive must be boolean")
+        if (
+            encoder_activation == "softplus"
+            and not topk_requires_strictly_positive
+        ):
+            raise ValueError(
+                "softplus must retain the strict-positive TopK contract"
+            )
         self.encoder_activation = encoder_activation
+        self.topk_requires_strictly_positive = (
+            topk_requires_strictly_positive
+        )
         _validate_contribution_mesh(mesh, layout, self.distributed)
         mapped = _build_mapped_evaluator(
             mesh,
@@ -849,6 +870,7 @@ class ContributionDistributedEvaluator:
             self.distributed,
             bank_capacity,
             encoder_activation,
+            topk_requires_strictly_positive,
         )
         self._compiled = jax.jit(
             mapped,
@@ -1001,10 +1023,21 @@ class ContributionDistributedEvaluator:
                 "evaluation component count differs from source-token count"
             )
         expected_l0 = token_count * self.layout.total_l0
-        if int(l0_sum) != expected_l0:
+        if (
+            self.topk_requires_strictly_positive
+            and int(l0_sum) != expected_l0
+        ):
             raise ContributionEvaluationError(
                 "evaluation TopK cardinality differs from the frozen layout: "
                 f"selected={int(l0_sum)}, expected={expected_l0}"
+            )
+        if (
+            not self.topk_requires_strictly_positive
+            and not 0 <= int(l0_sum) <= expected_l0
+        ):
+            raise ContributionEvaluationError(
+                "inclusive-zero ReLU positive L0 is outside its nominal "
+                "TopK slot budget"
             )
         if (
             not math.isfinite(float(component_sse))
@@ -1018,10 +1051,18 @@ class ContributionDistributedEvaluator:
 
         chunk = _host_chunk(rows)
         scientific_l0 = chunk.per_contribution_l0[chunk.valid_mask]
+        invalid_per_contribution_l0 = (
+            np.any(scientific_l0 != self.layout.k_per_contribution)
+            if self.topk_requires_strictly_positive
+            else np.any(
+                (scientific_l0 < 0)
+                | (scientific_l0 > self.layout.k_per_contribution)
+            )
+        )
         if (
             scientific_l0.shape
             != (chunk.tokens, self.layout.top_routed)
-            or np.any(scientific_l0 != self.layout.k_per_contribution)
+            or invalid_per_contribution_l0
         ):
             raise ContributionEvaluationError(
                 "evaluation failed exact per-contribution TopK"
