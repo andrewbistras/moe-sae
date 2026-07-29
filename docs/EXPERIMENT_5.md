@@ -555,7 +555,23 @@ extension below does exactly that: it has its own protocol ID, namespace, run
 accounting, and interpretation, and does not retroactively alter this frozen
 core.
 
-## Post-launch routed-activation-ladder extension
+## Corrected routed-activation-ladder extension
+
+The executable ladder is now protocol v2. The original v1 extension omitted
+the Experiment-4-width `A256ReLU` arm and therefore could not answer the
+overprovisioning/scale question that motivated the follow-up. The complete
+corrected contract, seed-reuse boundary, workload counts, and authorized
+contrasts are in
+[`EXPERIMENT_5_LADDER_V2.md`](EXPERIMENT_5_LADDER_V2.md).
+
+V2 adds `A256ReLU`, reuses only the compatible historical SAE seed-0
+checkpoint, trains SAE seeds 1 and 2, and trains all three transcoder seeds.
+The historical transcoder A256 used Softplus and is excluded from the ReLU
+condition. V2 refuses to produce a three-seed scale effect until all three
+exact cells in that panel exist. The v1 text below is retained as the
+superseded design record; it is not a launch contract.
+
+## Superseded v1 routed-activation-ladder design
 
 Status: exploratory post-launch amendment, selected after observing initial H
 training behavior

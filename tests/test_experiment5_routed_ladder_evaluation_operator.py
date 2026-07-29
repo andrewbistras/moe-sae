@@ -11,12 +11,17 @@ import numpy as np
 import pytest
 
 from moe_sae.experiment5_routed_ladder_evaluation_worker import (
+    BUNDLE_CONDITIONS,
+    CHECKPOINT_TOKENS,
     _parser as _worker_parser,
     load_process_evidence,
     merge_process_evidence,
+    parse_resident_bundle_spec,
     seal_merged_result,
     seal_process_evidence,
 )
+from moe_sae.contribution_artifacts import canonical_sha256
+from moe_sae.experiment5_routed_ladder import PROTOCOL_ID
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -84,11 +89,12 @@ def _arguments(
     condition: str = "A512ReLU",
     dry_run: bool = False,
 ) -> list[str]:
+    historical_a256 = panel == "sae" and condition == "A256ReLU"
     arguments = [
         "--panel",
         panel,
         "--config",
-        f"/remote/configs/gemma4_experiment5_routed_ladder_{panel}_v1.yaml",
+        f"/remote/configs/gemma4_experiment5_routed_ladder_{panel}_v2.yaml",
         "--condition",
         condition,
         "--seed",
@@ -98,12 +104,33 @@ def _arguments(
         "--source-revision",
         SOURCE_REVISION,
         "--training-source-revision",
-        H_TRAINING_REVISION if condition == "H" else SOURCE_REVISION,
+        (
+            H_TRAINING_REVISION
+            if condition == "H" or historical_a256
+            else SOURCE_REVISION
+        ),
         "--run-root",
         f"/remote/runs/{panel}/{condition}/seed0",
         "--result-root",
         f"/remote/results/{panel}/{condition}/seed0/2000000",
+        "--parent-training-result-sha256",
+        "3" * 64,
+        "--parent-training-result-file-sha256",
+        "e" * 64,
+        "--parent-checkpoint-pointer-sha256",
+        "5" * 64,
+        "--parent-checkpoint-pointer-file-sha256",
+        "0" * 64,
     ]
+    if condition != "H":
+        arguments.extend(
+            (
+                "--parent-run-contract-sha256",
+                "c" * 64 if historical_a256 else "4" * 64,
+                "--parent-run-contract-file-sha256",
+                "d" * 64 if historical_a256 else "f" * 64,
+            )
+        )
     if condition == "H":
         arguments.extend(
             (
@@ -111,15 +138,198 @@ def _arguments(
                 f"/remote/configs/gemma4_hybrid_{panel}_v1.yaml",
             )
         )
+    if historical_a256:
+        arguments.extend(
+            (
+                "--a256-config",
+                "/remote/configs/gemma4_contribution_horizon_v1.yaml",
+                "--reference-run-contract-sha256",
+                "c" * 64,
+                "--reference-run-contract-file-sha256",
+                "d" * 64,
+            )
+        )
     if dry_run:
         arguments.append("--dry-run")
     return arguments
+
+
+def _bundle_manifest(
+    operator,
+    tmp_path: Path,
+    *,
+    panel: str,
+    seed: int = 0,
+) -> tuple[Path, str]:
+    config = (
+        f"/remote/configs/gemma4_experiment5_routed_ladder_{panel}_v2.yaml"
+    )
+    cells = []
+    for condition in BUNDLE_CONDITIONS:
+        for checkpoint_tokens in CHECKPOINT_TOKENS:
+            historical_a256 = (
+                panel == "sae"
+                and seed == 0
+                and condition == "A256ReLU"
+            )
+            reference_kind = (
+                "a256"
+                if historical_a256
+                else "h"
+                if condition == "H"
+                else "none"
+            )
+            cells.append(
+                {
+                    "condition": condition,
+                    "checkpoint_tokens": checkpoint_tokens,
+                    "training_source_revision": (
+                        H_TRAINING_REVISION
+                        if reference_kind != "none"
+                        else SOURCE_REVISION
+                    ),
+                    "run_root_remote": (
+                        f"/remote/runs/{panel}/{condition}/seed{seed}"
+                    ),
+                    "checkpoint_payload_root_gcs": (
+                        f"gs://bucket/checkpoints/{panel}/{condition}/seed{seed}"
+                    ),
+                    "result_root_remote": (
+                        f"/remote/results/{panel}/{condition}/seed{seed}/"
+                        f"{checkpoint_tokens}"
+                    ),
+                    "result_root_controller": str(
+                        tmp_path
+                        / "published"
+                        / panel
+                        / condition
+                        / f"seed{seed}"
+                        / str(checkpoint_tokens)
+                    ),
+                    "reference_kind": reference_kind,
+                    "reference_config_remote": (
+                        f"/remote/configs/{reference_kind}-{panel}.yaml"
+                        if reference_kind != "none"
+                        else None
+                    ),
+                    "reference_run_contract_sha256": (
+                        "c" * 64 if reference_kind == "a256" else None
+                    ),
+                    "reference_run_contract_file_sha256": (
+                        "d" * 64 if reference_kind == "a256" else None
+                    ),
+                    "parent_training_result_sha256": "3" * 64,
+                    "parent_training_result_file_sha256": "e" * 64,
+                    "parent_run_contract_sha256": (
+                        None
+                        if reference_kind == "h"
+                        else "c" * 64
+                        if reference_kind == "a256"
+                        else "4" * 64
+                    ),
+                    "parent_run_contract_file_sha256": (
+                        None
+                        if reference_kind == "h"
+                        else "d" * 64
+                        if reference_kind == "a256"
+                        else "f" * 64
+                    ),
+                    "parent_checkpoint_pointer_sha256": "5" * 64,
+                    "parent_checkpoint_pointer_file_sha256": "0" * 64,
+                }
+            )
+    unsigned = {
+        "schema_version": operator.OPERATOR_BUNDLE_MANIFEST_SCHEMA_VERSION,
+        "protocol_id": PROTOCOL_ID,
+        "panel": panel,
+        "seed": seed,
+        "source_revision": SOURCE_REVISION,
+        "config_remote": config,
+        "bundle_result_root_remote": (
+            f"/remote/results/{panel}/seed{seed}/bundle"
+        ),
+        "bundle_result_root_controller": str(
+            tmp_path / "published" / panel / f"seed{seed}" / "bundle"
+        ),
+        "cells": cells,
+    }
+    manifest = {
+        **unsigned,
+        "manifest_sha256": canonical_sha256(unsigned),
+    }
+    path = tmp_path / f"{panel}-seed{seed}-bundle.json"
+    path.write_text(json.dumps(manifest), encoding="ascii")
+    return path, config
+
+
+@pytest.mark.parametrize("panel", ("sae", "transcoder"))
+def test_bundle_dry_run_emits_one_exact_twelve_cell_worker(
+    operator,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    panel: str,
+) -> None:
+    manifest, config = _bundle_manifest(operator, tmp_path, panel=panel)
+    for name, value in _environment(tmp_path, panel=panel).items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(
+        operator,
+        "_mapping",
+        lambda _settings: pytest.fail("dry bundle contacted controllers"),
+    )
+
+    assert (
+        operator.main(
+            [
+                "--panel",
+                panel,
+                "--config",
+                config,
+                "--seed",
+                "0",
+                "--source-revision",
+                SOURCE_REVISION,
+                "--bundle-manifest",
+                str(manifest),
+                "--attempt-id",
+                "attempt-1",
+                "--dry-run",
+            ]
+        )
+        == 0
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["cells"] == 12
+    command = payload["worker_process_zero"]
+    parsed = _worker_parser().parse_args(
+        command[
+            command.index(
+                "moe_sae.experiment5_routed_ladder_evaluation_worker"
+            )
+            + 1 :
+        ]
+    )
+    spec = parse_resident_bundle_spec(json.loads(parsed.bundle_spec_json))
+    assert [cell.identity for cell in spec.cells] == [
+        (condition, checkpoint_tokens)
+        for condition in BUNDLE_CONDITIONS
+        for checkpoint_tokens in CHECKPOINT_TOKENS
+    ]
+    assert {
+        cell.reference_kind
+        for cell in spec.cells
+        if cell.condition == "A256ReLU"
+    } == ({"a256"} if panel == "sae" else {"none"})
 
 
 @pytest.mark.parametrize(
     ("panel", "condition"),
     (
         ("sae", "A512ReLU"),
+        ("sae", "A256ReLU"),
+        ("transcoder", "A256ReLU"),
         ("transcoder", "A512Softplus"),
         ("sae", "H"),
         ("transcoder", "H"),
@@ -150,8 +360,20 @@ def test_a_and_h_commands_exactly_match_worker_contract(
     assert parsed.process_index == 3
     assert parsed.cache_root == "/local/cache/process-p00003"
     assert (parsed.h_config is not None) == (condition == "H")
+    assert (parsed.a256_config is not None) == (
+        panel == "sae" and condition == "A256ReLU"
+    )
+    assert (parsed.reference_run_contract_sha256 is not None) == (
+        panel == "sae" and condition == "A256ReLU"
+    )
+    assert (
+        parsed.reference_run_contract_file_sha256 is not None
+    ) == (panel == "sae" and condition == "A256ReLU")
     assert parsed.training_source_revision == (
-        H_TRAINING_REVISION if condition == "H" else SOURCE_REVISION
+        H_TRAINING_REVISION
+        if condition == "H"
+        or (panel == "sae" and condition == "A256ReLU")
+        else SOURCE_REVISION
     )
     assert (parsed.train_source_root is None) == (panel == "sae")
 
@@ -178,6 +400,20 @@ def test_h_config_is_required_only_for_h_and_a_revision_is_current(
     a_arguments.extend(("--h-config", "/remote/configs/wrong.yaml"))
     with pytest.raises(operator.OperatorError, match="valid only for H"):
         operator._settings(operator._parser().parse_args(a_arguments), environment)
+
+    historical = _arguments(condition="A256ReLU")
+    index = historical.index("--a256-config")
+    del historical[index : index + 2]
+    with pytest.raises(operator.OperatorError, match="requires --a256-config"):
+        operator._settings(operator._parser().parse_args(historical), environment)
+
+    transcoder = _arguments(panel="transcoder", condition="A256ReLU")
+    transcoder.extend(("--a256-config", "/remote/configs/wrong.yaml"))
+    with pytest.raises(operator.OperatorError, match="historical SAE"):
+        operator._settings(
+            operator._parser().parse_args(transcoder),
+            _environment(tmp_path, panel="transcoder"),
+        )
 
 
 @pytest.mark.parametrize("condition", ("A512ReLU", "H"))
@@ -243,6 +479,12 @@ def _sealed_result(root: Path) -> tuple[bytes, str, bytes]:
         training_result_sha256="3" * 64,
         training_contract_sha256="4" * 64,
         checkpoint_sha256="5" * 64,
+        parent_training_result_sha256="3" * 64,
+        parent_training_result_file_sha256="e" * 64,
+        parent_run_contract_sha256="4" * 64,
+        parent_run_contract_file_sha256="f" * 64,
+        parent_checkpoint_pointer_sha256="5" * 64,
+        parent_checkpoint_pointer_file_sha256="0" * 64,
         target_manifest_sha256="6" * 64,
         source_manifest_sha256=None,
         recomposition_sidecar_sha256="7" * 64,

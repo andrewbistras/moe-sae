@@ -14,6 +14,9 @@ from moe_sae.experiment5_routed_ladder import (
     h_token_scores_to_existing_reference,
 )
 from moe_sae.experiment5_routed_ladder_evaluation_worker import (
+    BUNDLE_CONDITIONS,
+    BUNDLE_SPEC_SCHEMA_VERSION,
+    CHECKPOINT_TOKENS,
     ENDPOINT_CENTERING_ALGORITHM_SCHEMA_VERSION,
     RESULT_SCHEMA_VERSION,
     RoutedLadderEvaluationError,
@@ -21,11 +24,16 @@ from moe_sae.experiment5_routed_ladder_evaluation_worker import (
     _endpoint_centering_cache_identity,
     load_merged_scores,
     load_process_evidence,
+    parse_resident_bundle_spec,
     main,
     merge_process_evidence,
+    seal_resident_bundle_result,
     seal_merged_result,
     seal_process_evidence,
+    run_resident_bundle,
 )
+from moe_sae.contribution_artifacts import canonical_sha256
+from moe_sae.experiment5_routed_ladder import PROTOCOL_ID
 
 
 SOURCE_REVISION = "a" * 40
@@ -39,8 +47,11 @@ DIGESTS = {
             "config",
             "config_file",
             "training_result",
+            "training_result_file",
             "training_contract",
+            "training_contract_file",
             "checkpoint",
+            "checkpoint_file",
             "target",
             "sidecar",
             "centering",
@@ -150,6 +161,20 @@ def _seal_lane(
         training_result_sha256=DIGESTS["training_result"],
         training_contract_sha256=DIGESTS["training_contract"],
         checkpoint_sha256=DIGESTS["checkpoint"],
+        parent_training_result_sha256=DIGESTS["training_result"],
+        parent_training_result_file_sha256=DIGESTS[
+            "training_result_file"
+        ],
+        parent_run_contract_sha256=(
+            None if condition == "H" else DIGESTS["training_contract"]
+        ),
+        parent_run_contract_file_sha256=(
+            None if condition == "H" else DIGESTS["training_contract_file"]
+        ),
+        parent_checkpoint_pointer_sha256=DIGESTS["checkpoint"],
+        parent_checkpoint_pointer_file_sha256=DIGESTS[
+            "checkpoint_file"
+        ],
         target_manifest_sha256=DIGESTS["target"],
         source_manifest_sha256=None,
         recomposition_sidecar_sha256=DIGESTS["sidecar"],
@@ -504,3 +529,429 @@ def test_cli_entry_passes_one_exact_cell_to_worker(
     assert observed.seed == 2
     assert observed.checkpoint_tokens == 10_000_000
     assert observed.process_index == 3
+
+
+def _bundle_spec(
+    tmp_path: Path,
+    *,
+    panel: str = "sae",
+    seed: int = 0,
+) -> dict:
+    cells = []
+    for condition in BUNDLE_CONDITIONS:
+        for checkpoint_tokens in CHECKPOINT_TOKENS:
+            historical_a256 = (
+                panel == "sae"
+                and seed == 0
+                and condition == "A256ReLU"
+            )
+            reference_kind = (
+                "a256"
+                if historical_a256
+                else "h"
+                if condition == "H"
+                else "none"
+            )
+            cells.append(
+                {
+                    "condition": condition,
+                    "checkpoint_tokens": checkpoint_tokens,
+                    "training_source_revision": (
+                        TRAINING_REVISION
+                        if reference_kind != "none"
+                        else SOURCE_REVISION
+                    ),
+                    "run_root": str(
+                        tmp_path
+                        / "runs"
+                        / panel
+                        / condition
+                        / f"seed{seed}"
+                    ),
+                    "checkpoint_payload_root": (
+                        f"gs://bucket/checkpoints/{panel}/{condition}/seed{seed}"
+                    ),
+                    "result_root": str(
+                        tmp_path
+                        / "results"
+                        / panel
+                        / condition
+                        / f"seed{seed}"
+                        / str(checkpoint_tokens)
+                    ),
+                    "reference_kind": reference_kind,
+                    "reference_config": (
+                        f"/remote/configs/{reference_kind}-{panel}.yaml"
+                        if reference_kind != "none"
+                        else None
+                    ),
+                    "reference_run_contract_sha256": (
+                        "7" * 64 if reference_kind == "a256" else None
+                    ),
+                    "reference_run_contract_file_sha256": (
+                        "8" * 64 if reference_kind == "a256" else None
+                    ),
+                    "parent_training_result_sha256": "1" * 64,
+                    "parent_training_result_file_sha256": "2" * 64,
+                    "parent_run_contract_sha256": (
+                        None
+                        if reference_kind == "h"
+                        else "7" * 64
+                        if reference_kind == "a256"
+                        else "9" * 64
+                    ),
+                    "parent_run_contract_file_sha256": (
+                        None
+                        if reference_kind == "h"
+                        else "8" * 64
+                        if reference_kind == "a256"
+                        else "a" * 64
+                    ),
+                    "parent_checkpoint_pointer_sha256": "b" * 64,
+                    "parent_checkpoint_pointer_file_sha256": "c" * 64,
+                }
+            )
+    unsigned = {
+        "schema_version": BUNDLE_SPEC_SCHEMA_VERSION,
+        "protocol_id": PROTOCOL_ID,
+        "panel": panel,
+        "seed": seed,
+        "source_revision": SOURCE_REVISION,
+        "config": f"/remote/configs/ladder-{panel}-v2.yaml",
+        "bundle_result_root": str(
+            tmp_path / "bundle-results" / panel / f"seed{seed}"
+        ),
+        "operator_manifest_sha256": "e" * 64,
+        "cells": cells,
+    }
+    return {
+        **unsigned,
+        "bundle_spec_sha256": canonical_sha256(unsigned),
+    }
+
+
+def test_resident_bundle_spec_is_exact_and_panel_specific(
+    tmp_path: Path,
+) -> None:
+    sae = parse_resident_bundle_spec(_bundle_spec(tmp_path))
+    transcoder = parse_resident_bundle_spec(
+        _bundle_spec(tmp_path, panel="transcoder")
+    )
+
+    assert len(sae.cells) == 12
+    assert [cell.identity for cell in sae.cells] == [
+        (condition, checkpoint_tokens)
+        for condition in BUNDLE_CONDITIONS
+        for checkpoint_tokens in CHECKPOINT_TOKENS
+    ]
+    assert {
+        cell.reference_kind
+        for cell in sae.cells
+        if cell.condition == "A256ReLU"
+    } == {"a256"}
+    assert {
+        cell.reference_kind
+        for cell in transcoder.cells
+        if cell.condition == "A256ReLU"
+    } == {"none"}
+
+
+def test_resident_bundle_rejects_reordering_and_transcoder_a256_parent(
+    tmp_path: Path,
+) -> None:
+    reordered = _bundle_spec(tmp_path)
+    reordered["cells"][0], reordered["cells"][1] = (
+        reordered["cells"][1],
+        reordered["cells"][0],
+    )
+    reordered["bundle_spec_sha256"] = canonical_sha256(
+        {
+            name: value
+            for name, value in reordered.items()
+            if name != "bundle_spec_sha256"
+        }
+    )
+    with pytest.raises(
+        RoutedLadderEvaluationError,
+        match="deterministic 12-cell order",
+    ):
+        parse_resident_bundle_spec(reordered)
+
+    transcoder = _bundle_spec(tmp_path, panel="transcoder")
+    transcoder["cells"][0]["reference_kind"] = "a256"
+    transcoder["cells"][0]["reference_config"] = "/remote/configs/a256.yaml"
+    transcoder["cells"][0]["training_source_revision"] = TRAINING_REVISION
+    transcoder["bundle_spec_sha256"] = canonical_sha256(
+        {
+            name: value
+            for name, value in transcoder.items()
+            if name != "bundle_spec_sha256"
+        }
+    )
+    with pytest.raises(
+        RoutedLadderEvaluationError,
+        match="reference role changed",
+    ):
+        parse_resident_bundle_spec(transcoder)
+
+    missing_pin = _bundle_spec(tmp_path)
+    missing_pin["cells"][0]["reference_run_contract_sha256"] = None
+    missing_pin["bundle_spec_sha256"] = canonical_sha256(
+        {
+            name: value
+            for name, value in missing_pin.items()
+            if name != "bundle_spec_sha256"
+        }
+    )
+    with pytest.raises(
+        RoutedLadderEvaluationError,
+        match="reference_run_contract_sha256",
+    ):
+        parse_resident_bundle_spec(missing_pin)
+
+
+def test_resident_bundle_completion_binds_all_twelve_cells(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    bundle = parse_resident_bundle_spec(_bundle_spec(tmp_path))
+
+    def completion(_bundle, cell):
+        return {
+            "condition": cell.condition,
+            "checkpoint_tokens": cell.checkpoint_tokens,
+            "training_source_revision": cell.training_source_revision,
+            "parent_training_result_sha256": (
+                cell.parent_training_result_sha256
+            ),
+            "parent_training_result_file_sha256": (
+                cell.parent_training_result_file_sha256
+            ),
+            "parent_run_contract_sha256": (
+                cell.parent_run_contract_sha256
+            ),
+            "parent_run_contract_file_sha256": (
+                cell.parent_run_contract_file_sha256
+            ),
+            "parent_checkpoint_pointer_sha256": (
+                cell.parent_checkpoint_pointer_sha256
+            ),
+            "parent_checkpoint_pointer_file_sha256": (
+                cell.parent_checkpoint_pointer_file_sha256
+            ),
+            "result_root": cell.result_root,
+            "result_sha256": f"{cell.checkpoint_tokens // 1_000_000:064x}",
+            "result_file_sha256": "1" * 64,
+            "score_artifact_sha256": "2" * 64,
+            "score_data_sha256": "3" * 64,
+            "score_data_bytes": 123,
+        }
+
+    monkeypatch.setattr(
+        "moe_sae.experiment5_routed_ladder_evaluation_worker."
+        "_resident_cell_completion",
+        completion,
+    )
+    rows = [completion(bundle, cell) for cell in bundle.cells]
+    timing = {
+        "accelerator_type": "v6e-16",
+        "chip_count": 16,
+        "successful_attempt_wall_seconds": 2.0,
+        "successful_attempt_chip_seconds": 32.0,
+        "timing_scope": (
+            "successful_resident_worker_after_cli_parse_through_cell_completion"
+        ),
+    }
+    result = seal_resident_bundle_result(bundle, rows, timing=timing)
+
+    assert result["status"] == "bundle_evaluated"
+    assert len(result["cell_results"]) == 12
+    with pytest.raises(
+        RoutedLadderEvaluationError,
+        match="incomplete or reordered",
+    ):
+        seal_resident_bundle_result(
+            bundle,
+            list(reversed(rows)),
+            timing=timing,
+        )
+
+
+def test_cli_dispatches_resident_bundle_without_single_cell_args(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    observed = None
+
+    def fake_run(args):
+        nonlocal observed
+        observed = args
+        return 11
+
+    monkeypatch.setattr(
+        "moe_sae.experiment5_routed_ladder_evaluation_worker."
+        "run_resident_bundle",
+        fake_run,
+    )
+    spec = _bundle_spec(tmp_path)
+    code = main(
+        [
+            "--config",
+            spec["config"],
+            "--panel",
+            "sae",
+            "--seed",
+            "0",
+            "--source-revision",
+            SOURCE_REVISION,
+            "--train-target-root",
+            "/train",
+            "--eval-target-root",
+            "/eval",
+            "--train-target-object-prefix",
+            "gs://bucket/train",
+            "--eval-target-object-prefix",
+            "gs://bucket/eval",
+            "--cache-root",
+            "/cache",
+            "--cache-max-bytes",
+            "1024",
+            "--recomposition-sidecar",
+            "/sidecar.json",
+            "--process-index",
+            "0",
+            "--bundle-spec-json",
+            json.dumps(spec),
+            "--attempt-id",
+            "attempt-1",
+        ]
+    )
+
+    assert code == 11
+    assert observed.condition is None
+    assert observed.checkpoint_tokens is None
+    assert observed.attempt_id == "attempt-1"
+
+
+def test_resident_bundle_skips_completed_cells_and_clears_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import jax
+
+    spec = _bundle_spec(tmp_path)
+    bundle = parse_resident_bundle_spec(spec)
+    completed = {cell.identity for cell in bundle.cells[:2]}
+    executed = []
+    observed_parent_pins = {}
+    clear_calls = 0
+
+    def completion(_bundle, cell):
+        if cell.identity not in completed:
+            return None
+        return {
+            "condition": cell.condition,
+            "checkpoint_tokens": cell.checkpoint_tokens,
+            "training_source_revision": cell.training_source_revision,
+            "parent_training_result_sha256": (
+                cell.parent_training_result_sha256
+            ),
+            "parent_training_result_file_sha256": (
+                cell.parent_training_result_file_sha256
+            ),
+            "parent_run_contract_sha256": (
+                cell.parent_run_contract_sha256
+            ),
+            "parent_run_contract_file_sha256": (
+                cell.parent_run_contract_file_sha256
+            ),
+            "parent_checkpoint_pointer_sha256": (
+                cell.parent_checkpoint_pointer_sha256
+            ),
+            "parent_checkpoint_pointer_file_sha256": (
+                cell.parent_checkpoint_pointer_file_sha256
+            ),
+            "result_root": cell.result_root,
+            "result_sha256": "1" * 64,
+            "result_file_sha256": "2" * 64,
+            "score_artifact_sha256": "3" * 64,
+            "score_data_sha256": "4" * 64,
+            "score_data_bytes": 123,
+        }
+
+    def fake_run(args, **_kwargs):
+        identity = (args.condition, args.checkpoint_tokens)
+        executed.append(identity)
+        observed_parent_pins[identity] = (
+            args.parent_training_result_sha256,
+            args.parent_training_result_file_sha256,
+            args.parent_run_contract_sha256,
+            args.parent_run_contract_file_sha256,
+            args.parent_checkpoint_pointer_sha256,
+            args.parent_checkpoint_pointer_file_sha256,
+        )
+        Path(args.result_root).mkdir(parents=True)
+        completed.add(identity)
+        return 0
+
+    def clear_caches():
+        nonlocal clear_calls
+        clear_calls += 1
+
+    monkeypatch.setattr(
+        "moe_sae.experiment5_routed_ladder_evaluation_worker."
+        "_resident_cell_completion",
+        completion,
+    )
+    monkeypatch.setattr(
+        "moe_sae.experiment5_routed_ladder_evaluation_worker.run",
+        fake_run,
+    )
+    monkeypatch.setattr(
+        "moe_sae.contribution_training_worker._collective_records",
+        lambda row: [row],
+    )
+    monkeypatch.setattr(
+        "moe_sae.contribution_training_worker._collective_barrier",
+        lambda _name: None,
+    )
+    monkeypatch.setattr(
+        "moe_sae.runtime.initialize_jax_distributed",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        "moe_sae.runtime.require_accelerator_runtime",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(jax, "process_index", lambda: 0)
+    monkeypatch.setattr(jax, "clear_caches", clear_caches)
+
+    code = run_resident_bundle(
+        SimpleNamespace(
+            attempt_id="attempt-1",
+            bundle_spec_json=json.dumps(spec),
+            panel=bundle.panel,
+            seed=bundle.seed,
+            source_revision=bundle.source_revision,
+            config=bundle.config,
+            accelerator_type="v6e-16",
+            peak_flops_per_second=1,
+            process_index=0,
+        )
+    )
+
+    assert code == 0
+    assert executed == [cell.identity for cell in bundle.cells[2:]]
+    for cell in bundle.cells[2:]:
+        assert observed_parent_pins[cell.identity] == (
+            cell.parent_training_result_sha256,
+            cell.parent_training_result_file_sha256,
+            cell.parent_run_contract_sha256,
+            cell.parent_run_contract_file_sha256,
+            cell.parent_checkpoint_pointer_sha256,
+            cell.parent_checkpoint_pointer_file_sha256,
+        )
+    assert clear_calls == 1
+    assert (
+        Path(bundle.bundle_result_root) / "bundle-result.json"
+    ).is_file()

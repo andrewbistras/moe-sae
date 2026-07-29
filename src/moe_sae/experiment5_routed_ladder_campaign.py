@@ -7,14 +7,15 @@ namespace.
 
 The extension schedules exactly:
 
-* 12 new training trajectories: A512ReLU/A512Softplus x two panels x seeds;
-* 36 A512ReLU/A512Softplus evaluations at 2M/5M/10M;
+* 17 new training trajectories under the protocol-v2 provenance matrix;
+* 54 A256ReLU/A512ReLU/A512Softplus evaluations at 2M/5M/10M;
 * 18 read-only rescorings of immutable H checkpoints; and
 * 18 hash-pinned H training/checkpoint references that are never retrained.
 
-The controller owns no cloud lifecycle.  Its seven resource rows must be the
-existing TRC inventory, and only the three already-authorized ready slices may
-own work.
+The controller owns no cloud lifecycle.  A self-hashed resource-pool manifest
+admits three to eighteen already-deployed, evidence-bound slices.  Every task
+has one immutable owner, while the inherited scheduler continues to serialize
+attempts per resource and to handle readiness, retry, and preemption evidence.
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import subprocess
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -53,78 +55,153 @@ from moe_sae.experiment5_campaign import (
     _positive_int,
     _read_record,
     _read_self_hashed_json,
+    _record,
     _remote_path,
     _resource,
     _safe_id,
     _seal_exact_bytes,
     _sha256,
+    _timestamp,
     _verify_file,
+    _write_create_only,
     inspect_training_completion as inspect_core_training_completion,
 )
 from moe_sae.checkpointing import milestone_pointer_path, validate_pointer
+from moe_sae.direct_horizon_campaign import (
+    PROTOCOL_ID as EXPERIMENT4_PROTOCOL_ID,
+    DirectCampaignPlan,
+    DirectCampaignPlanError,
+    inspect_training_completion as inspect_horizon_training_completion,
+    parse_direct_campaign_plan,
+)
 from moe_sae.experiment5_config import (
     Experiment5ConfigError,
     load_experiment5_config,
 )
-from moe_sae.experiment5_plan_builder import (
-    EXECUTION_PROFILE,
-    EXPECTED_RESOURCE_EVIDENCE_OVERRIDES,
-    EXPECTED_SURVIVING_TPUS,
-    build_experiment5_plan,
-)
+from moe_sae.experiment5_plan_builder import _PRESERVED_GLOBAL_ENVIRONMENT
 from moe_sae.experiment5_routed_ladder import (
     PROTOCOL_ID,
     SCORE_SCHEMA_VERSION,
     Experiment5RoutedLadderError,
     ImmutableArtifactReference,
+    RoutedLadderEvaluationBundleAccounting,
     RoutedLadderHTokenScores,
     RoutedLadderTokenScores,
+    RoutedLadderTrainingCost,
+    RoutedLadderTrajectoryAccounting,
+    RoutedLadderWallCashAccounting,
     build_experiment5_routed_ladder_report,
     h_token_scores_to_existing_reference,
     validate_experiment5_routed_ladder_report,
 )
 from moe_sae.experiment5_routed_ladder_evaluation_worker import (
+    BUNDLE_CONDITIONS,
+    BUNDLE_RESULT_SCHEMA_VERSION,
     RESULT_SCHEMA_VERSION as EVALUATION_RESULT_SCHEMA_VERSION,
     RoutedLadderEvaluationError,
     load_merged_scores,
 )
 from moe_sae.experiment5_routed_ladder_config import (
     H_CONFIG_SHA256,
+)
+from moe_sae.experiment5_routed_ladder_v2_config import (
+    A256_SAE_CONFIG_SHA256,
+    A256_SAE_NEW_TRAINING_SEEDS,
+    ANALYZED_CONDITIONS,
+    CONDITIONS as V2_CONDITIONS,
     PHASE_NAME,
-    RoutedLadderConfigError,
-    load_routed_ladder_config,
+    RoutedLadderV2ConfigError,
+    load_routed_ladder_v2_config,
+)
+from moe_sae.experiment5_routed_ladder_resources import (
+    MAX_RESOURCE_COUNT,
+    MIN_RESOURCE_COUNT,
+    RoutedLadderResourcePool,
+    RoutedLadderResourcePoolError,
+    parse_routed_ladder_resource_pool,
+)
+from moe_sae.learning_horizon_config import (
+    LearningHorizonConfigError,
+    load_learning_horizon_config,
 )
 
 PLAN_SCHEMA_VERSION = (
-    "gemma4-experiment5-routed-activation-ladder-campaign-plan-v1"
+    "gemma4-experiment5-routed-activation-ladder-campaign-plan-v2"
 )
 H_REFERENCE_MANIFEST_SCHEMA_VERSION = (
     "gemma4-experiment5-routed-activation-ladder-h-reference-manifest-v1"
 )
+A256_REFERENCE_MANIFEST_SCHEMA_VERSION = (
+    "gemma4-experiment5-routed-activation-ladder-a256-reference-manifest-v1"
+)
 EVALUATION_SCORE_SCHEMA_VERSION = SCORE_SCHEMA_VERSION
 REPORT_INPUT_SCHEMA_VERSION = (
-    "gemma4-experiment5-routed-activation-ladder-report-inputs-v1"
+    "gemma4-experiment5-routed-activation-ladder-report-inputs-v2"
 )
 
 PANELS = ("sae", "transcoder")
-CONDITIONS = ("A512ReLU", "A512Softplus")
-EVALUATION_CONDITIONS = (*CONDITIONS, "H")
+CONDITIONS = V2_CONDITIONS
+EVALUATION_CONDITIONS = ANALYZED_CONDITIONS
 SEEDS = (0, 1, 2)
 MILESTONES = (2_000_000, 5_000_000, 10_000_000)
 TRAIN_TOKENS = 10_000_000
-RESOURCE_COUNT = 7
-TRAINING_TASK_COUNT = 12
-EVALUATION_TASK_COUNT = 54
+
+
+def training_seeds_for_condition(
+    panel: str,
+    condition: str,
+) -> tuple[int, ...]:
+    """Return the exact protocol-v2 set of newly trained seeds."""
+
+    if panel not in PANELS or condition not in CONDITIONS:
+        raise RoutedLadderCampaignPlanError(
+            "training role is outside the protocol-v2 matrix"
+        )
+    if panel == "sae" and condition == "A256ReLU":
+        return A256_SAE_NEW_TRAINING_SEEDS
+    return SEEDS
+
+
+EXPECTED_TRAINING_ROLES = frozenset(
+    (panel, condition, seed)
+    for panel in PANELS
+    for condition in CONDITIONS
+    for seed in training_seeds_for_condition(panel, condition)
+)
+EXPECTED_EVALUATION_ROLES = frozenset(
+    (panel, condition, seed, milestone)
+    for panel in PANELS
+    for condition in EVALUATION_CONDITIONS
+    for seed in SEEDS
+    for milestone in MILESTONES
+)
+TRAINING_TASK_COUNT = len(EXPECTED_TRAINING_ROLES)
+EVALUATION_TASK_COUNT = len(EXPECTED_EVALUATION_ROLES)
+EVALUATION_BUNDLE_COUNT = len(PANELS) * len(SEEDS)
 H_REFERENCE_COUNT = 18
+A256_REFERENCE_COUNT = 3
 EXTENSION_NAMESPACE = (
-    "experiment5/extensions/routed-activation-ladder-v1"
+    "experiment5/extensions/routed-activation-ladder-v2"
 )
 CONTINUOUS_RUNTIME_SECONDS = 43_200
+OPERATOR_BUNDLE_MANIFEST_SCHEMA_VERSION = (
+    "gemma4-experiment5-routed-activation-ladder-operator-bundle-manifest-v1"
+)
+_CHIP_COUNT_BY_ACCELERATOR = {
+    "v4-32": 16,
+    "v6e-16": 16,
+    "v5litepod-16": 16,
+}
+_EVALUATION_TIMING_SCOPE = (
+    "successful_resident_worker_after_cli_parse_through_cell_completion"
+)
+_CAMPAIGN_WALL_SCOPE = (
+    "durable_campaign_clock_through_evaluation_completion"
+)
 
-_ACTIVE_TPU_NAMES = frozenset(EXPECTED_RESOURCE_EVIDENCE_OVERRIDES.values())
 _CONFIG_NAMES = {
-    "sae": "gemma4_experiment5_routed_ladder_sae_v1.yaml",
-    "transcoder": "gemma4_experiment5_routed_ladder_transcoder_v1.yaml",
+    "sae": "gemma4_experiment5_routed_ladder_sae_v2.yaml",
+    "transcoder": "gemma4_experiment5_routed_ladder_transcoder_v2.yaml",
 }
 _RESERVED_ENVIRONMENT = frozenset(
     {
@@ -132,6 +209,7 @@ _RESERVED_ENVIRONMENT = frozenset(
     }
 )
 _CONDITION_SLUG = {
+    "A256ReLU": "a256-relu",
     "A512ReLU": "a512-relu",
     "A512Softplus": "a512-softplus",
     "H": "h",
@@ -179,6 +257,10 @@ class RoutedLadderEvaluationTask:
     config_sha256: str
     h_config_remote: str | None
     h_config_sha256: str | None
+    a256_config_remote: str | None
+    a256_config_sha256: str | None
+    reference_run_contract_sha256: str | None
+    reference_run_contract_file_sha256: str | None
     training_source_revision: str
     control_root_remote: str
     checkpoint_root_gcs: str
@@ -196,7 +278,36 @@ class RoutedLadderEvaluationTask:
         return dict(self.environment)
 
 
-RoutedLadderTask = RoutedLadderTrainingTask | RoutedLadderEvaluationTask
+@dataclass(frozen=True, slots=True)
+class RoutedLadderEvaluationBundleTask:
+    """One resident operator invocation covering twelve immutable cells."""
+
+    task_id: str
+    panel: str
+    seed: int
+    eligible_resource_ids: tuple[str, ...]
+    config_remote: str
+    control_root_remote: str
+    checkpoint_root_gcs: str
+    train_source_root_remote: str | None
+    eval_source_root_remote: str | None
+    train_source_object_prefix_gcs: str | None
+    eval_source_object_prefix_gcs: str | None
+    result_root_remote: str
+    result_root_controller: Path
+    completion_path_controller: Path
+    cells: tuple[RoutedLadderEvaluationTask, ...]
+    environment: tuple[tuple[str, str], ...] = ()
+
+    def environment_dict(self) -> dict[str, str]:
+        return dict(self.environment)
+
+
+RoutedLadderTask = (
+    RoutedLadderTrainingTask
+    | RoutedLadderEvaluationTask
+    | RoutedLadderEvaluationBundleTask
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,6 +333,41 @@ class HCheckpointReference:
 
 
 @dataclass(frozen=True, slots=True)
+class A256HistoricalCost:
+    """Measured cost provenance for the one reused Experiment-4 trajectory."""
+
+    resource_id: str
+    accelerator_type: str
+    chip_count: int
+    marginal_wall_seconds: float
+    chip_seconds: float
+    chip_seconds_scope: str
+    chip_seconds_excludes: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class A256CheckpointReference:
+    """One milestone of the sole compatible historical SAE A256 trajectory."""
+
+    checkpoint_tokens: int
+    training_source_revision: str
+    a256_config: EvidencePath
+    a256_config_sha256: str
+    run_root_remote: str
+    checkpoint_payload_root_gcs: str
+    run_contract: EvidencePath
+    run_contract_sha256: str
+    training_result: EvidencePath
+    training_result_sha256: str
+    checkpoint_pointer: EvidencePath
+    checkpoint_pointer_sha256: str
+
+    @property
+    def identity(self) -> tuple[str, str, int, int]:
+        return "sae", "A256ReLU", 0, self.checkpoint_tokens
+
+
+@dataclass(frozen=True, slots=True)
 class RoutedLadderCampaignPlan:
     campaign_id: str
     state_root: Path
@@ -236,10 +382,14 @@ class RoutedLadderCampaignPlan:
     cost_policy: CostPolicy
     environment: tuple[tuple[str, str], ...]
     resources: tuple[CampaignResource, ...]
+    resource_pool: RoutedLadderResourcePool
     trajectories: tuple[RoutedLadderTrainingTask, ...]
     evaluations: tuple[RoutedLadderEvaluationTask, ...]
     h_reference_manifest: Mapping[str, Any]
     h_references: tuple[HCheckpointReference, ...]
+    a256_reference_manifest: Mapping[str, Any]
+    a256_references: tuple[A256CheckpointReference, ...]
+    a256_historical_cost: A256HistoricalCost
     plan_sha256: str
     source: Mapping[str, Any]
 
@@ -293,6 +443,19 @@ def _task_environment(value: Any, name: str) -> tuple[tuple[str, str], ...]:
             f"{sorted(overlap)!r}"
         )
     return result
+
+
+def _positive_number(value: Any, name: str) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or float(value) <= 0.0
+    ):
+        raise RoutedLadderCampaignPlanError(
+            f"{name} must be finite and positive"
+        )
+    return float(value)
 
 
 def _training_task(value: Any, index: int) -> RoutedLadderTrainingTask:
@@ -392,6 +555,10 @@ def _evaluation_task(value: Any, index: int) -> RoutedLadderEvaluationTask:
             "config_sha256",
             "h_config_remote",
             "h_config_sha256",
+            "a256_config_remote",
+            "a256_config_sha256",
+            "reference_run_contract_sha256",
+            "reference_run_contract_file_sha256",
             "training_source_revision",
             "phase",
             "control_root_remote",
@@ -425,6 +592,17 @@ def _evaluation_task(value: Any, index: int) -> RoutedLadderEvaluationTask:
         raise RoutedLadderCampaignPlanError(f"{name} identity changed")
     h_config_remote = selected["h_config_remote"]
     h_config_sha256 = selected["h_config_sha256"]
+    a256_config_remote = selected["a256_config_remote"]
+    a256_config_sha256 = selected["a256_config_sha256"]
+    reference_run_contract_sha256 = selected[
+        "reference_run_contract_sha256"
+    ]
+    reference_run_contract_file_sha256 = selected[
+        "reference_run_contract_file_sha256"
+    ]
+    historical_a256 = (
+        panel == "sae" and condition == "A256ReLU" and seed == 0
+    )
     if condition == "H":
         h_config_remote = _remote_path(
             h_config_remote, f"{name}.h_config_remote"
@@ -432,9 +610,56 @@ def _evaluation_task(value: Any, index: int) -> RoutedLadderEvaluationTask:
         h_config_sha256 = _sha256(
             h_config_sha256, f"{name}.h_config_sha256"
         )
+        if a256_config_remote is not None or a256_config_sha256 is not None:
+            raise RoutedLadderCampaignPlanError(
+                f"{name} H task may not carry an A256 config"
+            )
+        if (
+            reference_run_contract_sha256 is not None
+            or reference_run_contract_file_sha256 is not None
+        ):
+            raise RoutedLadderCampaignPlanError(
+                f"{name} H task may not carry an A256 run contract"
+            )
+    elif historical_a256:
+        a256_config_remote = _remote_path(
+            a256_config_remote,
+            f"{name}.a256_config_remote",
+        )
+        a256_config_sha256 = _sha256(
+            a256_config_sha256,
+            f"{name}.a256_config_sha256",
+        )
+        if (
+            a256_config_sha256 != A256_SAE_CONFIG_SHA256
+            or h_config_remote is not None
+            or h_config_sha256 is not None
+        ):
+            raise RoutedLadderCampaignPlanError(
+                f"{name} historical A256 config identity changed"
+            )
+        reference_run_contract_sha256 = _sha256(
+            reference_run_contract_sha256,
+            f"{name}.reference_run_contract_sha256",
+        )
+        reference_run_contract_file_sha256 = _sha256(
+            reference_run_contract_file_sha256,
+            f"{name}.reference_run_contract_file_sha256",
+        )
     elif h_config_remote is not None or h_config_sha256 is not None:
         raise RoutedLadderCampaignPlanError(
             f"{name} non-H task may not carry an H config"
+        )
+    elif a256_config_remote is not None or a256_config_sha256 is not None:
+        raise RoutedLadderCampaignPlanError(
+            f"{name} new task may not carry an A256 parent config"
+        )
+    elif (
+        reference_run_contract_sha256 is not None
+        or reference_run_contract_file_sha256 is not None
+    ):
+        raise RoutedLadderCampaignPlanError(
+            f"{name} new task may not carry a historical run contract"
         )
     completion = _controller_path(
         selected["completion_path_controller"],
@@ -469,6 +694,12 @@ def _evaluation_task(value: Any, index: int) -> RoutedLadderEvaluationTask:
         ),
         h_config_remote=h_config_remote,
         h_config_sha256=h_config_sha256,
+        a256_config_remote=a256_config_remote,
+        a256_config_sha256=a256_config_sha256,
+        reference_run_contract_sha256=reference_run_contract_sha256,
+        reference_run_contract_file_sha256=(
+            reference_run_contract_file_sha256
+        ),
         training_source_revision=_git_sha(
             selected["training_source_revision"],
             f"{name}.training_source_revision",
@@ -511,7 +742,12 @@ def _evaluation_task(value: Any, index: int) -> RoutedLadderEvaluationTask:
     )
 
 
-def _cost_policy(value: Any) -> CostPolicy:
+def _cost_policy(
+    value: Any,
+    *,
+    training_task_count: int,
+    evaluation_task_count: int,
+) -> CostPolicy:
     selected = _exact_mapping(
         value,
         {
@@ -546,17 +782,11 @@ def _cost_policy(value: Any) -> CostPolicy:
         raise RoutedLadderCampaignPlanError(
             "activation ladder inherits the cumulative $50/$5 policy"
         )
-    projection = (
-        policy.already_spent_usd
-        + policy.fixed_cost_reserve_usd
-        + TRAINING_TASK_COUNT * policy.training_attempt_reserve_usd
-        + EVALUATION_TASK_COUNT * policy.evaluation_attempt_reserve_usd
-    )
-    if projection > policy.initial_launch_limit_usd + 1e-9:
-        raise RoutedLadderCampaignPlanError(
-            "one-attempt activation-ladder projection exceeds the protected "
-            "$45 limit"
-        )
+    # Protocol v2 preserves the historical cumulative spend and the inherited
+    # reserve model as measurement provenance.  It deliberately does not use
+    # either value as a launch gate: TPU time is grant-funded and the operator
+    # explicitly prioritized completing this extension over the retired
+    # ready-three cash watchdog.
     return policy
 
 
@@ -676,8 +906,299 @@ def parse_h_reference_manifest(
         raise RoutedLadderCampaignPlanError(
             "H reference manifest must contain exactly 18 unique cells"
         )
+    for panel in PANELS:
+        for seed in SEEDS:
+            trajectory = [
+                cell
+                for cell in cells
+                if cell.panel == panel and cell.seed == seed
+            ]
+            if (
+                len(trajectory) != len(MILESTONES)
+                or len(
+                    {
+                        (
+                            cell.training_source_revision,
+                            cell.h_config_remote,
+                            cell.h_config_sha256,
+                            cell.run_root_remote,
+                            cell.checkpoint_payload_root_gcs,
+                            cell.training_result,
+                            cell.training_result_sha256,
+                        )
+                        for cell in trajectory
+                    }
+                )
+                != 1
+            ):
+                raise RoutedLadderCampaignPlanError(
+                    f"H {panel}/seed{seed} milestones do not share one "
+                    "immutable training trajectory"
+                )
+            if (
+                len({cell.checkpoint_pointer for cell in trajectory})
+                != len(MILESTONES)
+                or len(
+                    {
+                        cell.checkpoint_pointer_sha256
+                        for cell in trajectory
+                    }
+                )
+                != len(MILESTONES)
+            ):
+                raise RoutedLadderCampaignPlanError(
+                    f"H {panel}/seed{seed} milestone pointers are not unique"
+                )
     return copy.deepcopy(selected), tuple(
         sorted(cells, key=lambda item: item.identity)
+    )
+
+
+def parse_a256_reference_manifest(
+    value: Any,
+) -> tuple[
+    Mapping[str, Any],
+    tuple[A256CheckpointReference, ...],
+    A256HistoricalCost,
+]:
+    """Validate the three milestones of historical SAE A256 seed zero."""
+
+    selected = _exact_mapping(
+        value,
+        {
+            "schema_version",
+            "protocol_id",
+            "source_protocol_id",
+            "source_plan_sha256",
+            "historical_training_cost",
+            "cells",
+            "manifest_sha256",
+        },
+        "a256_reference_manifest",
+    )
+    if (
+        selected["schema_version"] != A256_REFERENCE_MANIFEST_SCHEMA_VERSION
+        or selected["protocol_id"] != PROTOCOL_ID
+        or selected["source_protocol_id"] != EXPERIMENT4_PROTOCOL_ID
+    ):
+        raise RoutedLadderCampaignPlanError(
+            "A256 reference manifest identity changed"
+        )
+    _sha256(
+        selected["source_plan_sha256"],
+        "a256_reference_manifest.source_plan_sha256",
+    )
+    body = {
+        key: selected[key] for key in selected if key != "manifest_sha256"
+    }
+    claimed = _sha256(
+        selected["manifest_sha256"],
+        "a256_reference_manifest.manifest_sha256",
+    )
+    if canonical_sha256(body) != claimed:
+        raise RoutedLadderCampaignPlanError(
+            "A256 reference manifest self-hash changed"
+        )
+    raw_cost = _exact_mapping(
+        selected["historical_training_cost"],
+        {
+            "resource_id",
+            "accelerator_type",
+            "chip_count",
+            "marginal_wall_seconds",
+            "chip_seconds",
+            "chip_seconds_scope",
+            "chip_seconds_excludes",
+        },
+        "a256_reference_manifest.historical_training_cost",
+    )
+    exclusions = raw_cost["chip_seconds_excludes"]
+    if (
+        not isinstance(exclusions, list)
+        or not exclusions
+        or not all(
+            isinstance(item, str) and item and "\x00" not in item
+            for item in exclusions
+        )
+        or len(set(exclusions)) != len(exclusions)
+    ):
+        raise RoutedLadderCampaignPlanError(
+            "A256 historical chip-second exclusions are invalid"
+        )
+    chip_count = _positive_int(
+        raw_cost["chip_count"],
+        "a256_reference_manifest.historical_training_cost.chip_count",
+        maximum=1024,
+    )
+    marginal = _positive_number(
+        raw_cost["marginal_wall_seconds"],
+        "a256_reference_manifest.historical_training_cost."
+        "marginal_wall_seconds",
+    )
+    chip_seconds = _positive_number(
+        raw_cost["chip_seconds"],
+        "a256_reference_manifest.historical_training_cost.chip_seconds",
+    )
+    if not math.isclose(
+        chip_seconds,
+        marginal * chip_count,
+        rel_tol=1e-9,
+        abs_tol=1e-6,
+    ):
+        raise RoutedLadderCampaignPlanError(
+            "A256 historical chip-seconds do not equal wall time times chips"
+        )
+    resource_id = _safe_id(
+        raw_cost["resource_id"],
+        "a256_reference_manifest.historical_training_cost.resource_id",
+    )
+    accelerator_type = raw_cost["accelerator_type"]
+    chip_seconds_scope = raw_cost["chip_seconds_scope"]
+    if (
+        not isinstance(accelerator_type, str)
+        or not accelerator_type
+        or not isinstance(chip_seconds_scope, str)
+        or not chip_seconds_scope
+    ):
+        raise RoutedLadderCampaignPlanError(
+            "A256 historical accelerator/cost scope is invalid"
+        )
+    cost = A256HistoricalCost(
+        resource_id=resource_id,
+        accelerator_type=accelerator_type,
+        chip_count=chip_count,
+        marginal_wall_seconds=marginal,
+        chip_seconds=chip_seconds,
+        chip_seconds_scope=chip_seconds_scope,
+        chip_seconds_excludes=tuple(exclusions),
+    )
+    raw_cells = selected["cells"]
+    if not isinstance(raw_cells, list):
+        raise RoutedLadderCampaignPlanError(
+            "A256 reference cells must be a list"
+        )
+    cells: list[A256CheckpointReference] = []
+    for index, raw in enumerate(raw_cells):
+        name = f"a256_reference_manifest.cells[{index}]"
+        row = _exact_mapping(
+            raw,
+            {
+                "panel",
+                "condition",
+                "seed",
+                "checkpoint_tokens",
+                "training_source_revision",
+                "a256_config",
+                "a256_config_sha256",
+                "run_root_remote",
+                "checkpoint_payload_root_gcs",
+                "run_contract",
+                "run_contract_sha256",
+                "training_result",
+                "training_result_sha256",
+                "checkpoint_pointer",
+                "checkpoint_pointer_sha256",
+            },
+            name,
+        )
+        if (
+            row["panel"] != "sae"
+            or row["condition"] != "A256ReLU"
+            or row["seed"] != 0
+            or row["checkpoint_tokens"] not in MILESTONES
+        ):
+            raise RoutedLadderCampaignPlanError(
+                f"{name} is not historical SAE A256 seed zero"
+            )
+        config_sha = _sha256(
+            row["a256_config_sha256"],
+            f"{name}.a256_config_sha256",
+        )
+        if config_sha != A256_SAE_CONFIG_SHA256:
+            raise RoutedLadderCampaignPlanError(
+                f"{name} historical SAE A256 config identity changed"
+            )
+        config_evidence = _evidence(
+            row["a256_config"],
+            f"{name}.a256_config",
+        )
+        cells.append(
+            A256CheckpointReference(
+                checkpoint_tokens=row["checkpoint_tokens"],
+                training_source_revision=_git_sha(
+                    row["training_source_revision"],
+                    f"{name}.training_source_revision",
+                ),
+                a256_config=config_evidence,
+                a256_config_sha256=config_sha,
+                run_root_remote=_remote_path(
+                    row["run_root_remote"],
+                    f"{name}.run_root_remote",
+                ),
+                checkpoint_payload_root_gcs=_gcs_prefix(
+                    row["checkpoint_payload_root_gcs"],
+                    f"{name}.checkpoint_payload_root_gcs",
+                ),
+                run_contract=_evidence(
+                    row["run_contract"],
+                    f"{name}.run_contract",
+                ),
+                run_contract_sha256=_sha256(
+                    row["run_contract_sha256"],
+                    f"{name}.run_contract_sha256",
+                ),
+                training_result=_evidence(
+                    row["training_result"],
+                    f"{name}.training_result",
+                ),
+                training_result_sha256=_sha256(
+                    row["training_result_sha256"],
+                    f"{name}.training_result_sha256",
+                ),
+                checkpoint_pointer=_evidence(
+                    row["checkpoint_pointer"],
+                    f"{name}.checkpoint_pointer",
+                ),
+                checkpoint_pointer_sha256=_sha256(
+                    row["checkpoint_pointer_sha256"],
+                    f"{name}.checkpoint_pointer_sha256",
+                ),
+            )
+        )
+    identities = {cell.identity for cell in cells}
+    expected = {
+        ("sae", "A256ReLU", 0, milestone) for milestone in MILESTONES
+    }
+    if len(cells) != A256_REFERENCE_COUNT or identities != expected:
+        raise RoutedLadderCampaignPlanError(
+            "A256 reference manifest must contain exactly the three "
+            "historical SAE seed-zero milestones"
+        )
+    if (
+        len({cell.training_source_revision for cell in cells}) != 1
+        or len({cell.a256_config for cell in cells}) != 1
+        or len({cell.run_root_remote for cell in cells}) != 1
+        or len({cell.checkpoint_payload_root_gcs for cell in cells}) != 1
+        or len({cell.run_contract for cell in cells}) != 1
+        or len({cell.run_contract_sha256 for cell in cells}) != 1
+        or len({cell.training_result for cell in cells}) != 1
+        or len({cell.training_result_sha256 for cell in cells}) != 1
+    ):
+        raise RoutedLadderCampaignPlanError(
+            "A256 reference milestones do not share one historical trajectory"
+        )
+    if (
+        len({cell.checkpoint_pointer for cell in cells}) != len(MILESTONES)
+        or len({cell.checkpoint_pointer_sha256 for cell in cells})
+        != len(MILESTONES)
+    ):
+        raise RoutedLadderCampaignPlanError(
+            "A256 historical milestone pointers are not unique"
+        )
+    return (
+        copy.deepcopy(selected),
+        tuple(sorted(cells, key=lambda item: item.checkpoint_tokens)),
+        cost,
     )
 
 
@@ -702,9 +1223,11 @@ def parse_routed_ladder_campaign_plan(value: Any) -> RoutedLadderCampaignPlan:
             "cost_policy",
             "environment",
             "resources",
+            "resource_pool",
             "trajectories",
             "evaluations",
             "h_reference_manifest",
+            "a256_reference_manifest",
         },
         "plan",
     )
@@ -719,7 +1242,7 @@ def parse_routed_ladder_campaign_plan(value: Any) -> RoutedLadderCampaignPlan:
     if tuple(state_root.parts[-5:]) != (
         "experiment5",
         "extensions",
-        "routed-activation-ladder-v1",
+        "routed-activation-ladder-v2",
         "controller",
         short,
     ):
@@ -767,6 +1290,19 @@ def parse_routed_ladder_campaign_plan(value: Any) -> RoutedLadderCampaignPlan:
         _resource(row, index, project_commit)
         for index, row in enumerate(raw_resources)
     )
+    try:
+        resource_pool = parse_routed_ladder_resource_pool(
+            selected["resource_pool"],
+            project_commit=project_commit,
+        )
+    except RoutedLadderResourcePoolError as error:
+        raise RoutedLadderCampaignPlanError(
+            f"resource pool is invalid: {error}"
+        ) from error
+    if resources != resource_pool.resources:
+        raise RoutedLadderCampaignPlanError(
+            "plan resources differ from the immutable resource pool"
+        )
     trajectories = tuple(
         _training_task(row, index) for index, row in enumerate(raw_training)
     )
@@ -776,6 +1312,11 @@ def parse_routed_ladder_campaign_plan(value: Any) -> RoutedLadderCampaignPlan:
     h_manifest, h_references = parse_h_reference_manifest(
         selected["h_reference_manifest"]
     )
+    (
+        a256_manifest,
+        a256_references,
+        a256_historical_cost,
+    ) = parse_a256_reference_manifest(selected["a256_reference_manifest"])
     environment = _task_environment(selected["environment"], "environment")
     plan = RoutedLadderCampaignPlan(
         campaign_id=_safe_id(selected["campaign_id"], "campaign_id"),
@@ -792,19 +1333,31 @@ def parse_routed_ladder_campaign_plan(value: Any) -> RoutedLadderCampaignPlan:
         remote_uv=_remote_path(selected["remote_uv"], "remote_uv"),
         project_commit=project_commit,
         max_parallel_train=_positive_int(
-            selected["max_parallel_train"], "max_parallel_train", maximum=RESOURCE_COUNT
+            selected["max_parallel_train"],
+            "max_parallel_train",
+            maximum=len(resources),
         ),
         max_parallel_eval=_positive_int(
-            selected["max_parallel_eval"], "max_parallel_eval", maximum=RESOURCE_COUNT
+            selected["max_parallel_eval"],
+            "max_parallel_eval",
+            maximum=len(resources),
         ),
         retry_policy=retry,
-        cost_policy=_cost_policy(selected["cost_policy"]),
+        cost_policy=_cost_policy(
+            selected["cost_policy"],
+            training_task_count=len(trajectories),
+            evaluation_task_count=EVALUATION_BUNDLE_COUNT,
+        ),
         environment=environment,
         resources=resources,
+        resource_pool=resource_pool,
         trajectories=trajectories,
         evaluations=evaluations,
         h_reference_manifest=h_manifest,
         h_references=h_references,
+        a256_reference_manifest=a256_manifest,
+        a256_references=a256_references,
+        a256_historical_cost=a256_historical_cost,
         plan_sha256=canonical_sha256(selected),
         source=copy.deepcopy(selected),
     )
@@ -814,23 +1367,53 @@ def parse_routed_ladder_campaign_plan(value: Any) -> RoutedLadderCampaignPlan:
 
 def _validate_plan_relations(plan: RoutedLadderCampaignPlan) -> None:
     if (
-        len(plan.resources) != RESOURCE_COUNT
+        not MIN_RESOURCE_COUNT <= len(plan.resources) <= MAX_RESOURCE_COUNT
         or len(plan.trajectories) != TRAINING_TASK_COUNT
         or len(plan.evaluations) != EVALUATION_TASK_COUNT
         or len(plan.h_references) != H_REFERENCE_COUNT
+        or len(plan.a256_references) != A256_REFERENCE_COUNT
     ):
         raise RoutedLadderCampaignPlanError(
-            "campaign must contain 7 resources, 12 training tasks, "
-            "54 evaluations, and 18 H references"
+            "campaign must contain 3..18 resources, the exact protocol-v2 "
+            f"{TRAINING_TASK_COUNT}-trajectory/{EVALUATION_TASK_COUNT}-cell "
+            "matrix, 18 H references, and three SAE A256 references"
         )
     resource_ids = [row.resource_id for row in plan.resources]
     tpu_names = [row.tpu_name for row in plan.resources]
     if (
-        len(set(resource_ids)) != RESOURCE_COUNT
-        or set(tpu_names) != set(EXPECTED_SURVIVING_TPUS)
+        len(set(resource_ids)) != len(resource_ids)
+        or len(set(tpu_names)) != len(tpu_names)
     ):
         raise RoutedLadderCampaignPlanError(
-            "resource rows differ from the existing seven-slice TRC inventory"
+            "resource IDs and TPU names must be unique"
+        )
+    training_owner_count = len(
+        {
+            task.eligible_resource_ids[0]
+            for task in plan.trajectories
+            if len(task.eligible_resource_ids) == 1
+        }
+    )
+    evaluation_owner_count = len(
+        {
+            task.eligible_resource_ids[0]
+            for task in plan.evaluations
+            if len(task.eligible_resource_ids) == 1
+        }
+    )
+    if plan.max_parallel_train != min(
+        training_owner_count,
+        len(plan.trajectories),
+    ):
+        raise RoutedLadderCampaignPlanError(
+            "max_parallel_train must consume every training owner"
+        )
+    if plan.max_parallel_eval != min(
+        evaluation_owner_count,
+        len(plan.evaluations),
+    ):
+        raise RoutedLadderCampaignPlanError(
+            "max_parallel_eval must consume every evaluation owner"
         )
     by_id = {row.resource_id: row for row in plan.resources}
     active_ids = {
@@ -838,62 +1421,43 @@ def _validate_plan_relations(plan: RoutedLadderCampaignPlan) -> None:
         for task in (*plan.trajectories, *plan.evaluations)
         for resource_id in task.eligible_resource_ids
     }
-    if {by_id[item].tpu_name for item in active_ids} != set(_ACTIVE_TPU_NAMES):
+    if active_ids != set(resource_ids):
         raise RoutedLadderCampaignPlanError(
-            "tasks must use only the existing three authorized ready slices"
+            "every admitted resource must own at least one campaign task"
         )
     if any(by_id[item].cache_profile != "paired" for item in active_ids):
         raise RoutedLadderCampaignPlanError(
             "every active activation-ladder resource requires the paired cache"
         )
-    expected_training = {
-        (panel, condition, seed)
-        for panel in PANELS
-        for condition in CONDITIONS
-        for seed in SEEDS
-    }
     observed_training = {
         (task.panel, task.condition, task.seed) for task in plan.trajectories
     }
-    if observed_training != expected_training:
+    if observed_training != EXPECTED_TRAINING_ROLES:
         raise RoutedLadderCampaignPlanError("training matrix is not exact")
-    expected_evaluations = {
-        (panel, condition, seed, milestone)
-        for panel in PANELS
-        for condition in EVALUATION_CONDITIONS
-        for seed in SEEDS
-        for milestone in MILESTONES
-    }
     observed_evaluations = {
         (task.panel, task.condition, task.seed, task.milestone_tokens)
         for task in plan.evaluations
     }
-    if observed_evaluations != expected_evaluations:
+    if observed_evaluations != EXPECTED_EVALUATION_ROLES:
         raise RoutedLadderCampaignPlanError("evaluation matrix is not exact")
-    if len({task.task_id for task in (*plan.trajectories, *plan.evaluations)}) != (
-        TRAINING_TASK_COUNT + EVALUATION_TASK_COUNT
-    ):
+    all_tasks = (*plan.trajectories, *plan.evaluations)
+    if len({task.task_id for task in all_tasks}) != len(all_tasks):
         raise RoutedLadderCampaignPlanError("task IDs are not unique")
-    for task in (*plan.trajectories, *plan.evaluations):
+    for task in all_tasks:
         if (
-            not task.eligible_resource_ids
-            or any(item not in active_ids for item in task.eligible_resource_ids)
+            len(task.eligible_resource_ids) != 1
+            or task.eligible_resource_ids[0] not in active_ids
         ):
             raise RoutedLadderCampaignPlanError(
-                f"{task.task_id} has an invalid eligible-resource set"
+                f"{task.task_id} must have one immutable resource owner"
             )
-        required_names = (
-            {"gemma4-horizon-v5e-usc-a"}
-            if task.seed == 0
-            else {
-                "gemma4-horizon-harvest-0728",
-                "gemma4-horizon-v4-spot-trans-b",
-            }
-        )
-        if {by_id[item].tpu_name for item in task.eligible_resource_ids} != required_names:
+        owner_id = task.eligible_resource_ids[0]
+        cohort = plan.resource_pool.cohort(task.panel, task.seed)
+        if owner_id not in cohort:
             raise RoutedLadderCampaignPlanError(
-                f"{task.task_id} resource generation/seed assignment changed"
+                f"{task.task_id} owner is outside its immutable cohort plane"
             )
+        plane = plan.resource_pool.plane(owner_id)
         namespace = f"/{EXTENSION_NAMESPACE}/{plan.project_commit[:12]}/"
         values = [task.control_root_remote, str(task.completion_path_controller)]
         if isinstance(task, RoutedLadderTrainingTask):
@@ -902,18 +1466,86 @@ def _validate_plan_relations(plan: RoutedLadderCampaignPlan) -> None:
             values.extend(
                 (task.result_root_remote, str(task.result_root_controller))
             )
-            if task.condition in CONDITIONS:
+            if task.condition in CONDITIONS and not (
+                task.panel == "sae"
+                and task.condition == "A256ReLU"
+                and task.seed == 0
+            ):
                 values.extend((task.run_root_remote, task.checkpoint_root_gcs))
         if any(namespace not in value for value in values):
             raise RoutedLadderCampaignPlanError(
                 f"{task.task_id} escapes the immutable extension namespace"
             )
+        try:
+            task.completion_path_controller.relative_to(
+                plane.controller_artifact_root
+            )
+            PurePosixPath(task.control_root_remote).relative_to(
+                PurePosixPath(plane.remote_artifact_root)
+            )
+            if isinstance(task, RoutedLadderEvaluationTask):
+                task.result_root_controller.relative_to(
+                    plane.controller_artifact_root
+                )
+                PurePosixPath(task.result_root_remote).relative_to(
+                    PurePosixPath(plane.remote_artifact_root)
+                )
+        except ValueError as error:
+            raise RoutedLadderCampaignPlanError(
+                f"{task.task_id} output paths cross its owner artifact plane"
+            ) from error
+        if (
+            isinstance(task, RoutedLadderTrainingTask)
+            or (
+                isinstance(task, RoutedLadderEvaluationTask)
+                and task.condition in CONDITIONS
+                and not (
+                    task.panel == "sae"
+                    and task.condition == "A256ReLU"
+                    and task.seed == 0
+                )
+            )
+        ) and not task.checkpoint_root_gcs.startswith(
+            plane.bulk_gcs_root + "/"
+        ):
+            raise RoutedLadderCampaignPlanError(
+                f"{task.task_id} checkpoint path crosses its owner object plane"
+            )
     training_by_role = {
         (task.panel, task.condition, task.seed): task for task in plan.trajectories
     }
     h_by_role = {row.identity: row for row in plan.h_references}
+    a256_by_milestone = {
+        row.checkpoint_tokens: row for row in plan.a256_references
+    }
     for task in plan.evaluations:
-        if task.condition in CONDITIONS:
+        historical_a256 = (
+            task.panel == "sae"
+            and task.condition == "A256ReLU"
+            and task.seed == 0
+        )
+        if historical_a256:
+            parent_a256 = a256_by_milestone[task.milestone_tokens]
+            if (
+                task.run_root_remote != parent_a256.run_root_remote
+                or task.checkpoint_root_gcs
+                != parent_a256.checkpoint_payload_root_gcs
+                or task.a256_config_remote
+                != parent_a256.a256_config.remote_path
+                or task.a256_config_sha256
+                != parent_a256.a256_config_sha256
+                or task.reference_run_contract_sha256
+                != parent_a256.run_contract_sha256
+                or task.reference_run_contract_file_sha256
+                != parent_a256.run_contract.sha256
+                or task.training_source_revision
+                != parent_a256.training_source_revision
+            ):
+                raise RoutedLadderCampaignPlanError(
+                    f"{task.task_id} is not bound to the immutable "
+                    "historical SAE A256 checkpoint"
+                )
+        elif task.condition in CONDITIONS:
             parent = training_by_role[(task.panel, task.condition, task.seed)]
             if (
                 task.run_root_remote
@@ -925,7 +1557,6 @@ def _validate_plan_relations(plan: RoutedLadderCampaignPlan) -> None:
                 or task.config_remote != parent.config_remote
                 or task.config_sha256 != parent.config_sha256
                 or task.checkpoint_root_gcs != parent.checkpoint_root_gcs
-                or task.eligible_resource_ids != parent.eligible_resource_ids
                 or task.training_source_revision != plan.project_commit
             ):
                 raise RoutedLadderCampaignPlanError(
@@ -946,6 +1577,27 @@ def _validate_plan_relations(plan: RoutedLadderCampaignPlan) -> None:
             ):
                 raise RoutedLadderCampaignPlanError(
                     f"{task.task_id} is not bound to its immutable H checkpoint"
+                )
+    for panel in PANELS:
+        for seed in SEEDS:
+            bundle = [
+                task
+                for task in plan.evaluations
+                if task.panel == panel and task.seed == seed
+            ]
+            if (
+                len(bundle) != len(EVALUATION_CONDITIONS) * len(MILESTONES)
+                or len(
+                    {
+                        task.eligible_resource_ids[0]
+                        for task in bundle
+                    }
+                )
+                != 1
+            ):
+                raise RoutedLadderCampaignPlanError(
+                    f"{panel}/seed{seed} evaluation rows do not share one "
+                    "resident bundle owner"
                 )
 
 
@@ -971,6 +1623,18 @@ def load_h_reference_manifest(path: str | Path) -> Mapping[str, Any]:
             f"cannot read H reference manifest: {selected}"
         ) from error
     manifest, _cells = parse_h_reference_manifest(value)
+    return manifest
+
+
+def load_a256_reference_manifest(path: str | Path) -> Mapping[str, Any]:
+    selected = Path(path).expanduser().resolve()
+    try:
+        value = yaml.safe_load(selected.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as error:
+        raise RoutedLadderCampaignPlanError(
+            f"cannot read A256 reference manifest: {selected}"
+        ) from error
+    manifest, _cells, _cost = parse_a256_reference_manifest(value)
     return manifest
 
 
@@ -1062,6 +1726,82 @@ def _validate_h_checkpoint_lineage(
     ):
         raise RoutedLadderCampaignStateError(
             f"H checkpoint progress changed: {cell.identity}"
+        )
+    return result, checked_pointer
+
+
+def _validate_a256_checkpoint_lineage(
+    cell: A256CheckpointReference,
+    cost: A256HistoricalCost,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    run_contract, _contract_payload = _read_self_hashed_json(
+        cell.run_contract.controller_path,
+        hash_field="run_contract_sha256",
+    )
+    result, _result_payload = _read_self_hashed_json(
+        cell.training_result.controller_path,
+        hash_field="result_sha256",
+    )
+    pointer, _pointer_payload = _read_self_hashed_json(
+        cell.checkpoint_pointer.controller_path,
+        hash_field="pointer_sha256",
+    )
+    identity = result.get("run_identity")
+    run_plan = identity.get("plan") if isinstance(identity, Mapping) else None
+    if (
+        result.get("schema_version")
+        != "gemma4-contribution-sae-training-result-v1"
+        or result.get("status") not in {"completed", "already_complete"}
+        or result.get("tokens") != TRAIN_TOKENS
+        or not isinstance(identity, Mapping)
+        or not isinstance(run_plan, Mapping)
+        or run_plan.get("phase_name") != "learning_horizon_10m"
+        or run_plan.get("condition") != "A"
+        or run_plan.get("seed") != 0
+        or run_plan.get("total_tokens") != TRAIN_TOKENS
+        or result.get("result_sha256") != cell.training_result_sha256
+        or result.get("marginal_wall_seconds")
+        != cost.marginal_wall_seconds
+        or result.get("chip_seconds") != cost.chip_seconds
+        or result.get("chip_seconds_scope") != cost.chip_seconds_scope
+        or result.get("chip_seconds_excludes")
+        != list(cost.chip_seconds_excludes)
+        or run_contract.get("run_contract_sha256")
+        != cell.run_contract_sha256
+        or run_contract.get("project_commit")
+        != cell.training_source_revision
+        or run_contract.get("phase") != "learning_horizon_10m"
+        or run_contract.get("scientific_model") != "sae"
+        or run_contract.get("condition") != "A"
+        or run_contract.get("seed") != 0
+        or run_contract.get("config_file_sha256")
+        != cell.a256_config.sha256
+    ):
+        raise RoutedLadderCampaignStateError(
+            f"historical SAE A256 lineage changed: {cell.identity}"
+        )
+    expected_step, expected_tokens = _expected_milestone_progress(
+        result,
+        cell.checkpoint_tokens,
+    )
+    try:
+        checked_pointer = validate_pointer(
+            pointer,
+            expected_kind="latest",
+            payload_root=cell.checkpoint_payload_root_gcs,
+            run_identity=identity,
+        )
+    except (RuntimeError, TypeError, ValueError) as error:
+        raise RoutedLadderCampaignStateError(
+            f"historical SAE A256 checkpoint is invalid: {cell.identity}"
+        ) from error
+    if (
+        checked_pointer["pointer_sha256"] != cell.checkpoint_pointer_sha256
+        or checked_pointer["step"] != expected_step
+        or checked_pointer["tokens_seen"] != expected_tokens
+    ):
+        raise RoutedLadderCampaignStateError(
+            f"historical SAE A256 checkpoint progress changed: {cell.identity}"
         )
     return result, checked_pointer
 
@@ -1178,6 +1918,234 @@ def write_h_reference_manifest(
     return parsed, cells
 
 
+def build_a256_reference_manifest(
+    horizon_plan: DirectCampaignPlan,
+) -> dict[str, Any]:
+    """Inventory historical SAE A seed zero without creating or restoring it."""
+
+    matches = [
+        task
+        for task in horizon_plan.trajectories
+        if task.scientific_model == "sae"
+        and task.condition == "A"
+        and task.seed == 0
+    ]
+    if len(matches) != 1:
+        raise RoutedLadderCampaignPlanError(
+            "horizon plan lacks one exact historical SAE A seed-zero trajectory"
+        )
+    task = matches[0]
+    completion = inspect_horizon_training_completion(task)
+    if completion is None:
+        raise RoutedLadderCampaignPlanError(
+            "historical SAE A256 training is incomplete"
+        )
+    result, result_payload = _read_self_hashed_json(
+        task.completion_path_controller,
+        hash_field="result_sha256",
+    )
+    environment = horizon_plan.environment_dict()
+    training_source_revision = _git_sha(
+        environment.get("TRAINING_PROJECT_COMMIT"),
+        "horizon_plan.environment.TRAINING_PROJECT_COMMIT",
+    )
+    remote_horizon_root = PurePosixPath(task.control_root_remote).parents[1]
+    try:
+        relative_config = PurePosixPath(task.config_remote).relative_to(
+            remote_horizon_root
+        )
+    except ValueError as error:
+        raise RoutedLadderCampaignPlanError(
+            "historical SAE config is outside its horizon artifact plane"
+        ) from error
+    try:
+        controller_horizon_root = task.completion_path_controller.parents[4]
+    except IndexError as error:
+        raise RoutedLadderCampaignPlanError(
+            "historical SAE completion path has no horizon artifact root"
+        ) from error
+    controller_config = controller_horizon_root / Path(*relative_config.parts)
+    try:
+        config = load_learning_horizon_config(
+            controller_config,
+            expected_scientific_model="sae",
+        )
+    except LearningHorizonConfigError as error:
+        raise RoutedLadderCampaignPlanError(
+            f"historical SAE A256 config is invalid: {error}"
+        ) from error
+    if config.config_hash != A256_SAE_CONFIG_SHA256:
+        raise RoutedLadderCampaignPlanError(
+            "historical SAE A256 config hash changed"
+        )
+    try:
+        config_payload = controller_config.read_bytes()
+    except OSError as error:
+        raise RoutedLadderCampaignPlanError(
+            "cannot read historical SAE A256 config"
+        ) from error
+    resource = horizon_plan.resource(task.resource_id)
+    marginal = _positive_number(
+        result.get("marginal_wall_seconds"),
+        "historical A256 marginal_wall_seconds",
+    )
+    chip_seconds = _positive_number(
+        result.get("chip_seconds"),
+        "historical A256 chip_seconds",
+    )
+    raw_chip_count = chip_seconds / marginal
+    chip_count = round(raw_chip_count)
+    if (
+        chip_count <= 0
+        or not math.isclose(
+            raw_chip_count,
+            chip_count,
+            rel_tol=1e-9,
+            abs_tol=1e-9,
+        )
+    ):
+        raise RoutedLadderCampaignPlanError(
+            "historical A256 result has non-integral chip accounting"
+        )
+    chip_scope = result.get("chip_seconds_scope")
+    chip_excludes = result.get("chip_seconds_excludes")
+    if (
+        not isinstance(chip_scope, str)
+        or not chip_scope
+        or not isinstance(chip_excludes, list)
+        or not chip_excludes
+        or not all(isinstance(item, str) and item for item in chip_excludes)
+    ):
+        raise RoutedLadderCampaignPlanError(
+            "historical A256 result lacks explicit chip-second scope"
+        )
+    run_root = str(
+        PurePosixPath(task.control_root_remote) / "runs" / task.run_id
+    )
+    run_contract_path = task.completion_path_controller.parent / "run-contract.json"
+    run_contract, run_contract_payload = _read_self_hashed_json(
+        run_contract_path,
+        hash_field="run_contract_sha256",
+    )
+    if (
+        run_contract.get("project_commit") != training_source_revision
+        or run_contract.get("phase") != "learning_horizon_10m"
+        or run_contract.get("scientific_model") != "sae"
+        or run_contract.get("condition") != "A"
+        or run_contract.get("seed") != 0
+        or run_contract.get("config_file_sha256")
+        != hashlib.sha256(config_payload).hexdigest()
+    ):
+        raise RoutedLadderCampaignPlanError(
+            "historical SAE A256 run contract changed"
+        )
+    controller_checkpoint_root = (
+        task.completion_path_controller.parent / "checkpoints"
+    )
+    remote_checkpoint_root = str(PurePosixPath(run_root) / "checkpoints")
+    config_evidence = {
+        "controller_path": str(controller_config),
+        "remote_path": task.config_remote,
+        "sha256": hashlib.sha256(config_payload).hexdigest(),
+    }
+    training_evidence = {
+        "controller_path": str(task.completion_path_controller),
+        "remote_path": str(
+            PurePosixPath(run_root) / "training-result.json"
+        ),
+        "sha256": hashlib.sha256(result_payload).hexdigest(),
+    }
+    cells: list[dict[str, Any]] = []
+    for milestone in MILESTONES:
+        pointer_path = milestone_pointer_path(
+            controller_checkpoint_root,
+            milestone,
+        )
+        pointer, pointer_payload = _read_self_hashed_json(
+            pointer_path,
+            hash_field="pointer_sha256",
+        )
+        cells.append(
+            {
+                "panel": "sae",
+                "condition": "A256ReLU",
+                "seed": 0,
+                "checkpoint_tokens": milestone,
+                "training_source_revision": training_source_revision,
+                "a256_config": config_evidence,
+                "a256_config_sha256": config.config_hash,
+                "run_root_remote": run_root,
+                "checkpoint_payload_root_gcs": task.checkpoint_root_gcs,
+                "run_contract": {
+                    "controller_path": str(run_contract_path),
+                    "remote_path": str(
+                        PurePosixPath(run_root) / "run-contract.json"
+                    ),
+                    "sha256": hashlib.sha256(
+                        run_contract_payload
+                    ).hexdigest(),
+                },
+                "run_contract_sha256": run_contract["run_contract_sha256"],
+                "training_result": training_evidence,
+                "training_result_sha256": result["result_sha256"],
+                "checkpoint_pointer": {
+                    "controller_path": str(pointer_path),
+                    "remote_path": str(
+                        milestone_pointer_path(
+                            remote_checkpoint_root,
+                            milestone,
+                        )
+                    ),
+                    "sha256": hashlib.sha256(pointer_payload).hexdigest(),
+                },
+                "checkpoint_pointer_sha256": pointer["pointer_sha256"],
+            }
+        )
+    body = {
+        "schema_version": A256_REFERENCE_MANIFEST_SCHEMA_VERSION,
+        "protocol_id": PROTOCOL_ID,
+        "source_protocol_id": EXPERIMENT4_PROTOCOL_ID,
+        "source_plan_sha256": horizon_plan.plan_sha256,
+        "historical_training_cost": {
+            "resource_id": resource.resource_id,
+            "accelerator_type": resource.accelerator_type,
+            "chip_count": chip_count,
+            "marginal_wall_seconds": marginal,
+            "chip_seconds": chip_seconds,
+            "chip_seconds_scope": chip_scope,
+            "chip_seconds_excludes": chip_excludes,
+        },
+        "cells": cells,
+    }
+    manifest = {**body, "manifest_sha256": canonical_sha256(body)}
+    _selected, parsed, cost = parse_a256_reference_manifest(manifest)
+    for cell in parsed:
+        _validate_a256_checkpoint_lineage(cell, cost)
+    return manifest
+
+
+def write_a256_reference_manifest(
+    path: str | Path,
+    manifest: Mapping[str, Any],
+) -> tuple[
+    Mapping[str, Any],
+    tuple[A256CheckpointReference, ...],
+    A256HistoricalCost,
+]:
+    parsed, cells, cost = parse_a256_reference_manifest(manifest)
+    selected = Path(path).expanduser().resolve()
+    selected.parent.mkdir(parents=True, exist_ok=True)
+    if selected.exists():
+        raise RoutedLadderCampaignPlanError(
+            f"refusing to overwrite A256 reference manifest: {selected}"
+        )
+    selected.write_text(
+        yaml.safe_dump(dict(manifest), sort_keys=False, default_flow_style=False),
+        encoding="utf-8",
+    )
+    return parsed, cells, cost
+
+
 def inspect_training_completion(
     plan: RoutedLadderCampaignPlan,
     task: RoutedLadderTrainingTask,
@@ -1285,6 +2253,40 @@ def inspect_evaluation_completion(
             raise RoutedLadderCampaignStateError(
                 f"H evaluation lineage changed: {task.task_id}"
             )
+    elif (
+        task.panel == "sae"
+        and task.condition == "A256ReLU"
+        and task.seed == 0
+    ):
+        parent = {
+            row.checkpoint_tokens: row for row in plan.a256_references
+        }[task.milestone_tokens]
+        if (
+            value.get("training_result_sha256")
+            != parent.training_result_sha256
+            or value.get("training_contract_sha256")
+            != parent.run_contract_sha256
+            or value.get("checkpoint_sha256")
+            != parent.checkpoint_pointer_sha256
+        ):
+            raise RoutedLadderCampaignStateError(
+                f"historical A256 evaluation lineage changed: {task.task_id}"
+            )
+    parent_pins = _evaluation_parent_pins(plan, task)
+    if (
+        value.get("training_result_sha256")
+        != parent_pins["parent_training_result_sha256"]
+        or value.get("checkpoint_sha256")
+        != parent_pins["parent_checkpoint_pointer_sha256"]
+        or (
+            parent_pins["parent_run_contract_sha256"] is not None
+            and value.get("training_contract_sha256")
+            != parent_pins["parent_run_contract_sha256"]
+        )
+    ):
+        raise RoutedLadderCampaignStateError(
+            f"evaluation parent pins changed: {task.task_id}"
+        )
     return CompletionFingerprint(
         path=str(result_path),
         size_bytes=len(payload),
@@ -1359,7 +2361,552 @@ def build_evaluation_command(
     ]
     if task.h_config_remote is not None:
         command.extend(("--h-config", task.h_config_remote))
+    if task.a256_config_remote is not None:
+        command.extend(("--a256-config", task.a256_config_remote))
+        if (
+            task.reference_run_contract_sha256 is None
+            or task.reference_run_contract_file_sha256 is None
+        ):
+            raise RoutedLadderCampaignStateError(
+                f"{task.task_id} lost its historical run-contract pins"
+            )
+        command.extend(
+            (
+                "--reference-run-contract-sha256",
+                task.reference_run_contract_sha256,
+                "--reference-run-contract-file-sha256",
+                task.reference_run_contract_file_sha256,
+            )
+        )
     return command
+
+
+def _evaluation_bundles(
+    plan: RoutedLadderCampaignPlan,
+) -> tuple[RoutedLadderEvaluationBundleTask, ...]:
+    """Derive the exact six resident execution units from the 72 plan rows."""
+
+    by_role = {
+        (task.panel, task.condition, task.seed, task.milestone_tokens): task
+        for task in plan.evaluations
+    }
+    bundles: list[RoutedLadderEvaluationBundleTask] = []
+    for panel in PANELS:
+        for seed in SEEDS:
+            cells = tuple(
+                by_role[(panel, condition, seed, milestone)]
+                for condition in BUNDLE_CONDITIONS
+                for milestone in MILESTONES
+            )
+            owners = {cell.eligible_resource_ids for cell in cells}
+            configs = {cell.config_remote for cell in cells}
+            controls = {cell.control_root_remote for cell in cells}
+            train_roots = {cell.train_source_root_remote for cell in cells}
+            eval_roots = {cell.eval_source_root_remote for cell in cells}
+            train_prefixes = {
+                cell.train_source_object_prefix_gcs for cell in cells
+            }
+            eval_prefixes = {
+                cell.eval_source_object_prefix_gcs for cell in cells
+            }
+            environments = {cell.environment for cell in cells}
+            if any(
+                len(values) != 1
+                for values in (
+                    owners,
+                    configs,
+                    controls,
+                    train_roots,
+                    eval_roots,
+                    train_prefixes,
+                    eval_prefixes,
+                    environments,
+                )
+            ):
+                raise RoutedLadderCampaignPlanError(
+                    f"{panel}/seed{seed} cannot form one resident bundle"
+                )
+            owner_id = cells[0].eligible_resource_ids[0]
+            plane = plan.resource_pool.plane(owner_id)
+            relative_root = (
+                PurePosixPath(EXTENSION_NAMESPACE)
+                / plan.project_commit[:12]
+                / "evaluation"
+                / panel
+                / f"seed{seed}"
+                / "_bundle"
+            )
+            remote_result = str(
+                PurePosixPath(plane.remote_artifact_root) / relative_root
+            )
+            controller_result = (
+                plane.controller_artifact_root / Path(*relative_root.parts)
+            )
+            # The operator replaces the per-cell roots from its manifest.  Its
+            # common environment is nevertheless validated through a current
+            # A512ReLU cell, so use that cell's object root as the probe value.
+            probe = next(
+                cell
+                for cell in cells
+                if cell.condition == "A512ReLU"
+                and cell.milestone_tokens == MILESTONES[0]
+            )
+            bundles.append(
+                RoutedLadderEvaluationBundleTask(
+                    task_id=f"eval-bundle-{panel}-seed{seed}",
+                    panel=panel,
+                    seed=seed,
+                    eligible_resource_ids=cells[0].eligible_resource_ids,
+                    config_remote=cells[0].config_remote,
+                    control_root_remote=cells[0].control_root_remote,
+                    checkpoint_root_gcs=probe.checkpoint_root_gcs,
+                    train_source_root_remote=cells[0].train_source_root_remote,
+                    eval_source_root_remote=cells[0].eval_source_root_remote,
+                    train_source_object_prefix_gcs=(
+                        cells[0].train_source_object_prefix_gcs
+                    ),
+                    eval_source_object_prefix_gcs=(
+                        cells[0].eval_source_object_prefix_gcs
+                    ),
+                    result_root_remote=remote_result,
+                    result_root_controller=controller_result,
+                    completion_path_controller=(
+                        controller_result / "bundle-result.json"
+                    ),
+                    cells=cells,
+                    environment=cells[0].environment,
+                )
+            )
+    if (
+        len(bundles) != EVALUATION_BUNDLE_COUNT
+        or len({bundle.task_id for bundle in bundles})
+        != EVALUATION_BUNDLE_COUNT
+    ):
+        raise RoutedLadderCampaignPlanError(
+            "evaluation plan did not derive the exact six resident bundles"
+        )
+    return tuple(bundles)
+
+
+def _operator_bundle_manifest(
+    plan: RoutedLadderCampaignPlan,
+    bundle: RoutedLadderEvaluationBundleTask,
+) -> dict[str, Any]:
+    """Build the exact self-hashed manifest consumed by the TPU operator."""
+
+    cells: list[dict[str, Any]] = []
+    for task in bundle.cells:
+        parent_pins = _evaluation_parent_pins(plan, task)
+        historical_a256 = (
+            task.panel == "sae"
+            and task.seed == 0
+            and task.condition == "A256ReLU"
+        )
+        reference_kind = (
+            "a256" if historical_a256 else "h" if task.condition == "H" else "none"
+        )
+        reference_config = (
+            task.a256_config_remote
+            if reference_kind == "a256"
+            else task.h_config_remote
+            if reference_kind == "h"
+            else None
+        )
+        cells.append(
+            {
+                "condition": task.condition,
+                "checkpoint_tokens": task.milestone_tokens,
+                "training_source_revision": task.training_source_revision,
+                "run_root_remote": task.run_root_remote,
+                "checkpoint_payload_root_gcs": task.checkpoint_root_gcs,
+                "result_root_remote": task.result_root_remote,
+                "result_root_controller": str(task.result_root_controller),
+                "reference_kind": reference_kind,
+                "reference_config_remote": reference_config,
+                "reference_run_contract_sha256": (
+                    task.reference_run_contract_sha256
+                    if reference_kind == "a256"
+                    else None
+                ),
+                "reference_run_contract_file_sha256": (
+                    task.reference_run_contract_file_sha256
+                    if reference_kind == "a256"
+                    else None
+                ),
+                **parent_pins,
+            }
+        )
+    body = {
+        "schema_version": OPERATOR_BUNDLE_MANIFEST_SCHEMA_VERSION,
+        "protocol_id": PROTOCOL_ID,
+        "panel": bundle.panel,
+        "seed": bundle.seed,
+        "source_revision": plan.project_commit,
+        "config_remote": bundle.config_remote,
+        "bundle_result_root_remote": bundle.result_root_remote,
+        "bundle_result_root_controller": str(bundle.result_root_controller),
+        "cells": cells,
+    }
+    return {**body, "manifest_sha256": canonical_sha256(body)}
+
+
+def _evaluation_parent_pins(
+    plan: RoutedLadderCampaignPlan,
+    task: RoutedLadderEvaluationTask,
+) -> dict[str, str | None]:
+    """Pin every parent artifact after training and before bundle launch."""
+
+    if task.condition == "H":
+        parent = {
+            row.identity: row for row in plan.h_references
+        }[(task.panel, task.seed, task.milestone_tokens)]
+        return {
+            "parent_training_result_sha256": parent.training_result_sha256,
+            "parent_training_result_file_sha256": (
+                parent.training_result.sha256
+            ),
+            "parent_run_contract_sha256": None,
+            "parent_run_contract_file_sha256": None,
+            "parent_checkpoint_pointer_sha256": (
+                parent.checkpoint_pointer_sha256
+            ),
+            "parent_checkpoint_pointer_file_sha256": (
+                parent.checkpoint_pointer.sha256
+            ),
+        }
+    historical_a256 = (
+        task.panel == "sae"
+        and task.condition == "A256ReLU"
+        and task.seed == 0
+    )
+    if historical_a256:
+        parent = {
+            row.checkpoint_tokens: row for row in plan.a256_references
+        }[task.milestone_tokens]
+        return {
+            "parent_training_result_sha256": parent.training_result_sha256,
+            "parent_training_result_file_sha256": (
+                parent.training_result.sha256
+            ),
+            "parent_run_contract_sha256": parent.run_contract_sha256,
+            "parent_run_contract_file_sha256": parent.run_contract.sha256,
+            "parent_checkpoint_pointer_sha256": (
+                parent.checkpoint_pointer_sha256
+            ),
+            "parent_checkpoint_pointer_file_sha256": (
+                parent.checkpoint_pointer.sha256
+            ),
+        }
+
+    training_by_role = {
+        (row.panel, row.condition, row.seed): row
+        for row in plan.trajectories
+    }
+    parent = training_by_role[(task.panel, task.condition, task.seed)]
+    completion = inspect_training_completion(plan, parent)
+    if completion is None:
+        raise RoutedLadderCampaignStateError(
+            f"{task.task_id} parent training is incomplete"
+        )
+    result, result_payload = _read_self_hashed_json(
+        parent.completion_path_controller,
+        hash_field="result_sha256",
+    )
+    run_contract_path = (
+        parent.completion_path_controller.parent / "run-contract.json"
+    )
+    run_contract, run_contract_payload = _read_self_hashed_json(
+        run_contract_path,
+        hash_field="run_contract_sha256",
+    )
+    config_path = (
+        plan.working_directory / "configs" / _CONFIG_NAMES[parent.panel]
+    )
+    try:
+        config_file_sha = hashlib.sha256(config_path.read_bytes()).hexdigest()
+    except OSError as error:
+        raise RoutedLadderCampaignStateError(
+            f"{task.task_id} cannot read its training config"
+        ) from error
+    if (
+        run_contract.get("project_commit") != plan.project_commit
+        or run_contract.get("config_file_sha256") != config_file_sha
+        or run_contract.get("phase") != PHASE_NAME
+        or run_contract.get("scientific_model") != parent.panel
+        or run_contract.get("condition") != parent.condition
+        or run_contract.get("seed") != parent.seed
+        or run_contract.get("checkpoint_payload_root")
+        != parent.checkpoint_root_gcs
+    ):
+        raise RoutedLadderCampaignStateError(
+            f"{task.task_id} parent run contract changed"
+        )
+    pointer_path = milestone_pointer_path(
+        parent.completion_path_controller.parent / "checkpoints",
+        task.milestone_tokens,
+    )
+    pointer, pointer_payload = _read_self_hashed_json(
+        pointer_path,
+        hash_field="pointer_sha256",
+    )
+    identity = result.get("run_identity")
+    if not isinstance(identity, Mapping):
+        raise RoutedLadderCampaignStateError(
+            f"{task.task_id} parent run identity is absent"
+        )
+    try:
+        checked = validate_pointer(
+            pointer,
+            expected_kind="latest",
+            payload_root=parent.checkpoint_root_gcs,
+            run_identity=identity,
+        )
+    except (RuntimeError, TypeError, ValueError) as error:
+        raise RoutedLadderCampaignStateError(
+            f"{task.task_id} parent milestone pointer is invalid"
+        ) from error
+    expected_step, expected_tokens = _expected_milestone_progress(
+        result,
+        task.milestone_tokens,
+    )
+    if (
+        checked["step"] != expected_step
+        or checked["tokens_seen"] != expected_tokens
+    ):
+        raise RoutedLadderCampaignStateError(
+            f"{task.task_id} parent milestone progress changed"
+        )
+    return {
+        "parent_training_result_sha256": str(result["result_sha256"]),
+        "parent_training_result_file_sha256": hashlib.sha256(
+            result_payload
+        ).hexdigest(),
+        "parent_run_contract_sha256": str(
+            run_contract["run_contract_sha256"]
+        ),
+        "parent_run_contract_file_sha256": hashlib.sha256(
+            run_contract_payload
+        ).hexdigest(),
+        "parent_checkpoint_pointer_sha256": str(
+            pointer["pointer_sha256"]
+        ),
+        "parent_checkpoint_pointer_file_sha256": hashlib.sha256(
+            pointer_payload
+        ).hexdigest(),
+    }
+
+
+def _bundle_manifest_path(
+    plan: RoutedLadderCampaignPlan,
+    bundle: RoutedLadderEvaluationBundleTask,
+) -> Path:
+    return (
+        plan.state_root
+        / "evaluation-bundles"
+        / bundle.task_id
+        / "operator-manifest.json"
+    )
+
+
+def _seal_operator_bundle_manifest(
+    plan: RoutedLadderCampaignPlan,
+    bundle: RoutedLadderEvaluationBundleTask,
+) -> tuple[Path, dict[str, Any]]:
+    manifest = _operator_bundle_manifest(plan, bundle)
+    payload = (
+        json.dumps(
+            manifest,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("ascii")
+        + b"\n"
+    )
+    path = _bundle_manifest_path(plan, bundle)
+    _seal_exact_bytes(path, payload, name=f"{bundle.task_id} operator manifest")
+    return path, manifest
+
+
+def build_evaluation_bundle_command(
+    plan: RoutedLadderCampaignPlan,
+    bundle: RoutedLadderEvaluationBundleTask,
+    attempt_id: str,
+) -> list[str]:
+    _require_evaluation_bundle_parents(plan, bundle)
+    manifest_path, _manifest = _seal_operator_bundle_manifest(plan, bundle)
+    return [
+        str(plan.python_executable),
+        str(
+            plan.working_directory
+            / "scripts/tpu/evaluate_experiment5_routed_ladder.py"
+        ),
+        "--panel",
+        bundle.panel,
+        "--config",
+        bundle.config_remote,
+        "--seed",
+        str(bundle.seed),
+        "--source-revision",
+        plan.project_commit,
+        "--bundle-manifest",
+        str(manifest_path),
+        "--attempt-id",
+        attempt_id,
+    ]
+
+
+def _require_evaluation_bundle_parents(
+    plan: RoutedLadderCampaignPlan,
+    bundle: RoutedLadderEvaluationBundleTask,
+) -> None:
+    """Fail closed unless every new trajectory parent is fully complete."""
+
+    training = {
+        (task.panel, task.condition, task.seed): task
+        for task in plan.trajectories
+    }
+    for condition in CONDITIONS:
+        historical = (
+            bundle.panel == "sae"
+            and bundle.seed == 0
+            and condition == "A256ReLU"
+        )
+        if historical:
+            # Preflight validates all three immutable A256 milestone parents.
+            if len(plan.a256_references) != A256_REFERENCE_COUNT:
+                raise RoutedLadderCampaignStateError(
+                    f"{bundle.task_id} lost its historical A256 parents"
+                )
+            continue
+        parent = training[(bundle.panel, condition, bundle.seed)]
+        if inspect_training_completion(plan, parent) is None:
+            raise RoutedLadderCampaignStateError(
+                f"{bundle.task_id} is not runnable before "
+                f"{parent.task_id} completes"
+            )
+
+
+def _bundle_cell_completion(
+    plan: RoutedLadderCampaignPlan,
+    task: RoutedLadderEvaluationTask,
+) -> dict[str, Any]:
+    completion = inspect_evaluation_completion(plan, task)
+    if completion is None:
+        raise RoutedLadderCampaignStateError(
+            f"resident bundle omitted evaluation cell: {task.task_id}"
+        )
+    value, payload = _read_self_hashed_json(
+        task.completion_path_controller,
+        hash_field="result_sha256",
+    )
+    return {
+        "condition": task.condition,
+        "checkpoint_tokens": task.milestone_tokens,
+        "training_source_revision": task.training_source_revision,
+        **_evaluation_parent_pins(plan, task),
+        "result_root": task.result_root_remote,
+        "result_sha256": str(value["result_sha256"]),
+        "result_file_sha256": hashlib.sha256(payload).hexdigest(),
+        "score_artifact_sha256": str(value["score_artifact_sha256"]),
+        "score_data_sha256": str(value["score_data_sha256"]),
+        "score_data_bytes": int(value["score_data_bytes"]),
+    }
+
+
+def inspect_evaluation_bundle_completion(
+    plan: RoutedLadderCampaignPlan,
+    bundle: RoutedLadderEvaluationBundleTask,
+) -> CompletionFingerprint | None:
+    path = bundle.completion_path_controller
+    if not path.exists():
+        if bundle.result_root_controller.exists() and any(
+            bundle.result_root_controller.iterdir()
+        ):
+            raise RoutedLadderCampaignStateError(
+                f"resident bundle completion is partial: {bundle.task_id}"
+            )
+        return None
+    value, payload = _read_self_hashed_json(path, hash_field="result_sha256")
+    _manifest_path, manifest = _seal_operator_bundle_manifest(plan, bundle)
+    expected_cells = [
+        _bundle_cell_completion(plan, task) for task in bundle.cells
+    ]
+    expected_keys = {
+        "schema_version",
+        "protocol_id",
+        "status",
+        "panel",
+        "seed",
+        "source_revision",
+        "operator_manifest_sha256",
+        "bundle_spec_sha256",
+        "timing",
+        "cell_results",
+        "result_sha256",
+    }
+    timing = value.get("timing")
+    resource = plan.resource(bundle.eligible_resource_ids[0])
+    expected_chips = _CHIP_COUNT_BY_ACCELERATOR.get(
+        resource.accelerator_type
+    )
+    if (
+        set(value) != expected_keys
+        or value.get("schema_version") != BUNDLE_RESULT_SCHEMA_VERSION
+        or value.get("protocol_id") != PROTOCOL_ID
+        or value.get("status") != "bundle_evaluated"
+        or value.get("panel") != bundle.panel
+        or value.get("seed") != bundle.seed
+        or value.get("source_revision") != plan.project_commit
+        or value.get("operator_manifest_sha256")
+        != manifest["manifest_sha256"]
+        or re.fullmatch(r"[0-9a-f]{64}", str(value.get("bundle_spec_sha256")))
+        is None
+        or not isinstance(timing, Mapping)
+        or set(timing)
+        != {
+            "accelerator_type",
+            "chip_count",
+            "successful_attempt_wall_seconds",
+            "successful_attempt_chip_seconds",
+            "timing_scope",
+        }
+        or timing.get("accelerator_type") != resource.accelerator_type
+        or timing.get("chip_count") != expected_chips
+        or timing.get("timing_scope") != _EVALUATION_TIMING_SCOPE
+        or value.get("cell_results") != expected_cells
+    ):
+        raise RoutedLadderCampaignStateError(
+            f"resident bundle completion changed: {bundle.task_id}"
+        )
+    try:
+        wall_seconds = float(timing["successful_attempt_wall_seconds"])
+        chip_seconds = float(timing["successful_attempt_chip_seconds"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise RoutedLadderCampaignStateError(
+            f"resident bundle timing is invalid: {bundle.task_id}"
+        ) from error
+    if (
+        not math.isfinite(wall_seconds)
+        or wall_seconds <= 0
+        or not math.isfinite(chip_seconds)
+        or chip_seconds <= 0
+        or expected_chips is None
+        or not math.isclose(
+            chip_seconds,
+            wall_seconds * expected_chips,
+            rel_tol=1e-9,
+            abs_tol=1e-6,
+        )
+    ):
+        raise RoutedLadderCampaignStateError(
+            f"resident bundle timing is invalid: {bundle.task_id}"
+        )
+    return CompletionFingerprint(
+        path=str(path),
+        size_bytes=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+        scientific_sha256=str(value["result_sha256"]),
+    )
 
 
 def _attempt_environment(
@@ -1487,8 +3034,11 @@ def _verify_checkout(plan: RoutedLadderCampaignPlan) -> None:
     for panel in PANELS:
         path = plan.working_directory / "configs" / _CONFIG_NAMES[panel]
         try:
-            config = load_routed_ladder_config(path, expected_panel=panel)
-        except RoutedLadderConfigError as error:
+            config = load_routed_ladder_v2_config(
+                path,
+                expected_panel=panel,
+            )
+        except RoutedLadderV2ConfigError as error:
             raise RoutedLadderCampaignStateError(
                 f"{panel} activation-ladder config is invalid: {error}"
             ) from error
@@ -1556,6 +3106,305 @@ def _preflight(
                 f"{label}",
             )
         _validate_h_checkpoint_lineage(cell)
+    for cell in plan.a256_references:
+        for label, reference in (
+            ("config", cell.a256_config),
+            ("run contract", cell.run_contract),
+            ("training result", cell.training_result),
+            ("checkpoint pointer", cell.checkpoint_pointer),
+        ):
+            _verify_file(
+                reference.controller_path,
+                reference.sha256,
+                f"A256 SAE/seed0/{cell.checkpoint_tokens} {label}",
+            )
+        try:
+            config = load_learning_horizon_config(
+                cell.a256_config.controller_path,
+                expected_scientific_model="sae",
+            )
+        except LearningHorizonConfigError as error:
+            raise RoutedLadderCampaignStateError(
+                f"historical A256 config is invalid: {error}"
+            ) from error
+        if config.config_hash != A256_SAE_CONFIG_SHA256:
+            raise RoutedLadderCampaignStateError(
+                "historical A256 config identity changed"
+            )
+        _validate_a256_checkpoint_lineage(
+            cell,
+            plan.a256_historical_cost,
+        )
+
+
+def _training_cost(
+    *,
+    result: Mapping[str, Any],
+    resource_id: str,
+    accelerator_type: str,
+) -> RoutedLadderTrainingCost:
+    """Bind one training-result timing ledger to its immutable owner."""
+
+    expected_chips = _CHIP_COUNT_BY_ACCELERATOR.get(accelerator_type)
+    if expected_chips is None:
+        raise RoutedLadderCampaignStateError(
+            f"unsupported training accelerator {accelerator_type!r}"
+        )
+    exclusions = result.get("chip_seconds_excludes")
+    try:
+        return RoutedLadderTrainingCost(
+            resource_id=resource_id,
+            accelerator_type=accelerator_type,
+            chip_count=expected_chips,
+            marginal_wall_seconds=float(result["marginal_wall_seconds"]),
+            chip_seconds=float(result["chip_seconds"]),
+            chip_seconds_scope=str(result["chip_seconds_scope"]),
+            chip_seconds_excludes=(
+                tuple(exclusions) if isinstance(exclusions, list) else ()
+            ),
+        )
+    except (KeyError, TypeError, ValueError, Experiment5RoutedLadderError) as error:
+        raise RoutedLadderCampaignStateError(
+            f"training result has invalid cost accounting for {resource_id}"
+        ) from error
+
+
+def _trajectory_accounting(
+    plan: RoutedLadderCampaignPlan,
+) -> tuple[RoutedLadderTrajectoryAccounting, ...]:
+    """Construct the exact 24-row historical/new training inventory."""
+
+    new_by_role = {
+        (task.panel, task.condition, task.seed): task
+        for task in plan.trajectories
+    }
+    a256_by_milestone = {
+        row.checkpoint_tokens: row for row in plan.a256_references
+    }
+    h_by_role = {
+        (row.panel, row.seed, row.checkpoint_tokens): row
+        for row in plan.h_references
+    }
+    rows: list[RoutedLadderTrajectoryAccounting] = []
+    for panel in PANELS:
+        for condition in EVALUATION_CONDITIONS:
+            for seed in SEEDS:
+                historical_a256 = (
+                    panel == "sae"
+                    and condition == "A256ReLU"
+                    and seed == 0
+                )
+                if historical_a256:
+                    parent = a256_by_milestone[TRAIN_TOKENS]
+                    historical = plan.a256_historical_cost
+                    cost = RoutedLadderTrainingCost(
+                        resource_id=historical.resource_id,
+                        accelerator_type=historical.accelerator_type,
+                        chip_count=historical.chip_count,
+                        marginal_wall_seconds=(
+                            historical.marginal_wall_seconds
+                        ),
+                        chip_seconds=historical.chip_seconds,
+                        chip_seconds_scope=historical.chip_seconds_scope,
+                        chip_seconds_excludes=(
+                            historical.chip_seconds_excludes
+                        ),
+                    )
+                    row = RoutedLadderTrajectoryAccounting(
+                        panel=panel,
+                        condition=condition,
+                        seed=seed,
+                        origin=(
+                            "historical_experiment4_seed0_reference"
+                        ),
+                        training_source_revision=(
+                            parent.training_source_revision
+                        ),
+                        reference_manifest_kind=(
+                            "a256_reference_manifest"
+                        ),
+                        reference_manifest_sha256=str(
+                            plan.a256_reference_manifest["manifest_sha256"]
+                        ),
+                        parent_training_result_sha256=(
+                            parent.training_result_sha256
+                        ),
+                        parent_training_result_file_sha256=(
+                            parent.training_result.sha256
+                        ),
+                        cost_status=(
+                            "measured_historical_training_result"
+                        ),
+                        training_cost=cost,
+                    )
+                elif condition == "H":
+                    parent = h_by_role[(panel, seed, TRAIN_TOKENS)]
+                    row = RoutedLadderTrajectoryAccounting(
+                        panel=panel,
+                        condition=condition,
+                        seed=seed,
+                        origin="historical_experiment5_reference",
+                        training_source_revision=(
+                            parent.training_source_revision
+                        ),
+                        reference_manifest_kind="h_reference_manifest",
+                        reference_manifest_sha256=str(
+                            plan.h_reference_manifest["manifest_sha256"]
+                        ),
+                        parent_training_result_sha256=(
+                            parent.training_result_sha256
+                        ),
+                        parent_training_result_file_sha256=(
+                            parent.training_result.sha256
+                        ),
+                        cost_status=(
+                            "not_supplied_by_h_reference_manifest"
+                        ),
+                        training_cost=None,
+                    )
+                else:
+                    task = new_by_role[(panel, condition, seed)]
+                    completion = inspect_training_completion(plan, task)
+                    if completion is None:
+                        raise RoutedLadderCampaignStateError(
+                            f"training accounting parent is incomplete: "
+                            f"{task.task_id}"
+                        )
+                    result, payload = _read_self_hashed_json(
+                        task.completion_path_controller,
+                        hash_field="result_sha256",
+                    )
+                    resource = plan.resource(
+                        task.eligible_resource_ids[0]
+                    )
+                    row = RoutedLadderTrajectoryAccounting(
+                        panel=panel,
+                        condition=condition,
+                        seed=seed,
+                        origin="protocol_v2_new_training",
+                        training_source_revision=plan.project_commit,
+                        reference_manifest_kind=None,
+                        reference_manifest_sha256=None,
+                        parent_training_result_sha256=str(
+                            result["result_sha256"]
+                        ),
+                        parent_training_result_file_sha256=hashlib.sha256(
+                            payload
+                        ).hexdigest(),
+                        cost_status="measured_v2_training_result",
+                        training_cost=_training_cost(
+                            result=result,
+                            resource_id=resource.resource_id,
+                            accelerator_type=resource.accelerator_type,
+                        ),
+                    )
+                rows.append(row)
+    return tuple(rows)
+
+
+def _evaluation_bundle_accounting(
+    plan: RoutedLadderCampaignPlan,
+) -> tuple[RoutedLadderEvaluationBundleAccounting, ...]:
+    """Construct the exact six measured resident-evaluation rows."""
+
+    rows: list[RoutedLadderEvaluationBundleAccounting] = []
+    for bundle in _evaluation_bundles(plan):
+        completion = inspect_evaluation_bundle_completion(plan, bundle)
+        if completion is None:
+            raise RoutedLadderCampaignStateError(
+                f"evaluation bundle accounting is incomplete: {bundle.task_id}"
+            )
+        result, payload = _read_self_hashed_json(
+            bundle.completion_path_controller,
+            hash_field="result_sha256",
+        )
+        timing = result.get("timing")
+        resource = plan.resource(bundle.eligible_resource_ids[0])
+        expected_chips = _CHIP_COUNT_BY_ACCELERATOR.get(
+            resource.accelerator_type
+        )
+        if (
+            not isinstance(timing, Mapping)
+            or timing.get("accelerator_type") != resource.accelerator_type
+            or timing.get("chip_count") != expected_chips
+            or timing.get("timing_scope") != _EVALUATION_TIMING_SCOPE
+        ):
+            raise RoutedLadderCampaignStateError(
+                f"evaluation bundle hardware timing changed: {bundle.task_id}"
+            )
+        try:
+            row = RoutedLadderEvaluationBundleAccounting(
+                panel=bundle.panel,
+                seed=bundle.seed,
+                source_revision=plan.project_commit,
+                operator_manifest_sha256=str(
+                    result["operator_manifest_sha256"]
+                ),
+                bundle_spec_sha256=str(result["bundle_spec_sha256"]),
+                bundle_result_sha256=str(result["result_sha256"]),
+                bundle_result_file_sha256=hashlib.sha256(
+                    payload
+                ).hexdigest(),
+                accelerator_type=resource.accelerator_type,
+                chip_count=int(timing["chip_count"]),
+                successful_attempt_wall_seconds=float(
+                    timing["successful_attempt_wall_seconds"]
+                ),
+                successful_attempt_chip_seconds=float(
+                    timing["successful_attempt_chip_seconds"]
+                ),
+                timing_scope=str(timing["timing_scope"]),
+            )
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+            Experiment5RoutedLadderError,
+        ) as error:
+            raise RoutedLadderCampaignStateError(
+                f"evaluation bundle accounting is invalid: {bundle.task_id}"
+            ) from error
+        rows.append(row)
+    return tuple(rows)
+
+
+def _wall_cash_accounting(
+    plan: RoutedLadderCampaignPlan,
+    cost_projection: Mapping[str, Any],
+) -> RoutedLadderWallCashAccounting:
+    """Bind report wall/cash fields to the sealed campaign projection."""
+
+    path = plan.state_root / "cost-projection.json"
+    observed = _read_record(path, record_type="cost_projection")
+    if observed != dict(cost_projection):
+        raise RoutedLadderCampaignStateError(
+            "report cost projection differs from its sealed record"
+        )
+    try:
+        payload = path.read_bytes()
+        return RoutedLadderWallCashAccounting(
+            campaign_wall_seconds=float(
+                observed["campaign_elapsed_seconds"]
+            ),
+            wall_scope=_CAMPAIGN_WALL_SCOPE,
+            cash_usd=float(observed["projected_committed_usd"]),
+            cash_currency=str(observed["currency"]),
+            cash_basis=(
+                "sealed projected committed cash: existing spend plus "
+                "the durable campaign infrastructure model and immutable "
+                "attempt reservations"
+            ),
+            accounting_source=ImmutableArtifactReference(
+                kind="cost_projection",
+                schema_version=str(observed["schema_version"]),
+                uri=str(path),
+                sha256=hashlib.sha256(payload).hexdigest(),
+            ),
+        )
+    except (KeyError, OSError, ValueError, Experiment5RoutedLadderError) as error:
+        raise RoutedLadderCampaignStateError(
+            "sealed campaign wall/cash accounting is invalid"
+        ) from error
 
 
 def _render_routed_ladder_report(report: Mapping[str, Any]) -> str:
@@ -1663,11 +3512,83 @@ class RoutedLadderCampaign(Experiment5Campaign):
     ) -> None:
         super().__init__(plan, **kwargs)  # type: ignore[arg-type]
 
+    def _maximum_campaign_wall_seconds(self) -> float:
+        """Retain a finite reporting horizon without a cash-derived stop."""
+
+        return float(CONTINUOUS_RUNTIME_SECONDS)
+
+    def _check_campaign_watchdog(self) -> None:
+        """Protocol v2 records cost but never blocks grant-funded TPU work."""
+
+    def _reserve_attempt_cost(
+        self,
+        task: RoutedLadderTask,
+        *,
+        kind: str,
+        attempt_number: int,
+        resource: CampaignResource,
+    ) -> dict[str, Any]:
+        """Append the inherited cash estimate as measurement-only evidence."""
+
+        path = (
+            self.plan.state_root
+            / "budget"
+            / "attempt-reservations"
+            / kind
+            / task.task_id
+            / f"attempt-{attempt_number:06d}.json"
+        )
+        with self._budget_lock:
+            if path.exists():
+                observed = _read_record(
+                    path,
+                    record_type="cost_reservation",
+                )
+                if (
+                    observed.get("task_id") != task.task_id
+                    or observed.get("kind") != kind
+                    or observed.get("attempt_number") != attempt_number
+                    or observed.get("eligible_resource_ids")
+                    != list(task.eligible_resource_ids)
+                    or observed.get("enforcement")
+                    != "measurement_only_grant_funded_v2"
+                ):
+                    raise RoutedLadderCampaignStateError(
+                        f"cost reservation changed for {task.task_id}"
+                    )
+                return observed
+            amount = self.plan.cost_policy.attempt_reserve(kind)
+            before = float(
+                self.cost_projection()["projected_committed_usd"]
+            )
+            reservation = _record(
+                "cost_reservation",
+                {
+                    "campaign_id": self.plan.campaign_id,
+                    "plan_sha256": self.plan.plan_sha256,
+                    "task_id": task.task_id,
+                    "kind": kind,
+                    "attempt_number": attempt_number,
+                    "resource_id": resource.resource_id,
+                    "eligible_resource_ids": list(
+                        task.eligible_resource_ids
+                    ),
+                    "amount_usd": amount,
+                    "projected_committed_after_usd": before + amount,
+                    "enforcement": "measurement_only_grant_funded_v2",
+                    "reserved_at": _timestamp(),
+                },
+            )
+            _write_create_only(path, reservation)
+            return reservation
+
     def _baseline_attempt_reserve_usd(self) -> float:
         policy = self.plan.cost_policy
         return (
-            TRAINING_TASK_COUNT * policy.training_attempt_reserve_usd
-            + EVALUATION_TASK_COUNT * policy.evaluation_attempt_reserve_usd
+            len(self.plan.trajectories)
+            * policy.training_attempt_reserve_usd
+            + EVALUATION_BUNDLE_COUNT
+            * policy.evaluation_attempt_reserve_usd
         )
 
     def _preflight(self) -> None:
@@ -1678,6 +3599,8 @@ class RoutedLadderCampaign(Experiment5Campaign):
     ) -> CompletionFingerprint | None:
         if isinstance(task, RoutedLadderTrainingTask):
             return inspect_training_completion(self.plan, task)
+        if isinstance(task, RoutedLadderEvaluationBundleTask):
+            return inspect_evaluation_bundle_completion(self.plan, task)
         return inspect_evaluation_completion(self.plan, task)
 
     def _attempt_environment(
@@ -1701,16 +3624,134 @@ class RoutedLadderCampaign(Experiment5Campaign):
     ) -> list[str]:
         if isinstance(task, RoutedLadderTrainingTask):
             return build_train_command(self.plan, task, attempt_id)
+        if isinstance(task, RoutedLadderEvaluationBundleTask):
+            return build_evaluation_bundle_command(
+                self.plan,
+                task,
+                attempt_id,
+            )
         return build_evaluation_command(self.plan, task)
 
     def _attempt_id(self, attempt_number: int) -> str:
         parent = super()._attempt_id(attempt_number)
         return parent.replace("e5-", "e5rl-", 1)
 
+    def run(self, *, stop_after_training: bool = False) -> dict[str, Any]:
+        """Train 17 trajectories, execute six bundles, then seal 72 cells."""
+
+        self._preflight()
+        self._acquire_lock()
+        try:
+            self._bind_plan()
+            self._bind_campaign_clock()
+            self._start_watchdog()
+            training = self._run_phase(
+                self.plan.trajectories,
+                kind="training",
+                max_parallel=self.plan.max_parallel_train,
+            )
+            barrier = self._seal_phase(
+                path=self.plan.state_root / "training-complete.json",
+                record_type="training_phase_completion",
+                status="training_completed",
+                field="training",
+                completions=training,
+            )
+            if stop_after_training:
+                return barrier
+
+            bundles = _evaluation_bundles(self.plan)
+            bundle_completions = self._run_phase(
+                bundles,
+                kind="evaluation",
+                max_parallel=self.plan.max_parallel_eval,
+            )
+            if set(bundle_completions) != {
+                bundle.task_id for bundle in bundles
+            }:
+                raise RoutedLadderCampaignStateError(
+                    "resident evaluation bundle matrix is incomplete"
+                )
+
+            evaluations: dict[str, CompletionFingerprint] = {}
+            for task in self.plan.evaluations:
+                completion = inspect_evaluation_completion(self.plan, task)
+                if completion is None:
+                    raise RoutedLadderCampaignStateError(
+                        f"resident evaluation omitted {task.task_id}"
+                    )
+                self._completion_witness(
+                    task,
+                    kind="evaluation",
+                    fingerprint=completion,
+                )
+                evaluations[task.task_id] = completion
+
+            evaluation_barrier = self._seal_phase(
+                path=self.plan.state_root / "evaluation-complete.json",
+                record_type="evaluation_phase_completion",
+                status="evaluation_completed",
+                field="evaluations",
+                completions=evaluations,
+            )
+            cost = self._seal_cost_projection(
+                completed_at=evaluation_barrier["completed_at"],
+            )
+            report_identity = self._seal_scientific_report(
+                evaluation_barrier=evaluation_barrier,
+                cost_projection=cost,
+            )
+            final = _record(
+                "campaign_completion",
+                {
+                    "campaign_id": self.plan.campaign_id,
+                    "plan_sha256": self.plan.plan_sha256,
+                    "status": "completed",
+                    "training": {
+                        key: training[key].to_dict()
+                        for key in sorted(training)
+                    },
+                    "evaluations": {
+                        key: evaluations[key].to_dict()
+                        for key in sorted(evaluations)
+                    },
+                    "report": report_identity,
+                    "cost_projection_record_sha256": cost["record_sha256"],
+                    "completed_at": evaluation_barrier["completed_at"],
+                },
+            )
+            path = self.plan.state_root / "final.json"
+            if path.exists():
+                observed = _read_record(
+                    path,
+                    record_type="campaign_completion",
+                )
+                for key in (
+                    "campaign_id",
+                    "plan_sha256",
+                    "status",
+                    "training",
+                    "evaluations",
+                    "report",
+                    "cost_projection_record_sha256",
+                    "completed_at",
+                ):
+                    if observed.get(key) != final.get(key):
+                        raise RoutedLadderCampaignStateError(
+                            "final campaign record changed"
+                        )
+                return observed
+            _write_create_only(path, final)
+            return final
+        finally:
+            self._stop_watchdog()
+            self._release_lock()
+
     def _seal_scientific_report(
         self,
         *,
         evaluation_barrier: Mapping[str, Any],
+        cost_projection: Mapping[str, Any],
     ) -> dict[str, Any]:
         """Build, validate, and seal the complete activation-ladder report."""
 
@@ -1722,10 +3763,10 @@ class RoutedLadderCampaign(Experiment5Campaign):
             or evaluation_barrier.get("status") != "evaluation_completed"
             or not isinstance(rows, Mapping)
             or set(rows) != expected
-            or len(expected) != EVALUATION_TASK_COUNT
+            or len(expected) != len(self.plan.evaluations)
         ):
             raise RoutedLadderCampaignStateError(
-                "evaluation barrier is not the exact 54-task ladder matrix"
+                "evaluation barrier is not the exact plan-bound ladder matrix"
             )
         score_rows: list[dict[str, Any]] = []
         score_sets: list[RoutedLadderTokenScores] = []
@@ -1813,6 +3854,12 @@ class RoutedLadderCampaign(Experiment5Campaign):
                         f"A report cell has H scores: {task.task_id}"
                     )
                 score_sets.append(scores)
+        trajectory_accounting = _trajectory_accounting(self.plan)
+        bundle_accounting = _evaluation_bundle_accounting(self.plan)
+        wall_cash = _wall_cash_accounting(
+            self.plan,
+            cost_projection,
+        )
         body = {
             "schema_version": REPORT_INPUT_SCHEMA_VERSION,
             "protocol_id": PROTOCOL_ID,
@@ -1821,6 +3868,19 @@ class RoutedLadderCampaign(Experiment5Campaign):
             "source_revision": self.plan.project_commit,
             "evaluation_cells": score_rows,
             "h_reference_manifest": self.plan.h_reference_manifest,
+            "a256_reference_manifest_sha256": (
+                self.plan.a256_reference_manifest["manifest_sha256"]
+            ),
+            "h_reference_manifest_sha256": (
+                self.plan.h_reference_manifest["manifest_sha256"]
+            ),
+            "trajectory_accounting": [
+                row.report_row() for row in trajectory_accounting
+            ],
+            "evaluation_bundle_accounting": [
+                row.report_row() for row in bundle_accounting
+            ],
+            "wall_cash_accounting": wall_cash.report_row(),
             "interpretation": (
                 "A512Softplus-minus-A512ReLU is the only paired bootstrap "
                 "contrast; "
@@ -1854,6 +3914,15 @@ class RoutedLadderCampaign(Experiment5Campaign):
                     uri=str(path),
                     sha256=file_sha,
                 ),
+                trajectory_accounting=trajectory_accounting,
+                evaluation_bundle_accounting=bundle_accounting,
+                a256_reference_manifest_sha256=str(
+                    self.plan.a256_reference_manifest["manifest_sha256"]
+                ),
+                h_reference_manifest_sha256=str(
+                    self.plan.h_reference_manifest["manifest_sha256"]
+                ),
+                wall_cash_accounting=wall_cash,
             )
             validate_experiment5_routed_ladder_report(report)
             markdown = _render_routed_ladder_report(report)
@@ -1985,160 +4054,341 @@ def routed_ladder_campaign_status(
     }
 
 
-def _replace_core_prefix(
-    value: str,
-    *,
-    core_marker: str,
-    replacement: str,
-    name: str,
-) -> str:
-    count = value.count(core_marker)
-    if count != 1:
-        raise RoutedLadderCampaignPlanError(
-            f"{name} does not contain one exact core namespace marker"
-        )
-    return value.replace(core_marker, replacement, 1)
-
-
 def build_routed_ladder_campaign_plan(
     source: Mapping[str, Any],
     *,
     project_commit: str,
-    execution_profile: str,
     h_reference_manifest: Mapping[str, Any],
+    a256_reference_manifest: Mapping[str, Any],
     already_spent_usd: float,
-    resource_evidence_overrides: Mapping[str, Any] | None,
+    resource_pool: Mapping[str, Any],
     campaign_id: str | None = None,
 ) -> dict[str, Any]:
-    """Build the extension from the same strict r8/evidence resource source."""
+    """Build one N-way plan without discovering or mutating cloud resources."""
 
-    if execution_profile != EXECUTION_PROFILE:
-        raise RoutedLadderCampaignPlanError(
-            f"execution_profile must be exactly {EXECUTION_PROFILE!r}"
+    if not isinstance(source, Mapping):
+        raise RoutedLadderCampaignPlanError("source must be a mapping")
+    try:
+        selected_commit = _git_sha(project_commit, "project_commit")
+        admitted = parse_routed_ladder_resource_pool(
+            resource_pool,
+            project_commit=selected_commit,
         )
-    # This creates no files or cloud resources.  It uses the frozen core
-    # builder as the authority for the seven resource descriptors and the
-    # ready-three data/cache planes at this exact commit.
-    core = build_experiment5_plan(
-        source,
-        project_commit=project_commit,
-        execution_profile=execution_profile,
-        already_spent_usd=0.0,
-        resource_evidence_overrides=resource_evidence_overrides,
-        campaign_id=f"temporary-resource-source-{project_commit[:12]}",
-    )
-    core_plan = __import__(
-        "moe_sae.experiment5_campaign",
-        fromlist=["parse_experiment5_campaign_plan"],
-    ).parse_experiment5_campaign_plan(core)
+        working_directory = _controller_path(
+            source.get("working_directory"),
+            "source.working_directory",
+        )
+        python_executable = _controller_path(
+            source.get("python_executable"),
+            "source.python_executable",
+        )
+        remote_project_root = _remote_path(
+            source.get("remote_project_root"),
+            "source.remote_project_root",
+        )
+        remote_uv = _remote_path(
+            source.get("remote_uv"),
+            "source.remote_uv",
+        )
+    except (Experiment5CampaignPlanError, RoutedLadderResourcePoolError) as error:
+        raise RoutedLadderCampaignPlanError(str(error)) from error
+    source_environment = source.get("environment")
+    if not isinstance(source_environment, Mapping) or not all(
+        isinstance(key, str) for key in source_environment
+    ):
+        raise RoutedLadderCampaignPlanError(
+            "source.environment must be a string-keyed mapping"
+        )
+    environment = {
+        key: copy.deepcopy(value)
+        for key, value in source_environment.items()
+        if key in _PRESERVED_GLOBAL_ENVIRONMENT
+    }
+    try:
+        environment = dict(_task_environment(environment, "environment"))
+        source_overlays = {
+            "train_root": _remote_path(
+                source_environment.get("CONTRIBUTION_SOURCE_OVERLAY_ROOT"),
+                "CONTRIBUTION_SOURCE_OVERLAY_ROOT",
+            ),
+            "eval_root": _remote_path(
+                source_environment.get("CONTRIBUTION_EVAL_SOURCE_OVERLAY_ROOT"),
+                "CONTRIBUTION_EVAL_SOURCE_OVERLAY_ROOT",
+            ),
+            "train_prefix": _gcs_prefix(
+                source_environment.get("CONTRIBUTION_SOURCE_OVERLAY_PREFIX"),
+                "CONTRIBUTION_SOURCE_OVERLAY_PREFIX",
+            ),
+            "eval_prefix": _gcs_prefix(
+                source_environment.get("CONTRIBUTION_EVAL_SOURCE_OVERLAY_PREFIX"),
+                "CONTRIBUTION_EVAL_SOURCE_OVERLAY_PREFIX",
+            ),
+        }
+    except Experiment5CampaignPlanError as error:
+        raise RoutedLadderCampaignPlanError(str(error)) from error
+    global_bulk = environment.get("BULK_GCS_ROOT")
+    for resource in admitted.resources:
+        if "BULK_GCS_ROOT" in resource.environment_dict():
+            continue
+        if global_bulk is None or admitted.plane(
+            resource.resource_id
+        ).bulk_gcs_root != global_bulk.removesuffix("/horizon-10m"):
+            raise RoutedLadderCampaignPlanError(
+                f"{resource.resource_id} object plane differs from the "
+                "source default"
+            )
     h_manifest, h_cells = parse_h_reference_manifest(h_reference_manifest)
     h_by_role = {cell.identity: cell for cell in h_cells}
-    short = project_commit[:12]
-    core_marker = f"/{execution_profile}/{short}/"
-    remote_replacement = f"/{EXTENSION_NAMESPACE}/{short}/"
-    controller_core_marker = f"/experiment5/{execution_profile}/{short}/"
-    controller_replacement = f"/{EXTENSION_NAMESPACE}/{short}/"
-    configs: dict[str, tuple[str, str]] = {}
+    (
+        a256_manifest,
+        a256_cells,
+        a256_cost,
+    ) = parse_a256_reference_manifest(a256_reference_manifest)
+    try:
+        historical_plan = parse_direct_campaign_plan(source)
+    except DirectCampaignPlanError as error:
+        raise RoutedLadderCampaignPlanError(
+            f"A256 source is not the strict Experiment-4 direct plan: {error}"
+        ) from error
+    if (
+        a256_manifest["source_plan_sha256"]
+        != historical_plan.plan_sha256
+    ):
+        raise RoutedLadderCampaignPlanError(
+            "A256 reference manifest names a different Experiment-4 plan"
+        )
+    historical_tasks = [
+        task
+        for task in historical_plan.trajectories
+        if task.scientific_model == "sae"
+        and task.condition == "A"
+        and task.seed == 0
+    ]
+    if len(historical_tasks) != 1:
+        raise RoutedLadderCampaignPlanError(
+            "Experiment-4 plan lacks the sole historical SAE A trajectory"
+        )
+    historical_task = historical_tasks[0]
+    historical_resource = historical_plan.resource(
+        historical_task.resource_id
+    )
+    historical_revision = historical_plan.environment_dict().get(
+        "TRAINING_PROJECT_COMMIT"
+    )
+    expected_run_root = str(
+        PurePosixPath(historical_task.control_root_remote)
+        / "runs"
+        / historical_task.run_id
+    )
+    expected_training_remote = str(
+        PurePosixPath(expected_run_root) / "training-result.json"
+    )
+    expected_contract_controller = (
+        historical_task.completion_path_controller.parent
+        / "run-contract.json"
+    )
+    expected_contract_remote = str(
+        PurePosixPath(expected_run_root) / "run-contract.json"
+    )
+    if (
+        historical_revision is None
+        or a256_cost.resource_id != historical_resource.resource_id
+        or a256_cost.accelerator_type
+        != historical_resource.accelerator_type
+        or a256_cost.chip_count != 16
+    ):
+        raise RoutedLadderCampaignPlanError(
+            "A256 historical cost/resource identity differs from its "
+            "Experiment-4 source plan"
+        )
+    for cell in a256_cells:
+        expected_pointer_controller = milestone_pointer_path(
+            historical_task.completion_path_controller.parent
+            / "checkpoints",
+            cell.checkpoint_tokens,
+        )
+        expected_pointer_remote = str(
+            milestone_pointer_path(
+                str(
+                    PurePosixPath(expected_run_root)
+                    / "checkpoints"
+                ),
+                cell.checkpoint_tokens,
+            )
+        )
+        if (
+            cell.training_source_revision != historical_revision
+            or cell.a256_config.remote_path
+            != historical_task.config_remote
+            or cell.run_root_remote != expected_run_root
+            or cell.checkpoint_payload_root_gcs
+            != historical_task.checkpoint_root_gcs
+            or cell.training_result.controller_path
+            != historical_task.completion_path_controller
+            or cell.training_result.remote_path
+            != expected_training_remote
+            or cell.run_contract.controller_path
+            != expected_contract_controller
+            or cell.run_contract.remote_path
+            != expected_contract_remote
+            or cell.checkpoint_pointer.controller_path
+            != expected_pointer_controller
+            or cell.checkpoint_pointer.remote_path
+            != expected_pointer_remote
+        ):
+            raise RoutedLadderCampaignPlanError(
+                "A256 historical artifact paths differ from the exact "
+                "Experiment-4 source trajectory"
+            )
+    a256_by_milestone = {
+        cell.checkpoint_tokens: cell for cell in a256_cells
+    }
+    short = selected_commit[:12]
+    relative_root = PurePosixPath(EXTENSION_NAMESPACE) / short
+    configs: dict[str, tuple[str, str, Any]] = {}
     for panel in PANELS:
-        local_path = core_plan.working_directory / "configs" / _CONFIG_NAMES[panel]
+        local_path = working_directory / "configs" / _CONFIG_NAMES[panel]
         try:
-            config = load_routed_ladder_config(local_path, expected_panel=panel)
-        except RoutedLadderConfigError as error:
+            config = load_routed_ladder_v2_config(
+                local_path,
+                expected_panel=panel,
+            )
+        except RoutedLadderV2ConfigError as error:
             raise RoutedLadderCampaignPlanError(
                 f"cannot bind {panel} activation-ladder config: {error}"
             ) from error
+        for condition in CONDITIONS:
+            if (
+                config.training_seeds_for_condition(condition)
+                != training_seeds_for_condition(panel, condition)
+            ):
+                raise RoutedLadderCampaignPlanError(
+                    f"{panel}/{condition} training provenance differs from "
+                    "the campaign matrix"
+                )
         configs[panel] = (
-            str(PurePosixPath(core_plan.remote_project_root) / "configs" / _CONFIG_NAMES[panel]),
+            str(
+                PurePosixPath(remote_project_root)
+                / "configs"
+                / _CONFIG_NAMES[panel]
+            ),
             config.config_hash,
+            config,
         )
     trajectories: list[dict[str, Any]] = []
     evaluations: list[dict[str, Any]] = []
-    core_training = {
-        (task.panel, task.seed): task
-        for task in core_plan.trajectories
-        if task.condition == "H"
-    }
-    core_evaluations = {
-        (task.panel, task.seed, task.milestone_tokens): task
-        for task in core_plan.evaluations
-    }
     for panel in PANELS:
-        config_remote, config_sha = configs[panel]
+        config_remote, config_sha, config = configs[panel]
         for seed in SEEDS:
-            plane = core_training[(panel, seed)]
-            control_root = _replace_core_prefix(
-                plane.control_root_remote,
-                core_marker=core_marker,
-                replacement=remote_replacement,
-                name=f"{panel}/seed{seed} control root",
+            cohort = admitted.cohort(panel, seed)
+            panel_offset = PANELS.index(panel) * len(CONDITIONS)
+            bundle_owner_id = cohort[
+                (PANELS.index(panel) * len(SEEDS) + seed) % len(cohort)
+            ]
+            bundle_plane = admitted.plane(bundle_owner_id)
+            evaluation_control_root = str(
+                PurePosixPath(bundle_plane.remote_artifact_root)
+                / relative_root
+                / "runs"
+                / panel
+                / f"seed{seed}"
             )
-            checkpoint_root = _replace_core_prefix(
-                plane.checkpoint_root_gcs,
-                core_marker=controller_core_marker,
-                replacement=controller_replacement,
-                name=f"{panel}/seed{seed} checkpoint root",
-            )
-            completion_core_marker = controller_core_marker
-            for condition in CONDITIONS:
+            for condition_index, condition in enumerate(CONDITIONS):
                 slug = _CONDITION_SLUG[condition]
+                owner_id = cohort[
+                    (panel_offset + condition_index) % len(cohort)
+                ]
+                owner_plane = admitted.plane(owner_id)
+                control_root = str(
+                    PurePosixPath(owner_plane.remote_artifact_root)
+                    / relative_root
+                    / "runs"
+                    / panel
+                    / f"seed{seed}"
+                )
+                controller_group = (
+                    owner_plane.controller_artifact_root
+                    / Path(*relative_root.parts)
+                    / "runs"
+                    / panel
+                    / f"seed{seed}"
+                )
+                checkpoint_root = (
+                    f"{owner_plane.bulk_gcs_root}/{relative_root}/"
+                    f"checkpoints/{panel}/seed{seed}"
+                )
                 run_id = (
                     f"experiment5-activation-ladder-{panel}-{slug}-seed{seed}"
                 )
-                controller_group = str(plane.completion_path_controller.parents[2])
-                controller_group = _replace_core_prefix(
-                    controller_group,
-                    core_marker=completion_core_marker,
-                    replacement=controller_replacement,
-                    name=f"{panel}/seed{seed} controller group",
+                train_new = seed in config.training_seeds_for_condition(
+                    condition
                 )
-                trajectories.append(
-                    {
-                        "id": f"train-{panel}-{slug}-seed{seed}",
-                        "panel": panel,
-                        "condition": condition,
-                        "seed": seed,
-                        "eligible_resource_ids": list(plane.eligible_resource_ids),
-                        "run_id": run_id,
-                        "config_remote": config_remote,
-                        "config_sha256": config_sha,
-                        "phase": PHASE_NAME,
-                        "control_root_remote": control_root,
-                        "checkpoint_root_gcs": checkpoint_root,
-                        "source_overlay_control_root_remote": (
-                            plane.source_overlay_control_root_remote
-                        ),
-                        "source_overlay_object_prefix_gcs": (
-                            plane.source_overlay_object_prefix_gcs
-                        ),
-                        "completion_path_controller": str(
-                            Path(controller_group)
-                            / "runs"
-                            / run_id
-                            / "training-result.json"
-                        ),
-                        "environment": {},
-                    }
-                )
+                if train_new:
+                    trajectories.append(
+                        {
+                            "id": f"train-{panel}-{slug}-seed{seed}",
+                            "panel": panel,
+                            "condition": condition,
+                            "seed": seed,
+                            "eligible_resource_ids": [owner_id],
+                            "run_id": run_id,
+                            "config_remote": config_remote,
+                            "config_sha256": config_sha,
+                            "phase": PHASE_NAME,
+                            "control_root_remote": control_root,
+                            "checkpoint_root_gcs": checkpoint_root,
+                            "source_overlay_control_root_remote": (
+                                None
+                                if panel == "sae"
+                                else source_overlays["train_root"]
+                            ),
+                            "source_overlay_object_prefix_gcs": (
+                                None
+                                if panel == "sae"
+                                else source_overlays["train_prefix"]
+                            ),
+                            "completion_path_controller": str(
+                                controller_group
+                                / "runs"
+                                / run_id
+                                / "training-result.json"
+                            ),
+                            "environment": {},
+                        }
+                    )
+                elif not (
+                    panel == "sae"
+                    and condition == "A256ReLU"
+                    and seed == 0
+                ):
+                    raise RoutedLadderCampaignPlanError(
+                        f"{panel}/{condition}/seed{seed} has no authorized "
+                        "training or historical reference"
+                    )
                 run_root = str(PurePosixPath(control_root) / "runs" / run_id)
                 for milestone in MILESTONES:
-                    eval_plane = core_evaluations[(panel, seed, milestone)]
-                    remote_result = _replace_core_prefix(
-                        eval_plane.result_root_remote,
-                        core_marker=core_marker,
-                        replacement=remote_replacement,
-                        name=f"{panel}/seed{seed}/{milestone} result root",
+                    historical = (
+                        a256_by_milestone[milestone]
+                        if not train_new
+                        else None
                     )
                     remote_result = str(
-                        PurePosixPath(remote_result) / slug
+                        PurePosixPath(bundle_plane.remote_artifact_root)
+                        / relative_root
+                        / "evaluation"
+                        / panel
+                        / f"seed{seed}"
+                        / str(milestone)
+                        / slug
                     )
-                    controller_result = _replace_core_prefix(
-                        str(eval_plane.completion_path_controller.parent),
-                        core_marker=controller_core_marker,
-                        replacement=controller_replacement,
-                        name=f"{panel}/seed{seed}/{milestone} controller result",
-                    )
-                    controller_result = str(
-                        Path(controller_result) / slug
+                    controller_result = (
+                        bundle_plane.controller_artifact_root
+                        / Path(*relative_root.parts)
+                        / "evaluation"
+                        / panel
+                        / f"seed{seed}"
+                        / str(milestone)
+                        / slug
                     )
                     evaluations.append(
                         {
@@ -2150,55 +4400,96 @@ def build_routed_ladder_campaign_plan(
                             "condition": condition,
                             "seed": seed,
                             "milestone_tokens": milestone,
-                            "eligible_resource_ids": list(
-                                eval_plane.eligible_resource_ids
-                            ),
+                            "eligible_resource_ids": [bundle_owner_id],
                             "config_remote": config_remote,
                             "config_sha256": config_sha,
                             "h_config_remote": None,
                             "h_config_sha256": None,
-                            "training_source_revision": project_commit,
+                            "a256_config_remote": (
+                                historical.a256_config.remote_path
+                                if historical is not None
+                                else None
+                            ),
+                            "a256_config_sha256": (
+                                historical.a256_config_sha256
+                                if historical is not None
+                                else None
+                            ),
+                            "reference_run_contract_sha256": (
+                                historical.run_contract_sha256
+                                if historical is not None
+                                else None
+                            ),
+                            "reference_run_contract_file_sha256": (
+                                historical.run_contract.sha256
+                                if historical is not None
+                                else None
+                            ),
+                            "training_source_revision": (
+                                historical.training_source_revision
+                                if historical is not None
+                                else selected_commit
+                            ),
                             "phase": PHASE_NAME,
-                            "control_root_remote": control_root,
-                            "checkpoint_root_gcs": checkpoint_root,
+                            "control_root_remote": evaluation_control_root,
+                            "checkpoint_root_gcs": (
+                                historical.checkpoint_payload_root_gcs
+                                if historical is not None
+                                else checkpoint_root
+                            ),
                             "train_source_root_remote": (
-                                eval_plane.train_source_root_remote
+                                None
+                                if panel == "sae"
+                                else source_overlays["train_root"]
                             ),
                             "eval_source_root_remote": (
-                                eval_plane.eval_source_root_remote
+                                None
+                                if panel == "sae"
+                                else source_overlays["eval_root"]
                             ),
                             "train_source_object_prefix_gcs": (
-                                eval_plane.train_source_object_prefix_gcs
+                                None
+                                if panel == "sae"
+                                else source_overlays["train_prefix"]
                             ),
                             "eval_source_object_prefix_gcs": (
-                                eval_plane.eval_source_object_prefix_gcs
+                                None
+                                if panel == "sae"
+                                else source_overlays["eval_prefix"]
                             ),
-                            "run_root_remote": run_root,
+                            "run_root_remote": (
+                                historical.run_root_remote
+                                if historical is not None
+                                else run_root
+                            ),
                             "result_root_remote": remote_result,
                             "completion_path_controller": str(
-                                Path(controller_result) / "evaluation-result.json"
+                                controller_result / "evaluation-result.json"
                             ),
-                            "result_root_controller": controller_result,
+                            "result_root_controller": str(controller_result),
                             "environment": {},
                         }
                     )
-            for milestone in MILESTONES:
-                eval_plane = core_evaluations[(panel, seed, milestone)]
+            for milestone_index, milestone in enumerate(MILESTONES):
                 parent_h = h_by_role[(panel, seed, milestone)]
-                remote_result = _replace_core_prefix(
-                    eval_plane.result_root_remote,
-                    core_marker=core_marker,
-                    replacement=remote_replacement,
-                    name=f"{panel}/seed{seed}/{milestone} H result root",
+                remote_result = str(
+                    PurePosixPath(bundle_plane.remote_artifact_root)
+                    / relative_root
+                    / "evaluation"
+                    / panel
+                    / f"seed{seed}"
+                    / str(milestone)
+                    / "h"
                 )
-                remote_result = str(PurePosixPath(remote_result) / "h")
-                controller_result = _replace_core_prefix(
-                    str(eval_plane.completion_path_controller.parent),
-                    core_marker=controller_core_marker,
-                    replacement=controller_replacement,
-                    name=f"{panel}/seed{seed}/{milestone} H controller result",
+                controller_result = (
+                    bundle_plane.controller_artifact_root
+                    / Path(*relative_root.parts)
+                    / "evaluation"
+                    / panel
+                    / f"seed{seed}"
+                    / str(milestone)
+                    / "h"
                 )
-                controller_result = str(Path(controller_result) / "h")
                 evaluations.append(
                     {
                         "id": f"eval-{panel}-h-seed{seed}-{milestone}",
@@ -2206,38 +4497,48 @@ def build_routed_ladder_campaign_plan(
                         "condition": "H",
                         "seed": seed,
                         "milestone_tokens": milestone,
-                        "eligible_resource_ids": list(
-                            eval_plane.eligible_resource_ids
-                        ),
+                        "eligible_resource_ids": [bundle_owner_id],
                         "config_remote": config_remote,
                         "config_sha256": config_sha,
                         "h_config_remote": parent_h.h_config_remote,
                         "h_config_sha256": parent_h.h_config_sha256,
+                        "a256_config_remote": None,
+                        "a256_config_sha256": None,
+                        "reference_run_contract_sha256": None,
+                        "reference_run_contract_file_sha256": None,
                         "training_source_revision": (
                             parent_h.training_source_revision
                         ),
                         "phase": PHASE_NAME,
-                        "control_root_remote": control_root,
+                        "control_root_remote": evaluation_control_root,
                         "checkpoint_root_gcs": (
                             parent_h.checkpoint_payload_root_gcs
                         ),
                         "train_source_root_remote": (
-                            eval_plane.train_source_root_remote
+                            None
+                            if panel == "sae"
+                            else source_overlays["train_root"]
                         ),
                         "eval_source_root_remote": (
-                            eval_plane.eval_source_root_remote
+                            None
+                            if panel == "sae"
+                            else source_overlays["eval_root"]
                         ),
                         "train_source_object_prefix_gcs": (
-                            eval_plane.train_source_object_prefix_gcs
+                            None
+                            if panel == "sae"
+                            else source_overlays["train_prefix"]
                         ),
                         "eval_source_object_prefix_gcs": (
-                            eval_plane.eval_source_object_prefix_gcs
+                            None
+                            if panel == "sae"
+                            else source_overlays["eval_prefix"]
                         ),
                         "run_root_remote": parent_h.run_root_remote,
                         "result_root_remote": remote_result,
-                        "result_root_controller": controller_result,
+                        "result_root_controller": str(controller_result),
                         "completion_path_controller": str(
-                            Path(controller_result) / "evaluation-result.json"
+                            controller_result / "evaluation-result.json"
                         ),
                         "environment": {},
                     }
@@ -2252,13 +4553,23 @@ def build_routed_ladder_campaign_plan(
         "state_root": (
             f"/mnt/moe-sae-control/{EXTENSION_NAMESPACE}/controller/{short}"
         ),
-        "working_directory": str(core_plan.working_directory),
-        "python_executable": str(core_plan.python_executable),
-        "remote_project_root": core_plan.remote_project_root,
-        "remote_uv": core_plan.remote_uv,
-        "project_commit": project_commit,
-        "max_parallel_train": 3,
-        "max_parallel_eval": 3,
+        "working_directory": str(working_directory),
+        "python_executable": str(python_executable),
+        "remote_project_root": remote_project_root,
+        "remote_uv": remote_uv,
+        "project_commit": selected_commit,
+        "max_parallel_train": len(
+            {
+                task["eligible_resource_ids"][0]
+                for task in trajectories
+            }
+        ),
+        "max_parallel_eval": len(
+            {
+                task["eligible_resource_ids"][0]
+                for task in evaluations
+            }
+        ),
         "retry_policy": {
             "max_transient_attempts": 8,
             "initial_backoff_seconds": 30,
@@ -2272,11 +4583,13 @@ def build_routed_ladder_campaign_plan(
             "training_attempt_reserve_usd": 0.5,
             "evaluation_attempt_reserve_usd": 0.2,
         },
-        "environment": dict(core_plan.environment),
-        "resources": copy.deepcopy(core["resources"]),
+        "environment": environment,
+        "resources": copy.deepcopy(list(admitted.resource_rows)),
+        "resource_pool": copy.deepcopy(admitted.source),
         "trajectories": trajectories,
         "evaluations": evaluations,
         "h_reference_manifest": h_manifest,
+        "a256_reference_manifest": a256_manifest,
     }
     parse_routed_ladder_campaign_plan(plan)
     return plan

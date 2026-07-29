@@ -51,6 +51,11 @@ TRANSCODER_HORIZON_TEMPLATE = (
 EXPERIMENT5_SAE_CONFIG = (
     Path(__file__).parents[1] / "configs" / "gemma4_hybrid_sae_v1.yaml"
 )
+ROUTED_LADDER_V2_SAE_CONFIG = (
+    Path(__file__).parents[1]
+    / "configs"
+    / "gemma4_experiment5_routed_ladder_sae_v2.yaml"
+)
 
 
 def test_stablehlo_manifest_explicitly_binds_scientific_model() -> None:
@@ -1247,6 +1252,143 @@ def test_experiment5_training_result_seals_source_revision_for_campaign(
     )
     assert generic == base_result
     assert "source_revision" not in generic
+
+
+def test_routed_ladder_v2_production_result_seals_campaign_provenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from moe_sae.experiment5_routed_ladder_campaign import (
+        inspect_training_completion,
+    )
+    from moe_sae.experiment5_routed_ladder_v2_config import (
+        load_routed_ladder_v2_config,
+    )
+
+    config = load_routed_ladder_v2_config(ROUTED_LADDER_V2_SAE_CONFIG)
+    selected_plan = TrainingWorkerPlan.from_config(
+        config,
+        phase="experiment5_routed_activation_ladder_v2_10m",
+        condition="A512Softplus",
+        seed=0,
+    )
+    source_revision = "c" * 40
+    unsigned_result = {
+        "schema_version": "gemma4-contribution-sae-training-result-v1",
+        "status": "completed",
+        "tokens": 10_000_000,
+        "run_identity": {
+            "plan": {
+                "phase_name": selected_plan.phase_name,
+                "condition": selected_plan.condition,
+                "seed": selected_plan.seed,
+                "total_tokens": selected_plan.total_tokens,
+            }
+        },
+    }
+    base_result = {
+        **unsigned_result,
+        "result_sha256": training_worker_module.canonical_sha256(unsigned_result),
+    }
+    no_op = lambda *_args, **_kwargs: None
+    engine = SimpleNamespace(
+        initialize_state=no_op,
+        lower=no_op,
+        compile=no_op,
+        step=no_op,
+        synchronize=no_op,
+        progress=no_op,
+    )
+    checkpoint = SimpleNamespace(restore=no_op, save=no_op)
+    monkeypatch.setattr(
+        training_worker_module,
+        "_ProductionEngine",
+        lambda *_args, **_kwargs: engine,
+    )
+    monkeypatch.setattr(
+        training_worker_module,
+        "_OrbaxCheckpointBackend",
+        lambda **_kwargs: checkpoint,
+    )
+    monkeypatch.setattr(
+        training_worker_module,
+        "run_qualified_training",
+        lambda *_args, **_kwargs: dict(base_result),
+    )
+    workload_context = {
+        "scientific_model": "sae",
+        "capture_manifest_sha256": "d" * 64,
+        "resident_cache_policy": "resident_only_no_refill",
+    }
+    workload = SimpleNamespace(
+        scientific_model="sae",
+        encoder_activation="softplus",
+        source=object(),
+        mean=object(),
+        mesh=SimpleNamespace(devices=np.empty((16,), dtype=object)),
+        checkpoint_training_config=object(),
+        expected_l0=64,
+        preprocessing_wall_seconds=0.0,
+        workload_context=workload_context,
+        experiment5_recomposition=None,
+    )
+
+    result = training_worker_module._run_production_training(
+        config,
+        selected_plan,
+        workload,
+        None,
+        source_revision=source_revision,
+        peak_flops_per_second=1_000,
+        accelerator_type="v6e-16",
+        checkpoint_control_root=tmp_path / "checkpoints",
+        checkpoint_payload_root="gs://test-bucket/checkpoints",
+        maximum_runtime_seconds=43_200,
+        metric_path=None,
+        direct_bounded_resident=True,
+        direct_runtime_max_seconds=43_200,
+    )
+
+    assert "source_revision" not in base_result
+    assert result["source_revision"] == source_revision
+    assert result["routed_ladder_v2_context"] == {
+        "schema_version": (
+            "gemma4-experiment5-routed-activation-ladder-training-context-v1"
+        ),
+        "protocol_id": config.protocol_id,
+        "config_sha256": config.config_hash,
+        "panel": "sae",
+        "scientific_model": "sae",
+        "phase_name": selected_plan.phase_name,
+        "condition": "A512Softplus",
+        "seed": 0,
+        "encoder_activation": "softplus",
+        "workload_context": workload_context,
+    }
+    assert result["routed_ladder_v2_execution"] == {
+        "schema_version": (
+            "gemma4-experiment5-routed-activation-ladder-training-execution-v1"
+        ),
+        "accelerator_type": "v6e-16",
+        "peak_flops_per_second": 1_000,
+        "global_chip_count": 16,
+    }
+    result_body = dict(result)
+    claimed_sha256 = result_body.pop("result_sha256")
+    assert claimed_sha256 == training_worker_module.canonical_sha256(result_body)
+
+    result_path = tmp_path / "training-result.json"
+    result_path.write_text(json.dumps(result, sort_keys=True), encoding="ascii")
+    campaign_plan = SimpleNamespace(project_commit=source_revision)
+    task = SimpleNamespace(
+        task_id="train-sae-a512softplus-seed0",
+        condition="A512Softplus",
+        seed=0,
+        completion_path_controller=result_path,
+    )
+    fingerprint = inspect_training_completion(campaign_plan, task)
+    assert fingerprint is not None
+    assert fingerprint.scientific_sha256 == claimed_sha256
 
 
 def test_bounded_direct_training_resumes_from_exact_lowered_identity() -> None:

@@ -67,6 +67,12 @@ TRAINING_HARDWARE_SCHEMA_VERSION = "gemma4-contribution-sae-hardware-v1"
 TRAINING_SUPERVISION_SCHEMA_VERSION = (
     "gemma4-contribution-sae-supervised-qualification-v1"
 )
+ROUTED_LADDER_V2_TRAINING_CONTEXT_SCHEMA_VERSION = (
+    "gemma4-experiment5-routed-activation-ladder-training-context-v1"
+)
+ROUTED_LADDER_V2_TRAINING_EXECUTION_SCHEMA_VERSION = (
+    "gemma4-experiment5-routed-activation-ladder-training-execution-v1"
+)
 PREFETCH_RECEIPT_SCHEMA_VERSION = "gemma4-contribution-sae-process-lane-prefetch-v1"
 TRANSCODER_PREFETCH_RECEIPT_SCHEMA_VERSION = (
     "gemma4-contribution-transcoder-paired-process-lane-prefetch-v1"
@@ -76,12 +82,13 @@ HORIZON_PREFETCH_MAX_SECONDS = 1_800
 HORIZON_DIRECT_ACCELERATOR_TYPES = frozenset(
     {"v4-32", "v6e-16", "v5litepod-16"}
 )
-ROUTED_LADDER_CONDITIONS = ("A512ReLU", "A512Softplus")
+ROUTED_LADDER_CONDITIONS = ("A256ReLU", "A512ReLU", "A512Softplus")
 LONG_HORIZON_PHASES = frozenset(
     {
         "learning_horizon_10m",
         "routed_shared_hybrid_10m",
         "experiment5_routed_activation_ladder_10m",
+        "experiment5_routed_activation_ladder_v2_10m",
     }
 )
 CHIP_SECONDS_SCOPE = (
@@ -112,6 +119,18 @@ def _finalized_horizon_config(config_path: str | Path) -> Any | None:
         return None
 
     schema = raw.get("schema_version")
+    if schema == "gemma4-experiment5-routed-activation-ladder-run-config-v2":
+        from moe_sae.experiment5_routed_ladder_v2_config import (
+            RoutedLadderV2ConfigError,
+            load_routed_ladder_v2_config,
+        )
+
+        try:
+            return load_routed_ladder_v2_config(selected)
+        except RoutedLadderV2ConfigError as error:
+            raise ContributionTrainingWorkerError(
+                "Experiment-5 routed-ladder v2 execution requires its strict config"
+            ) from error
     if schema == "gemma4-experiment5-routed-activation-ladder-run-config-v1":
         from moe_sae.experiment5_routed_ladder_config import (
             RoutedLadderConfigError,
@@ -383,6 +402,18 @@ class TrainingWorkerPlan:
         if seed not in selected.seeds:
             raise ContributionTrainingWorkerError(
                 "seed is not authorized by the selected phase"
+            )
+        training_seeds_for_condition = getattr(
+            config,
+            "training_seeds_for_condition",
+            None,
+        )
+        if (
+            callable(training_seeds_for_condition)
+            and seed not in training_seeds_for_condition(condition)
+        ):
+            raise ContributionTrainingWorkerError(
+                "seed is a read-only historical reference for this condition"
             )
         if condition not in {
             layout.condition for layout in config.layouts_for_phase(phase)
@@ -3957,11 +3988,59 @@ def _run_production_training(
         preprocessing_wall_seconds=workload.preprocessing_wall_seconds,
         global_chip_count=int(np.asarray(workload.mesh.devices, dtype=object).size),
     )
-    if workload.experiment5_recomposition is None:
+    from moe_sae.experiment5_routed_ladder_v2_config import RoutedLadderV2Config
+
+    is_routed_ladder_v2 = isinstance(config, RoutedLadderV2Config)
+    if workload.experiment5_recomposition is None and not is_routed_ladder_v2:
         return result
     unsigned = dict(result)
     unsigned.pop("result_sha256")
     unsigned["source_revision"] = source_revision
+    if is_routed_ladder_v2:
+        config.validate()
+        expected_plan = TrainingWorkerPlan.from_config(
+            config,
+            phase=plan.phase_name,
+            condition=plan.condition,
+            seed=plan.seed,
+        )
+        layout = config.layout_for_condition(plan.condition)
+        if (
+            plan != expected_plan
+            or config.panel != config.scientific_model
+            or workload.experiment5_recomposition is not None
+            or workload.scientific_model != config.scientific_model
+            or workload.workload_context.get("scientific_model")
+            != config.scientific_model
+            or workload.encoder_activation != layout.encoder_activation
+        ):
+            raise ContributionTrainingWorkerError(
+                "routed-ladder v2 production workload differs from its config"
+            )
+        unsigned["routed_ladder_v2_context"] = {
+            "schema_version": ROUTED_LADDER_V2_TRAINING_CONTEXT_SCHEMA_VERSION,
+            "protocol_id": config.protocol_id,
+            "config_sha256": config.config_hash,
+            "panel": config.panel,
+            "scientific_model": config.scientific_model,
+            "phase_name": plan.phase_name,
+            "condition": plan.condition,
+            "seed": plan.seed,
+            "encoder_activation": layout.encoder_activation,
+            "workload_context": dict(workload.workload_context),
+        }
+        unsigned["routed_ladder_v2_execution"] = {
+            "schema_version": ROUTED_LADDER_V2_TRAINING_EXECUTION_SCHEMA_VERSION,
+            "accelerator_type": accelerator_type,
+            "peak_flops_per_second": int(peak_flops_per_second),
+            "global_chip_count": int(
+                np.asarray(workload.mesh.devices, dtype=object).size
+            ),
+        }
+        return {
+            **unsigned,
+            "result_sha256": canonical_sha256(unsigned),
+        }
     unsigned["experiment5_context"] = dict(workload.workload_context)
     unsigned["experiment5_execution"] = {
         "accelerator_type": accelerator_type,
@@ -4021,6 +4100,19 @@ def _load_worker_config(
         from moe_sae.experiment5_config import load_experiment5_config
 
         return load_experiment5_config(
+            selected,
+            expected_panel=scientific_model,
+        )
+    if (
+        isinstance(raw, Mapping)
+        and raw.get("schema_version")
+        == "gemma4-experiment5-routed-activation-ladder-run-config-v2"
+    ):
+        from moe_sae.experiment5_routed_ladder_v2_config import (
+            load_routed_ladder_v2_config,
+        )
+
+        return load_routed_ladder_v2_config(
             selected,
             expected_panel=scientific_model,
         )

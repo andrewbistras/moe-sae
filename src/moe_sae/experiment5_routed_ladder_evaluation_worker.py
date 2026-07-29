@@ -1,16 +1,21 @@
-"""Single-cell multi-host evaluator for the routed-activation ladder.
+"""Multi-host evaluator for the corrected routed-activation ladder.
 
-One invocation evaluates exactly one of the 54 ladder evidence cells:
+Single-cell mode evaluates exactly one of the 72 ladder evidence cells:
 
 ``panel in {sae,transcoder} x
- condition in {A512ReLU,A512Softplus,H} x seed in {0,1,2} x
+ condition in {A256ReLU,A512ReLU,A512Softplus,H} x seed in {0,1,2} x
  checkpoint in {2M,5M,10M}``.
 
-The A cells restore the existing contribution SAE/transcoder checkpoint layout
-and score the component, routed, and exact-oracle-shared endpoints.  The H
-cells restore the frozen Experiment-5 H checkpoint read-only, rescore the same
-three routed endpoints, and add its learned full-FFN endpoint.  Every cell uses
-the complete common held-out capture and seals:
+Resident-bundle mode executes the exact twelve condition-by-checkpoint cells
+for one ``(panel, seed)`` in a single initialized JAX process.  It preserves
+the same immutable per-cell outputs while amortizing common dataset,
+centering, and runtime initialization work.
+
+The current-v2 A cells restore the contribution SAE/transcoder checkpoint
+layout.  SAE A256ReLU seed 0 alone restores a hash-pinned historical
+Experiment-4 ReLU checkpoint; the historical transcoder used Softplus and is
+never admitted.  H restores the frozen Experiment-5 checkpoint read-only.
+Every cell uses the complete common held-out capture and seals:
 
 * one self-hashed, content-addressed evidence object per JAX process; and
 * one process-zero ``RoutedLadderTokenScores`` artifact bound to the config,
@@ -35,7 +40,7 @@ import os
 import re
 import time
 from collections.abc import Mapping, Sequence
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from typing import Any, Callable, Literal
 
@@ -58,19 +63,28 @@ from moe_sae.experiment5_routed_ladder import (
     RoutedLadderHTokenScores,
     RoutedLadderTokenScores,
 )
-from moe_sae.experiment5_routed_ladder_config import (
+from moe_sae.experiment5_routed_ladder_v2_config import (
     CONDITIONS,
     PHASE_NAME,
     PROTOCOL_ID,
-    RoutedLadderConfig,
-    load_routed_ladder_config,
+    RoutedLadderV2Config as RoutedLadderConfig,
+    load_routed_ladder_v2_config as load_routed_ladder_config,
 )
 
 PROCESS_EVIDENCE_SCHEMA_VERSION = (
-    "gemma4-experiment5-routed-activation-ladder-process-evidence-v1"
+    "gemma4-experiment5-routed-activation-ladder-process-evidence-v2"
 )
 RESULT_SCHEMA_VERSION = (
-    "gemma4-experiment5-routed-activation-ladder-cell-evaluation-v1"
+    "gemma4-experiment5-routed-activation-ladder-cell-evaluation-v2"
+)
+BUNDLE_SPEC_SCHEMA_VERSION = (
+    "gemma4-experiment5-routed-activation-ladder-resident-bundle-spec-v2"
+)
+BUNDLE_RESULT_SCHEMA_VERSION = (
+    "gemma4-experiment5-routed-activation-ladder-resident-bundle-result-v2"
+)
+BUNDLE_TIMING_SCOPE = (
+    "successful_resident_worker_after_cli_parse_through_cell_completion"
 )
 CENTERING_SCHEMA_VERSION = (
     "gemma4-experiment5-routed-activation-ladder-centering-v1"
@@ -83,9 +97,16 @@ ENDPOINT_CENTERING_ALGORITHM_SCHEMA_VERSION = (
 )
 PANELS = ("sae", "transcoder")
 EVALUATED_CONDITIONS = (*CONDITIONS, "H")
+BUNDLE_CONDITIONS = (
+    "A256ReLU",
+    "A512ReLU",
+    "A512Softplus",
+    "H",
+)
 CHECKPOINT_TOKENS = (2_000_000, 5_000_000, 10_000_000)
 _GIT_RE = re.compile(r"^[0-9a-f]{40}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_ATTEMPT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _ROUTED_TENSORS = {
     "sequence_id",
     "position",
@@ -192,6 +213,358 @@ def _require_git_sha(name: str, value: Any) -> str:
             f"{name} must be a lowercase Git SHA"
         )
     return value
+
+
+def _bundle_remote_path(name: str, value: Any) -> str:
+    if not isinstance(value, str):
+        raise RoutedLadderEvaluationError(f"{name} must be an absolute path")
+    path = PurePosixPath(value)
+    if (
+        not path.is_absolute()
+        or value == "/"
+        or ".." in path.parts
+        or any(character in value for character in "\x00\n\r")
+    ):
+        raise RoutedLadderEvaluationError(f"{name} must be an absolute path")
+    return str(path)
+
+
+def _bundle_gcs_prefix(name: str, value: Any) -> str:
+    if (
+        not isinstance(value, str)
+        or not value.startswith("gs://")
+        or value.endswith("/")
+        or any(character in value for character in "\x00\n\r")
+    ):
+        raise RoutedLadderEvaluationError(f"{name} must be a GCS prefix")
+    return value
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class ResidentEvaluationCell:
+    condition: str
+    checkpoint_tokens: int
+    training_source_revision: str
+    run_root: str
+    checkpoint_payload_root: str
+    result_root: str
+    reference_kind: str
+    reference_config: str | None
+    reference_run_contract_sha256: str | None
+    reference_run_contract_file_sha256: str | None
+    parent_training_result_sha256: str
+    parent_training_result_file_sha256: str
+    parent_run_contract_sha256: str | None
+    parent_run_contract_file_sha256: str | None
+    parent_checkpoint_pointer_sha256: str
+    parent_checkpoint_pointer_file_sha256: str
+
+    @property
+    def identity(self) -> tuple[str, int]:
+        return self.condition, self.checkpoint_tokens
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class ResidentEvaluationBundle:
+    panel: str
+    seed: int
+    source_revision: str
+    config: str
+    bundle_result_root: str
+    operator_manifest_sha256: str
+    cells: tuple[ResidentEvaluationCell, ...]
+    bundle_spec_sha256: str
+
+
+@dataclasses.dataclass(slots=True)
+class _ResidentRuntime:
+    """Process-private objects which are safe to reuse inside one bundle."""
+
+    identity: tuple[Any, ...] | None = None
+    common: dict[str, Any] | None = None
+    means: dict[str, Any] | None = None
+    evaluators: dict[tuple[Any, ...], Any] = dataclasses.field(
+        default_factory=dict
+    )
+    h_evaluators: dict[tuple[Any, ...], Any] = dataclasses.field(
+        default_factory=dict
+    )
+    capacities: dict[
+        tuple[str, float],
+        tuple[Any, tuple[Any, ...]],
+    ] = dataclasses.field(default_factory=dict)
+
+
+def parse_resident_bundle_spec(
+    value: Mapping[str, Any],
+) -> ResidentEvaluationBundle:
+    """Validate the exact 12-cell worker contract for one panel and seed."""
+
+    selected = dict(value)
+    expected_keys = {
+        "schema_version",
+        "protocol_id",
+        "panel",
+        "seed",
+        "source_revision",
+        "config",
+        "bundle_result_root",
+        "operator_manifest_sha256",
+        "cells",
+        "bundle_spec_sha256",
+    }
+    if set(selected) != expected_keys:
+        raise RoutedLadderEvaluationError(
+            "resident bundle spec fields changed"
+        )
+    claimed = _require_sha256(
+        "bundle_spec_sha256",
+        selected["bundle_spec_sha256"],
+    )
+    unsigned = {
+        name: selected[name]
+        for name in selected
+        if name != "bundle_spec_sha256"
+    }
+    if (
+        selected["schema_version"] != BUNDLE_SPEC_SCHEMA_VERSION
+        or selected["protocol_id"] != PROTOCOL_ID
+        or canonical_sha256(unsigned) != claimed
+        or selected["panel"] not in PANELS
+        or selected["seed"] not in (0, 1, 2)
+    ):
+        raise RoutedLadderEvaluationError(
+            "resident bundle spec identity is invalid"
+        )
+    source_revision = _require_git_sha(
+        "source_revision",
+        selected["source_revision"],
+    )
+    operator_manifest_sha = _require_sha256(
+        "operator_manifest_sha256",
+        selected["operator_manifest_sha256"],
+    )
+    raw_cells = selected["cells"]
+    if not isinstance(raw_cells, list):
+        raise RoutedLadderEvaluationError("resident bundle cells must be a list")
+    expected_identities = [
+        (condition, checkpoint_tokens)
+        for condition in BUNDLE_CONDITIONS
+        for checkpoint_tokens in CHECKPOINT_TOKENS
+    ]
+    cells: list[ResidentEvaluationCell] = []
+    observed_identities: list[tuple[str, int]] = []
+    result_roots: set[str] = set()
+    for index, raw in enumerate(raw_cells):
+        if not isinstance(raw, Mapping):
+            raise RoutedLadderEvaluationError(
+                f"resident bundle cell {index} must be an object"
+            )
+        cell = dict(raw)
+        if set(cell) != {
+            "condition",
+            "checkpoint_tokens",
+            "training_source_revision",
+            "run_root",
+            "checkpoint_payload_root",
+            "result_root",
+            "reference_kind",
+            "reference_config",
+            "reference_run_contract_sha256",
+            "reference_run_contract_file_sha256",
+            "parent_training_result_sha256",
+            "parent_training_result_file_sha256",
+            "parent_run_contract_sha256",
+            "parent_run_contract_file_sha256",
+            "parent_checkpoint_pointer_sha256",
+            "parent_checkpoint_pointer_file_sha256",
+        }:
+            raise RoutedLadderEvaluationError(
+                f"resident bundle cell {index} fields changed"
+            )
+        condition = cell["condition"]
+        checkpoint_tokens = cell["checkpoint_tokens"]
+        if (
+            condition not in BUNDLE_CONDITIONS
+            or isinstance(checkpoint_tokens, bool)
+            or checkpoint_tokens not in CHECKPOINT_TOKENS
+        ):
+            raise RoutedLadderEvaluationError(
+                f"resident bundle cell {index} role is invalid"
+            )
+        reference_kind = cell["reference_kind"]
+        historical_a256 = (
+            selected["panel"] == "sae"
+            and condition == "A256ReLU"
+            and selected["seed"] == 0
+        )
+        expected_reference = (
+            "a256" if historical_a256 else "h" if condition == "H" else "none"
+        )
+        if reference_kind != expected_reference:
+            raise RoutedLadderEvaluationError(
+                f"resident bundle cell {index} reference role changed"
+            )
+        reference_config = cell["reference_config"]
+        reference_run_contract_sha = cell[
+            "reference_run_contract_sha256"
+        ]
+        reference_run_contract_file_sha = cell[
+            "reference_run_contract_file_sha256"
+        ]
+        parent_training_result_sha = _require_sha256(
+            f"cell {index} parent_training_result_sha256",
+            cell["parent_training_result_sha256"],
+        )
+        parent_training_result_file_sha = _require_sha256(
+            f"cell {index} parent_training_result_file_sha256",
+            cell["parent_training_result_file_sha256"],
+        )
+        parent_checkpoint_pointer_sha = _require_sha256(
+            f"cell {index} parent_checkpoint_pointer_sha256",
+            cell["parent_checkpoint_pointer_sha256"],
+        )
+        parent_checkpoint_pointer_file_sha = _require_sha256(
+            f"cell {index} parent_checkpoint_pointer_file_sha256",
+            cell["parent_checkpoint_pointer_file_sha256"],
+        )
+        parent_run_contract_sha = cell["parent_run_contract_sha256"]
+        parent_run_contract_file_sha = cell[
+            "parent_run_contract_file_sha256"
+        ]
+        if (parent_run_contract_sha is None) is not (
+            parent_run_contract_file_sha is None
+        ):
+            raise RoutedLadderEvaluationError(
+                f"resident bundle cell {index} parent run-contract pins must "
+                "both be present or absent"
+            )
+        if parent_run_contract_sha is not None:
+            parent_run_contract_sha = _require_sha256(
+                f"cell {index} parent_run_contract_sha256",
+                parent_run_contract_sha,
+            )
+            parent_run_contract_file_sha = _require_sha256(
+                f"cell {index} parent_run_contract_file_sha256",
+                parent_run_contract_file_sha,
+            )
+        if reference_kind == "none":
+            if reference_config is not None:
+                raise RoutedLadderEvaluationError(
+                    f"resident bundle cell {index} has an unexpected parent config"
+                )
+        else:
+            reference_config = _bundle_remote_path(
+                f"cell {index} reference_config",
+                reference_config,
+            )
+        if reference_kind == "a256":
+            reference_run_contract_sha = _require_sha256(
+                f"cell {index} reference_run_contract_sha256",
+                reference_run_contract_sha,
+            )
+            reference_run_contract_file_sha = _require_sha256(
+                f"cell {index} reference_run_contract_file_sha256",
+                reference_run_contract_file_sha,
+            )
+        elif (
+            reference_run_contract_sha is not None
+            or reference_run_contract_file_sha is not None
+        ):
+            raise RoutedLadderEvaluationError(
+                f"resident bundle cell {index} has unexpected run-contract pins"
+            )
+        if reference_kind == "a256" and (
+            parent_run_contract_sha != reference_run_contract_sha
+            or parent_run_contract_file_sha
+            != reference_run_contract_file_sha
+        ):
+            raise RoutedLadderEvaluationError(
+                f"resident bundle cell {index} A256 parent run-contract pins "
+                "differ from its reference pins"
+            )
+        if (reference_kind == "h") is not (
+            parent_run_contract_sha is None
+        ):
+            raise RoutedLadderEvaluationError(
+                f"resident bundle cell {index} parent run-contract presence "
+                "differs from its reference role"
+            )
+        training_revision = _require_git_sha(
+            f"cell {index} training_source_revision",
+            cell["training_source_revision"],
+        )
+        if reference_kind == "none" and training_revision != source_revision:
+            raise RoutedLadderEvaluationError(
+                f"resident bundle cell {index} new training revision changed"
+            )
+        result_root = _bundle_remote_path(
+            f"cell {index} result_root",
+            cell["result_root"],
+        )
+        if result_root in result_roots:
+            raise RoutedLadderEvaluationError(
+                "resident bundle result roots must be unique"
+            )
+        result_roots.add(result_root)
+        parsed = ResidentEvaluationCell(
+            condition=str(condition),
+            checkpoint_tokens=int(checkpoint_tokens),
+            training_source_revision=training_revision,
+            run_root=_bundle_remote_path(
+                f"cell {index} run_root",
+                cell["run_root"],
+            ),
+            checkpoint_payload_root=_bundle_gcs_prefix(
+                f"cell {index} checkpoint_payload_root",
+                cell["checkpoint_payload_root"],
+            ),
+            result_root=result_root,
+            reference_kind=str(reference_kind),
+            reference_config=reference_config,
+            reference_run_contract_sha256=reference_run_contract_sha,
+            reference_run_contract_file_sha256=(
+                reference_run_contract_file_sha
+            ),
+            parent_training_result_sha256=parent_training_result_sha,
+            parent_training_result_file_sha256=(
+                parent_training_result_file_sha
+            ),
+            parent_run_contract_sha256=parent_run_contract_sha,
+            parent_run_contract_file_sha256=(
+                parent_run_contract_file_sha
+            ),
+            parent_checkpoint_pointer_sha256=(
+                parent_checkpoint_pointer_sha
+            ),
+            parent_checkpoint_pointer_file_sha256=(
+                parent_checkpoint_pointer_file_sha
+            ),
+        )
+        cells.append(parsed)
+        observed_identities.append(parsed.identity)
+    if observed_identities != expected_identities:
+        raise RoutedLadderEvaluationError(
+            "resident bundle must contain the exact deterministic 12-cell order"
+        )
+    bundle_result_root = _bundle_remote_path(
+        "bundle_result_root",
+        selected["bundle_result_root"],
+    )
+    if bundle_result_root in result_roots:
+        raise RoutedLadderEvaluationError(
+            "bundle result root aliases one cell result root"
+        )
+    return ResidentEvaluationBundle(
+        panel=str(selected["panel"]),
+        seed=int(selected["seed"]),
+        source_revision=source_revision,
+        config=_bundle_remote_path("config", selected["config"]),
+        bundle_result_root=bundle_result_root,
+        operator_manifest_sha256=operator_manifest_sha,
+        cells=tuple(cells),
+        bundle_spec_sha256=claimed,
+    )
 
 
 def _artifact_file(
@@ -301,6 +674,12 @@ def seal_process_evidence(
     training_result_sha256: str,
     training_contract_sha256: str,
     checkpoint_sha256: str,
+    parent_training_result_sha256: str,
+    parent_training_result_file_sha256: str,
+    parent_run_contract_sha256: str | None,
+    parent_run_contract_file_sha256: str | None,
+    parent_checkpoint_pointer_sha256: str,
+    parent_checkpoint_pointer_file_sha256: str,
     target_manifest_sha256: str,
     source_manifest_sha256: str | None,
     recomposition_sidecar_sha256: str,
@@ -375,6 +754,20 @@ def seal_process_evidence(
         "training_result_sha256": training_result_sha256,
         "training_contract_sha256": training_contract_sha256,
         "checkpoint_sha256": checkpoint_sha256,
+        "parent_training_result_sha256": parent_training_result_sha256,
+        "parent_training_result_file_sha256": (
+            parent_training_result_file_sha256
+        ),
+        "parent_run_contract_sha256": parent_run_contract_sha256,
+        "parent_run_contract_file_sha256": (
+            parent_run_contract_file_sha256
+        ),
+        "parent_checkpoint_pointer_sha256": (
+            parent_checkpoint_pointer_sha256
+        ),
+        "parent_checkpoint_pointer_file_sha256": (
+            parent_checkpoint_pointer_file_sha256
+        ),
         "target_manifest_sha256": target_manifest_sha256,
         "source_manifest_sha256": source_manifest_sha256,
         "recomposition_sidecar_sha256": recomposition_sidecar_sha256,
@@ -483,6 +876,10 @@ def load_process_evidence(
         "training_result_sha256",
         "training_contract_sha256",
         "checkpoint_sha256",
+        "parent_training_result_sha256",
+        "parent_training_result_file_sha256",
+        "parent_checkpoint_pointer_sha256",
+        "parent_checkpoint_pointer_file_sha256",
         "target_manifest_sha256",
         "recomposition_sidecar_sha256",
         "centering_receipt_sha256",
@@ -491,6 +888,34 @@ def load_process_evidence(
         "data_sha256",
     ):
         _require_sha256(name, metadata.get(name))
+    parent_run_contract = metadata.get("parent_run_contract_sha256")
+    parent_run_contract_file = metadata.get(
+        "parent_run_contract_file_sha256"
+    )
+    if (parent_run_contract is None) is not (
+        parent_run_contract_file is None
+    ):
+        raise RoutedLadderEvaluationError(
+            "parent run-contract semantic/file pins must both be present or "
+            "absent"
+        )
+    if metadata.get("condition") == "H":
+        if (
+            parent_run_contract is not None
+            or parent_run_contract_file is not None
+        ):
+            raise RoutedLadderEvaluationError(
+                "H evidence cannot claim an A-worker parent run contract"
+            )
+    else:
+        _require_sha256(
+            "parent_run_contract_sha256",
+            parent_run_contract,
+        )
+        _require_sha256(
+            "parent_run_contract_file_sha256",
+            parent_run_contract_file,
+        )
     source_manifest = metadata.get("source_manifest_sha256")
     if source_manifest is not None:
         _require_sha256("source_manifest_sha256", source_manifest)
@@ -535,6 +960,12 @@ def _fixed_process_fields() -> tuple[str, ...]:
         "training_result_sha256",
         "training_contract_sha256",
         "checkpoint_sha256",
+        "parent_training_result_sha256",
+        "parent_training_result_file_sha256",
+        "parent_run_contract_sha256",
+        "parent_run_contract_file_sha256",
+        "parent_checkpoint_pointer_sha256",
+        "parent_checkpoint_pointer_file_sha256",
         "target_manifest_sha256",
         "source_manifest_sha256",
         "recomposition_sidecar_sha256",
@@ -813,6 +1244,238 @@ def load_merged_scores(
     return scores
 
 
+def _resident_cell_completion(
+    bundle: ResidentEvaluationBundle,
+    cell: ResidentEvaluationCell,
+) -> dict[str, Any] | None:
+    """Return one exact immutable cell completion, or ``None`` when absent."""
+
+    root = Path(cell.result_root)
+    result_path = root / "evaluation-result.json"
+    if not root.exists():
+        return None
+    if (
+        not root.is_dir()
+        or root.is_symlink()
+        or not result_path.is_file()
+        or result_path.is_symlink()
+    ):
+        raise RoutedLadderEvaluationError(
+            f"resident cell completion is partial: {cell.identity}"
+        )
+    scores = load_merged_scores(result_path)
+    result = _read_json(
+        result_path,
+        name="resident cell evaluation result",
+    )
+    if (
+        result.get("panel") != bundle.panel
+        or result.get("condition") != cell.condition
+        or result.get("seed") != bundle.seed
+        or result.get("checkpoint_tokens") != cell.checkpoint_tokens
+        or result.get("source_revision") != bundle.source_revision
+        or result.get("training_source_revision")
+        != cell.training_source_revision
+        or result.get("parent_training_result_sha256")
+        != cell.parent_training_result_sha256
+        or result.get("parent_training_result_file_sha256")
+        != cell.parent_training_result_file_sha256
+        or result.get("parent_run_contract_sha256")
+        != cell.parent_run_contract_sha256
+        or result.get("parent_run_contract_file_sha256")
+        != cell.parent_run_contract_file_sha256
+        or result.get("parent_checkpoint_pointer_sha256")
+        != cell.parent_checkpoint_pointer_sha256
+        or result.get("parent_checkpoint_pointer_file_sha256")
+        != cell.parent_checkpoint_pointer_file_sha256
+        or scores.panel != bundle.panel
+        or scores.condition != cell.condition
+        or scores.seed != bundle.seed
+        or scores.checkpoint_tokens != cell.checkpoint_tokens
+        or scores.source_revision != bundle.source_revision
+        or scores.score_artifact_sha256
+        != result.get("score_artifact_sha256")
+    ):
+        raise RoutedLadderEvaluationError(
+            f"resident cell completion identity changed: {cell.identity}"
+        )
+    payload = result_path.read_bytes()
+    return {
+        "condition": cell.condition,
+        "checkpoint_tokens": cell.checkpoint_tokens,
+        "training_source_revision": cell.training_source_revision,
+        "parent_training_result_sha256": (
+            cell.parent_training_result_sha256
+        ),
+        "parent_training_result_file_sha256": (
+            cell.parent_training_result_file_sha256
+        ),
+        "parent_run_contract_sha256": cell.parent_run_contract_sha256,
+        "parent_run_contract_file_sha256": (
+            cell.parent_run_contract_file_sha256
+        ),
+        "parent_checkpoint_pointer_sha256": (
+            cell.parent_checkpoint_pointer_sha256
+        ),
+        "parent_checkpoint_pointer_file_sha256": (
+            cell.parent_checkpoint_pointer_file_sha256
+        ),
+        "result_root": cell.result_root,
+        "result_sha256": _require_sha256(
+            "cell result_sha256",
+            result.get("result_sha256"),
+        ),
+        "result_file_sha256": hashlib.sha256(payload).hexdigest(),
+        "score_artifact_sha256": _require_sha256(
+            "cell score_artifact_sha256",
+            result.get("score_artifact_sha256"),
+        ),
+        "score_data_sha256": _require_sha256(
+            "cell score_data_sha256",
+            result.get("score_data_sha256"),
+        ),
+        "score_data_bytes": int(result["score_data_bytes"]),
+    }
+
+
+def seal_resident_bundle_result(
+    bundle: ResidentEvaluationBundle,
+    cell_results: Sequence[Mapping[str, Any]],
+    *,
+    timing: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Seal one create-only completion binding all twelve cell results."""
+
+    selected = [dict(row) for row in cell_results]
+    expected = [cell.identity for cell in bundle.cells]
+    observed = [
+        (row.get("condition"), row.get("checkpoint_tokens"))
+        for row in selected
+    ]
+    if observed != expected:
+        raise RoutedLadderEvaluationError(
+            "resident bundle completion cells are incomplete or reordered"
+        )
+    for cell, row in zip(bundle.cells, selected, strict=True):
+        exact = _resident_cell_completion(bundle, cell)
+        if exact is None or row != exact:
+            raise RoutedLadderEvaluationError(
+                f"resident bundle completion changed: {cell.identity}"
+            )
+    selected_timing = _validate_bundle_timing(timing)
+    body = {
+        "schema_version": BUNDLE_RESULT_SCHEMA_VERSION,
+        "protocol_id": PROTOCOL_ID,
+        "status": "bundle_evaluated",
+        "panel": bundle.panel,
+        "seed": bundle.seed,
+        "source_revision": bundle.source_revision,
+        "operator_manifest_sha256": bundle.operator_manifest_sha256,
+        "bundle_spec_sha256": bundle.bundle_spec_sha256,
+        "timing": selected_timing,
+        "cell_results": selected,
+    }
+    result = _self_hash(body, field="result_sha256")
+    _write_json(
+        Path(bundle.bundle_result_root) / "bundle-result.json",
+        result,
+    )
+    return result
+
+
+def _validate_bundle_timing(value: Mapping[str, Any]) -> dict[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != {
+        "accelerator_type",
+        "chip_count",
+        "successful_attempt_wall_seconds",
+        "successful_attempt_chip_seconds",
+        "timing_scope",
+    }:
+        raise RoutedLadderEvaluationError(
+            "resident bundle timing fields changed"
+        )
+    accelerator_type = value["accelerator_type"]
+    chip_count = value["chip_count"]
+    wall_seconds = value["successful_attempt_wall_seconds"]
+    chip_seconds = value["successful_attempt_chip_seconds"]
+    if (
+        not isinstance(accelerator_type, str)
+        or not accelerator_type
+        or isinstance(chip_count, bool)
+        or not isinstance(chip_count, int)
+        or chip_count <= 0
+        or isinstance(wall_seconds, bool)
+        or not isinstance(wall_seconds, (int, float))
+        or not math.isfinite(float(wall_seconds))
+        or float(wall_seconds) <= 0
+        or isinstance(chip_seconds, bool)
+        or not isinstance(chip_seconds, (int, float))
+        or not math.isfinite(float(chip_seconds))
+        or float(chip_seconds) <= 0
+        or not math.isclose(
+            float(chip_seconds),
+            chip_count * float(wall_seconds),
+            rel_tol=1e-9,
+            abs_tol=1e-6,
+        )
+        or value["timing_scope"] != BUNDLE_TIMING_SCOPE
+    ):
+        raise RoutedLadderEvaluationError(
+            "resident bundle timing is invalid"
+        )
+    return {
+        "accelerator_type": accelerator_type,
+        "chip_count": chip_count,
+        "successful_attempt_wall_seconds": float(wall_seconds),
+        "successful_attempt_chip_seconds": float(chip_seconds),
+        "timing_scope": BUNDLE_TIMING_SCOPE,
+    }
+
+
+def load_resident_bundle_result(
+    path: str | Path,
+    bundle: ResidentEvaluationBundle,
+) -> dict[str, Any]:
+    """Load and fully revalidate one resident bundle completion."""
+
+    selected = Path(path)
+    result = _read_json(selected, name="resident bundle result")
+    claimed = _require_sha256("bundle result_sha256", result.get("result_sha256"))
+    unsigned = {
+        name: result[name] for name in result if name != "result_sha256"
+    }
+    if (
+        canonical_sha256(unsigned) != claimed
+        or result.get("schema_version") != BUNDLE_RESULT_SCHEMA_VERSION
+        or result.get("protocol_id") != PROTOCOL_ID
+        or result.get("status") != "bundle_evaluated"
+        or result.get("panel") != bundle.panel
+        or result.get("seed") != bundle.seed
+        or result.get("source_revision") != bundle.source_revision
+        or result.get("operator_manifest_sha256")
+        != bundle.operator_manifest_sha256
+        or result.get("bundle_spec_sha256") != bundle.bundle_spec_sha256
+    ):
+        raise RoutedLadderEvaluationError(
+            "resident bundle result identity is invalid"
+        )
+    _validate_bundle_timing(result.get("timing"))
+    rows = result.get("cell_results")
+    if not isinstance(rows, list) or len(rows) != len(bundle.cells):
+        raise RoutedLadderEvaluationError(
+            "resident bundle result cell inventory changed"
+        )
+    expected = [
+        _resident_cell_completion(bundle, cell)
+        for cell in bundle.cells
+    ]
+    if any(row is None for row in expected) or rows != expected:
+        raise RoutedLadderEvaluationError(
+            "resident bundle result differs from its immutable cells"
+        )
+    return result
+
+
 def _layout(config: RoutedLadderConfig, condition: str, seed: int) -> Any:
     from moe_sae.contribution_sae import ContributionSAEConfig
 
@@ -902,12 +1565,13 @@ def _validate_run_contract(
     run_root: Path,
     *,
     config_path: Path,
-    config: RoutedLadderConfig,
+    config: Any,
     condition: str,
     seed: int,
     training_source_revision: str,
     target_manifest_sha256: str,
     source_manifest_sha256: str | None,
+    phase_name: str = PHASE_NAME,
 ) -> dict[str, Any]:
     contract = _read_json(run_root / "run-contract.json", name="run contract")
     claimed = _require_sha256(
@@ -927,7 +1591,7 @@ def _validate_run_contract(
     if (
         contract.get("project_commit") != training_source_revision
         or contract.get("config_file_sha256") != expected_file_sha
-        or contract.get("phase") != PHASE_NAME
+        or contract.get("phase") != phase_name
         or contract.get("condition") != condition
         or contract.get("seed") != seed
         or contract.get("capture_manifest_sha256")
@@ -936,8 +1600,13 @@ def _validate_run_contract(
         raise RoutedLadderEvaluationError(
             "training run contract differs from the requested ladder cell"
         )
+    scientific_model = getattr(
+        config,
+        "panel",
+        getattr(config, "scientific_model", None),
+    )
     if (
-        config.panel == "transcoder"
+        scientific_model == "transcoder"
         and (
             contract.get("scientific_model") != "transcoder"
             or contract.get("source_overlay_manifest_sha256")
@@ -1442,7 +2111,7 @@ def _validate_args(args: argparse.Namespace) -> RoutedLadderConfig:
     phase = config.phase(PHASE_NAME)
     if args.condition not in EVALUATED_CONDITIONS:
         raise RoutedLadderEvaluationError(
-            "condition must be A512ReLU, A512Softplus, or read-only H"
+            "condition must be A256ReLU, A512ReLU, A512Softplus, or read-only H"
         )
     if args.seed not in phase.seeds:
         raise RoutedLadderEvaluationError("seed must be 0, 1, or 2")
@@ -1471,18 +2140,380 @@ def _validate_args(args: argparse.Namespace) -> RoutedLadderConfig:
                 raise RoutedLadderEvaluationError(
                     f"transcoder panel requires --{name.replace('_', '-')}"
                 )
-    if args.condition == "H" and args.h_config is None:
+    historical_a256 = (
+        config.panel == "sae"
+        and args.condition == "A256ReLU"
+        and args.seed == 0
+    )
+    h_config_arg = getattr(args, "h_config", None)
+    a256_config_arg = getattr(args, "a256_config", None)
+    reference_run_contract_sha = getattr(
+        args,
+        "reference_run_contract_sha256",
+        None,
+    )
+    reference_run_contract_file_sha = getattr(
+        args,
+        "reference_run_contract_file_sha256",
+        None,
+    )
+    parent_training_result_sha = getattr(
+        args,
+        "parent_training_result_sha256",
+        None,
+    )
+    parent_training_result_file_sha = getattr(
+        args,
+        "parent_training_result_file_sha256",
+        None,
+    )
+    parent_run_contract_sha = getattr(
+        args,
+        "parent_run_contract_sha256",
+        None,
+    )
+    parent_run_contract_file_sha = getattr(
+        args,
+        "parent_run_contract_file_sha256",
+        None,
+    )
+    parent_checkpoint_pointer_sha = getattr(
+        args,
+        "parent_checkpoint_pointer_sha256",
+        None,
+    )
+    parent_checkpoint_pointer_file_sha = getattr(
+        args,
+        "parent_checkpoint_pointer_file_sha256",
+        None,
+    )
+    for name, value in (
+        ("parent_training_result_sha256", parent_training_result_sha),
+        (
+            "parent_training_result_file_sha256",
+            parent_training_result_file_sha,
+        ),
+        (
+            "parent_checkpoint_pointer_sha256",
+            parent_checkpoint_pointer_sha,
+        ),
+        (
+            "parent_checkpoint_pointer_file_sha256",
+            parent_checkpoint_pointer_file_sha,
+        ),
+    ):
+        _require_sha256(name, value)
+    if (parent_run_contract_sha is None) is not (
+        parent_run_contract_file_sha is None
+    ):
+        raise RoutedLadderEvaluationError(
+            "parent run-contract semantic/file pins must both be present or "
+            "absent"
+        )
+    if args.condition == "H":
+        if (
+            parent_run_contract_sha is not None
+            or parent_run_contract_file_sha is not None
+        ):
+            raise RoutedLadderEvaluationError(
+                "H rescoring cannot claim an A-worker parent run contract"
+            )
+    else:
+        _require_sha256(
+            "parent_run_contract_sha256",
+            parent_run_contract_sha,
+        )
+        _require_sha256(
+            "parent_run_contract_file_sha256",
+            parent_run_contract_file_sha,
+        )
+    if args.condition == "H" and h_config_arg is None:
         raise RoutedLadderEvaluationError(
             "read-only H rescoring requires --h-config"
         )
-    if args.condition != "H" and args.h_config is not None:
+    if args.condition != "H" and h_config_arg is not None:
         raise RoutedLadderEvaluationError(
             "--h-config is valid only for read-only H rescoring"
+        )
+    if historical_a256 and a256_config_arg is None:
+        raise RoutedLadderEvaluationError(
+            "historical SAE A256ReLU seed 0 requires --a256-config"
+        )
+    if not historical_a256 and a256_config_arg is not None:
+        raise RoutedLadderEvaluationError(
+            "--a256-config is valid only for historical SAE A256ReLU seed 0"
+        )
+    if historical_a256:
+        _require_sha256(
+            "reference_run_contract_sha256",
+            reference_run_contract_sha,
+        )
+        _require_sha256(
+            "reference_run_contract_file_sha256",
+            reference_run_contract_file_sha,
+        )
+        if (
+            reference_run_contract_sha != parent_run_contract_sha
+            or reference_run_contract_file_sha
+            != parent_run_contract_file_sha
+        ):
+            raise RoutedLadderEvaluationError(
+                "historical A256 reference and parent run-contract pins differ"
+            )
+    elif (
+        reference_run_contract_sha is not None
+        or reference_run_contract_file_sha is not None
+    ):
+        raise RoutedLadderEvaluationError(
+            "run-contract pins are valid only for historical SAE A256ReLU seed 0"
         )
     return config
 
 
-def run(args: argparse.Namespace) -> int:
+def _validate_parent_artifact_pins(
+    *,
+    args: argparse.Namespace,
+    run_root: Path,
+    result: Mapping[str, Any],
+    pointer: Mapping[str, Any],
+    run_contract: Mapping[str, Any] | None,
+) -> None:
+    """Bind loaded parent bytes and semantic hashes to the operator contract."""
+
+    from moe_sae.contribution_evaluation_worker import (
+        _selected_checkpoint_path,
+    )
+
+    result_path = run_root / "training-result.json"
+    pointer_path = _selected_checkpoint_path(
+        run_root,
+        args.checkpoint_tokens,
+    )
+    try:
+        result_file_sha = hashlib.sha256(result_path.read_bytes()).hexdigest()
+        pointer_file_sha = hashlib.sha256(pointer_path.read_bytes()).hexdigest()
+    except OSError as error:
+        raise RoutedLadderEvaluationError(
+            "cannot hash loaded parent training artifacts"
+        ) from error
+    if (
+        result.get("result_sha256")
+        != args.parent_training_result_sha256
+        or result_file_sha != args.parent_training_result_file_sha256
+        or pointer.get("pointer_sha256")
+        != args.parent_checkpoint_pointer_sha256
+        or pointer_file_sha
+        != args.parent_checkpoint_pointer_file_sha256
+    ):
+        raise RoutedLadderEvaluationError(
+            "loaded parent result/checkpoint differs from immutable pins"
+        )
+    if args.condition == "H":
+        if run_contract is not None:
+            raise RoutedLadderEvaluationError(
+                "H parent unexpectedly supplied an A-worker run contract"
+            )
+        return
+    if run_contract is None:
+        raise RoutedLadderEvaluationError(
+            "A parent run contract is absent"
+        )
+    run_contract_path = run_root / "run-contract.json"
+    try:
+        run_contract_file_sha = hashlib.sha256(
+            run_contract_path.read_bytes()
+        ).hexdigest()
+    except OSError as error:
+        raise RoutedLadderEvaluationError(
+            "cannot hash loaded parent run contract"
+        ) from error
+    if (
+        run_contract.get("run_contract_sha256")
+        != args.parent_run_contract_sha256
+        or run_contract_file_sha != args.parent_run_contract_file_sha256
+    ):
+        raise RoutedLadderEvaluationError(
+            "loaded parent run contract differs from immutable pins"
+        )
+
+
+def _resident_common_means(
+    *,
+    config: RoutedLadderConfig,
+    train_target: Any,
+    train_source: Any,
+    sidecar: Mapping[str, Any],
+    decoded_sidecar: Any,
+    cache_root: str,
+) -> dict[str, Any]:
+    """Compute and collectively validate bundle-wide centering exactly once."""
+
+    import jax
+
+    from moe_sae.contribution_training_worker import (
+        _collective_records,
+        _pooled_routed_mean,
+    )
+    from moe_sae.contribution_transcoder_evaluation_worker import (
+        _endpoint_training_means,
+    )
+    from moe_sae.contribution_transcoder_input import routed_input_mean
+
+    target_mean, target_mean_sha = _pooled_routed_mean(train_target)
+    endpoint_cache_identity = _endpoint_centering_cache_identity(
+        target_manifest_sha256=train_target.manifest_sha256,
+        recomposition_sidecar_sha256=decoded_sidecar.sidecar_sha256,
+    )
+    cached_endpoint: (
+        tuple[np.ndarray, str, np.ndarray, str, dict[str, Any]] | None
+    ) = None
+    cache_probe_error: str | None = None
+    try:
+        cached_endpoint = _load_endpoint_centering_cache(
+            cache_root,
+            target_manifest_sha256=train_target.manifest_sha256,
+            recomposition_sidecar_sha256=decoded_sidecar.sidecar_sha256,
+            expected_tokens=int(train_target.total_tokens),
+        )
+    except RoutedLadderEvaluationError as error:
+        cache_probe_error = str(error)
+    cache_probe_rows = _collective_records(
+        {
+            "process_index": int(jax.process_index()),
+            "cache_key_sha256": endpoint_cache_identity[
+                "cache_key_sha256"
+            ],
+            "hit": cached_endpoint is not None,
+            "error": cache_probe_error,
+            "routed_mean_sha256": (
+                cached_endpoint[1] if cached_endpoint is not None else None
+            ),
+            "oracle_shared_mean_sha256": (
+                cached_endpoint[3] if cached_endpoint is not None else None
+            ),
+            "endpoint_receipt_sha256": (
+                cached_endpoint[4]["receipt_sha256"]
+                if cached_endpoint is not None
+                else None
+            ),
+        }
+    )
+    cache_errors = [
+        str(row["error"])
+        for row in cache_probe_rows
+        if row.get("error") is not None
+    ]
+    if cache_errors:
+        raise RoutedLadderEvaluationError(
+            "endpoint centering cache validation failed on at least one "
+            f"process: {cache_errors}"
+        )
+    all_cache_hits = all(bool(row["hit"]) for row in cache_probe_rows)
+    if all_cache_hits:
+        cache_signatures = {
+            (
+                row["cache_key_sha256"],
+                row["routed_mean_sha256"],
+                row["oracle_shared_mean_sha256"],
+                row["endpoint_receipt_sha256"],
+            )
+            for row in cache_probe_rows
+        }
+        if len(cache_signatures) != 1 or cached_endpoint is None:
+            raise RoutedLadderEvaluationError(
+                "process-local endpoint caches disagree on one scientific "
+                "centering value"
+            )
+        endpoint_values = cached_endpoint
+        endpoint_cache_status = "hit"
+    else:
+        endpoint_values, endpoint_cache_status = (
+            _cached_endpoint_training_means(
+                cache_root,
+                target_manifest_sha256=train_target.manifest_sha256,
+                recomposition_sidecar_sha256=(
+                    decoded_sidecar.sidecar_sha256
+                ),
+                expected_tokens=int(train_target.total_tokens),
+                compute=lambda: _endpoint_training_means(
+                    train_target,
+                    sidecar,
+                ),
+                force_recompute=True,
+            )
+        )
+    (
+        routed_mean,
+        routed_mean_sha,
+        oracle_mean,
+        oracle_mean_sha,
+        endpoint_receipt,
+    ) = endpoint_values
+    endpoint_rows = _collective_records(
+        {
+            "process_index": int(jax.process_index()),
+            "cache_key_sha256": endpoint_cache_identity[
+                "cache_key_sha256"
+            ],
+            "routed_mean_sha256": routed_mean_sha,
+            "oracle_shared_mean_sha256": oracle_mean_sha,
+            "endpoint_receipt_sha256": endpoint_receipt[
+                "receipt_sha256"
+            ],
+        }
+    )
+    if len(
+        {
+            (
+                row["cache_key_sha256"],
+                row["routed_mean_sha256"],
+                row["oracle_shared_mean_sha256"],
+                row["endpoint_receipt_sha256"],
+            )
+            for row in endpoint_rows
+        }
+    ) != 1:
+        raise RoutedLadderEvaluationError(
+            "endpoint centering differs across process-private caches"
+        )
+    if int(jax.process_index()) == 0:
+        print(
+            json.dumps(
+                {
+                    "action": "endpoint-centering-cache",
+                    "cache_key_sha256": endpoint_cache_identity[
+                        "cache_key_sha256"
+                    ],
+                    "status": endpoint_cache_status,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+    source_mean: np.ndarray | None = None
+    source_mean_sha: str | None = None
+    if config.panel == "transcoder":
+        source_mean, source_mean_sha = routed_input_mean(train_source)
+    return {
+        "target_mean": target_mean,
+        "target_mean_sha": target_mean_sha,
+        "endpoint_cache_identity": endpoint_cache_identity,
+        "routed_mean": routed_mean,
+        "routed_mean_sha": routed_mean_sha,
+        "oracle_mean": oracle_mean,
+        "oracle_mean_sha": oracle_mean_sha,
+        "endpoint_receipt": endpoint_receipt,
+        "source_mean": source_mean,
+        "source_mean_sha": source_mean_sha,
+    }
+
+
+def run(
+    args: argparse.Namespace,
+    *,
+    resident_runtime: _ResidentRuntime | None = None,
+    clear_jax_caches: bool = True,
+) -> int:
     """Execute one activation-ladder cell on an initialized multi-host TPU."""
 
     import jax
@@ -1508,7 +2539,6 @@ def run(args: argparse.Namespace) -> int:
         TrainingWorkerPlan,
         _collective_barrier,
         _collective_records,
-        _pooled_routed_mean,
         _verify_repository_revision,
     )
     from moe_sae.contribution_transcoder_evaluation import (
@@ -1516,15 +2546,11 @@ def run(args: argparse.Namespace) -> int:
         score_transcoder_sufficient_rows,
     )
     from moe_sae.contribution_transcoder_evaluation_worker import (
-        _endpoint_training_means,
         _evaluation_capacity_roles,
         _target_auxiliary,
         _validate_phase_datasets,
     )
-    from moe_sae.contribution_transcoder_input import (
-        ContributionTranscoderProcessInput,
-        routed_input_mean,
-    )
+    from moe_sae.contribution_transcoder_input import ContributionTranscoderProcessInput
     from moe_sae.contribution_transcoder_storage import RoutedInputDataset
     from moe_sae.checkpointing import milestone_pointer_path
     from moe_sae.contribution_distributed import (
@@ -1560,106 +2586,164 @@ def run(args: argparse.Namespace) -> int:
         production_experiment5_layout,
     )
     from moe_sae.experiment5_input import Experiment5ProcessInput
+    from moe_sae.learning_horizon_config import load_learning_horizon_config
 
     config = _validate_args(args)
     config_path = Path(args.config).expanduser().resolve()
     _verify_repository_revision(args.source_revision)
-    initialize_jax_distributed()
-    require_accelerator_runtime(
-        args.accelerator_type,
-        peak_flops_per_second=args.peak_flops_per_second,
-    )
+    if resident_runtime is None:
+        initialize_jax_distributed()
+        require_accelerator_runtime(
+            args.accelerator_type,
+            peak_flops_per_second=args.peak_flops_per_second,
+        )
     if int(jax.process_index()) != args.process_index:
         raise RoutedLadderEvaluationError(
             "physical controller/JAX process mapping changed"
         )
-    distributed = DistributedConfig(
-        data_axis_size=int(jax.process_count()),
-        feature_axis_size=int(jax.local_device_count()),
-        microbatches_per_update=(
-            config.runtime.effective_batch_tokens
-            // config.runtime.microbatch_tokens
-        ),
-    )
-    mesh = create_mesh(distributed)
-    sidecar_path = Path(args.recomposition_sidecar).expanduser().resolve()
-    sidecar = _read_json(sidecar_path, name="recomposition sidecar")
-    decoded_sidecar = decode_recomposition_sidecar(sidecar)
-    expected_sidecar_file_sha = config.raw["artifacts"][
-        "recomposition_sidecar_file_sha256"
-    ]
-    if (
-        decoded_sidecar.sidecar_sha256 != config.recomposition_sidecar_sha256
-        or hashlib.sha256(sidecar_path.read_bytes()).hexdigest()
-        != expected_sidecar_file_sha
-    ):
-        raise RoutedLadderEvaluationError(
-            "recomposition sidecar differs from the frozen ladder config"
-        )
-
-    object_store: Any = GCSObjectStore()
-    if args.regional_mirror_seal is not None:
-        from moe_sae.regional_execution import RegionalMirrorStore
-
-        object_store = RegionalMirrorStore(
-            _read_json(
-                args.regional_mirror_seal,
-                name="regional mirror seal",
-            ),
-            object_store,
-        )
-    cache = ShardCache(
-        Path(args.cache_root),
-        object_store,
-        max_bytes=args.cache_max_bytes,
-    )
-    train_target = ContributionDataset(
+    common_identity = (
+        config.panel,
+        config.config_hash,
+        args.source_revision,
         args.train_target_root,
-        object_prefix=args.train_target_object_prefix,
-        cache=cache,
-        recomposition_sidecar=sidecar,
-    )
-    eval_target = ContributionDataset(
         args.eval_target_root,
-        object_prefix=args.eval_target_object_prefix,
-        cache=cache,
-        recomposition_sidecar=sidecar,
+        args.train_target_object_prefix,
+        args.eval_target_object_prefix,
+        args.train_source_root,
+        args.eval_source_root,
+        args.train_source_object_prefix,
+        args.eval_source_object_prefix,
+        args.cache_root,
+        args.cache_max_bytes,
+        args.regional_mirror_seal,
+        args.recomposition_sidecar,
+        args.process_index,
+        args.accelerator_type,
+        args.peak_flops_per_second,
+        int(jax.process_count()),
+        int(jax.local_device_count()),
     )
-    phase = config.phase(PHASE_NAME)
-    if (
-        train_target.total_tokens != phase.train_tokens
-        or eval_target.total_tokens != phase.eval_tokens
-        or train_target.manifest_sha256
-        != config.parents["train_target_manifest_sha256"]
-        or eval_target.manifest_sha256
-        != config.parents["eval_target_manifest_sha256"]
-    ):
-        raise RoutedLadderEvaluationError(
-            "target captures differ from the frozen ladder config"
+    reused_common = (
+        resident_runtime is not None
+        and resident_runtime.common is not None
+    )
+    if reused_common:
+        if resident_runtime.identity != common_identity:
+            raise RoutedLadderEvaluationError(
+                "resident bundle common runtime identity changed"
+            )
+        common = resident_runtime.common
+        distributed = common["distributed"]
+        mesh = common["mesh"]
+        sidecar = common["sidecar"]
+        decoded_sidecar = common["decoded_sidecar"]
+        train_target = common["train_target"]
+        eval_target = common["eval_target"]
+        train_source = common["train_source"]
+        eval_source = common["eval_source"]
+        phase = common["phase"]
+    else:
+        distributed = DistributedConfig(
+            data_axis_size=int(jax.process_count()),
+            feature_axis_size=int(jax.local_device_count()),
+            microbatches_per_update=(
+                config.runtime.effective_batch_tokens
+                // config.runtime.microbatch_tokens
+            ),
         )
-    train_source: Any = None
-    eval_source: Any = None
-    if config.panel == "transcoder":
-        train_source = RoutedInputDataset(
-            args.train_source_root,
-            object_prefix=args.train_source_object_prefix,
+        mesh = create_mesh(distributed)
+        sidecar_path = Path(args.recomposition_sidecar).expanduser().resolve()
+        sidecar = _read_json(sidecar_path, name="recomposition sidecar")
+        decoded_sidecar = decode_recomposition_sidecar(sidecar)
+        expected_sidecar_file_sha = config.raw["artifacts"][
+            "recomposition_sidecar_file_sha256"
+        ]
+        if (
+            decoded_sidecar.sidecar_sha256
+            != config.recomposition_sidecar_sha256
+            or hashlib.sha256(sidecar_path.read_bytes()).hexdigest()
+            != expected_sidecar_file_sha
+        ):
+            raise RoutedLadderEvaluationError(
+                "recomposition sidecar differs from the frozen ladder config"
+            )
+
+        object_store: Any = GCSObjectStore()
+        if args.regional_mirror_seal is not None:
+            from moe_sae.regional_execution import RegionalMirrorStore
+
+            object_store = RegionalMirrorStore(
+                _read_json(
+                    args.regional_mirror_seal,
+                    name="regional mirror seal",
+                ),
+                object_store,
+            )
+        cache = ShardCache(
+            Path(args.cache_root),
+            object_store,
+            max_bytes=args.cache_max_bytes,
+        )
+        train_target = ContributionDataset(
+            args.train_target_root,
+            object_prefix=args.train_target_object_prefix,
             cache=cache,
-            target_manifest=train_target.manifest,
+            recomposition_sidecar=sidecar,
         )
-        eval_source = RoutedInputDataset(
-            args.eval_source_root,
-            object_prefix=args.eval_source_object_prefix,
+        eval_target = ContributionDataset(
+            args.eval_target_root,
+            object_prefix=args.eval_target_object_prefix,
             cache=cache,
-            target_manifest=eval_target.manifest,
+            recomposition_sidecar=sidecar,
         )
-        _validate_phase_datasets(
-            config,
-            phase,
-            train_target=train_target,
-            train_source=train_source,
-            eval_target=eval_target,
-            eval_source=eval_source,
-        )
+        phase = config.phase(PHASE_NAME)
+        if (
+            train_target.total_tokens != phase.train_tokens
+            or eval_target.total_tokens != phase.eval_tokens
+            or train_target.manifest_sha256
+            != config.parents["train_target_manifest_sha256"]
+            or eval_target.manifest_sha256
+            != config.parents["eval_target_manifest_sha256"]
+        ):
+            raise RoutedLadderEvaluationError(
+                "target captures differ from the frozen ladder config"
+            )
+        train_source: Any = None
+        eval_source: Any = None
+        if config.panel == "transcoder":
+            train_source = RoutedInputDataset(
+                args.train_source_root,
+                object_prefix=args.train_source_object_prefix,
+                cache=cache,
+                target_manifest=train_target.manifest,
+            )
+            eval_source = RoutedInputDataset(
+                args.eval_source_root,
+                object_prefix=args.eval_source_object_prefix,
+                cache=cache,
+                target_manifest=eval_target.manifest,
+            )
+            _validate_phase_datasets(
+                config,
+                phase,
+                train_target=train_target,
+                train_source=train_source,
+                eval_target=eval_target,
+                eval_source=eval_source,
+            )
+        if resident_runtime is not None:
+            resident_runtime.identity = common_identity
+            resident_runtime.common = {
+                "distributed": distributed,
+                "mesh": mesh,
+                "sidecar": sidecar,
+                "decoded_sidecar": decoded_sidecar,
+                "train_target": train_target,
+                "eval_target": eval_target,
+                "train_source": train_source,
+                "eval_source": eval_source,
+                "phase": phase,
+            }
 
     layout = _layout(config, args.condition, args.seed)
     run_root = Path(args.run_root).expanduser().resolve()
@@ -1672,6 +2756,13 @@ def run(args: argparse.Namespace) -> int:
     h_centering: Any = None
     h_config_sha: str | None = None
     h_config_file_sha: str | None = None
+    training_optimizer_source: Any = config
+    parent_run_contract: Mapping[str, Any] | None = None
+    historical_a256 = (
+        config.panel == "sae"
+        and args.condition == "A256ReLU"
+        and args.seed == 0
+    )
     if args.condition == "H":
         h_config_path = Path(args.h_config).expanduser().resolve()
         h_config = load_experiment5_config(
@@ -1746,6 +2837,69 @@ def run(args: argparse.Namespace) -> int:
             source_manifest_sha256=source_manifest_sha,
         )
         training_contract_sha = binding["training_contract_sha256"]
+        training_optimizer_source = h_config
+    elif historical_a256:
+        reference = config.existing_a256_reference
+        if reference is None:
+            raise RoutedLadderEvaluationError(
+                "SAE A256ReLU seed 0 lacks its frozen parent reference"
+            )
+        a256_config_path = Path(args.a256_config).expanduser().resolve()
+        a256_config = load_learning_horizon_config(
+            a256_config_path,
+            expected_scientific_model="sae",
+        )
+        if (
+            a256_config.config_hash != reference.source_config_sha256
+            or a256_config.protocol_id != reference.source_protocol_id
+            or a256_config.encoder_activation != reference.encoder_activation
+        ):
+            raise RoutedLadderEvaluationError(
+                "historical SAE A256 parent config differs from the v2 reference"
+            )
+        plan = TrainingWorkerPlan.from_config(
+            a256_config,
+            phase=reference.source_phase_name,
+            condition=reference.source_condition,
+            seed=args.seed,
+        )
+        if (
+            plan.phase_name != reference.source_phase_name
+            or plan.condition != reference.source_condition
+        ):
+            raise RoutedLadderEvaluationError(
+                "historical SAE A256 parent plan differs from the v2 reference"
+            )
+        result, pointer = _load_run(
+            run_root,
+            plan,
+            args.checkpoint_payload_root,
+            checkpoint_target_tokens=args.checkpoint_tokens,
+        )
+        run_contract = _validate_run_contract(
+            run_root,
+            config_path=a256_config_path,
+            config=a256_config,
+            condition=reference.source_condition,
+            seed=args.seed,
+            training_source_revision=args.training_source_revision,
+            target_manifest_sha256=train_target.manifest_sha256,
+            source_manifest_sha256=None,
+            phase_name=reference.source_phase_name,
+        )
+        parent_run_contract = run_contract
+        run_contract_path = run_root / "run-contract.json"
+        if (
+            run_contract["run_contract_sha256"]
+            != args.reference_run_contract_sha256
+            or hashlib.sha256(run_contract_path.read_bytes()).hexdigest()
+            != args.reference_run_contract_file_sha256
+        ):
+            raise RoutedLadderEvaluationError(
+                "historical SAE A256 run contract differs from its manifest pins"
+            )
+        training_contract_sha = run_contract["run_contract_sha256"]
+        training_optimizer_source = a256_config
     else:
         plan = TrainingWorkerPlan.from_config(
             config,
@@ -1769,147 +2923,40 @@ def run(args: argparse.Namespace) -> int:
             target_manifest_sha256=train_target.manifest_sha256,
             source_manifest_sha256=source_manifest_sha,
         )
+        parent_run_contract = run_contract
         training_contract_sha = run_contract["run_contract_sha256"]
-    optimizer = _optimizer(config, plan)
+    _validate_parent_artifact_pins(
+        args=args,
+        run_root=run_root,
+        result=result,
+        pointer=pointer,
+        run_contract=parent_run_contract,
+    )
+    optimizer = _optimizer(training_optimizer_source, plan)
 
-    target_mean, target_mean_sha = _pooled_routed_mean(train_target)
-    endpoint_cache_identity = _endpoint_centering_cache_identity(
-        target_manifest_sha256=train_target.manifest_sha256,
-        recomposition_sidecar_sha256=decoded_sidecar.sidecar_sha256,
-    )
-    cached_endpoint: (
-        tuple[np.ndarray, str, np.ndarray, str, dict[str, Any]] | None
-    ) = None
-    cache_probe_error: str | None = None
-    try:
-        cached_endpoint = _load_endpoint_centering_cache(
-            args.cache_root,
-            target_manifest_sha256=train_target.manifest_sha256,
-            recomposition_sidecar_sha256=decoded_sidecar.sidecar_sha256,
-            expected_tokens=int(train_target.total_tokens),
-        )
-    except RoutedLadderEvaluationError as error:
-        cache_probe_error = str(error)
-    cache_probe_rows = _collective_records(
-        {
-            "process_index": int(jax.process_index()),
-            "cache_key_sha256": endpoint_cache_identity[
-                "cache_key_sha256"
-            ],
-            "hit": cached_endpoint is not None,
-            "error": cache_probe_error,
-            "routed_mean_sha256": (
-                cached_endpoint[1] if cached_endpoint is not None else None
-            ),
-            "oracle_shared_mean_sha256": (
-                cached_endpoint[3] if cached_endpoint is not None else None
-            ),
-            "endpoint_receipt_sha256": (
-                cached_endpoint[4]["receipt_sha256"]
-                if cached_endpoint is not None
-                else None
-            ),
-        }
-    )
-    cache_errors = [
-        str(row["error"])
-        for row in cache_probe_rows
-        if row.get("error") is not None
-    ]
-    if cache_errors:
-        raise RoutedLadderEvaluationError(
-            "endpoint centering cache validation failed on at least one "
-            f"process: {cache_errors}"
-        )
-    all_cache_hits = all(bool(row["hit"]) for row in cache_probe_rows)
-    if all_cache_hits:
-        cache_signatures = {
-            (
-                row["cache_key_sha256"],
-                row["routed_mean_sha256"],
-                row["oracle_shared_mean_sha256"],
-                row["endpoint_receipt_sha256"],
-            )
-            for row in cache_probe_rows
-        }
-        if len(cache_signatures) != 1 or cached_endpoint is None:
-            raise RoutedLadderEvaluationError(
-                "process-local endpoint caches disagree on one scientific "
-                "centering value"
-            )
-        endpoint_values = cached_endpoint
-        endpoint_cache_status = "hit"
+    if resident_runtime is not None and resident_runtime.means is not None:
+        common_means = resident_runtime.means
     else:
-        endpoint_values, endpoint_cache_status = (
-            _cached_endpoint_training_means(
-                args.cache_root,
-                target_manifest_sha256=train_target.manifest_sha256,
-                recomposition_sidecar_sha256=(
-                    decoded_sidecar.sidecar_sha256
-                ),
-                expected_tokens=int(train_target.total_tokens),
-                compute=lambda: _endpoint_training_means(
-                    train_target,
-                    sidecar,
-                ),
-                # If one process missed, every process must enter the
-                # multihost centering collectives. Existing entries are
-                # revalidated by their create-only replay.
-                force_recompute=True,
-            )
+        common_means = _resident_common_means(
+            config=config,
+            train_target=train_target,
+            train_source=train_source,
+            sidecar=sidecar,
+            decoded_sidecar=decoded_sidecar,
+            cache_root=args.cache_root,
         )
-    (
-        routed_mean,
-        routed_mean_sha,
-        oracle_mean,
-        oracle_mean_sha,
-        endpoint_receipt,
-    ) = endpoint_values
-    endpoint_rows = _collective_records(
-        {
-            "process_index": int(jax.process_index()),
-            "cache_key_sha256": endpoint_cache_identity[
-                "cache_key_sha256"
-            ],
-            "routed_mean_sha256": routed_mean_sha,
-            "oracle_shared_mean_sha256": oracle_mean_sha,
-            "endpoint_receipt_sha256": endpoint_receipt[
-                "receipt_sha256"
-            ],
-        }
-    )
-    if len(
-        {
-            (
-                row["cache_key_sha256"],
-                row["routed_mean_sha256"],
-                row["oracle_shared_mean_sha256"],
-                row["endpoint_receipt_sha256"],
-            )
-            for row in endpoint_rows
-        }
-    ) != 1:
-        raise RoutedLadderEvaluationError(
-            "endpoint centering differs across process-private caches"
-        )
-    if int(jax.process_index()) == 0:
-        print(
-            json.dumps(
-                {
-                    "action": "endpoint-centering-cache",
-                    "cache_key_sha256": endpoint_cache_identity[
-                        "cache_key_sha256"
-                    ],
-                    "status": endpoint_cache_status,
-                },
-                sort_keys=True,
-            ),
-            flush=True,
-        )
-    source_mean: np.ndarray | None = None
-    source_mean_sha: str | None = None
-    if config.panel == "transcoder":
-        source_mean, source_mean_sha = routed_input_mean(train_source)
+        if resident_runtime is not None:
+            resident_runtime.means = common_means
+    target_mean = common_means["target_mean"]
+    target_mean_sha = common_means["target_mean_sha"]
+    endpoint_cache_identity = common_means["endpoint_cache_identity"]
+    routed_mean = common_means["routed_mean"]
+    routed_mean_sha = common_means["routed_mean_sha"]
+    oracle_mean = common_means["oracle_mean"]
+    oracle_mean_sha = common_means["oracle_mean_sha"]
+    endpoint_receipt = common_means["endpoint_receipt"]
+    source_mean = common_means["source_mean"]
+    source_mean_sha = common_means["source_mean_sha"]
     if args.condition == "H":
         if h_centering is None:
             raise RoutedLadderEvaluationError("H centering was not restored")
@@ -1973,14 +3020,31 @@ def run(args: argparse.Namespace) -> int:
             process_count=int(jax.process_count()),
             process_index=int(jax.process_index()),
         )
-    local_capacity = source.scan_local_capacity(
-        margin_fraction=config.runtime.capacity_margin_fraction
+    capacity_key = (
+        source.receipt.receipt_sha256,
+        float(config.runtime.capacity_margin_fraction),
     )
-    capacity_receipts = tuple(
-        CapacityReceipt(**row)
-        for row in _collective_records(dataclasses.asdict(local_capacity))
+    cached_capacity = (
+        resident_runtime.capacities.get(capacity_key)
+        if resident_runtime is not None
+        else None
     )
-    evaluation_capacity = merge_capacity_receipts(capacity_receipts)
+    if cached_capacity is None:
+        local_capacity = source.scan_local_capacity(
+            margin_fraction=config.runtime.capacity_margin_fraction
+        )
+        capacity_receipts = tuple(
+            CapacityReceipt(**row)
+            for row in _collective_records(dataclasses.asdict(local_capacity))
+        )
+        evaluation_capacity = merge_capacity_receipts(capacity_receipts)
+        if resident_runtime is not None:
+            resident_runtime.capacities[capacity_key] = (
+                evaluation_capacity,
+                capacity_receipts,
+            )
+    else:
+        evaluation_capacity, capacity_receipts = cached_capacity
     if args.condition == "H":
         if h_context is None:
             raise RoutedLadderEvaluationError(
@@ -2102,22 +3166,38 @@ def run(args: argparse.Namespace) -> int:
         )
     evaluator: Any
     encoder_activation = _encoder_activation(config, args.condition)
-    if config.panel == "sae":
-        evaluator = ContributionDistributedEvaluator(
-            mesh,
-            layout,
-            distributed,
-            bank_capacity=int(capacity_roles.execution),
-            encoder_activation=encoder_activation,
-        )
-    else:
-        evaluator = ContributionTranscoderDistributedEvaluator(
-            mesh,
-            layout,
-            distributed,
-            bank_capacity=int(capacity_roles.execution),
-            encoder_activation=encoder_activation,
-        )
+    evaluator_key = (
+        config.panel,
+        layout.bank_width,
+        layout.k_per_contribution,
+        layout.randomization_key,
+        int(capacity_roles.execution),
+        encoder_activation,
+    )
+    evaluator = (
+        resident_runtime.evaluators.get(evaluator_key)
+        if resident_runtime is not None
+        else None
+    )
+    if evaluator is None:
+        if config.panel == "sae":
+            evaluator = ContributionDistributedEvaluator(
+                mesh,
+                layout,
+                distributed,
+                bank_capacity=int(capacity_roles.execution),
+                encoder_activation=encoder_activation,
+            )
+        else:
+            evaluator = ContributionTranscoderDistributedEvaluator(
+                mesh,
+                layout,
+                distributed,
+                bank_capacity=int(capacity_roles.execution),
+                encoder_activation=encoder_activation,
+            )
+        if resident_runtime is not None:
+            resident_runtime.evaluators[evaluator_key] = evaluator
 
     pieces: dict[str, list[np.ndarray]] = {
         name: [] for name in _ROUTED_TENSORS
@@ -2238,17 +3318,37 @@ def run(args: argparse.Namespace) -> int:
             ),
             epsilon=float(decoded_sidecar.epsilon),
         )
-        h_evaluator = Experiment5DistributedEvaluator(
-            mesh,
-            h_layout,
-            distributed,
-            encoder_kind=config.panel,
-            bank_capacity=int(capacity_roles.execution),
-            rmsnorm_epsilon=float(recomposition.epsilon),
-            expected_physical_layout_sha256=h_context[
-                "physical_feature_layout_identity"
-            ]["identity_sha256"],
+        h_evaluator_key = (
+            config.panel,
+            h_layout.total_features,
+            h_layout.total_l0,
+            int(capacity_roles.execution),
+            float(recomposition.epsilon),
+            h_context["physical_feature_layout_identity"][
+                "identity_sha256"
+            ],
         )
+        h_evaluator = (
+            resident_runtime.h_evaluators.get(h_evaluator_key)
+            if resident_runtime is not None
+            else None
+        )
+        if h_evaluator is None:
+            h_evaluator = Experiment5DistributedEvaluator(
+                mesh,
+                h_layout,
+                distributed,
+                encoder_kind=config.panel,
+                bank_capacity=int(capacity_roles.execution),
+                rmsnorm_epsilon=float(recomposition.epsilon),
+                expected_physical_layout_sha256=h_context[
+                    "physical_feature_layout_identity"
+                ]["identity_sha256"],
+            )
+            if resident_runtime is not None:
+                resident_runtime.h_evaluators[
+                    h_evaluator_key
+                ] = h_evaluator
         iterator = iter(h_source.iter_updates())
         try:
             first = next(iterator)
@@ -2380,6 +3480,22 @@ def run(args: argparse.Namespace) -> int:
         training_result_sha256=result["result_sha256"],
         training_contract_sha256=training_contract_sha,
         checkpoint_sha256=pointer["pointer_sha256"],
+        parent_training_result_sha256=(
+            args.parent_training_result_sha256
+        ),
+        parent_training_result_file_sha256=(
+            args.parent_training_result_file_sha256
+        ),
+        parent_run_contract_sha256=args.parent_run_contract_sha256,
+        parent_run_contract_file_sha256=(
+            args.parent_run_contract_file_sha256
+        ),
+        parent_checkpoint_pointer_sha256=(
+            args.parent_checkpoint_pointer_sha256
+        ),
+        parent_checkpoint_pointer_file_sha256=(
+            args.parent_checkpoint_pointer_file_sha256
+        ),
         target_manifest_sha256=eval_target.manifest_sha256,
         source_manifest_sha256=(
             eval_source.manifest_sha256 if eval_source is not None else None
@@ -2397,7 +3513,8 @@ def run(args: argparse.Namespace) -> int:
         del h_state
     else:
         del state
-    jax.clear_caches()
+    if clear_jax_caches:
+        jax.clear_caches()
     _collective_barrier(
         f"routed-activation-ladder-evidence-{config.panel}-{args.condition}-"
         f"{args.seed}-{args.checkpoint_tokens}"
@@ -2457,6 +3574,244 @@ def run(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_resident_bundle(args: argparse.Namespace) -> int:
+    """Evaluate all twelve cells for one panel/seed in one JAX process."""
+
+    bundle_started = time.perf_counter()
+    import jax
+
+    from moe_sae.contribution_training_worker import (
+        _collective_barrier,
+        _collective_records,
+    )
+    from moe_sae.runtime import (
+        initialize_jax_distributed,
+        require_accelerator_runtime,
+    )
+
+    if (
+        not isinstance(args.attempt_id, str)
+        or _ATTEMPT_RE.fullmatch(args.attempt_id) is None
+    ):
+        raise RoutedLadderEvaluationError(
+            "resident bundle attempt ID is invalid"
+        )
+    try:
+        raw = json.loads(args.bundle_spec_json)
+    except (TypeError, json.JSONDecodeError) as error:
+        raise RoutedLadderEvaluationError(
+            "resident bundle spec is not JSON"
+        ) from error
+    if not isinstance(raw, Mapping):
+        raise RoutedLadderEvaluationError(
+            "resident bundle spec must be an object"
+        )
+    bundle = parse_resident_bundle_spec(raw)
+    if (
+        args.panel != bundle.panel
+        or args.seed != bundle.seed
+        or args.source_revision != bundle.source_revision
+        or args.config != bundle.config
+    ):
+        raise RoutedLadderEvaluationError(
+            "resident bundle CLI identity differs from its spec"
+        )
+    if tuple(CONDITIONS) != BUNDLE_CONDITIONS[:-1]:
+        raise RoutedLadderEvaluationError(
+            "resident bundle requires the exact three-A v2 config"
+        )
+    initialize_jax_distributed()
+    require_accelerator_runtime(
+        args.accelerator_type,
+        peak_flops_per_second=args.peak_flops_per_second,
+    )
+    if int(jax.process_index()) != args.process_index:
+        raise RoutedLadderEvaluationError(
+            "physical controller/JAX process mapping changed"
+        )
+
+    runtime = _ResidentRuntime()
+    completions: list[dict[str, Any]] = []
+    try:
+        for cell_index, cell in enumerate(bundle.cells):
+            local_error: str | None = None
+            completion: dict[str, Any] | None = None
+            try:
+                completion = _resident_cell_completion(bundle, cell)
+            except RoutedLadderEvaluationError as error:
+                local_error = str(error)
+            observations = _collective_records(
+                {
+                    "process_index": int(jax.process_index()),
+                    "cell_index": cell_index,
+                    "complete": completion is not None,
+                    "error": local_error,
+                }
+            )
+            errors = [
+                str(row["error"])
+                for row in observations
+                if row.get("error") is not None
+            ]
+            states = {bool(row["complete"]) for row in observations}
+            if errors:
+                raise RoutedLadderEvaluationError(
+                    f"resident cell {cell.identity} is partial or invalid: "
+                    f"{errors}"
+                )
+            if len(states) != 1:
+                raise RoutedLadderEvaluationError(
+                    f"resident cell visibility differs across processes: "
+                    f"{cell.identity}"
+                )
+            if completion is None:
+                canonical_root = Path(cell.result_root)
+                attempt_root = (
+                    canonical_root.parent
+                    / ".resident-attempts"
+                    / canonical_root.name
+                    / args.attempt_id
+                )
+                if attempt_root.exists():
+                    raise RoutedLadderEvaluationError(
+                        f"resident attempt root already exists: {cell.identity}"
+                    )
+                cell_args = argparse.Namespace(
+                    **{
+                        **vars(args),
+                        "condition": cell.condition,
+                        "checkpoint_tokens": cell.checkpoint_tokens,
+                        "training_source_revision": (
+                            cell.training_source_revision
+                        ),
+                        "run_root": cell.run_root,
+                        "checkpoint_payload_root": (
+                            cell.checkpoint_payload_root
+                        ),
+                        "result_root": str(attempt_root),
+                        "h_config": (
+                            cell.reference_config
+                            if cell.reference_kind == "h"
+                            else None
+                        ),
+                        "a256_config": (
+                            cell.reference_config
+                            if cell.reference_kind == "a256"
+                            else None
+                        ),
+                        "reference_kind": cell.reference_kind,
+                        "reference_run_contract_sha256": (
+                            cell.reference_run_contract_sha256
+                        ),
+                        "reference_run_contract_file_sha256": (
+                            cell.reference_run_contract_file_sha256
+                        ),
+                        "parent_training_result_sha256": (
+                            cell.parent_training_result_sha256
+                        ),
+                        "parent_training_result_file_sha256": (
+                            cell.parent_training_result_file_sha256
+                        ),
+                        "parent_run_contract_sha256": (
+                            cell.parent_run_contract_sha256
+                        ),
+                        "parent_run_contract_file_sha256": (
+                            cell.parent_run_contract_file_sha256
+                        ),
+                        "parent_checkpoint_pointer_sha256": (
+                            cell.parent_checkpoint_pointer_sha256
+                        ),
+                        "parent_checkpoint_pointer_file_sha256": (
+                            cell.parent_checkpoint_pointer_file_sha256
+                        ),
+                    }
+                )
+                run(
+                    cell_args,
+                    resident_runtime=runtime,
+                    clear_jax_caches=False,
+                )
+                _collective_barrier(
+                    "routed-activation-ladder-resident-promote-"
+                    f"{bundle.panel}-{bundle.seed}-{cell_index}"
+                )
+                if int(jax.process_index()) == 0:
+                    if canonical_root.exists():
+                        raise RoutedLadderEvaluationError(
+                            f"resident canonical cell appeared during execution: "
+                            f"{cell.identity}"
+                        )
+                    canonical_root.parent.mkdir(
+                        parents=True,
+                        exist_ok=True,
+                        mode=0o700,
+                    )
+                    os.rename(attempt_root, canonical_root)
+                _collective_barrier(
+                    "routed-activation-ladder-resident-promoted-"
+                    f"{bundle.panel}-{bundle.seed}-{cell_index}"
+                )
+                completion = _resident_cell_completion(bundle, cell)
+                if completion is None:
+                    raise RoutedLadderEvaluationError(
+                        f"resident cell promotion is not visible: {cell.identity}"
+                    )
+            completions.append(completion)
+    finally:
+        jax.clear_caches()
+
+    timing_rows = _collective_records(
+        {
+            "process_index": int(jax.process_index()),
+            "accelerator_type": args.accelerator_type,
+            "chip_count": int(jax.device_count()),
+            "successful_attempt_wall_seconds": (
+                time.perf_counter() - bundle_started
+            ),
+        }
+    )
+    accelerator_types = {
+        str(row["accelerator_type"]) for row in timing_rows
+    }
+    chip_counts = {int(row["chip_count"]) for row in timing_rows}
+    if len(accelerator_types) != 1 or len(chip_counts) != 1:
+        raise RoutedLadderEvaluationError(
+            "resident bundle hardware timing differs across processes"
+        )
+    chip_count = next(iter(chip_counts))
+    bundle_wall_seconds = max(
+        float(row["successful_attempt_wall_seconds"])
+        for row in timing_rows
+    )
+    bundle_timing = _validate_bundle_timing(
+        {
+            "accelerator_type": next(iter(accelerator_types)),
+            "chip_count": chip_count,
+            "successful_attempt_wall_seconds": bundle_wall_seconds,
+            "successful_attempt_chip_seconds": (
+                bundle_wall_seconds * chip_count
+            ),
+            "timing_scope": BUNDLE_TIMING_SCOPE,
+        }
+    )
+    if int(jax.process_index()) == 0:
+        sealed = seal_resident_bundle_result(
+            bundle,
+            completions,
+            timing=bundle_timing,
+        )
+        print(json.dumps(sealed, sort_keys=True), flush=True)
+    _collective_barrier(
+        f"routed-activation-ladder-resident-final-"
+        f"{bundle.panel}-{bundle.seed}"
+    )
+    load_resident_bundle_result(
+        Path(bundle.bundle_result_root) / "bundle-result.json",
+        bundle,
+    )
+    return 0
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
@@ -2464,18 +3819,25 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--condition",
         choices=EVALUATED_CONDITIONS,
-        required=True,
     )
     parser.add_argument("--h-config")
+    parser.add_argument("--a256-config")
+    parser.add_argument("--reference-run-contract-sha256")
+    parser.add_argument("--reference-run-contract-file-sha256")
+    parser.add_argument("--parent-training-result-sha256")
+    parser.add_argument("--parent-training-result-file-sha256")
+    parser.add_argument("--parent-run-contract-sha256")
+    parser.add_argument("--parent-run-contract-file-sha256")
+    parser.add_argument("--parent-checkpoint-pointer-sha256")
+    parser.add_argument("--parent-checkpoint-pointer-file-sha256")
     parser.add_argument("--seed", type=int, choices=(0, 1, 2), required=True)
     parser.add_argument(
         "--checkpoint-tokens",
         type=int,
         choices=CHECKPOINT_TOKENS,
-        required=True,
     )
     parser.add_argument("--source-revision", required=True)
-    parser.add_argument("--training-source-revision", required=True)
+    parser.add_argument("--training-source-revision")
     parser.add_argument("--train-target-root", required=True)
     parser.add_argument("--eval-target-root", required=True)
     parser.add_argument("--train-target-object-prefix", required=True)
@@ -2487,10 +3849,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--cache-root", required=True)
     parser.add_argument("--cache-max-bytes", type=int, required=True)
     parser.add_argument("--regional-mirror-seal")
-    parser.add_argument("--run-root", required=True)
-    parser.add_argument("--checkpoint-payload-root", required=True)
+    parser.add_argument("--run-root")
+    parser.add_argument("--checkpoint-payload-root")
     parser.add_argument("--recomposition-sidecar", required=True)
-    parser.add_argument("--result-root", required=True)
+    parser.add_argument("--result-root")
+    parser.add_argument("--bundle-spec-json")
+    parser.add_argument("--attempt-id")
     parser.add_argument("--process-index", type=int, required=True)
     parser.add_argument("--expected-token-identity-sha256")
     parser.add_argument(
@@ -2507,7 +3871,50 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    return run(_parser().parse_args(argv))
+    args = _parser().parse_args(argv)
+    if args.bundle_spec_json is not None:
+        forbidden = (
+            args.condition,
+            args.h_config,
+            args.a256_config,
+            args.reference_run_contract_sha256,
+            args.reference_run_contract_file_sha256,
+            args.parent_training_result_sha256,
+            args.parent_training_result_file_sha256,
+            args.parent_run_contract_sha256,
+            args.parent_run_contract_file_sha256,
+            args.parent_checkpoint_pointer_sha256,
+            args.parent_checkpoint_pointer_file_sha256,
+            args.checkpoint_tokens,
+            args.training_source_revision,
+            args.run_root,
+            args.checkpoint_payload_root,
+            args.result_root,
+        )
+        if any(value is not None for value in forbidden):
+            raise RoutedLadderEvaluationError(
+                "resident bundle mode prohibits single-cell arguments"
+            )
+        if args.attempt_id is None:
+            raise RoutedLadderEvaluationError(
+                "resident bundle mode requires --attempt-id"
+            )
+        return run_resident_bundle(args)
+    required = {
+        "condition": args.condition,
+        "checkpoint_tokens": args.checkpoint_tokens,
+        "training_source_revision": args.training_source_revision,
+        "run_root": args.run_root,
+        "checkpoint_payload_root": args.checkpoint_payload_root,
+        "result_root": args.result_root,
+    }
+    if args.attempt_id is not None or any(
+        value is None for value in required.values()
+    ):
+        raise RoutedLadderEvaluationError(
+            "single-cell mode has incomplete or bundle-only arguments"
+        )
+    return run(args)
 
 
 if __name__ == "__main__":
@@ -2515,15 +3922,24 @@ if __name__ == "__main__":
 
 
 __all__ = [
+    "BUNDLE_CONDITIONS",
+    "BUNDLE_RESULT_SCHEMA_VERSION",
+    "BUNDLE_SPEC_SCHEMA_VERSION",
     "CENTERING_SCHEMA_VERSION",
     "CHECKPOINT_TOKENS",
     "PROCESS_EVIDENCE_SCHEMA_VERSION",
     "RESULT_SCHEMA_VERSION",
     "RoutedLadderEvaluationError",
+    "ResidentEvaluationBundle",
+    "ResidentEvaluationCell",
     "load_merged_scores",
     "load_process_evidence",
+    "load_resident_bundle_result",
     "main",
     "merge_process_evidence",
+    "parse_resident_bundle_spec",
+    "run_resident_bundle",
+    "seal_resident_bundle_result",
     "run",
     "seal_merged_result",
     "seal_process_evidence",

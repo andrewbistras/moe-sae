@@ -459,7 +459,7 @@ separate post-launch extension. Nothing in the `ready-three-v1` plan or
 commands above launches it, and its work must not be inserted into the
 running or sealed H/R/B/F campaign.
 
-The extension operator must:
+The corrected protocol-v2 extension operator must:
 
 1. leave the core plan, unit, state root, completion counters, and report
    immutable;
@@ -467,21 +467,25 @@ The extension operator must:
    content-hashed parents;
 3. validate their model, captures, overlays, seeds, token order, milestones,
    and panel-specific activation/objective identities before reuse;
-4. treat historical Experiment-4 A trajectories only as pilot context; their
-   width, activation, config, and source identities exclude them from the
-   extension matrix;
-5. launch all 12 new A trajectories—A512ReLU and A512Softplus,
-   SAE/transcoder, seeds 0, 1, and 2—under a new extension-scoped plan and
-   controller unit;
-6. execute 36 A512ReLU/A512Softplus evaluation cells plus 18 read-only H
-   checkpoint rescoring cells, for 54 extension-owned evaluation results
-   across two panels, three seeds, and the 2M/5M/10M milestones, including
-   component, routed, oracle-shared full-FFN, and H learned-full-FFN
-   endpoints as applicable;
+4. inventory the one compatible historical Experiment-4 trajectory—SAE
+   `A256ReLU`, seed 0—through a separate config/run-contract/result/checkpoint
+   manifest; historical transcoder A256 is Softplus and is never reused as a
+   ReLU parent;
+5. launch exactly 17 new trajectories: SAE A256ReLU seeds 1–2, transcoder
+   A256ReLU seeds 0–2, and all SAE/transcoder A512ReLU/A512Softplus seeds;
+6. execute the 72 immutable evaluation cells as six resident `(panel, seed)`
+   bundles of 12 cells each. The plan and report retain one completion row per
+   cell; residency changes execution granularity only and avoids 72 repeated
+   TPU process/bootstrap/cache cycles;
 7. carry forward original chip-seconds for reused H trajectories, while
    accounting newly incurred cash separately and reserving only against the
    unspent remainder of the cumulative USD 50.00 ceiling; and
 8. seal a standalone extension report without modifying either parent report.
+
+For audit continuity, the superseded v1 instruction was to “launch all 12 new A trajectories.”
+That sentence describes only the frozen A512ReLU/
+A512Softplus v1 matrix; it is not an executable v2 instruction and must not be
+used to omit the five new A256ReLU trajectories.
 
 All new state is create-only beneath:
 
@@ -496,6 +500,13 @@ silently retrain H under the historical identity or substitute historical
 Experiment-4 A for either activation arm.
 
 ### Durable sealed-core handoff for the current campaign
+
+The historical `handoff_experiment5_activation_ladder.py` path below is
+retained only as an audit record for the unlaunched ready-three v1 contract.
+It cannot build the N-way ladder plan: the plan CLI rejects its legacy
+`--execution-profile`/`--resource-evidence-overrides` arguments with an
+explicit migration error. New launches must use the `--resource-pool` path in
+the N-way launch section below.
 
 The current core and extension have one exact automated handoff:
 
@@ -662,8 +673,9 @@ namespace are all `routed-activation-ladder`; filenames are not identities.
 export PROJECT_COMMIT="$(git rev-parse HEAD)"
 export CORE_EXPERIMENT5_PLAN="/absolute/path/to/sealed-experiment5-plan.yaml"
 export R8_PLAN="/absolute/path/to/sealed-r8-plan.yaml"
-export RESOURCE_EVIDENCE_OVERRIDES="/absolute/path/to/resource-evidence-overrides.yaml"
+export RESOURCE_POOL="/absolute/path/to/routed-ladder-resource-pool.yaml"
 export H_REFERENCE_MANIFEST="/absolute/path/to/experiment5-activation-ladder-h-references.yaml"
+export A256_REFERENCE_MANIFEST="/absolute/path/to/experiment5-activation-ladder-a256-references.yaml"
 export ROUTED_ACTIVATION_LADDER_PLAN="/absolute/path/to/experiment5-activation-ladder-plan.yaml"
 export ALREADY_SPENT_USD="0.00"  # replace with the sealed cumulative ledger value
 ```
@@ -680,22 +692,37 @@ uv run --frozen python \
   --output "$H_REFERENCE_MANIFEST"
 ```
 
-Then build the disjoint extension plan from the same seven-resource inventory
-and the current three ready-slice evidence.
+Independently inventory the compatible historical SAE A256 seed-zero
+trajectory from the sealed Experiment-4 direct-horizon plan. The builder
+validates the exact old config, producer revision from the run contract,
+training cost, and all three milestone pointers:
+
+```bash
+uv run --frozen python \
+  scripts/tpu/build_experiment5_routed_ladder_a256_references.py \
+  --horizon-plan "$R8_PLAN" \
+  --output "$A256_REFERENCE_MANIFEST"
+```
+
+Then build the disjoint extension plan from both reference manifests and the
+self-hashed N-way resource pool. The pool contains 3–18 already-deployed
+resources, their immutable mapping/cache/mirror evidence, exact regional
+artifact planes, and the compatible resource set for every panel/seed cohort.
+This step performs no cloud discovery or mutation.
 
 ```bash
 uv run --frozen python \
   scripts/tpu/build_experiment5_routed_ladder_plan.py \
   --r8-plan "$R8_PLAN" \
   --project-commit "$PROJECT_COMMIT" \
-  --execution-profile ready-three-v1 \
-  --resource-evidence-overrides "$RESOURCE_EVIDENCE_OVERRIDES" \
+  --resource-pool "$RESOURCE_POOL" \
   --h-reference-manifest "$H_REFERENCE_MANIFEST" \
+  --a256-reference-manifest "$A256_REFERENCE_MANIFEST" \
   --already-spent-usd "$ALREADY_SPENT_USD" \
   --output "$ROUTED_ACTIVATION_LADDER_PLAN"
 ```
 
-Validate the exact 7-resource/12-training/54-evaluation plan before launch:
+Validate the exact N-resource scientific plan before launch:
 
 ```bash
 uv run --frozen python \
@@ -724,7 +751,9 @@ uv run --frozen python \
 ```
 
 The campaign invokes
-`scripts/tpu/evaluate_experiment5_routed_ladder.py` internally for each of the
-54 cells. Do not run that fourth script manually: the controller supplies its
-resource binding, immutable source revisions, checkpoint roots, and
-extension-owned result namespace.
+`scripts/tpu/evaluate_experiment5_routed_ladder.py` internally exactly six
+times, once for each resident `(panel, seed)` bundle. Each invocation
+publishes 12 independently hash-bound cell results plus one bundle completion.
+Do not run that fourth script manually: the controller supplies its resource
+binding, immutable source revisions, checkpoint roots, and extension-owned
+result namespace.
