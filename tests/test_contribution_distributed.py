@@ -227,6 +227,57 @@ def test_tied_scores_use_lowest_global_ids_and_padding_never_fires() -> None:
     assert bool(metrics.topk_valid)
 
 
+def test_sae_distributed_trainer_can_run_the_softplus_activation_graph() -> None:
+    layout = _layout("A", hidden=2, experts=2, routes=1, width=2, k=1)
+    optimizer = _optimizer()
+    distributed = DistributedConfig(microbatches_per_update=1)
+    mesh = create_mesh(distributed)
+    state = init_contribution_train_state(
+        jax.random.key(19),
+        layout,
+        optimizer,
+    )
+    state = state._replace(
+        params=SAEParams(
+            encoder=jnp.zeros_like(state.params.encoder),
+            decoder=state.params.decoder,
+            bias=jnp.full_like(state.params.bias, -1.0e6),
+        )
+    )
+    trainer = ContributionDistributedTrainer(
+        mesh,
+        layout,
+        optimizer,
+        distributed,
+        bank_capacity=1,
+        rematerialize_microbatch=False,
+        encoder_activation="softplus",
+    )
+    _updated, metrics = trainer.step(
+        shard_contribution_train_state(
+            state,
+            mesh,
+            layout,
+            optimizer,
+            distributed,
+        ),
+        [
+            {
+                "expert_output": np.asarray([[[1.0, -0.5]]], np.float32),
+                "bank_ids": np.asarray([[0]], np.int32),
+                "router_weights": np.asarray([[1.0]], np.float32),
+                "valid_mask": np.asarray([True]),
+            }
+        ],
+        np.zeros((2,), np.float32),
+    )
+
+    assert trainer.encoder_activation == "softplus"
+    assert float(metrics.l0) == 1.0
+    assert np.isfinite(float(metrics.loss))
+    assert bool(metrics.topk_valid)
+
+
 def test_no_rematerialization_preserves_the_exact_update() -> None:
     layout = _layout("B", hidden=2, routes=2, width=4, k=2)
     optimizer = _optimizer()

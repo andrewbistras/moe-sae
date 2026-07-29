@@ -1862,6 +1862,49 @@ class Experiment5Campaign:
             + EVALUATION_TASK_COUNT * policy.evaluation_attempt_reserve_usd
         )
 
+    def _preflight(self) -> None:
+        """Validate the immutable local/deployment boundary before state writes.
+
+        Sibling campaigns may override this hook while reusing the durable
+        scheduler.  The frozen Experiment-5 behavior remains the default.
+        """
+
+        _preflight(self.plan, verify_checkout=self.verify_checkout)
+
+    def _attempt_environment(
+        self,
+        resource: CampaignResource,
+        task: CampaignTask,
+        operator_log_root: Path,
+    ) -> tuple[dict[str, str], dict[str, str]]:
+        """Build one executable and audited attempt environment."""
+
+        return _task_environment(
+            self.plan,
+            resource,
+            task,
+            operator_log_root,
+        )
+
+    def _attempt_command(
+        self,
+        task: CampaignTask,
+        *,
+        attempt_id: str,
+    ) -> list[str]:
+        """Build the immutable command for one training or evaluation task."""
+
+        return (
+            build_train_command(self.plan, task, attempt_id)
+            if isinstance(task, TrainingTask)
+            else build_evaluation_command(self.plan, task)
+        )
+
+    def _attempt_id(self, attempt_number: int) -> str:
+        """Return a collision-resistant operator attempt identity."""
+
+        return f"e5-a{attempt_number:08d}-{uuid.uuid4().hex[:16]}"
+
     def _maximum_campaign_wall_seconds(self) -> float:
         """Derive a finite wall bound while preserving the $5 contingency."""
 
@@ -2568,18 +2611,13 @@ class Experiment5Campaign:
             / "attempts"
             / f"attempt-{number:06d}"
         )
-        environment, audited = _task_environment(
-            self.plan,
+        environment, audited = self._attempt_environment(
             resource,
             task,
             provisional / "operator",
         )
-        attempt_id = f"e5-a{number:08d}-{uuid.uuid4().hex[:16]}"
-        command = (
-            build_train_command(self.plan, task, attempt_id)
-            if isinstance(task, TrainingTask)
-            else build_evaluation_command(self.plan, task)
-        )
+        attempt_id = self._attempt_id(number)
+        command = self._attempt_command(task, attempt_id=attempt_id)
         attempt_root = self._new_attempt(
             task,
             kind=kind,
@@ -3184,7 +3222,7 @@ class Experiment5Campaign:
         return expected
 
     def run(self, *, stop_after_training: bool = False) -> dict[str, Any]:
-        _preflight(self.plan, verify_checkout=self.verify_checkout)
+        self._preflight()
         self._acquire_lock()
         try:
             self._bind_plan()

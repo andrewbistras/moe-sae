@@ -343,6 +343,7 @@ def _build_mapped_objective(
     bank_capacity: int | None,
     parameter_dtype: str,
     rematerialize_microbatch: bool,
+    encoder_activation: str,
 ):
     data_axis = distributed.data_axis
     feature_axis = distributed.feature_axis
@@ -421,7 +422,7 @@ def _build_mapped_objective(
                     layout,
                     feature_axis=feature_axis,
                     capacity=capacity,
-                    encoder_activation=ENCODER_ACTIVATION,
+                    encoder_activation=encoder_activation,
                 )
             else:
                 local_values, local_ids = _local_rank_candidates(
@@ -430,7 +431,7 @@ def _build_mapped_objective(
                     component_valid,
                     layout,
                     feature_axis=feature_axis,
-                    encoder_activation=ENCODER_ACTIVATION,
+                    encoder_activation=encoder_activation,
                 )
                 overflow_here = jnp.asarray(False)
             selection = _merge_local_candidates(
@@ -616,6 +617,7 @@ class ContributionTranscoderDistributedTrainer:
         *,
         bank_capacity: int | None = None,
         rematerialize_microbatch: bool = True,
+        encoder_activation: str = ENCODER_ACTIVATION,
     ) -> None:
         self.mesh = mesh
         self.layout = layout
@@ -625,7 +627,10 @@ class ContributionTranscoderDistributedTrainer:
         self.bank_capacity = bank_capacity
         if type(rematerialize_microbatch) is not bool:
             raise TypeError("rematerialize_microbatch must be boolean")
+        if encoder_activation not in {"relu", "softplus"}:
+            raise ValueError("encoder_activation must be 'relu' or 'softplus'")
         self.rematerialize_microbatch = rematerialize_microbatch
+        self.encoder_activation = encoder_activation
         _validate_contribution_mesh(mesh, layout, self.distributed)
         mapped = _build_mapped_objective(
             mesh,
@@ -634,6 +639,7 @@ class ContributionTranscoderDistributedTrainer:
             bank_capacity,
             self.optimizer.parameter_dtype,
             rematerialize_microbatch,
+            encoder_activation,
         )
 
         def complete_step(

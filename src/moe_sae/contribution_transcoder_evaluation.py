@@ -1031,6 +1031,7 @@ def _build_transcoder_mapped_evaluator(
     layout: ContributionSAEConfig,
     distributed: DistributedConfig,
     bank_capacity: int | None,
+    encoder_activation: str = ENCODER_ACTIVATION,
 ):
     data_axis = distributed.data_axis
     feature_axis = distributed.feature_axis
@@ -1087,7 +1088,7 @@ def _build_transcoder_mapped_evaluator(
                     layout,
                     feature_axis=feature_axis,
                     capacity=capacity,
-                    encoder_activation=ENCODER_ACTIVATION,
+                    encoder_activation=encoder_activation,
                 )
             else:
                 local_values, local_ids = _local_rank_candidates(
@@ -1096,7 +1097,7 @@ def _build_transcoder_mapped_evaluator(
                     component_valid,
                     layout,
                     feature_axis=feature_axis,
-                    encoder_activation=ENCODER_ACTIVATION,
+                    encoder_activation=encoder_activation,
                 )
                 overflow = jnp.asarray(False)
             selection = _merge_local_candidates(
@@ -1364,17 +1365,24 @@ class ContributionTranscoderDistributedEvaluator:
         distributed: DistributedConfig | None = None,
         *,
         bank_capacity: int | None = None,
+        encoder_activation: str = ENCODER_ACTIVATION,
     ) -> None:
         self.mesh = mesh
         self.layout = layout
         self.distributed = distributed or DistributedConfig()
         self.bank_capacity = bank_capacity
+        if encoder_activation not in {"relu", "softplus"}:
+            raise ValueError(
+                "encoder_activation must be 'relu' or 'softplus'"
+            )
+        self.encoder_activation = encoder_activation
         _validate_contribution_mesh(mesh, layout, self.distributed)
         mapped = _build_transcoder_mapped_evaluator(
             mesh,
             layout,
             self.distributed,
             bank_capacity,
+            encoder_activation,
         )
         batch_shardings = contribution_transcoder_batch_shardings(
             mesh,

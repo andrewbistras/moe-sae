@@ -479,6 +479,91 @@ def test_sealed_input_runner_consumes_exact_tail_and_emits_rows() -> None:
         )
 
 
+def test_distributed_evaluator_softplus_matches_dense_grouped_scores() -> None:
+    """Frozen H SAE rescoring must not silently fall back to ReLU."""
+
+    layout = _layout("A", experts=4, routes=2, width=4, k=2)
+    optimizer = _optimizer()
+    distributed = DistributedConfig(microbatches_per_update=2)
+    mesh = create_mesh(distributed)
+    state = init_contribution_train_state(
+        jax.random.key(13),
+        layout,
+        optimizer,
+    )
+    # Every ReLU score is zero, while Softplus supplies a strict, deterministic
+    # positive ordering within each bank.
+    bias = np.tile(
+        np.asarray([-4.0, -3.0, -2.0, -1.0], np.float32),
+        layout.bank_count,
+    )
+    state = state._replace(
+        params=state.params._replace(
+            encoder=jnp.zeros_like(state.params.encoder),
+            bias=jnp.asarray(bias),
+        )
+    )
+    state = shard_contribution_train_state(
+        state,
+        mesh,
+        layout,
+        optimizer,
+        distributed,
+    )
+    microbatches = _microbatches("A")
+    mean = np.zeros((layout.hidden_dim,), np.float32)
+    evaluator = ContributionDistributedEvaluator(
+        mesh,
+        layout,
+        distributed,
+        bank_capacity=3,
+        encoder_activation="softplus",
+    )
+    _aux, actual = evaluator.step(state.params, microbatches, mean)
+
+    decoder = np.asarray(jax.device_get(state.params.decoder), np.float32)
+    values = np.log1p(np.exp(np.asarray([-2.0, -1.0], np.float32)))
+    expected = []
+    for batch in microbatches:
+        banks = np.asarray(batch["bank_ids"])
+        weights = np.asarray(batch["router_weights"])
+        valid = np.asarray(batch["valid_mask"])
+        reconstructed = np.zeros(
+            (banks.shape[0], layout.top_routed, layout.hidden_dim),
+            np.float32,
+        )
+        for token in range(banks.shape[0]):
+            for route in range(layout.top_routed):
+                bank = int(banks[token, route])
+                ids = bank * layout.bank_width + np.asarray([2, 3])
+                reconstructed[token, route] = decoder[:, ids] @ values
+        raw = np.einsum(
+            "nkh,nk->nh",
+            reconstructed,
+            weights,
+            dtype=np.float32,
+        )
+        expected.append(np.where(valid[:, None], raw, 0.0))
+    np.testing.assert_allclose(
+        actual.raw_routed_reconstruction.reshape(-1, layout.hidden_dim),
+        np.concatenate(expected, axis=0),
+        rtol=3e-5,
+        atol=3e-5,
+    )
+
+    relu = ContributionDistributedEvaluator(
+        mesh,
+        layout,
+        distributed,
+        bank_capacity=3,
+    )
+    with pytest.raises(
+        ContributionEvaluationError,
+        match="fewer than k strictly positive",
+    ):
+        relu.step(state.params, microbatches, mean)
+
+
 def test_two_axis_collectives_match_dense_oracle() -> None:
     script = r"""
 import jax

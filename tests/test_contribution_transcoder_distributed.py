@@ -128,3 +128,49 @@ def test_cpu_distributed_strongly_negative_update_is_finite_and_exact_l0(
     assert int(updated.tokens_seen) == 2
     assert float(metrics.l0) == layout.total_l0
     assert np.isfinite(float(metrics.loss))
+
+
+def test_transcoder_distributed_trainer_can_select_relu_instead_of_softplus():
+    layout = _layout("A")
+    distributed = DistributedConfig(
+        data_axis_size=1,
+        feature_axis_size=1,
+        microbatches_per_update=1,
+    )
+    mesh = create_mesh(distributed, devices=np.asarray(jax.devices()[:1]))
+    optimizer = _optimizer()
+    state = init_contribution_transcoder_distributed_state(
+        jax.random.key(23),
+        mesh,
+        layout,
+        optimizer,
+        distributed,
+    )
+    state = state._replace(
+        params=state.params._replace(
+            encoder=np.zeros(state.params.encoder.shape, np.float32),
+            encoder_bias=np.ones(state.params.encoder_bias.shape, np.float32),
+        )
+    )
+    trainer = ContributionTranscoderDistributedTrainer(
+        mesh,
+        layout,
+        optimizer,
+        distributed,
+        bank_capacity=2,
+        rematerialize_microbatch=False,
+        encoder_activation="relu",
+    )
+    _updated, metrics = trainer.step(
+        state,
+        [_microbatch()],
+        ContributionTranscoderCentering(
+            source_mean=np.zeros((4,), np.float32),
+            target_mean=np.zeros((4,), np.float32),
+        ),
+    )
+
+    assert trainer.encoder_activation == "relu"
+    assert float(metrics.l0) == layout.total_l0
+    assert np.isfinite(float(metrics.loss))
+    assert bool(metrics.topk_valid)

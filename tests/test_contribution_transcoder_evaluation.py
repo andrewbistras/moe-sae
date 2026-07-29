@@ -247,6 +247,98 @@ def test_distributed_transcoder_evaluator_uses_source_only_operand(
     )
 
 
+def test_distributed_transcoder_evaluator_honors_relu_or_softplus() -> None:
+    layout = ContributionSAEConfig(
+        condition="A",
+        hidden_dim=3,
+        num_experts=4,
+        top_routed=2,
+        bank_width=4,
+        k_per_contribution=2,
+        randomization_key=17,
+    )
+    distributed = DistributedConfig(microbatches_per_update=2)
+    mesh = create_mesh(distributed)
+    optimizer = ContributionOptimizerConfig(
+        parameter_dtype="float32",
+        warmup_steps=0,
+        total_steps=2,
+    )
+    state = init_contribution_transcoder_distributed_state(
+        jax.random.key(3),
+        mesh,
+        layout,
+        optimizer,
+        distributed,
+    )
+    bias = np.tile(
+        np.asarray([-4.0, -3.0, -2.0, -1.0], np.float32),
+        layout.bank_count,
+    )
+    state = state._replace(
+        params=state.params._replace(
+            encoder=jnp.zeros_like(state.params.encoder),
+            encoder_bias=jnp.asarray(bias),
+        )
+    )
+    banks = np.asarray(
+        [[0, 1], [2, 3], [0, 2], [1, 3], [3, 2], [0, 1]],
+        np.int32,
+    )
+    weights = np.broadcast_to(
+        np.asarray([[0.625, 0.375]], np.float32),
+        (6, 2),
+    ).copy()
+    source = np.zeros((6, 3), np.float32)
+    target = np.arange(36, dtype=np.float32).reshape(6, 2, 3) / 30.0
+    valid = np.asarray([True, True, True, True, False, False])
+    microbatches = [
+        {
+            "routed_input": source[:3],
+            "expert_output": target[:3],
+            "bank_ids": banks[:3],
+            "router_weights": weights[:3],
+            "valid_mask": valid[:3],
+        },
+        {
+            "routed_input": source[3:],
+            "expert_output": target[3:],
+            "bank_ids": banks[3:],
+            "router_weights": weights[3:],
+            "valid_mask": valid[3:],
+        },
+    ]
+    zeros = np.zeros((3,), np.float32)
+
+    softplus = ContributionTranscoderDistributedEvaluator(
+        mesh,
+        layout,
+        distributed,
+        bank_capacity=3,
+        encoder_activation="softplus",
+    )
+    aux, _chunk = softplus.step(
+        state.params,
+        microbatches,
+        zeros,
+        zeros,
+    )
+    assert bool(aux.topk_valid)
+
+    relu = ContributionTranscoderDistributedEvaluator(
+        mesh,
+        layout,
+        distributed,
+        bank_capacity=3,
+        encoder_activation="relu",
+    )
+    with pytest.raises(
+        ContributionTranscoderEvaluationError,
+        match="fewer than two positive",
+    ):
+        relu.step(state.params, microbatches, zeros, zeros)
+
+
 def _token_scores(
     component_sse: np.ndarray,
     *,

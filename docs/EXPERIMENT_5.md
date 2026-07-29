@@ -1,6 +1,7 @@
 # Experiment 5: Routed–Shared Hybrid Sparse Models
 
-Status: frozen implementation contract, amended pre-result 2026-07-29
+Status: frozen H/R/B/F core contract, with a post-launch activation-ladder
+extension added 2026-07-29
 
 Protocol ID: `gemma4-routed-shared-hybrid-v1-20260728`
 
@@ -535,9 +536,9 @@ reported independently and cannot rescue a failed transcoder claim.
 - fail-closed budget reservation and USD 50.00 ceiling tests; and
 - synthetic end-to-end training through self-hashed report.
 
-## Explicitly deferred
+## Explicitly deferred from the frozen core
 
-Experiment 5 does not include:
+The original H/R/B/F Experiment-5 protocol does not include:
 
 - alternative routed/shared L0 splits;
 - traffic-proportional bank widths;
@@ -549,4 +550,244 @@ Experiment 5 does not include:
 - a new activation harvest.
 
 Those are Experiment-6 optimization questions. Changing any of them after
-viewing Experiment-5 quality creates a new protocol ID.
+viewing Experiment-5 quality creates a new protocol ID. The activation-ladder
+extension below does exactly that: it has its own protocol ID, namespace, run
+accounting, and interpretation, and does not retroactively alter this frozen
+core.
+
+## Post-launch routed-activation-ladder extension
+
+Status: exploratory post-launch amendment, selected after observing initial H
+training behavior
+
+Extension protocol ID:
+`gemma4-experiment5-routed-activation-ladder-v1-20260729`
+
+This extension answers the narrower diagnostic question raised by the
+Experiment-4 result:
+
+> At fixed 128-by-512 routed geometry and TopK-4 per visible expert, does
+> strictly positive Softplus encoding improve reconstruction over ReLU, and
+> how do both routed-only systems relate descriptively to the complete
+> routed/shared H model?
+
+This question was not in the frozen H/R/B/F contract. It was added after the
+initial H training losses had been inspected. Its results are therefore
+exploratory and cannot repair, replace, or strengthen the preregistration
+status of the original Experiment-5 verdict. The frozen H/R/B/F endpoints,
+contrasts, completion counts, and report remain unchanged.
+
+### Ladder conditions
+
+The extension uses the unambiguous keys `A512ReLU`, `A512Softplus`, and `H`.
+Neither A condition may be shortened to `A` or `A512` in an artifact because
+those names would erase the activation treatment or collide with historical
+condition names.
+
+| condition | activation | routed features | candidates/token | routed L0 | shared learned features | total features |
+|---|---|---:|---:|---:|---:|---:|
+| A512ReLU | ReLU | 128 x 512 = 65,536 | 8 x 512 = 4,096 | 8 x 4 = 32 | 0 | 65,536 |
+| A512Softplus | Softplus | 128 x 512 = 65,536 | 8 x 512 = 4,096 | 8 x 4 = 32 | 0 | 65,536 |
+| H | Softplus, frozen Experiment-5 hybrid | 128 x 512 = 65,536 | 4,096 routed + 4,096 shared | 32 routed + 32 shared | 4,096 | 69,632 |
+
+Every routed condition exposes eight true-expert-ID banks. Both A conditions
+expose 6.25% of the routed dictionary per token and select the same fraction
+inside each visible bank:
+
+```text
+A512ReLU:     TopK-4 / 512 = 0.78125%
+A512Softplus: TopK-4 / 512 = 0.78125%
+```
+
+Their trainable parameter counts, including encoder, decoder, and bias, are:
+
+```text
+A512ReLU     = 65,536 * (2 * 2,816 + 1) = 369,164,288
+A512Softplus = 65,536 * (2 * 2,816 + 1) = 369,164,288
+H            = 69,632 * (2 * 2,816 + 1) = 392,237,056
+```
+
+H is the already-frozen core condition, not a newly tuned H trajectory. Its
+routed half is geometrically identical to both A conditions. Its additional shared
+dictionary contributes 4,096 features, 4,096 candidates, L0 32, and
+23,072,768 parameters.
+
+### Sources, activations, and training objectives
+
+A512ReLU and A512Softplus are newly trained, extension-owned trajectories.
+Within each panel they are identical in source tensors, targets, true-expert
+bank identity, 128-by-512 geometry, TopK-4, centering, initialization,
+optimizer, batch order, seed, and component objective. Their only treatment
+difference is the encoder nonlinearity:
+
+- in the SAE panel, each encoder receives and reconstructs its selected raw
+  expert output `e_ts`;
+- in the transcoder panel, each true-ID bank receives the common routed input
+  `x_t` and predicts its `e_ts`;
+- A512ReLU applies ReLU before the exact per-bank TopK-4 in both panels;
+- A512Softplus applies Softplus before the same TopK-4 in both panels; and
+- both conditions use the Experiment-4 normalized router-weighted component
+  objective.
+
+The strict-positive selected-support contract remains unchanged. If
+A512ReLU cannot supply four positive features in a visible bank, that
+trajectory fails closed; it is never repaired by switching activation.
+
+For both A conditions, with the pooled raw-expert-output mean `m_e`, the
+training objective is exactly:
+
+```text
+SSE_component = sum_t,s ||g_ts * (e_ts - e_hat_ts)||^2
+SST_component = sum_t,s ||g_ts * (e_ts - m_e)||^2
+loss_component = SSE_component / SST_component
+```
+
+Thus the normalized router weights are applied before squaring. This is the
+Experiment-4 objective; it is not the full-FFN objective.
+
+H remains exactly the frozen condition defined above:
+
+- its SAE uses softplus for both routed and shared encoders, receives native
+  `e_ts` and `q_t`, and reconstructs them through the exact Gemma graph;
+- its transcoder uses softplus, receives only common `x_t`, and predicts the
+  routed `e_ts` and normalized shared branch `q_t`; and
+- both panels train only against normalized full-FFN SSE on `y_t`.
+
+No A512ReLU or A512Softplus shared dictionary is implicit. Neither condition
+may use a learned, zero, mean, or H-derived shared prediction during training.
+
+### Common held-out endpoints
+
+Every available 2M, 5M, and 10M checkpoint is rescored on the same sealed
+250,000-token held-out capture. The extension publishes the following paired
+endpoints for all three conditions wherever mathematically defined:
+
+1. **Component EV:** raw expert-output SSE under the common Experiment-4
+   router-weighted component SST.
+2. **Routed EV:** reconstruct `u_hat_t = sum_s g_ts * e_hat_ts`, apply the
+   frozen routed RMSNorm, and score `r_hat_t` against `r_t` under one common
+   routed SST.
+3. **Oracle-shared full-FFN EV:** use the exact held-out shared branch for all
+   three conditions,
+   `y_hat_oracle_t = outer_norm(r_hat_t + q_t)`, and score against `y_t` under
+   the frozen common full-FFN SST.
+4. **Learned full-FFN EV:** for H only, use its own `q_hat_t` and report the
+   original Experiment-5 `EV_y`.
+
+The oracle-shared endpoint is a diagnostic of routed reconstruction after the
+real nonlinear recomposition. It is not an end-to-end model: A512ReLU and
+A512Softplus receive unavailable target information through `q_t` at
+evaluation. Their oracle-shared EV must never be presented as directly
+beating H's learned full-FFN EV. H also publishes its oracle-shared endpoint
+so routed quality can be compared with like-for-like shared information.
+
+All conditions retain exact per-token additive score rows aggregated by
+packed sequence. The 20,000-replicate paired bootstrap is authoritative only
+for A512Softplus minus A512ReLU. H gaps are matched descriptive point
+diagnostics with no interval. Component, routed, and full-FFN endpoints each
+use their own single target-only SST shared across
+A512ReLU/A512Softplus/H; SSTs may not be copied between different endpoint
+spaces.
+
+### Extension contrasts and limits
+
+The planned diagnostic contrasts at each milestone and panel are:
+
+```text
+activation effect = EV(A512Softplus) - EV(A512ReLU)
+descriptive joint-system gap = EV(H oracle shared) - EV(A512Softplus oracle shared)
+H shared gap = EV(H oracle shared) - EV(H learned shared)
+```
+
+The activation contrast is the clean comparison: within each panel it changes
+only ReLU to Softplus while holding geometry, TopK, L0, parameter count,
+expert identity, source boundary, targets, initialization, optimizer, token
+order, and component loss fixed. Seed-level intervals are paired by packed
+sequence; the three-seed verdict uses the hierarchical paired bootstrap.
+
+The H-versus-A512Softplus routed contrast is not a pure shared-dictionary
+ablation. Although their routed geometry and activation match, H trains
+routed and shared decoders jointly through full-FFN SSE; A512Softplus trains
+routed components directly. The contrast localizes the transition to the
+hybrid training system but cannot attribute it uniquely to the shared branch
+or loss.
+
+`H shared gap` is the descriptive reconstruction-quality penalty from
+replacing the exact shared branch with H's learned shared reconstruction while
+holding H's routed reconstruction fixed. It is not an A-versus-H treatment
+effect. No direct end-to-end full-FFN contrast exists for either routed-only A
+condition without choosing an arbitrary shared predictor.
+
+The extension adds no randomized-ID control. Stable identity evidence
+continues to come from Experiment-4 A/R and the frozen Experiment-5 H/R
+contrasts. The activation ladder cannot independently establish that expert
+identity caused either A result.
+
+### Run and cost accounting
+
+The analyzed trajectory matrix contains:
+
+```text
+12 newly trained A trajectories + 6 immutable pre-existing H trajectories
+  = 18 analyzed trajectories
+2 panels x 3 seeds x 3 milestones x 3 conditions = 54 evaluation cells
+```
+
+Of the 18 analyzed trajectories:
+
+- six A512ReLU trajectories are new extension training work;
+- six A512Softplus trajectories are new extension training work; and
+- six H trajectories are read-only Experiment-5 core references.
+
+Thus the extension launches 12 new trajectories. Historical Experiment-4 A
+trajectories are pilot context, not members of this three-seed matrix. Their
+width, activation policy, config, and source identities differ from the
+extension contract, so they must not substitute for either activation arm.
+
+Reuse is permitted only after exact checkpoint, model, capture, source-overlay,
+seed, token-order, optimizer, and milestone identities validate. This reuse
+rule applies to H. A missing or incompatible H artifact is not silently
+regenerated under the old name; retraining it requires a new extension
+protocol revision and condition identity.
+
+Evaluation accounting is correspondingly:
+
+```text
+36 A512ReLU/A512Softplus evaluation executions
+  + 18 extension-owned H checkpoint rescoring executions
+  = 54 evaluation cells
+```
+
+H's historical compute is not assigned zero scientific cost merely because it
+is reused operationally. Where validated parent timing records are supplied,
+the report carries each trajectory's measured training chip-seconds and
+accelerator generation. Newly incurred cash is reported separately from total
+scientific compute. Any cross-protocol chip-second contrast remains
+descriptive unless the paired trajectories used the same accelerator
+generation and compatible timing boundaries.
+
+This extension shares Experiment 5's cumulative USD 50.00 incremental cash
+ceiling unless the user explicitly authorizes a replacement ceiling. The
+extension scheduler may reserve only the unspent remainder after the core
+ledger; reused H work does not create a fictional cash credit.
+
+### Immutable namespace rule
+
+The running or sealed H/R/B/F campaign is immutable. Its plan, controller
+state, checkpoints, scores, report, completion counts, and protocol ID must
+not be edited, resumed, or resealed to include A512ReLU or A512Softplus.
+
+All extension-owned state lives under a disjoint logical prefix:
+
+```text
+experiment5/extensions/routed-activation-ladder-v1/<extension-run-identity>/
+```
+
+An extension manifest contains read-only content-hash references to the
+Experiment-5 H artifacts; it never copies them into a mutable old-condition
+path. The new A512ReLU and A512Softplus checkpoints, endpoint score vectors,
+budget ledger, plan, controller state, report, and newly rescored H endpoint
+vectors are create-only beneath the extension prefix. Historical Experiment-4
+A trajectories may be linked as audit context but not imported as extension
+results. The extension report is sealed separately and may link to, but may
+not replace or amend, either parent report.

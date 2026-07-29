@@ -32,6 +32,8 @@ from typing import BinaryIO
 
 from moe_sae.contribution_training_worker import (
     HORIZON_DIRECT_ACCELERATOR_TYPES,
+    LONG_HORIZON_PHASES,
+    ROUTED_LADDER_CONDITIONS,
     direct_resident_runtime_limit_seconds,
     prefetch_runtime_limit_seconds,
 )
@@ -80,7 +82,7 @@ _COORDINATOR_BUNDLE_FIELDS = {
     "coordinator_bundle_sha256",
 }
 
-CONDITIONS = ("A", "H", "R", "B", "F", "Q")
+CONDITIONS = ("A", *ROUTED_LADDER_CONDITIONS, "H", "R", "B", "F", "Q")
 SCIENTIFIC_MODELS = ("sae", "transcoder")
 ACTIONS = ("qualify", "train")
 DIRECT_BOUNDED_ADMISSION = "bounded_direct_resident"
@@ -336,7 +338,7 @@ def _is_horizon_direct(
     return (
         action == "train"
         and accelerator_type in HORIZON_DIRECT_ACCELERATOR_TYPES
-        and phase in {"learning_horizon_10m", "routed_shared_hybrid_10m"}
+        and phase in LONG_HORIZON_PHASES
         and direct_limit > DIRECT_EXPERIMENT_SECONDS
         and maximum_runtime_seconds <= direct_limit
     )

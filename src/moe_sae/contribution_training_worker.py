@@ -76,6 +76,14 @@ HORIZON_PREFETCH_MAX_SECONDS = 1_800
 HORIZON_DIRECT_ACCELERATOR_TYPES = frozenset(
     {"v4-32", "v6e-16", "v5litepod-16"}
 )
+ROUTED_LADDER_CONDITIONS = ("A512ReLU", "A512Softplus")
+LONG_HORIZON_PHASES = frozenset(
+    {
+        "learning_horizon_10m",
+        "routed_shared_hybrid_10m",
+        "experiment5_routed_activation_ladder_10m",
+    }
+)
 CHIP_SECONDS_SCOPE = (
     "fixed_capacity_scan_in_training_invocation_plus_synchronized_"
     "optimizer_loop_including_input_wait"
@@ -104,6 +112,18 @@ def _finalized_horizon_config(config_path: str | Path) -> Any | None:
         return None
 
     schema = raw.get("schema_version")
+    if schema == "gemma4-experiment5-routed-activation-ladder-run-config-v1":
+        from moe_sae.experiment5_routed_ladder_config import (
+            RoutedLadderConfigError,
+            load_routed_ladder_config,
+        )
+
+        try:
+            return load_routed_ladder_config(selected)
+        except RoutedLadderConfigError as error:
+            raise ContributionTrainingWorkerError(
+                "Experiment-5 routed-ladder execution requires its strict config"
+            ) from error
     if schema == "gemma4-routed-shared-hybrid-run-config-v1":
         from moe_sae.experiment5_config import (
             Experiment5ConfigError,
@@ -144,7 +164,7 @@ def prefetch_runtime_limit_seconds(
 
     if (
         accelerator_type in HORIZON_DIRECT_ACCELERATOR_TYPES
-        and phase in {"learning_horizon_10m", "routed_shared_hybrid_10m"}
+        and phase in LONG_HORIZON_PHASES
         and _finalized_horizon_config(config_path) is not None
     ):
         return HORIZON_PREFETCH_MAX_SECONDS
@@ -167,7 +187,7 @@ def direct_resident_runtime_limit_seconds(
 
     if (
         accelerator_type not in HORIZON_DIRECT_ACCELERATOR_TYPES
-        or phase not in {"learning_horizon_10m", "routed_shared_hybrid_10m"}
+        or phase not in LONG_HORIZON_PHASES
     ):
         return MAX_UNGATED_ACCELERATOR_SECONDS
     config = _finalized_horizon_config(config_path)
@@ -189,12 +209,24 @@ InputMode = Literal["resident", "rematerialized"]
 INPUT_MODES: tuple[InputMode, ...] = ("resident", "rematerialized")
 ScientificModel = Literal["sae", "transcoder"]
 SCIENTIFIC_MODELS: tuple[ScientificModel, ...] = ("sae", "transcoder")
-CONDITIONS = ("A", "H", "R", "B", "F", "Q")
+CONDITIONS = ("A", *ROUTED_LADDER_CONDITIONS, "H", "R", "B", "F", "Q")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 class ContributionTrainingWorkerError(RuntimeError):
     """The qualified training boundary failed closed."""
+
+
+def _contribution_kernel_condition(condition: str) -> str:
+    """Map public ladder identities onto the unchanged routed kernel enum."""
+
+    if condition in ROUTED_LADDER_CONDITIONS:
+        return "A"
+    if condition in {"A", "R", "B", "F"}:
+        return condition
+    raise ContributionTrainingWorkerError(
+        f"{condition!r} has no routed contribution-kernel identity"
+    )
 
 
 def _sha256(name: str, value: Any) -> str:
@@ -965,8 +997,7 @@ def run_qualified_training(
         )
     if (
         direct_maximum == MAX_LEARNING_HORIZON_ACCELERATOR_SECONDS
-        and plan.phase_name
-        not in {"learning_horizon_10m", "routed_shared_hybrid_10m"}
+        and plan.phase_name not in LONG_HORIZON_PHASES
     ):
         raise ContributionTrainingWorkerError(
             "the twelve-hour direct policy is restricted to finalized "
@@ -2141,6 +2172,7 @@ class _PreparedHandle:
 @dataclass(frozen=True, slots=True)
 class _ProductionWorkload:
     scientific_model: ScientificModel
+    encoder_activation: str
     source: Any
     mean: Any
     routed_layout: Any | None
@@ -2552,6 +2584,7 @@ class _ProductionEngine:
                 self.workload.distributed,
                 bank_capacity=self.workload.bank_capacity,
                 rematerialize_microbatch=rematerialize,
+                encoder_activation=self.workload.encoder_activation,
             )
         elif self.workload.routed_layout is not None:
             from moe_sae.contribution_distributed import (
@@ -2565,6 +2598,7 @@ class _ProductionEngine:
                 self.workload.distributed,
                 bank_capacity=self.workload.bank_capacity,
                 rematerialize_microbatch=rematerialize,
+                encoder_activation=self.workload.encoder_activation,
             )
         else:
             from moe_sae.contribution_shared import SharedQDistributedTrainer
@@ -3296,6 +3330,7 @@ def _build_experiment5_workload(
     )
     return _ProductionWorkload(
         scientific_model=scientific_model,
+        encoder_activation=str(config.encoder_activation),
         source=input_source,
         mean=centering,
         routed_layout=layout,
@@ -3438,6 +3473,13 @@ def _build_production_workload(
     )
     mesh = create_mesh(distributed)
     selected_layout = _phase_layout(config, plan)
+    encoder_activation = getattr(selected_layout, "encoder_activation", None)
+    if encoder_activation is None:
+        encoder_activation = getattr(config, "encoder_activation", None)
+    if encoder_activation not in {"relu", "softplus"}:
+        raise ContributionTrainingWorkerError(
+            "selected layout does not freeze a supported encoder activation"
+        )
     routed_layout: Any | None = None
     q_config: Any | None = None
     optimizer: Any | None = None
@@ -3494,7 +3536,7 @@ def _build_production_workload(
         checkpoint_sae = q_config
     else:
         routed_layout = ContributionSAEConfig(
-            condition=plan.condition,
+            condition=_contribution_kernel_condition(plan.condition),
             hidden_dim=config.model.hidden_size,
             num_experts=config.model.num_routed_experts,
             top_routed=config.model.experts_per_token,
@@ -3620,7 +3662,7 @@ def _build_production_workload(
         )
 
     preprocessing_wall_seconds = 0.0
-    if plan.condition in {"A", "R"}:
+    if plan.condition in {"A", "R", *ROUTED_LADDER_CONDITIONS}:
         if expected_context is None:
             preprocessing_started = time.perf_counter()
             local_capacity = source.scan_local_capacity(
@@ -3684,6 +3726,7 @@ def _build_production_workload(
     )
     return _ProductionWorkload(
         scientific_model=scientific_model,
+        encoder_activation=encoder_activation,
         source=source,
         mean=mean,
         routed_layout=routed_layout,
@@ -3978,6 +4021,19 @@ def _load_worker_config(
         from moe_sae.experiment5_config import load_experiment5_config
 
         return load_experiment5_config(
+            selected,
+            expected_panel=scientific_model,
+        )
+    if (
+        isinstance(raw, Mapping)
+        and raw.get("schema_version")
+        == "gemma4-experiment5-routed-activation-ladder-run-config-v1"
+    ):
+        from moe_sae.experiment5_routed_ladder_config import (
+            load_routed_ladder_config,
+        )
+
+        return load_routed_ladder_config(
             selected,
             expected_panel=scientific_model,
         )
@@ -4987,8 +5043,10 @@ if __name__ == "__main__":  # pragma: no cover - exercised via module CLI
 
 __all__ = [
     "CONDITIONS",
+    "LONG_HORIZON_PHASES",
     "INPUT_MODES",
     "PREFETCH_RECEIPT_SCHEMA_VERSION",
+    "ROUTED_LADDER_CONDITIONS",
     "TRAINING_MODE_SELECTION_SCHEMA_VERSION",
     "TRAINING_RESULT_SCHEMA_VERSION",
     "TRAINING_RUN_IDENTITY_SCHEMA_VERSION",

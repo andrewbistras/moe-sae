@@ -5,11 +5,17 @@ make sparse representation learning more effective than an unstructured
 global dictionary at the same candidate or parameter budget.
 
 The active model is `google/gemma-4-26B-A4B`, text only, at one-indexed block
-15. The project now contains three linked experiments:
+15. The project now contains three linked experiments and a post-launch
+diagnostic extension:
 
 1. aggregate routed-branch sparse autoencoders;
 2. per-expert contribution sparse autoencoders; and
 3. source-only contribution transcoders.
+
+Experiment 5 tests a routed/shared hybrid on the exact full FFN output. Its
+separate activation-ladder extension compares fixed-width routed-only
+`A512ReLU` and `A512Softplus` conditions, plus the existing hybrid `H`,
+without altering the frozen H/R/B/F campaign.
 
 ## Current result
 
@@ -42,9 +48,15 @@ the active tree. It is preserved at Git tag
   — per-expert contribution SAE configuration.
 - [`configs/gemma4_transcoder_v2.yaml`](configs/gemma4_transcoder_v2.yaml) —
   exact-positive source-only transcoder configuration.
+- [`configs/gemma4_experiment5_routed_ladder_sae_v1.yaml`](configs/gemma4_experiment5_routed_ladder_sae_v1.yaml)
+  and
+  [`configs/gemma4_experiment5_routed_ladder_transcoder_v1.yaml`](configs/gemma4_experiment5_routed_ladder_transcoder_v1.yaml)
+  — strict A512ReLU/A512Softplus activation-ladder extension contracts.
 - [`EXPERIMENT_2.md`](EXPERIMENT_2.md) and
   [`EXPERIMENT_3.md`](EXPERIMENT_3.md) — frozen scientific contracts and
   execution records.
+- [`docs/EXPERIMENT_5.md`](docs/EXPERIMENT_5.md) — frozen H/R/B/F contract and
+  the explicitly post-launch A512ReLU/A512Softplus/H activation ladder.
 - `moe-sae` — the single CLI, with `stage-c4`, `qualify-storage`,
   `qualify-sae-storage`, `preflight`,
   `convert-checkpoint`, `benchmark-harvest`, `harvest`, `activation-farm`,
