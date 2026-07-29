@@ -51,6 +51,17 @@ EVAL_TOKENS = 250_000
 HARD_BUDGET_USD = 50.0
 HYBRID_EXPOSURE = 8_192 / 69_632
 
+# Canonical targets are identical across conditions, but their FP32 SST
+# reductions can differ slightly when the same held-out examples are evaluated
+# on different TPU generations.  The per-sequence tolerance covers the
+# measured cross-hardware reduction drift; the much tighter aggregate
+# tolerance prevents that allowance from hiding a material change in the
+# normalization basis.  Both checks are purely relative because every
+# per-sequence SST is independently required to be finite and strictly
+# positive.
+CROSS_HARDWARE_SST_RTOL = 2e-6
+CROSS_HARDWARE_SST_SUM_RTOL = 1e-9
+
 TRAIN_TARGET_SHA256 = (
     "f29aaf45d9ff93be08cc3d175cdcea9fa4aecc37fc0e256d09720e88e1ae838c"
 )
@@ -1078,13 +1089,44 @@ def _validate_grid(
             reference = paired_grid[(panel, 0, milestone)]
             for seed in SEEDS[1:]:
                 row = paired_grid[(panel, seed, milestone)]
-                if (
-                    not np.array_equal(row.sequence_ids, reference.sequence_ids)
-                    or not np.array_equal(row.valid_tokens, reference.valid_tokens)
-                    or not np.array_equal(row.sst, reference.sst)
+                basis = f"{panel}.{milestone}"
+                if not np.array_equal(
+                    row.sequence_ids,
+                    reference.sequence_ids,
                 ):
                     raise Experiment5ReportError(
-                        f"{panel}.{milestone} held-out sequence basis changed by seed"
+                        f"{basis} packed-sequence IDs changed in seed {seed}; "
+                        "exact cross-seed equality is required"
+                    )
+                if not np.array_equal(
+                    row.valid_tokens,
+                    reference.valid_tokens,
+                ):
+                    raise Experiment5ReportError(
+                        f"{basis} valid-token counts changed in seed {seed}; "
+                        "exact cross-seed equality is required"
+                    )
+                if not np.allclose(
+                    row.sst,
+                    reference.sst,
+                    rtol=CROSS_HARDWARE_SST_RTOL,
+                    atol=0.0,
+                ):
+                    raise Experiment5ReportError(
+                        f"{basis} per-sequence SST changed beyond the "
+                        f"cross-hardware tolerance in seed {seed} "
+                        f"(rtol={CROSS_HARDWARE_SST_RTOL:g}, atol=0)"
+                    )
+                if not np.isclose(
+                    np.sum(row.sst, dtype=np.float64),
+                    np.sum(reference.sst, dtype=np.float64),
+                    rtol=CROSS_HARDWARE_SST_SUM_RTOL,
+                    atol=0.0,
+                ):
+                    raise Experiment5ReportError(
+                        f"{basis} aggregate SST changed beyond the "
+                        f"cross-hardware tolerance in seed {seed} "
+                        f"(rtol={CROSS_HARDWARE_SST_SUM_RTOL:g}, atol=0)"
                     )
     return result_grid, paired_grid
 

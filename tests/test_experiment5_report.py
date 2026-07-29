@@ -8,6 +8,8 @@ from moe_sae.contribution_artifacts import canonical_sha256
 from moe_sae.experiment5_report import (
     BUDGET_SCHEMA_VERSION,
     CONDITIONS,
+    CROSS_HARDWARE_SST_RTOL,
+    CROSS_HARDWARE_SST_SUM_RTOL,
     EVAL_SOURCE_SHA256,
     EVAL_TARGET_SHA256,
     MILESTONES,
@@ -320,6 +322,86 @@ def _budget(spent: float = 5.0) -> dict:
     )
 
 
+def _curve_point(
+    results: list[dict],
+    paired: list[dict],
+    *,
+    panel: str = "sae",
+    seed: int = 1,
+    milestone: int = 2_000_000,
+) -> tuple[dict, dict]:
+    identity = (panel, seed, milestone)
+    result = next(
+        row
+        for row in results
+        if (
+            row["panel"],
+            row["seed"],
+            row["checkpoint_target_tokens"],
+        )
+        == identity
+    )
+    scores = next(
+        row
+        for row in paired
+        if (
+            row["panel"],
+            row["seed"],
+            row["checkpoint_target_tokens"],
+        )
+        == identity
+    )
+    return result, scores
+
+
+def _rehash_curve_point(result: dict, paired: dict) -> None:
+    paired_body = {
+        name: value
+        for name, value in paired.items()
+        if name != "artifact_sha256"
+    }
+    paired["artifact_sha256"] = canonical_sha256(paired_body)
+    result["predictions_artifact_sha256"] = paired["artifact_sha256"]
+    result_body = {
+        name: value
+        for name, value in result.items()
+        if name != "result_sha256"
+    }
+    result["result_sha256"] = canonical_sha256(result_body)
+
+
+def _scale_curve_point_scores(
+    result: dict,
+    paired: dict,
+    *,
+    scale: float,
+) -> None:
+    paired["sequence_sst"] = [
+        value * scale for value in paired["sequence_sst"]
+    ]
+    for condition in CONDITIONS:
+        paired["sequence_sse"][condition] = [
+            value * scale for value in paired["sequence_sse"][condition]
+        ]
+    result["common_full_ffn_sst"] *= scale
+    for condition in CONDITIONS:
+        row = result["conditions"][condition]
+        scaled_scores: set[int] = set()
+        for endpoint in (
+            "full_ffn",
+            "routed",
+            "shared",
+            "oracle_shared_full_ffn",
+            "oracle_routed_full_ffn",
+        ):
+            score = row[endpoint]
+            if score is not None and id(score) not in scaled_scores:
+                score["sse"] *= scale
+                score["sst"] *= scale
+                scaled_scores.add(id(score))
+    _rehash_curve_point(result, paired)
+
+
 def test_report_computes_gain_hierarchical_effects_and_earliest_observed_q5():
     results, paired = _grid()
     report = build_experiment5_report(
@@ -398,6 +480,116 @@ def test_paired_score_tampering_fails_closed():
     results, paired = _grid()
     paired[0]["sequence_sse"]["H"][0] += 1.0
     with pytest.raises(Experiment5ReportError, match="self-hash"):
+        build_experiment5_report(
+            results=results,
+            paired_scores=paired,
+            budget_ledger=_budget(),
+        )
+
+
+def test_cross_hardware_measured_like_sst_drift_is_accepted():
+    results, paired = _grid()
+    result, scores = _curve_point(results, paired)
+    drift = CROSS_HARDWARE_SST_RTOL / 2
+    scores["sequence_sst"] = [
+        (SST / 2) * (1 + drift),
+        (SST / 2) * (1 - drift),
+    ]
+    _rehash_curve_point(result, scores)
+
+    report = build_experiment5_report(
+        results=results,
+        paired_scores=paired,
+        budget_ledger=_budget(),
+    )
+
+    assert report["status"] == "headline_ready"
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement", "message"),
+    [
+        (
+            "packed_sequence_ids",
+            [1001, 1003],
+            "packed-sequence IDs changed in seed 1; exact cross-seed equality",
+        ),
+        (
+            "valid_tokens",
+            [124_999, 125_001],
+            "valid-token counts changed in seed 1; exact cross-seed equality",
+        ),
+    ],
+)
+def test_cross_seed_sequence_identity_and_counts_remain_exact(
+    field: str,
+    replacement: list[int],
+    message: str,
+):
+    results, paired = _grid()
+    result, scores = _curve_point(results, paired)
+    scores[field] = replacement
+    _rehash_curve_point(result, scores)
+
+    with pytest.raises(Experiment5ReportError, match=message):
+        build_experiment5_report(
+            results=results,
+            paired_scores=paired,
+            budget_ledger=_budget(),
+        )
+
+
+def test_cross_hardware_per_sequence_sst_beyond_tolerance_is_rejected():
+    results, paired = _grid()
+    result, scores = _curve_point(results, paired)
+    drift = CROSS_HARDWARE_SST_RTOL * 1.5
+    scores["sequence_sst"] = [
+        (SST / 2) * (1 + drift),
+        (SST / 2) * (1 - drift),
+    ]
+    _rehash_curve_point(result, scores)
+
+    with pytest.raises(
+        Experiment5ReportError,
+        match="per-sequence SST changed beyond the cross-hardware tolerance",
+    ):
+        build_experiment5_report(
+            results=results,
+            paired_scores=paired,
+            budget_ledger=_budget(),
+        )
+
+
+def test_cross_hardware_aggregate_sst_has_a_tighter_tolerance():
+    results, paired = _grid()
+    result, scores = _curve_point(results, paired)
+    _scale_curve_point_scores(
+        result,
+        scores,
+        scale=1 + 2 * CROSS_HARDWARE_SST_SUM_RTOL,
+    )
+
+    with pytest.raises(
+        Experiment5ReportError,
+        match="aggregate SST changed beyond the cross-hardware tolerance",
+    ):
+        build_experiment5_report(
+            results=results,
+            paired_scores=paired,
+            budget_ledger=_budget(),
+        )
+
+
+def test_cross_hardware_tolerance_does_not_admit_zero_sst():
+    results, paired = _grid()
+    result, scores = _curve_point(results, paired)
+    scores["sequence_sst"] = [0.0, SST]
+    _rehash_curve_point(result, scores)
+
+    with pytest.raises(
+        Experiment5ReportError,
+        match="per-sequence SST must be finite and positive",
+    ):
         build_experiment5_report(
             results=results,
             paired_scores=paired,
