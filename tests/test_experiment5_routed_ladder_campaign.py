@@ -180,8 +180,8 @@ def _a256_reference_manifest(tmp_path: Path, source: dict) -> dict:
                 "training_source_revision": training_revision,
                 "a256_config": config,
                 "a256_config_sha256": (
-                    "d2bc2a5f77ac303398b4570bd174ebb1afc4d69b9f94d1d5f"
-                    "601156b01ea8f50"
+                    "035e1afc91f7351fda3128582ac52e2051fcb0741f6f71913f"
+                    "5141aaa1c7ab59"
                 ),
                 "run_root_remote": run_root,
                 "checkpoint_payload_root_gcs": task.checkpoint_root_gcs,

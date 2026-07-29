@@ -53,7 +53,7 @@ SAE panel: seed 0 at 2M, 5M, and 10M checkpoints. Its production config
 identity is:
 
 ```text
-SAE: d2bc2a5f77ac303398b4570bd174ebb1afc4d69b9f94d1d5f601156b01ea8f50
+SAE: 035e1afc91f7351fda3128582ac52e2051fcb0741f6f71913f5141aaa1c7ab59
 ```
 
 Experiment 4's transcoder A256 seed 0 is not compatible: that panel used a
@@ -203,7 +203,7 @@ The v2 run is invalid if any of the following occurs:
 Their canonical config identities are:
 
 ```text
-SAE v2:        729902a48f48859eb0ce1aac386e4a5b16dd3c32417dc361af9633a41e8349b2
+SAE v2:        eec72b479ef470fa02917bef78a731503a4ad890e86a4571eae5ba64e9217f46
 transcoder v2: 12062fbc4073bc93d72a55643ff3031d6166996e8454b35e557596e6361a9787
 ```
 

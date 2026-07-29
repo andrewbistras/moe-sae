@@ -146,7 +146,7 @@ existing_a256_reference:
   condition: A256ReLU
   source_condition: A
   source_protocol_id: gemma4-pilot-learning-horizon-v1-20260728
-  source_config_sha256: d2bc2a5f77ac303398b4570bd174ebb1afc4d69b9f94d1d5f601156b01ea8f50
+  source_config_sha256: 035e1afc91f7351fda3128582ac52e2051fcb0741f6f71913f5141aaa1c7ab59
   source_phase_name: learning_horizon_10m
   training_policy: reuse_seed0_train_missing_seeds
   reused_seeds:
