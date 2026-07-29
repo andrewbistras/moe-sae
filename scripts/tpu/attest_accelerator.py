@@ -67,7 +67,8 @@ def attest(args: argparse.Namespace) -> dict[str, object]:
         zone=args.zone,
         accelerator_type=args.accelerator_type,
         provisioning_model=(
-            "ON_DEMAND" if args.accelerator_type == "v4-32" else "SPOT"
+            args.provisioning_model
+            or ("ON_DEMAND" if args.accelerator_type == "v4-32" else "SPOT")
         ),
     )
     attestation = assert_spot_tpu_description(description, contract)
@@ -96,6 +97,14 @@ def _parser() -> argparse.ArgumentParser:
         "--accelerator-type",
         choices=("v4-32", "v6e-16", "v5litepod-16"),
         default="v6e-16",
+    )
+    parser.add_argument(
+        "--provisioning-model",
+        choices=("ON_DEMAND", "SPOT"),
+        help=(
+            "expected live scheduling mode; defaults to the historical "
+            "v4=ON_DEMAND, v5/v6=SPOT policy, but must be explicit for Spot v4"
+        ),
     )
     parser.add_argument("--output-root", required=True)
     return parser

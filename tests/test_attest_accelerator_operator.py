@@ -27,6 +27,7 @@ def arguments(
     tmp_path: Path,
     *,
     accelerator_type: str | None = None,
+    provisioning_model: str | None = None,
 ):
     argv = [
         "--run-id",
@@ -46,6 +47,8 @@ def arguments(
     ]
     if accelerator_type is not None:
         argv.extend(("--accelerator-type", accelerator_type))
+    if provisioning_model is not None:
+        argv.extend(("--provisioning-model", provisioning_model))
     return operator._parser().parse_args(argv)
 
 
@@ -129,8 +132,7 @@ def test_attestation_accepts_exact_on_demand_v4(
 ) -> None:
     description = {
         "name": (
-            "projects/neural-dragnet/locations/us-central2-b/nodes/"
-            "experiment4-sae-f"
+            "projects/neural-dragnet/locations/us-central2-b/nodes/" "experiment4-sae-f"
         ),
         "acceleratorType": "v4-32",
         "state": "READY",
@@ -149,3 +151,48 @@ def test_attestation_accepts_exact_on_demand_v4(
     result = operator.attest(args)
     assert result["contract"]["provisioning_model"] == "ON_DEMAND"
     assert result["attestation"]["spot"] is False
+
+
+def test_attestation_accepts_exact_spot_v4_only_when_declared(
+    operator,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    description = {
+        "name": (
+            "projects/neural-dragnet/locations/us-central2-b/nodes/" "experiment4-sae-f"
+        ),
+        "acceleratorType": "v4-32",
+        "state": "READY",
+        "createTime": "2026-07-28T12:00:00.000Z",
+        "schedulingConfig": {"spot": True, "preemptible": True},
+    }
+
+    class Completed:
+        returncode = 0
+        stdout = json.dumps(description)
+        stderr = ""
+
+    monkeypatch.setattr(operator.subprocess, "run", lambda *_a, **_k: Completed())
+    args = arguments(
+        operator,
+        tmp_path,
+        accelerator_type="v4-32",
+        provisioning_model="SPOT",
+    )
+    args.zone = "us-central2-b"
+    result = operator.attest(args)
+    assert result["contract"]["provisioning_model"] == "SPOT"
+    assert result["attestation"]["spot"] is True
+
+    mismatch = arguments(
+        operator,
+        tmp_path / "mismatch",
+        accelerator_type="v4-32",
+        provisioning_model="ON_DEMAND",
+    )
+    mismatch.zone = "us-central2-b"
+    with pytest.raises(
+        operator.RegionalExecutionError, match="exact ready provisioned"
+    ):
+        operator.attest(mismatch)

@@ -52,10 +52,12 @@ already-composed output.
 
 The experiment distinguishes four claims:
 
-1. **Alignment:** true expert identity must beat a load-preserving
-   randomized-ID hybrid.
-2. **Architecture:** the hybrid must beat a global candidate-matched
-   dictionary.
+1. **Alignment:** true expert identity must beat a per-sequence randomized-ID
+   hybrid with the same per-token route cardinality and sparse candidate
+   budget.
+2. **Architecture:** the complete routed/shared hybrid factorization,
+   including its known Gemma recomposition, must beat a global
+   candidate-matched dictionary.
 3. **Capacity:** the hybrid is compared directly with a global
    parameter-matched dictionary.
 4. **Efficiency:** the hybrid's earliest measured checkpoint reaching the
@@ -187,11 +189,13 @@ trainable encoder/decoder/bias parameters. H exposes
 
 R changes only the routed bank key. For every packed sequence and training
 seed, a keyed deterministic bijection maps each true expert ID to a randomized
-bank ID. It preserves bank traffic, eight unique visible banks, shared
-dictionary use, candidate count, parameter count, and L0 while destroying
-stable expert meaning. The same mapping is used in training and held-out
-evaluation. A global fixed permutation, per-token remapping, or
-inference-only shuffle is invalid.
+bank ID. It preserves total routed traffic, eight unique visible banks per
+token, shared dictionary use, candidate count, parameter count, and L0 while
+destroying stable expert meaning. Because the bijection changes by packed
+sequence, it need not preserve each bank's aggregate exposure; H/R exposure is
+reported explicitly. The same mapping is used in training and held-out
+evaluation. A global fixed permutation, per-token remapping, or inference-only
+shuffle is invalid.
 
 B and F each use one global dictionary and decode `y_t` directly. B has 8,192
 features and F has 69,632. Both use exact per-token TopK-64. No dense latent
@@ -298,6 +302,24 @@ The direct resident campaign therefore requires no standalone qualification
 run. Correctness, finiteness, exact L0, data identity, resumability, and the
 cash ceiling remain fail-closed.
 
+Cloud availability is a scheduler state, not a scientific attempt. Before
+creating an attempt intent or reserving attempt cost, the controller records a
+typed observation of the exact plan-bound TPU incarnation and requires both
+`state=READY` and `health=HEALTHY`. An absent or forming node, an unhealthy but
+recoverable node, or a transient control-plane failure leaves its work pending
+and places only that resource worker on a bounded polling cooldown; another
+eligible ready slice may claim the task. Malformed or unauthorized
+observations remain hard errors. Terminal TPU states, accelerator drift, or
+create-time/incarnation drift produce append-only
+`terminal_replacement_required` evidence and stop promptly; this controller
+does not mutate cloud resources. If an in-flight attempt fails through SSH or
+resource loss, it is relabeled `spot_preemption` only when the pre-attempt
+observation proved a ready spot node and the post-failure observation proves
+that exact node terminal or absent. The attempt, conservative cost
+reservation, and both observations remain in the audit trail, and the
+campaign stops for fresh replacement evidence and replanning. Unconfirmed
+transport failures retain the bounded transient-retry policy.
+
 This experiment intentionally retains general sharded XLA primitives rather
 than introducing a new hand-written routed grouped kernel. The measured bank
 traffic and winning routed/shared geometry from this and the immediately
@@ -312,6 +334,24 @@ the projected remaining work, leaving USD 5.00 contingency. It must not launch
 a task whose conservative projection would cross USD 50.00. Cost pressure may
 reduce parallelism or stop with an incomplete verdict; it may not silently
 reduce tokens, seeds, conditions, or evaluation.
+
+The controller binds a durable campaign clock and conservatively accounts
+infrastructure at USD 1.25/hour. Its finite wall bound is derived from the USD
+45 protected launch envelope after subtracting already-spent cost and the
+baseline reserves for all 24 training and 18 evaluation attempts. A 15-second
+watchdog uses the greater of the fixed reserve or accrued wall cost, protects
+all not-yet-created baseline attempt reserves, and stops with an immutable
+budget record before consuming the USD 5 contingency.
+
+After the eighteenth evaluation, the controller seals the budget ledger and
+the JSON/Markdown scientific report without operator intervention. Cash spend
+is the plan's already-spent amount plus the greater of the fixed reserve or
+USD 1.25/hour from the durable campaign start through the immutable evaluation
+completion time; TPU attempt reservations are not cash charges. Quota-funded
+TPU time is the sum of the cumulative 10M training chip-seconds for both
+panels, all three seeds, and H/R/B/F exactly once. Evaluation TPU chip-seconds
+are not present in the Experiment-5 scientific-result contract, so the final
+campaign record explicitly marks them absent rather than estimating them.
 
 H and F within one seed must use the same accelerator generation for a
 headline chip-second ratio. Raw chip-seconds are always retained across
