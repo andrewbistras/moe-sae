@@ -1167,8 +1167,18 @@ def observe_local_jax_controller(
 
     try:
         import jax
+        from moe_sae.runtime import (
+            RuntimeDependencyError,
+            initialize_jax_distributed,
+        )
     except ImportError as error:  # pragma: no cover - TPU dependency boundary
         raise RegionalExecutionError("controller probe requires JAX") from error
+    try:
+        initialize_jax_distributed()
+    except RuntimeDependencyError as error:
+        raise RegionalExecutionError(
+            "controller probe could not initialize distributed JAX"
+        ) from error
     devices = tuple(jax.devices())
     local_devices = tuple(jax.local_devices())
     try:

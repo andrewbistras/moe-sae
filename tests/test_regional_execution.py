@@ -4,10 +4,13 @@ import copy
 import json
 import subprocess
 import sys
+import types
 from pathlib import Path
 
 import pytest
 
+import moe_sae.regional_execution as regional_execution
+import moe_sae.runtime as runtime
 from moe_sae.object_store import ObjectIdentity, ObjectStoreError
 from moe_sae.regional_execution import (
     MINIMUM_10M_PROCESS_CACHE_FREE_BYTES,
@@ -35,6 +38,58 @@ from moe_sae.regional_execution import (
 )
 
 CRC32C = "AAAAAA=="
+
+
+def test_controller_observation_initializes_distributed_jax_before_devices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = {"initialized": False}
+
+    def initialize() -> None:
+        state["initialized"] = True
+
+    def devices():
+        assert state["initialized"]
+        return [
+            types.SimpleNamespace(platform="tpu", device_kind="TPU v5 lite")
+            for _ in range(16)
+        ]
+
+    fake_jax = types.SimpleNamespace(
+        devices=devices,
+        local_devices=lambda: devices()[:4],
+        process_index=lambda: 1,
+        process_count=lambda: 4,
+        device_count=lambda: 16,
+        local_device_count=lambda: 4,
+    )
+    monkeypatch.setattr(runtime, "initialize_jax_distributed", initialize)
+    monkeypatch.setitem(sys.modules, "jax", fake_jax)
+    monkeypatch.setattr(
+        Path,
+        "read_text",
+        lambda _self, **_kwargs: "00000000-0000-0000-0000-000000000001\n",
+    )
+    contract = build_accelerator_contract(
+        run_id="probe-test",
+        scientific_model="hybrid",
+        condition="all",
+        project="neural-dragnet",
+        tpu_name="gemma4-v5e",
+        resource_create_time="2026-07-28T12:40:53Z",
+        region="us-central1",
+        zone="us-central1-a",
+        accelerator_type="v5litepod-16",
+    )
+
+    observation = regional_execution.observe_local_jax_controller(
+        contract=contract,
+        probe_id="probe-test",
+        controller_index=2,
+    )
+    assert state["initialized"]
+    assert observation["process_index"] == 1
+    assert observation["global_device_count"] == 16
 
 
 def object_identity(
