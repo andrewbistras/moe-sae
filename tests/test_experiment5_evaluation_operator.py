@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import importlib.util
 import re
 import sys
@@ -240,3 +241,77 @@ def test_main_fans_all_four_controllers_fetches_validates_and_publishes_pair(
         Path(environment["EXPERIMENT5_PAIRED_SCORES_PATH_CONTROLLER"]).read_bytes()
         == b"{}\n"
     )
+
+
+@pytest.mark.parametrize("rename_errno", (errno.EEXIST, errno.ENOTEMPTY))
+def test_publish_pair_accepts_matching_nfs_rename_race(
+    operator,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    rename_errno: int,
+) -> None:
+    result = tmp_path / "published" / "scientific-result.json"
+    paired = tmp_path / "published" / "paired-scores.json"
+    settings = SimpleNamespace(
+        result_path_controller=result,
+        paired_scores_path_controller=paired,
+    )
+    result_payload = b'{"result":"expected"}\n'
+    paired_payload = b'{"paired":"expected"}\n'
+
+    def raced_rename(_staging: Path, destination: Path) -> None:
+        destination.mkdir()
+        result.write_bytes(result_payload)
+        paired.write_bytes(paired_payload)
+        raise OSError(rename_errno, "simulated NFS rename race")
+
+    monkeypatch.setattr(operator.os, "rename", raced_rename)
+
+    operator._publish_pair(
+        settings,
+        result_payload=result_payload,
+        paired_payload=paired_payload,
+    )
+
+    assert result.read_bytes() == result_payload
+    assert paired.read_bytes() == paired_payload
+    assert not any(tmp_path.glob(".published.tmp-*"))
+
+
+@pytest.mark.parametrize("rename_errno", (errno.EEXIST, errno.ENOTEMPTY))
+def test_publish_pair_rejects_mismatched_nfs_rename_race(
+    operator,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    rename_errno: int,
+) -> None:
+    result = tmp_path / "published" / "scientific-result.json"
+    paired = tmp_path / "published" / "paired-scores.json"
+    settings = SimpleNamespace(
+        result_path_controller=result,
+        paired_scores_path_controller=paired,
+    )
+    result_payload = b'{"result":"expected"}\n'
+    paired_payload = b'{"paired":"expected"}\n'
+
+    def raced_rename(_staging: Path, destination: Path) -> None:
+        destination.mkdir()
+        result.write_bytes(b'{"result":"different"}\n')
+        paired.write_bytes(paired_payload)
+        raise OSError(rename_errno, "simulated NFS rename race")
+
+    monkeypatch.setattr(operator.os, "rename", raced_rename)
+
+    with pytest.raises(
+        operator.OperatorError,
+        match="publication raced with different evidence",
+    ):
+        operator._publish_pair(
+            settings,
+            result_payload=result_payload,
+            paired_payload=paired_payload,
+        )
+
+    assert result.read_bytes() != result_payload
+    assert paired.read_bytes() == paired_payload
+    assert not any(tmp_path.glob(".published.tmp-*"))

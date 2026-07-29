@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
 import re
@@ -615,15 +616,21 @@ def _publish_pair(
         (staging / result.name).write_bytes(result_payload)
         (staging / paired.name).write_bytes(paired_payload)
         os.rename(staging, destination)
-    except FileExistsError:
+    except OSError as error:
+        if error.errno not in {errno.EEXIST, errno.ENOTEMPTY}:
+            raise
         if (
             result.is_file()
+            and not result.is_symlink()
             and paired.is_file()
+            and not paired.is_symlink()
             and result.read_bytes() == result_payload
             and paired.read_bytes() == paired_payload
         ):
             return
-        raise OperatorError("completion publication raced with different evidence")
+        raise OperatorError(
+            "completion publication raced with different evidence"
+        ) from error
     finally:
         if staging.exists():
             for child in staging.iterdir():
