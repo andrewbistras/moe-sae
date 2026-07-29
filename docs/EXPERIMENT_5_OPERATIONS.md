@@ -185,7 +185,7 @@ GCS and the regional mirror.
 First verify there is no active Experiment 5 or horizon worker:
 
 ```bash
-if systemctl --user --state=running --no-legend --plain \
+if systemctl --user list-units --state=running --no-legend --plain \
   'moe-sae-experiment5-*' | grep -q .; then
   echo 'an Experiment 5 controller unit is still running' >&2
   exit 1
