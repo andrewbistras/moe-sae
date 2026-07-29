@@ -435,6 +435,66 @@ def _evidence(
     return cells, timings, costs
 
 
+def _with_cross_hardware_sst_representation(
+    cells: list[PrimaryCellEvidence],
+    timings: list[BundleTimingEvidence],
+    *,
+    relative_shift: float,
+) -> tuple[list[PrimaryCellEvidence], list[BundleTimingEvidence]]:
+    selected_identity = ("transcoder", 2)
+    original_timing = next(
+        row
+        for row in timings
+        if (row.panel, row.seed) == selected_identity
+    )
+    shifted_timing = dataclasses.replace(
+        original_timing,
+        accelerator_type="v5litepod-16",
+    )
+    shifted_timings = [
+        shifted_timing
+        if (row.panel, row.seed) == selected_identity
+        else row
+        for row in timings
+    ]
+    shifted_cells: list[PrimaryCellEvidence] = []
+    for cell in cells:
+        if (cell.panel, cell.seed) != selected_identity:
+            shifted_cells.append(cell)
+            continue
+        source = cell.scores
+        shifted_scores = RoutedLadderTokenScores(
+            condition=source.condition,
+            panel=source.panel,
+            seed=source.seed,
+            checkpoint_tokens=source.checkpoint_tokens,
+            source_revision=source.source_revision,
+            capture_manifest_sha256=source.capture_manifest_sha256,
+            recomposition_sidecar_sha256=(
+                source.recomposition_sidecar_sha256
+            ),
+            sequence_id=source.sequence_id,
+            position=source.position,
+            endpoint_sse=source.endpoint_sse,
+            endpoint_sst={
+                endpoint: np.asarray(
+                    source.endpoint_sst[endpoint],
+                    dtype=np.float64,
+                )
+                * (1.0 + relative_shift)
+                for endpoint in ENDPOINTS
+            },
+        )
+        shifted_cells.append(
+            dataclasses.replace(
+                cell,
+                scores=shifted_scores,
+                bundle_timing=shifted_timing,
+            )
+        )
+    return shifted_cells, shifted_timings
+
+
 def test_v3_bootstraps_are_deterministic_and_require_three_paired_seeds() -> None:
     pairs = [
         (
@@ -527,6 +587,83 @@ def test_crossed_bootstrap_preserves_common_sequence_covariance() -> None:
         crossed["bootstrap_unit"]
         == "crossed_seed_and_packed_sequence"
     )
+
+
+def test_report_records_equivalent_cross_hardware_sst_representations(
+    tmp_path: Path,
+) -> None:
+    cells, timings, costs = _evidence(tmp_path)
+    cells, timings = _with_cross_hardware_sst_representation(
+        cells,
+        timings,
+        relative_shift=5e-9,
+    )
+    report = build_v3_primary_report_from_evidence(
+        _evaluation_plan(tmp_path),
+        cells,
+        timings,
+        costs,
+    )
+
+    representations = report["common_evaluation_identity"][
+        "sst_representations"
+    ]
+    shifted = next(
+        row
+        for row in representations
+        if row["panel"] == "transcoder" and row["seed"] == 2
+    )
+    reference = next(
+        row
+        for row in representations
+        if row["panel"] == "sae" and row["seed"] == 0
+    )
+    assert shifted["accelerator_type"] == "v5litepod-16"
+    assert (
+        shifted["endpoints"]["component"]["sst_sha256"]
+        != reference["endpoints"]["component"]["sst_sha256"]
+    )
+    assert (
+        0
+        < shifted["endpoints"]["component"][
+            "aggregate_relative_difference"
+        ]
+        <= 1e-8
+    )
+    assert (
+        0
+        < shifted["endpoints"]["component"][
+            "normalized_l1_difference"
+        ]
+        <= 1e-7
+    )
+    markdown = render_v3_primary_report_markdown(report)
+    assert "Distinct hardware representations are not described as bit-identical" in (
+        markdown
+    )
+    assert "v5litepod-16" in markdown
+    assert validate_v3_primary_report(report) == report
+
+
+def test_report_rejects_meaningful_cross_hardware_sst_divergence(
+    tmp_path: Path,
+) -> None:
+    cells, timings, costs = _evidence(tmp_path)
+    cells, timings = _with_cross_hardware_sst_representation(
+        cells,
+        timings,
+        relative_shift=2e-7,
+    )
+    with pytest.raises(
+        RoutedLadderV3ReportError,
+        match="exceeds the numerical-equivalence envelope",
+    ):
+        build_v3_primary_report_from_evidence(
+            _evaluation_plan(tmp_path),
+            cells,
+            timings,
+            costs,
+        )
 
 
 def test_v3_report_is_complete_self_hashed_and_create_only(

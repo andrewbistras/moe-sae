@@ -97,6 +97,13 @@ SOFTPLUS_CONDITION = "A512Softplus"
 CONTRAST = f"{SOFTPLUS_CONDITION}-{RELU_CONDITION}"
 _SHA256_LENGTH = 64
 _CROSSED_BOOTSTRAP_UNIT = "crossed_seed_and_packed_sequence"
+_SST_AGGREGATE_RELATIVE_TOLERANCE = 1e-8
+_SST_NORMALIZED_L1_TOLERANCE = 1e-7
+_COMMON_EVALUATION_SCOPE = (
+    "all 36 cells share exact token and target parents; target-only SST is "
+    "bit-exact within each panel/seed six-cell group and explicitly "
+    "numerically equivalent across hardware"
+)
 _TRAINING_EXECUTION_BY_ORIGIN = {
     "fresh_v3": (
         "routed_ladder_v3_execution",
@@ -559,6 +566,48 @@ def _sequence_sufficient_statistics(
     return sequence_sst, sequence_delta
 
 
+def _sst_equivalence_metrics(
+    reference: np.ndarray,
+    candidate: np.ndarray,
+) -> dict[str, float]:
+    """Measure a target-only SST representation against one reference."""
+
+    left = np.asarray(reference, dtype=np.float64)
+    right = np.asarray(candidate, dtype=np.float64)
+    if left.shape != right.shape or left.ndim != 1 or left.size == 0:
+        raise RoutedLadderV3ReportError(
+            "cross-hardware SST representation shape changed"
+        )
+    reference_total = float(left.sum(dtype=np.float64))
+    reference_l1 = float(np.abs(left).sum(dtype=np.float64))
+    if reference_total <= 0 or reference_l1 <= 0:
+        raise RoutedLadderV3ReportError(
+            "cross-hardware SST reference must have positive mass"
+        )
+    difference = np.abs(right - left)
+    metrics = {
+        "aggregate_relative_difference": (
+            abs(float(right.sum(dtype=np.float64)) - reference_total)
+            / abs(reference_total)
+        ),
+        "normalized_l1_difference": (
+            float(difference.sum(dtype=np.float64)) / reference_l1
+        ),
+        "max_abs_difference": float(difference.max(initial=0.0)),
+    }
+    if (
+        metrics["aggregate_relative_difference"]
+        > _SST_AGGREGATE_RELATIVE_TOLERANCE
+        or metrics["normalized_l1_difference"]
+        > _SST_NORMALIZED_L1_TOLERANCE
+    ):
+        raise RoutedLadderV3ReportError(
+            "cross-hardware SST representation exceeds the numerical-"
+            "equivalence envelope"
+        )
+    return metrics
+
+
 def paired_v3_bootstrap(
     relu_scores: RoutedLadderTokenScores,
     softplus_scores: RoutedLadderTokenScores,
@@ -682,14 +731,14 @@ def hierarchical_v3_bootstrap(
             != first.recomposition_sidecar_sha256
             or not np.array_equal(left.sequence_id, first.sequence_id)
             or not np.array_equal(left.position, first.position)
-            or not np.array_equal(
-                left.endpoint_sst[endpoint],
-                first.endpoint_sst[endpoint],
-            )
         ):
             raise RoutedLadderV3ReportError(
-                "three-seed bootstrap cohorts do not share one token/SST parent"
+                "three-seed bootstrap cohorts do not share one token parent"
             )
+        _sst_equivalence_metrics(
+            first.endpoint_sst[endpoint],
+            left.endpoint_sst[endpoint],
+        )
     denominators: list[np.ndarray] = []
     deltas: list[np.ndarray] = []
     seed_effects: list[float] = []
@@ -718,7 +767,7 @@ def hierarchical_v3_bootstrap(
     )
     rng = np.random.Generator(np.random.PCG64(seed))
     samples = np.empty(replicates, dtype=np.float64)
-    common_denominator_rows = denominators[0]
+    sequence_count = denominators[0].size
     for start in range(0, replicates, chunk_size):
         end = min(start + chunk_size, replicates)
         rows = end - start
@@ -730,15 +779,11 @@ def hierarchical_v3_bootstrap(
         )
         sequence_draws = rng.integers(
             0,
-            common_denominator_rows.size,
-            size=(rows, common_denominator_rows.size),
+            sequence_count,
+            size=(rows, sequence_count),
             endpoint=False,
         )
-        denominator = common_denominator_rows[sequence_draws].sum(
-            axis=1,
-            dtype=np.float64,
-        )
-        replicate_delta = np.zeros(rows, dtype=np.float64)
+        replicate_effect = np.zeros(rows, dtype=np.float64)
         for slot in range(len(SEEDS)):
             selected_seed = seed_draws[:, slot]
             for seed_index in range(len(SEEDS)):
@@ -746,15 +791,21 @@ def hierarchical_v3_bootstrap(
                 if not np.any(mask):
                     continue
                 delta_rows = deltas[seed_index]
-                replicate_delta[mask] += delta_rows[
-                    sequence_draws[mask]
+                denominator_rows = denominators[seed_index]
+                selected_draws = sequence_draws[mask]
+                selected_denominator = denominator_rows[
+                    selected_draws
                 ].sum(
                     axis=1,
                     dtype=np.float64,
                 )
-        samples[start:end] = (
-            replicate_delta / len(SEEDS) / denominator
-        )
+                replicate_effect[mask] += delta_rows[
+                    selected_draws
+                ].sum(
+                    axis=1,
+                    dtype=np.float64,
+                ) / selected_denominator
+        samples[start:end] = replicate_effect / len(SEEDS)
     lower, upper = np.quantile(samples, (0.025, 0.975), method="linear")
     return {
         "estimate_mean_ev_difference": estimate,
@@ -1376,11 +1427,8 @@ def _validate_common_evaluation(
             "common evaluation validation requires all 36 cells"
         )
     first = cells[0].scores
-    common_sst = {
-        endpoint: np.asarray(first.endpoint_sst[endpoint], dtype=np.float64)
-        for endpoint in ENDPOINTS
-    }
-    for cell in cells[1:]:
+    groups: dict[tuple[str, int], list[PrimaryCellEvidence]] = {}
+    for cell in cells:
         scores = cell.scores
         if (
             scores.tokens != first.tokens
@@ -1396,14 +1444,102 @@ def _validate_common_evaluation(
             raise RoutedLadderV3ReportError(
                 f"common evaluation token identity changed: {cell.identity}"
             )
-        for endpoint in ENDPOINTS:
-            if not np.array_equal(
-                scores.endpoint_sst[endpoint],
-                common_sst[endpoint],
+        groups.setdefault((cell.panel, cell.seed), []).append(cell)
+    expected_groups = {
+        (panel, seed) for panel in PANELS for seed in SEEDS
+    }
+    if set(groups) != expected_groups:
+        raise RoutedLadderV3ReportError(
+            "common evaluation does not contain six panel/seed groups"
+        )
+
+    reference_cell = groups[(PANELS[0], SEEDS[0])][0]
+    reference_sst = {
+        endpoint: np.asarray(
+            reference_cell.scores.endpoint_sst[endpoint],
+            dtype=np.float64,
+        )
+        for endpoint in ENDPOINTS
+    }
+    representations: list[dict[str, Any]] = []
+    endpoint_metrics: dict[str, list[dict[str, float]]] = {
+        endpoint: [] for endpoint in ENDPOINTS
+    }
+    for panel in PANELS:
+        for seed in SEEDS:
+            group = groups[(panel, seed)]
+            expected_cells = {
+                (condition, checkpoint)
+                for condition in CONDITIONS
+                for checkpoint in CHECKPOINT_TOKENS
+            }
+            if (
+                len(group) != len(expected_cells)
+                or {
+                    (cell.condition, cell.checkpoint_tokens)
+                    for cell in group
+                }
+                != expected_cells
             ):
                 raise RoutedLadderV3ReportError(
-                    f"common {endpoint} SST changed: {cell.identity}"
+                    f"panel/seed SST group is incomplete: {panel}/seed{seed}"
                 )
+            exemplar = group[0]
+            for cell in group[1:]:
+                if cell.bundle_timing != exemplar.bundle_timing:
+                    raise RoutedLadderV3ReportError(
+                        f"panel/seed hardware identity changed within six "
+                        f"matched cells: {panel}/seed{seed}"
+                    )
+                for endpoint in ENDPOINTS:
+                    if (
+                        not np.array_equal(
+                            cell.scores.endpoint_sst[endpoint],
+                            exemplar.scores.endpoint_sst[endpoint],
+                        )
+                        or cell.scores.endpoint_sst_sha256(endpoint)
+                        != exemplar.scores.endpoint_sst_sha256(endpoint)
+                    ):
+                        raise RoutedLadderV3ReportError(
+                            f"{endpoint} SST is not exact within six matched "
+                            f"cells: {panel}/seed{seed}"
+                        )
+            hardware = exemplar.bundle_timing.accelerator_type
+            selected_sst = {
+                endpoint: np.asarray(
+                    exemplar.scores.endpoint_sst[endpoint],
+                    dtype=np.float64,
+                )
+                for endpoint in ENDPOINTS
+            }
+            endpoints: dict[str, dict[str, Any]] = {}
+            for endpoint in ENDPOINTS:
+                metrics = _sst_equivalence_metrics(
+                    reference_sst[endpoint],
+                    selected_sst[endpoint],
+                )
+                endpoint_metrics[endpoint].append(metrics)
+                endpoints[endpoint] = {
+                    "sst": float(
+                        selected_sst[endpoint].sum(dtype=np.float64)
+                    ),
+                    "sst_sha256": (
+                        exemplar.scores.endpoint_sst_sha256(endpoint)
+                    ),
+                    **metrics,
+                }
+            representations.append(
+                {
+                    "panel": panel,
+                    "seed": seed,
+                    "accelerator_type": hardware,
+                    "chip_count": exemplar.bundle_timing.chip_count,
+                    "bundle_result_sha256": (
+                        exemplar.bundle_timing.bundle_result_sha256
+                    ),
+                    "endpoints": endpoints,
+                }
+            )
     return {
         "evaluation_tokens": first.tokens,
         "packed_sequences": first.packed_sequences,
@@ -1414,16 +1550,35 @@ def _validate_common_evaluation(
         ),
         "endpoint_sst": {
             endpoint: {
-                "sst": float(
-                    common_sst[endpoint].sum(dtype=np.float64)
+                "reference_sst": float(
+                    reference_sst[endpoint].sum(dtype=np.float64)
                 ),
-                "sst_sha256": first.endpoint_sst_sha256(endpoint),
+                "reference_sst_sha256": (
+                    reference_cell.scores.endpoint_sst_sha256(endpoint)
+                ),
+                "aggregate_relative_tolerance": (
+                    _SST_AGGREGATE_RELATIVE_TOLERANCE
+                ),
+                "normalized_l1_tolerance": (
+                    _SST_NORMALIZED_L1_TOLERANCE
+                ),
+                "maximum_observed_aggregate_relative_difference": max(
+                    row["aggregate_relative_difference"]
+                    for row in endpoint_metrics[endpoint]
+                ),
+                "maximum_observed_normalized_l1_difference": max(
+                    row["normalized_l1_difference"]
+                    for row in endpoint_metrics[endpoint]
+                ),
+                "maximum_observed_max_abs_difference": max(
+                    row["max_abs_difference"]
+                    for row in endpoint_metrics[endpoint]
+                ),
             }
             for endpoint in ENDPOINTS
         },
-        "scope": (
-            "all_36_cells_share_exact_token_rows_and_target_only_sst_rows"
-        ),
+        "sst_representations": representations,
+        "scope": _COMMON_EVALUATION_SCOPE,
     }
 
 
@@ -2405,8 +2560,11 @@ def build_v3_primary_report_from_evidence(
             "context_is_causal": False,
             "notes": [
                 (
-                    "All 36 cells use exactly the same held-out token rows "
-                    "and target-only SST rows."
+                    "All 36 cells use exactly the same held-out token and "
+                    "target parents. SST rows are bit-exact within each "
+                    "panel/seed six-cell group; distinct hardware "
+                    "representations are explicitly recorded under a strict "
+                    "numerical-equivalence envelope."
                 ),
                 (
                     "Per-seed intervals resample packed sequences; the n=3 "
@@ -2495,6 +2653,36 @@ def _render_v3_primary_markdown_core(value: Mapping[str, Any]) -> str:
                 "sequence bootstrap replicates. No multiplicity adjustment "
                 "is applied."
             ),
+            "",
+            "## Target-only SST representations",
+            "",
+            (
+                "SST rows are exact within each panel/seed group. Distinct "
+                "hardware representations are not described as bit-identical; "
+                "they must pass aggregate-relative <= 1e-8 and normalized-L1 "
+                "<= 1e-7."
+            ),
+            "",
+            "| panel | seed | hardware | endpoint | SST hash | SST | "
+            "aggregate rel | normalized L1 | max abs |",
+            "|---|---:|---|---|---|---:|---:|---:|---:|",
+        ]
+    )
+    for representation in value["common_evaluation_identity"][
+        "sst_representations"
+    ]:
+        for endpoint in ENDPOINTS:
+            row = representation["endpoints"][endpoint]
+            lines.append(
+                f"| {representation['panel']} | {representation['seed']} | "
+                f"{representation['accelerator_type']} | {endpoint} | "
+                f"`{row['sst_sha256']}` | {row['sst']:.9f} | "
+                f"{row['aggregate_relative_difference']:.3e} | "
+                f"{row['normalized_l1_difference']:.3e} | "
+                f"{row['max_abs_difference']:.3e} |"
+            )
+    lines.extend(
+        [
             "",
             "## Learning-curve contrasts",
             "",
@@ -2760,7 +2948,21 @@ def validate_v3_primary_report(
             "primary estimand or fixed-L0 claim changed"
         )
     common = report["common_evaluation_identity"]
-    if not isinstance(common, Mapping):
+    if (
+        not isinstance(common, Mapping)
+        or set(common)
+        != {
+            "evaluation_tokens",
+            "packed_sequences",
+            "token_identity_sha256",
+            "capture_manifest_sha256",
+            "recomposition_sidecar_sha256",
+            "endpoint_sst",
+            "sst_representations",
+            "scope",
+        }
+        or common.get("scope") != _COMMON_EVALUATION_SCOPE
+    ):
         raise RoutedLadderV3ReportError(
             "common evaluation identity is invalid"
         )
@@ -2790,12 +2992,212 @@ def validate_v3_primary_report(
         raise RoutedLadderV3ReportError("common endpoint SST inventory changed")
     for endpoint in ENDPOINTS:
         row = common_endpoints[endpoint]
-        if not isinstance(row, Mapping):
+        if (
+            not isinstance(row, Mapping)
+            or set(row)
+            != {
+                "reference_sst",
+                "reference_sst_sha256",
+                "aggregate_relative_tolerance",
+                "normalized_l1_tolerance",
+                "maximum_observed_aggregate_relative_difference",
+                "maximum_observed_normalized_l1_difference",
+                "maximum_observed_max_abs_difference",
+            }
+            or row.get("aggregate_relative_tolerance")
+            != _SST_AGGREGATE_RELATIVE_TOLERANCE
+            or row.get("normalized_l1_tolerance")
+            != _SST_NORMALIZED_L1_TOLERANCE
+        ):
             raise RoutedLadderV3ReportError(
                 f"common {endpoint} SST is invalid"
             )
-        _finite(row.get("sst"), f"common {endpoint} SST", positive=True)
-        _sha256(row.get("sst_sha256"), f"common {endpoint} SST hash")
+        _finite(
+            row.get("reference_sst"),
+            f"common {endpoint} reference SST",
+            positive=True,
+        )
+        _sha256(
+            row.get("reference_sst_sha256"),
+            f"common {endpoint} reference SST hash",
+        )
+        for name in (
+            "maximum_observed_aggregate_relative_difference",
+            "maximum_observed_normalized_l1_difference",
+            "maximum_observed_max_abs_difference",
+        ):
+            if _finite(row.get(name), f"common {endpoint} {name}") < 0:
+                raise RoutedLadderV3ReportError(
+                    f"common {endpoint} equivalence metric is negative"
+                )
+        if (
+            row["maximum_observed_aggregate_relative_difference"]
+            > _SST_AGGREGATE_RELATIVE_TOLERANCE
+            or row["maximum_observed_normalized_l1_difference"]
+            > _SST_NORMALIZED_L1_TOLERANCE
+        ):
+            raise RoutedLadderV3ReportError(
+                f"common {endpoint} SST exceeds its equivalence envelope"
+            )
+    raw_representations = common.get("sst_representations")
+    if (
+        not isinstance(raw_representations, list)
+        or len(raw_representations) != len(PANELS) * len(SEEDS)
+    ):
+        raise RoutedLadderV3ReportError(
+            "common SST representation inventory changed"
+        )
+    sst_representation_grid: dict[
+        tuple[str, int], Mapping[str, Any]
+    ] = {}
+    observed_metrics: dict[str, list[Mapping[str, Any]]] = {
+        endpoint: [] for endpoint in ENDPOINTS
+    }
+    for representation in raw_representations:
+        if (
+            not isinstance(representation, Mapping)
+            or set(representation)
+            != {
+                "panel",
+                "seed",
+                "accelerator_type",
+                "chip_count",
+                "bundle_result_sha256",
+                "endpoints",
+            }
+        ):
+            raise RoutedLadderV3ReportError(
+                "common SST representation fields changed"
+            )
+        identity = (
+            representation.get("panel"),
+            representation.get("seed"),
+        )
+        accelerator_type = representation.get("accelerator_type")
+        chip_count = _positive_int(
+            representation.get("chip_count"),
+            f"{identity} SST representation chip count",
+        )
+        endpoints = representation.get("endpoints")
+        if (
+            identity[0] not in PANELS
+            or identity[1] not in SEEDS
+            or identity in sst_representation_grid
+            or not isinstance(accelerator_type, str)
+            or _CHIP_COUNT_BY_ACCELERATOR.get(accelerator_type)
+            != chip_count
+            or not isinstance(endpoints, Mapping)
+            or set(endpoints) != set(ENDPOINTS)
+        ):
+            raise RoutedLadderV3ReportError(
+                f"common SST representation identity changed: {identity}"
+            )
+        _sha256(
+            representation.get("bundle_result_sha256"),
+            f"{identity} SST representation bundle hash",
+        )
+        sst_representation_grid[identity] = representation
+        for endpoint in ENDPOINTS:
+            endpoint_row = endpoints[endpoint]
+            if (
+                not isinstance(endpoint_row, Mapping)
+                or set(endpoint_row)
+                != {
+                    "sst",
+                    "sst_sha256",
+                    "aggregate_relative_difference",
+                    "normalized_l1_difference",
+                    "max_abs_difference",
+                }
+            ):
+                raise RoutedLadderV3ReportError(
+                    f"{identity} {endpoint} SST representation changed"
+                )
+            _finite(
+                endpoint_row.get("sst"),
+                f"{identity} {endpoint} SST",
+                positive=True,
+            )
+            _sha256(
+                endpoint_row.get("sst_sha256"),
+                f"{identity} {endpoint} SST hash",
+            )
+            aggregate = _finite(
+                endpoint_row.get("aggregate_relative_difference"),
+                f"{identity} {endpoint} aggregate difference",
+            )
+            normalized_l1 = _finite(
+                endpoint_row.get("normalized_l1_difference"),
+                f"{identity} {endpoint} normalized L1 difference",
+            )
+            maximum = _finite(
+                endpoint_row.get("max_abs_difference"),
+                f"{identity} {endpoint} maximum difference",
+            )
+            if (
+                aggregate < 0
+                or normalized_l1 < 0
+                or maximum < 0
+                or aggregate > _SST_AGGREGATE_RELATIVE_TOLERANCE
+                or normalized_l1 > _SST_NORMALIZED_L1_TOLERANCE
+            ):
+                raise RoutedLadderV3ReportError(
+                    f"{identity} {endpoint} SST is outside the equivalence "
+                    "envelope"
+                )
+            observed_metrics[endpoint].append(endpoint_row)
+    if set(sst_representation_grid) != {
+        (panel, seed) for panel in PANELS for seed in SEEDS
+    }:
+        raise RoutedLadderV3ReportError(
+            "common SST representation grid is incomplete"
+        )
+    for endpoint in ENDPOINTS:
+        summary = common_endpoints[endpoint]
+        reference = sst_representation_grid[
+            (PANELS[0], SEEDS[0])
+        ]["endpoints"][endpoint]
+        if (
+            summary["reference_sst_sha256"] != reference["sst_sha256"]
+            or not math.isclose(
+                summary["reference_sst"],
+                reference["sst"],
+                rel_tol=0,
+                abs_tol=0,
+            )
+            or not math.isclose(
+                summary[
+                    "maximum_observed_aggregate_relative_difference"
+                ],
+                max(
+                    row["aggregate_relative_difference"]
+                    for row in observed_metrics[endpoint]
+                ),
+                rel_tol=0,
+                abs_tol=1e-18,
+            )
+            or not math.isclose(
+                summary["maximum_observed_normalized_l1_difference"],
+                max(
+                    row["normalized_l1_difference"]
+                    for row in observed_metrics[endpoint]
+                ),
+                rel_tol=0,
+                abs_tol=1e-18,
+            )
+            or not math.isclose(
+                summary["maximum_observed_max_abs_difference"],
+                max(
+                    row["max_abs_difference"]
+                    for row in observed_metrics[endpoint]
+                ),
+                rel_tol=0,
+                abs_tol=1e-18,
+            )
+        ):
+            raise RoutedLadderV3ReportError(
+                f"common {endpoint} SST equivalence summary changed"
+            )
 
     raw_cells = report["cells"]
     if not isinstance(raw_cells, list) or len(raw_cells) != CELL_COUNT:
@@ -2891,14 +3293,16 @@ def validate_v3_primary_report(
             raise RoutedLadderV3ReportError(
                 f"cell endpoint inventory changed: {identity}"
             )
+        representation = sst_representation_grid[
+            (str(identity[0]), int(identity[2]))
+        ]
         for endpoint in ENDPOINTS:
+            expected_sst = representation["endpoints"][endpoint]
             _validate_score_summary(
                 endpoints[endpoint],
                 name=f"{identity}.{endpoint}",
-                expected_sst=float(common_endpoints[endpoint]["sst"]),
-                expected_sst_sha256=str(
-                    common_endpoints[endpoint]["sst_sha256"]
-                ),
+                expected_sst=float(expected_sst["sst"]),
+                expected_sst_sha256=str(expected_sst["sst_sha256"]),
             )
         sparsity = row.get("sparsity")
         if (
@@ -3132,6 +3536,9 @@ def validate_v3_primary_report(
         raise RoutedLadderV3ReportError("bundle timing grid is incomplete")
     for cell_identity, cell in cell_grid.items():
         bundle = bundle_grid[(str(cell_identity[0]), int(cell_identity[2]))]
+        representation = sst_representation_grid[
+            (str(cell_identity[0]), int(cell_identity[2]))
+        ]
         timing = cell["timing"]
         if (
             timing["bundle_accelerator_type"] != bundle["accelerator_type"]
@@ -3143,6 +3550,11 @@ def validate_v3_primary_report(
             or timing["bundle_successful_attempt_chip_seconds"]
             != bundle["successful_attempt_chip_seconds"]
             or timing["bundle_timing_scope"] != bundle["timing_scope"]
+            or representation["accelerator_type"]
+            != bundle["accelerator_type"]
+            or representation["chip_count"] != bundle["chip_count"]
+            or representation["bundle_result_sha256"]
+            != bundle["bundle_result_sha256"]
         ):
             raise RoutedLadderV3ReportError(
                 f"cell timing is not bound to its resident bundle: "

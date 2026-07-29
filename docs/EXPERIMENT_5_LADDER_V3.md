@@ -188,12 +188,17 @@ strictly positive decoded values. `zero_selected_slot_fraction` is
 weights. Softplus should therefore report positive L0 32 and zero fraction
 zero; ReLU is allowed to report fewer positives without failing.
 
-Packed-sequence paired intervals use identical held-out rows and a common SST
-within each panel/endpoint. The across-seed primary interval is emitted only
-after all three paired seeds validate. Because every seed is evaluated on the
-same packed sequences, the hierarchical interval treats seed and sequence as
-crossed factors: each bootstrap replicate draws seeds and one common sequence
-sample that is applied to every selected seed occurrence.
+Packed-sequence paired intervals use identical held-out rows and an exact
+common SST within each panel/seed/endpoint six-cell group. Each group records
+its SST hash and accelerator type. Cross-hardware SST representations need
+not be bit-identical, but they must have aggregate-relative difference at
+most `1e-8` and normalized-L1 difference at most `1e-7`; otherwise sealing
+fails. The across-seed primary interval is emitted only after all three paired
+seeds validate. Because every seed is evaluated on the same packed sequences,
+the hierarchical interval treats seed and sequence as crossed factors: each
+bootstrap replicate draws seeds and one common sequence-index sample, then
+computes each sampled seed's effect using that seed's internally exact SST
+denominator before averaging.
 
 Raw marginal chip-seconds are retained for every trajectory. A paired
 Softplus/ReLU cost ratio is emitted only when both trajectories used the same
