@@ -258,7 +258,7 @@ attest_and_probe() {
     --worker=0 \
     --internal-ip \
     --quiet \
-    --command="$REMOTE_UV run --frozen --extra tpu python $TPU_REPO/scripts/tpu/attest_accelerator.py \
+    --command="cd $TPU_REPO && $REMOTE_UV run --frozen --extra tpu python scripts/tpu/attest_accelerator.py \
       --run-id $EVIDENCE_RUN_ID \
       --scientific-model hybrid \
       --condition all \
