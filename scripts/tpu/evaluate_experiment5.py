@@ -11,6 +11,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 import uuid
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -38,6 +39,8 @@ from moe_sae.runtime import (
 PROCESS_COUNT = 4
 REGIONAL_PROCESS_CACHE_MAX_BYTES = 160 * 1024**3
 WORKER_TIMEOUT_SECONDS = 7_500
+NFS_PUBLICATION_VISIBILITY_ATTEMPTS = 21
+NFS_PUBLICATION_VISIBILITY_RETRY_SECONDS = 0.25
 _GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 _SAFE_PHASE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _SAFE_SSH_USER = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
@@ -583,6 +586,55 @@ def _json_payload(payload: bytes, name: str) -> dict:
     return value
 
 
+def _published_pair_state(
+    result: Path,
+    paired: Path,
+    *,
+    result_payload: bytes,
+    paired_payload: bytes,
+) -> str:
+    if result.is_symlink() or paired.is_symlink():
+        return "changed"
+    if not result.exists() or not paired.exists():
+        return "partial"
+    if not result.is_file() or not paired.is_file():
+        return "changed"
+    try:
+        published_result = result.read_bytes()
+        published_paired = paired.read_bytes()
+    except FileNotFoundError:
+        return "partial"
+    if (
+        published_result == result_payload
+        and published_paired == paired_payload
+    ):
+        return "exact"
+    return "changed"
+
+
+def _raced_publication_is_exact(
+    result: Path,
+    paired: Path,
+    *,
+    result_payload: bytes,
+    paired_payload: bytes,
+) -> bool:
+    for attempt in range(NFS_PUBLICATION_VISIBILITY_ATTEMPTS):
+        state = _published_pair_state(
+            result,
+            paired,
+            result_payload=result_payload,
+            paired_payload=paired_payload,
+        )
+        if state == "exact":
+            return True
+        if state == "changed":
+            return False
+        if attempt + 1 < NFS_PUBLICATION_VISIBILITY_ATTEMPTS:
+            time.sleep(NFS_PUBLICATION_VISIBILITY_RETRY_SECONDS)
+    return False
+
+
 def _publish_pair(
     settings: Settings,
     *,
@@ -598,14 +650,12 @@ def _publish_pair(
     ):
         raise OperatorError("controller completion destinations changed")
     if result.exists() or paired.exists():
-        if (
-            result.is_file()
-            and not result.is_symlink()
-            and paired.is_file()
-            and not paired.is_symlink()
-            and result.read_bytes() == result_payload
-            and paired.read_bytes() == paired_payload
-        ):
+        if _published_pair_state(
+            result,
+            paired,
+            result_payload=result_payload,
+            paired_payload=paired_payload,
+        ) == "exact":
             return
         raise OperatorError("controller completion destination is partial or changed")
     destination = result.parent
@@ -619,13 +669,11 @@ def _publish_pair(
     except OSError as error:
         if error.errno not in {errno.EEXIST, errno.ENOTEMPTY}:
             raise
-        if (
-            result.is_file()
-            and not result.is_symlink()
-            and paired.is_file()
-            and not paired.is_symlink()
-            and result.read_bytes() == result_payload
-            and paired.read_bytes() == paired_payload
+        if _raced_publication_is_exact(
+            result,
+            paired,
+            result_payload=result_payload,
+            paired_payload=paired_payload,
         ):
             return
         raise OperatorError(

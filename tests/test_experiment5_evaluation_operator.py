@@ -279,6 +279,87 @@ def test_publish_pair_accepts_matching_nfs_rename_race(
 
 
 @pytest.mark.parametrize("rename_errno", (errno.EEXIST, errno.ENOTEMPTY))
+def test_publish_pair_retries_delayed_nfs_visibility(
+    operator,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    rename_errno: int,
+) -> None:
+    result = tmp_path / "published" / "scientific-result.json"
+    paired = tmp_path / "published" / "paired-scores.json"
+    settings = SimpleNamespace(
+        result_path_controller=result,
+        paired_scores_path_controller=paired,
+    )
+    result_payload = b'{"result":"expected"}\n'
+    paired_payload = b'{"paired":"expected"}\n'
+    sleeps: list[float] = []
+
+    def raced_rename(_staging: Path, destination: Path) -> None:
+        destination.mkdir()
+        raise OSError(rename_errno, "simulated delayed NFS visibility")
+
+    def reveal_after_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        result.write_bytes(result_payload)
+        paired.write_bytes(paired_payload)
+
+    monkeypatch.setattr(operator.os, "rename", raced_rename)
+    monkeypatch.setattr(operator.time, "sleep", reveal_after_sleep)
+
+    operator._publish_pair(
+        settings,
+        result_payload=result_payload,
+        paired_payload=paired_payload,
+    )
+
+    assert sleeps == [operator.NFS_PUBLICATION_VISIBILITY_RETRY_SECONDS]
+    assert result.read_bytes() == result_payload
+    assert paired.read_bytes() == paired_payload
+    assert not any(tmp_path.glob(".published.tmp-*"))
+
+
+def test_publish_pair_bounds_incomplete_nfs_visibility_retries(
+    operator,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    result = tmp_path / "published" / "scientific-result.json"
+    paired = tmp_path / "published" / "paired-scores.json"
+    settings = SimpleNamespace(
+        result_path_controller=result,
+        paired_scores_path_controller=paired,
+    )
+    sleeps: list[float] = []
+
+    def raced_rename(_staging: Path, destination: Path) -> None:
+        destination.mkdir()
+        raise OSError(errno.ENOTEMPTY, "simulated delayed NFS visibility")
+
+    monkeypatch.setattr(operator.os, "rename", raced_rename)
+    monkeypatch.setattr(operator, "NFS_PUBLICATION_VISIBILITY_ATTEMPTS", 3)
+    monkeypatch.setattr(operator.time, "sleep", sleeps.append)
+
+    with pytest.raises(
+        operator.OperatorError,
+        match="publication raced with different evidence",
+    ):
+        operator._publish_pair(
+            settings,
+            result_payload=b'{"result":"expected"}\n',
+            paired_payload=b'{"paired":"expected"}\n',
+        )
+
+    assert sleeps == [
+        operator.NFS_PUBLICATION_VISIBILITY_RETRY_SECONDS,
+        operator.NFS_PUBLICATION_VISIBILITY_RETRY_SECONDS,
+    ]
+    assert not result.exists()
+    assert not paired.exists()
+    assert not any(tmp_path.glob(".published.tmp-*"))
+
+
+@pytest.mark.parametrize("rename_errno", (errno.EEXIST, errno.ENOTEMPTY))
 def test_publish_pair_rejects_mismatched_nfs_rename_race(
     operator,
     monkeypatch: pytest.MonkeyPatch,
@@ -301,6 +382,11 @@ def test_publish_pair_rejects_mismatched_nfs_rename_race(
         raise OSError(rename_errno, "simulated NFS rename race")
 
     monkeypatch.setattr(operator.os, "rename", raced_rename)
+    monkeypatch.setattr(
+        operator.time,
+        "sleep",
+        lambda _seconds: pytest.fail("complete mismatch must not be retried"),
+    )
 
     with pytest.raises(
         operator.OperatorError,
@@ -314,4 +400,80 @@ def test_publish_pair_rejects_mismatched_nfs_rename_race(
 
     assert result.read_bytes() != result_payload
     assert paired.read_bytes() == paired_payload
+    assert not any(tmp_path.glob(".published.tmp-*"))
+
+
+def test_publish_pair_rejects_symlink_without_retry(
+    operator,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    result = tmp_path / "published" / "scientific-result.json"
+    paired = tmp_path / "published" / "paired-scores.json"
+    settings = SimpleNamespace(
+        result_path_controller=result,
+        paired_scores_path_controller=paired,
+    )
+    result_payload = b'{"result":"expected"}\n'
+    paired_payload = b'{"paired":"expected"}\n'
+
+    def raced_rename(_staging: Path, destination: Path) -> None:
+        destination.mkdir()
+        target = tmp_path / "symlink-target.json"
+        target.write_bytes(result_payload)
+        result.symlink_to(target)
+        paired.write_bytes(paired_payload)
+        raise OSError(errno.ENOTEMPTY, "simulated NFS rename race")
+
+    monkeypatch.setattr(operator.os, "rename", raced_rename)
+    monkeypatch.setattr(
+        operator.time,
+        "sleep",
+        lambda _seconds: pytest.fail("symlink must not be retried"),
+    )
+
+    with pytest.raises(
+        operator.OperatorError,
+        match="publication raced with different evidence",
+    ):
+        operator._publish_pair(
+            settings,
+            result_payload=result_payload,
+            paired_payload=paired_payload,
+        )
+
+    assert result.is_symlink()
+    assert not any(tmp_path.glob(".published.tmp-*"))
+
+
+def test_publish_pair_propagates_unrelated_rename_error(
+    operator,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    result = tmp_path / "published" / "scientific-result.json"
+    paired = tmp_path / "published" / "paired-scores.json"
+    settings = SimpleNamespace(
+        result_path_controller=result,
+        paired_scores_path_controller=paired,
+    )
+
+    def failed_rename(_staging: Path, _destination: Path) -> None:
+        raise OSError(errno.EIO, "simulated unrelated rename failure")
+
+    monkeypatch.setattr(operator.os, "rename", failed_rename)
+    monkeypatch.setattr(
+        operator.time,
+        "sleep",
+        lambda _seconds: pytest.fail("unrelated rename errors must not be retried"),
+    )
+
+    with pytest.raises(OSError) as caught:
+        operator._publish_pair(
+            settings,
+            result_payload=b'{"result":"expected"}\n',
+            paired_payload=b'{"paired":"expected"}\n',
+        )
+
+    assert caught.value.errno == errno.EIO
     assert not any(tmp_path.glob(".published.tmp-*"))
