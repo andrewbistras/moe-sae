@@ -1,6 +1,8 @@
 # Experiment 5 routed-activation policy v3
 
-Status: executable replacement protocol
+Status: completed; see
+[`EXPERIMENT_5_RESULTS.md`](EXPERIMENT_5_RESULTS.md) for the sealed verdict and
+immutable evidence locations.
 
 Protocol ID:
 `gemma4-experiment5-routed-activation-ladder-v3-20260729`

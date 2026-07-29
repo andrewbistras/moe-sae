@@ -20,6 +20,14 @@ immutable terminal evidence for the infeasible strict-positive ReLU policy.
 
 ## Current result
 
+Experiment 5 v3 is complete. At 10M training tokens, inclusive-zero ReLU beat
+exact-positive Softplus by 0.03970 component EV in the SAE panel and 0.03181
+component EV in the transcoder panel. All six paired seed differences favored
+ReLU, both crossed 95% intervals excluded zero, and marginal training cost was
+approximately unchanged. See
+[`docs/EXPERIMENT_5_RESULTS.md`](docs/EXPERIMENT_5_RESULTS.md) for the sealed
+verdict, learning curves, cost comparison, and immutable evidence locations.
+
 Experiment 3 shows that expert alignment transfers from reconstruction to
 prediction. On 250,000 held-out tokens, the true-expert transcoder A reached
 component EV 0.18743, versus -0.04715 for randomized identity R, 0.15532 for
@@ -64,7 +72,9 @@ the active tree. It is preserved at Git tag
   [`docs/EXPERIMENT_5_LADDER_V2.md`](docs/EXPERIMENT_5_LADDER_V2.md) — the
   immutable strict-positive feasibility attempt; and
   [`docs/EXPERIMENT_5_LADDER_V3.md`](docs/EXPERIMENT_5_LADDER_V3.md) — the
-  active panel-native activation-policy reset.
+  completed panel-native activation-policy reset, with
+  [`docs/EXPERIMENT_5_RESULTS.md`](docs/EXPERIMENT_5_RESULTS.md) as its sealed
+  result summary.
 - `moe-sae` — the single CLI, with `stage-c4`, `qualify-storage`,
   `qualify-sae-storage`, `preflight`,
   `convert-checkpoint`, `benchmark-harvest`, `harvest`, `activation-farm`,
