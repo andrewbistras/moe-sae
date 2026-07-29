@@ -495,6 +495,159 @@ missing or incompatible, stop and issue a new protocol revision; do not
 silently retrain H under the historical identity or substitute historical
 Experiment-4 A for either activation arm.
 
+### Durable sealed-core handoff for the current campaign
+
+The current core and extension have one exact automated handoff:
+
+| Item | Frozen value |
+|---|---|
+| Core source | `674cecbb19ba9130a81a4e27249c9862de08ad17` |
+| Core plan | `/mnt/moe-sae-control/experiment5/contracts/campaign-ready-three-v1-674cecbb19ba-a1.yaml` |
+| Core unit | `moe-sae-experiment5-674cecbb19ba-a1.service` |
+| Extension source | `4472ff228b43d272caeac6a31b547dbe11e7e2be` |
+| Staged extension checkout | `/home/tpuops/src/moe-sae-activation-4472ff228b43` |
+| Staged bundle | `/home/tpuops/.cache/moe-sae-deploy/4472ff228b43/repository.bundle` |
+
+Use `scripts/tpu/handoff_experiment5_activation_ladder.py` for this
+transition. The handoff program is operations-plane code added after the
+frozen scientific revision. Its own file SHA-256 is recorded separately; it
+never changes the extension plan's `project_commit` from `4472ff2…`.
+
+Install that one file on the controller without changing either Git checkout:
+
+```bash
+export GCP_PROJECT='neural-dragnet'
+export CONTROLLER_ZONE='us-central2-b'
+export HANDOFF_LOCAL='scripts/tpu/handoff_experiment5_activation_ladder.py'
+export HANDOFF_REMOTE='/home/tpuops/.local/libexec/handoff_experiment5_activation_ladder.py'
+export HANDOFF_UNIT_LOCAL='deploy/systemd/moe-sae-experiment5-activation-handoff-4472ff228b43-a1.service'
+export HANDOFF_UNIT_REMOTE='/home/tpuops/.config/systemd/user/moe-sae-experiment5-activation-handoff-4472ff228b43-a1.service'
+
+gcloud compute scp \
+  --project="$GCP_PROJECT" \
+  --zone="$CONTROLLER_ZONE" \
+  "$HANDOFF_LOCAL" \
+  gemma4-horizon-controller:/tmp/handoff_experiment5_activation_ladder.py
+
+gcloud compute scp \
+  --project="$GCP_PROJECT" \
+  --zone="$CONTROLLER_ZONE" \
+  "$HANDOFF_UNIT_LOCAL" \
+  gemma4-horizon-controller:/tmp/moe-sae-experiment5-activation-handoff-4472ff228b43-a1.service
+
+gcloud compute ssh gemma4-horizon-controller \
+  --project="$GCP_PROJECT" \
+  --zone="$CONTROLLER_ZONE" \
+  --command="set -eu
+    sudo install -d -m 0750 -o tpuops -g tpuops /home/tpuops/.local/libexec
+    sudo install -d -m 0750 -o tpuops -g tpuops /home/tpuops/.config/systemd/user
+    sudo install -m 0550 -o tpuops -g tpuops \
+      /tmp/handoff_experiment5_activation_ladder.py \
+      $HANDOFF_REMOTE
+    sudo install -m 0640 -o tpuops -g tpuops \
+      /tmp/moe-sae-experiment5-activation-handoff-4472ff228b43-a1.service \
+      $HANDOFF_UNIT_REMOTE"
+```
+
+On the controller, remain in an administrative shell, confirm lingering, and
+bind commands explicitly to the lingering `tpuops` user manager. A plain
+`sudo -iu tpuops` shell on this image does not inherit
+`XDG_RUNTIME_DIR`/`DBUS_SESSION_BUS_ADDRESS`, so it cannot safely operate the
+user service manager. `validate` itself is read-only:
+
+```bash
+export HANDOFF='/home/tpuops/.local/libexec/handoff_experiment5_activation_ladder.py'
+export STAGED_PYTHON='/home/tpuops/src/moe-sae-activation-4472ff228b43/.venv/bin/python'
+export HANDOFF_UNIT='moe-sae-activation-handoff-4472ff228b43-a1'
+export TPUOPS_UID="$(id -u tpuops)"
+export TPUOPS_BUS="unix:path=/run/user/$TPUOPS_UID/bus"
+
+test "$(loginctl show-user tpuops -p Linger --value)" = yes
+test -S "/run/user/$TPUOPS_UID/bus"
+sha256sum "$HANDOFF"
+sudo -u tpuops env \
+  HOME=/home/tpuops \
+  USER=tpuops \
+  LOGNAME=tpuops \
+  XDG_RUNTIME_DIR="/run/user/$TPUOPS_UID" \
+  DBUS_SESSION_BUS_ADDRESS="$TPUOPS_BUS" \
+  "$STAGED_PYTHON" "$HANDOFF" validate
+```
+
+Enable and start the persistent handoff user unit. It is safe to start while
+the core is still running, and the checked-in unit remains installed across a
+controller reboot:
+
+```bash
+sudo -u tpuops env \
+  HOME=/home/tpuops \
+  USER=tpuops \
+  LOGNAME=tpuops \
+  XDG_RUNTIME_DIR="/run/user/$TPUOPS_UID" \
+  DBUS_SESSION_BUS_ADDRESS="$TPUOPS_BUS" \
+  systemctl --user daemon-reload
+
+sudo -u tpuops env \
+  HOME=/home/tpuops \
+  USER=tpuops \
+  LOGNAME=tpuops \
+  XDG_RUNTIME_DIR="/run/user/$TPUOPS_UID" \
+  DBUS_SESSION_BUS_ADDRESS="$TPUOPS_BUS" \
+  systemctl --user enable --now "$HANDOFF_UNIT"
+```
+
+Before the core final record exists, the program may write only its
+extension-owned payload-validation record and lock. It does not update the
+canonical controller checkout, SSH to mutate a TPU worker, clear a cache,
+generate evidence, or launch extension work. Once the exact core final and
+budget ledger validate, the core unit is inactive, and all three worker
+cohorts are quiescent, it proceeds in this order:
+
+1. update the clean canonical controller and all 12 TPU workers to the exact
+   staged extension commit;
+2. clear only the reproducible `/dev/shm` caches and regenerate exact
+   commit/incarnation/controller-mapping evidence;
+3. preserve an interrupted create-only probe and monotonically select the
+   next evidence attempt rather than overwrite it;
+4. build the 18 read-only H references from the sealed core ledger;
+5. build and validate the 7-resource/12-training/54-evaluation extension
+   plan using the sealed core cash total; and
+6. install, enable, and start the persistent
+   `moe-sae-experiment5-activation-4472ff228b43-<attempt>.service`.
+
+The persistent campaign unit runs through training, all 54 evaluations, and
+report sealing. It does not use `--stop-after-training`. Handoff phase
+records are self-hashed and create-only beneath:
+
+```text
+/mnt/moe-sae-control/experiment5/extensions/routed-activation-ladder-v1/handoff-4472ff228b43-a1/
+```
+
+Read-only monitoring:
+
+```bash
+sudo -u tpuops env \
+  HOME=/home/tpuops \
+  XDG_RUNTIME_DIR="/run/user/$TPUOPS_UID" \
+  DBUS_SESSION_BUS_ADDRESS="$TPUOPS_BUS" \
+  "$STAGED_PYTHON" "$HANDOFF" status
+
+sudo -u tpuops env \
+  XDG_RUNTIME_DIR="/run/user/$TPUOPS_UID" \
+  DBUS_SESSION_BUS_ADDRESS="$TPUOPS_BUS" \
+  journalctl --user -u "$HANDOFF_UNIT" -n 100 --no-pager
+
+sudo -u tpuops env \
+  XDG_RUNTIME_DIR="/run/user/$TPUOPS_UID" \
+  DBUS_SESSION_BUS_ADDRESS="$TPUOPS_BUS" \
+  systemctl --user list-units \
+    'moe-sae-experiment5-activation-4472ff228b43-*'
+```
+
+After phase `05-campaign-launched` appears, use the `status_command` recorded
+in that phase or follow the persistent campaign unit's journal. Do not run
+the manual commands below in parallel with this handoff.
+
 ### Routed-activation-ladder launch commands
 
 Run these from the clean, committed controller checkout. Set the paths to the
