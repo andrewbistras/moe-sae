@@ -25,6 +25,15 @@ def _source_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--training-plan", required=True, type=Path)
     parser.add_argument("--softplus-references", required=True, type=Path)
     parser.add_argument(
+        "--a256-provenance-addendum",
+        type=Path,
+        help=(
+            "Optional immutable two-panel A256Native provenance addendum. "
+            "It attaches config, cost, and checkpoint context only; no A256 "
+            "score enters primary A512 inference."
+        ),
+    )
+    parser.add_argument(
         "--h-reference-manifest",
         type=Path,
         help=(
@@ -43,7 +52,13 @@ def _parser() -> argparse.ArgumentParser:
     seal.add_argument("--output-json", required=True, type=Path)
     seal.add_argument("--output-markdown", required=True, type=Path)
 
-    validate = commands.add_parser("validate")
+    validate = commands.add_parser(
+        "validate",
+        help=(
+            "Integrity-only check of self-hashes, internal arithmetic, and "
+            "Markdown. This is not evidence-backed scientific verification."
+        ),
+    )
     validate.add_argument("--report", required=True, type=Path)
     validate.add_argument("--markdown", required=True, type=Path)
 
@@ -62,6 +77,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 evaluation_plan_path=args.evaluation_plan,
                 training_plan_path=args.training_plan,
                 completed_manifest_path=args.softplus_references,
+                a256_provenance_addendum_path=(
+                    args.a256_provenance_addendum
+                ),
                 h_reference_manifest_path=args.h_reference_manifest,
             )
             result = write_v3_primary_report(
@@ -80,7 +98,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "Markdown differs from deterministic report rendering"
                 )
             result = {
-                "status": "primary_report_valid",
+                "status": (
+                    "primary_report_integrity_valid_non_authoritative"
+                ),
+                "authoritative": False,
+                "validation_scope": (
+                    "self_hash_internal_arithmetic_and_markdown_only"
+                ),
+                "authoritative_command": "verify",
                 "report_sha256": report["report_sha256"],
                 "json_file_sha256": hashlib.sha256(
                     args.report.read_bytes()
@@ -96,6 +121,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 evaluation_plan_path=args.evaluation_plan,
                 training_plan_path=args.training_plan,
                 completed_manifest_path=args.softplus_references,
+                a256_provenance_addendum_path=(
+                    args.a256_provenance_addendum
+                ),
                 h_reference_manifest_path=args.h_reference_manifest,
             )
     except (

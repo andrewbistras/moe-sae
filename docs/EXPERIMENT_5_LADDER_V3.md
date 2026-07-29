@@ -92,6 +92,25 @@ panels. It requires the SAE declaration to match and the transcoder
 declaration to mismatch. Its scope flags permanently exclude A256 from the
 matched A512 primary inference and estimand.
 
+Pass the sealed addendum to both primary-report sealing and verification:
+
+```text
+scripts/tpu/seal_experiment5_routed_ladder_v3_report.py seal \
+  --evaluation-plan /path/to/primary-evaluation-plan.yaml \
+  --training-plan /path/to/v3-training-plan.yaml \
+  --softplus-references /path/to/softplus-references.yaml \
+  --a256-provenance-addendum /path/to/a256native-provenance-addendum.yaml \
+  --output-json /new/create-only/primary-report.json \
+  --output-markdown /new/create-only/primary-report.md
+```
+
+This attaches two validated parent lineages, their measured training costs,
+and six checkpoint pointers under `optional_context.A256Native`. It does not
+add A256 rows to the 36-cell A512 matrix, contrasts, primary verdict, or A512
+cost comparison. The provenance addendum contains no A256 quality scores; a
+quantitative A256-to-A512 curve requires a separately sealed context-score
+manifest.
+
 Only historical seed 0 is available. Both references are read-only, with
 2M/5M/10M checkpoints. They are context points, not substitutes for three
 new seeds.
@@ -171,7 +190,19 @@ zero; ReLU is allowed to report fewer positives without failing.
 
 Packed-sequence paired intervals use identical held-out rows and a common SST
 within each panel/endpoint. The across-seed primary interval is emitted only
-after all three paired seeds validate.
+after all three paired seeds validate. Because every seed is evaluated on the
+same packed sequences, the hierarchical interval treats seed and sequence as
+crossed factors: each bootstrap replicate draws seeds and one common sequence
+sample that is applied to every selected seed occurrence.
+
+Raw marginal chip-seconds are retained for every trajectory. A paired
+Softplus/ReLU cost ratio is emitted only when both trajectories used the same
+accelerator type; cross-generation pairs are explicitly non-comparable.
+The report CLI's `validate` command checks only self-hashes, internal
+arithmetic, and deterministic Markdown and returns a non-authoritative
+receipt. Only `verify`, supplied with the immutable evaluation/training plans
+and reference manifests, authenticates the scientific report against source
+evidence.
 
 ## Immutable v2 boundary
 

@@ -2,14 +2,15 @@
 
 The report is assembled only from the sealed 36-cell primary evaluation
 matrix, the six fresh v3 ReLU training results, and the six completed v2
-Softplus trajectory references.  It deliberately does not wait for the
-optional panel-native A256 or H provenance addendum.
+Softplus trajectory references.  Optional panel-native A256 and H evidence
+may be attached as read-only context, but neither can enter the primary
+cells, contrasts, verdict, or cost comparison.
 
 Every quality contrast is paired on the retained packed-sequence score rows.
-The three-seed interval follows the precommitted hierarchical bootstrap:
-seeds are resampled first and packed sequences are resampled within every
-selected seed occurrence.  The JSON report is self-hashed, while its
-deterministic Markdown rendering is content-hashed by the JSON.
+The three-seed interval treats training seed and held-out sequence as crossed
+factors: each replicate resamples seeds and applies one common packed-sequence
+resample to every selected seed occurrence.  The JSON report is self-hashed,
+while its deterministic Markdown rendering is content-hashed by the JSON.
 """
 
 from __future__ import annotations
@@ -36,6 +37,7 @@ from moe_sae.experiment5_routed_ladder import (
 from moe_sae.experiment5_routed_ladder_campaign import (
     CompletedTrajectoryCheckpointReference,
     RoutedLadderCampaignPlanError,
+    _CHIP_COUNT_BY_ACCELERATOR,
     _validate_h_checkpoint_lineage,
     parse_completed_trajectory_reference_manifest,
     parse_h_reference_manifest,
@@ -52,6 +54,10 @@ from moe_sae.experiment5_routed_ladder_v3_campaign import (
     load_routed_ladder_v3_training_plan,
 )
 from moe_sae.experiment5_routed_ladder_v3_config import (
+    A256_NATIVE_ACTIVATION,
+    A256_NATIVE_CONFIG_SHA256,
+    A256_NATIVE_LABEL,
+    A256_NATIVE_SELECTION_POLICY,
     CHECKPOINT_TOKENS,
     CONDITIONS,
     PANELS,
@@ -64,6 +70,10 @@ from moe_sae.experiment5_routed_ladder_v3_evaluation import (
     CELL_COUNT,
     load_v3_primary_evaluation_plan,
     validate_v3_primary_evaluation_plan,
+)
+from moe_sae.experiment5_routed_ladder_v3_provenance import (
+    parse_a256_provenance_addendum,
+    validate_a256_addendum_panel,
 )
 
 REPORT_SCHEMA_VERSION = (
@@ -79,13 +89,44 @@ SEED_BOOTSTRAP_ALGORITHM = (
     "paired-packed-sequence-percentile-bootstrap-v1"
 )
 HIERARCHICAL_BOOTSTRAP_ALGORITHM = (
-    "paired-seed-then-packed-sequence-percentile-bootstrap-v1"
+    "crossed-paired-seed-and-packed-sequence-percentile-bootstrap-v1"
 )
 PRIMARY_ENDPOINT = "component"
 RELU_CONDITION = "A512ReLUInclusiveTopK"
 SOFTPLUS_CONDITION = "A512Softplus"
 CONTRAST = f"{SOFTPLUS_CONDITION}-{RELU_CONDITION}"
 _SHA256_LENGTH = 64
+_CROSSED_BOOTSTRAP_UNIT = "crossed_seed_and_packed_sequence"
+_TRAINING_EXECUTION_BY_ORIGIN = {
+    "fresh_v3": (
+        "routed_ladder_v3_execution",
+        "gemma4-experiment5-routed-activation-policy-v3-training-execution-v1",
+    ),
+    "imported_v2_exact_graph": (
+        "routed_ladder_v2_execution",
+        "gemma4-experiment5-routed-activation-ladder-training-execution-v1",
+    ),
+}
+_A256_CONTEXT_SCOPE = {
+    "condition": "A256Native",
+    "evidentiary_role": "panel_native_descriptive_context_only",
+    "included_in_primary_a512_inference": False,
+    "included_in_primary_a512_estimand": False,
+    "cross_panel_pooling_allowed": False,
+    "across_seed_inference_allowed": False,
+    "allowed_use": "within_panel_historical_scale_context",
+    "prohibited_uses": [
+        "matched_a512_activation_policy_contrast",
+        "cross_panel_activation_policy_contrast",
+        "three_seed_inference",
+        "replacement_for_any_a512_cell",
+    ],
+}
+_A256_CONTEXT_STATEMENT = (
+    "Two panel-native historical A256 lineages and six checkpoint pointers "
+    "are hash-pinned. No A256 quality score row is mixed into the v3 A512 "
+    "ReLU-versus-Softplus inference."
+)
 
 
 class RoutedLadderV3ReportError(RuntimeError):
@@ -183,6 +224,13 @@ class BundleTimingEvidence:
                 "bundle timing hardware/scope is absent"
             )
         _positive_int(self.chip_count, "bundle chip_count")
+        expected_chip_count = _CHIP_COUNT_BY_ACCELERATOR.get(
+            self.accelerator_type
+        )
+        if expected_chip_count != self.chip_count:
+            raise RoutedLadderV3ReportError(
+                "bundle chip count differs from its accelerator type"
+            )
         wall = _finite(
             self.successful_attempt_wall_seconds,
             "bundle successful wall seconds",
@@ -328,6 +376,14 @@ class TrainingCostEvidence:
                 f"training cost origin/token count changed: {self.identity}"
             )
         _positive_int(self.chip_count, "training chip_count")
+        expected_chip_count = _CHIP_COUNT_BY_ACCELERATOR.get(
+            self.accelerator_type
+        )
+        if expected_chip_count != self.chip_count:
+            raise RoutedLadderV3ReportError(
+                f"training chip count differs from accelerator type: "
+                f"{self.identity}"
+            )
         wall = _finite(
             self.marginal_wall_seconds,
             "training marginal_wall_seconds",
@@ -372,6 +428,15 @@ class TrainingCostEvidence:
                 raise RoutedLadderV3ReportError(
                     f"training {name} must be nonnegative"
                 )
+        if not math.isclose(
+            wall,
+            self.preprocessing_wall_seconds + self.optimizer_wall_seconds,
+            rel_tol=1e-9,
+            abs_tol=1e-6,
+        ):
+            raise RoutedLadderV3ReportError(
+                f"training marginal wall-time scope changed: {self.identity}"
+            )
         _sha256(
             self.training_result_sha256,
             "training result semantic hash",
@@ -578,7 +643,12 @@ def hierarchical_v3_bootstrap(
     replicates: int = BOOTSTRAP_REPLICATES,
     chunk_size: int = 256,
 ) -> dict[str, Any]:
-    """Deterministic seed-then-packed-sequence interval for exactly n=3."""
+    """Deterministic crossed seed-by-packed-sequence interval for n=3.
+
+    Every model seed was evaluated on the same held-out packed sequences.
+    One sequence resample is therefore shared by all seed occurrences in a
+    replicate, preserving the observed cross-seed sequence covariance.
+    """
 
     if replicates != BOOTSTRAP_REPLICATES:
         raise RoutedLadderV3ReportError(
@@ -644,10 +714,11 @@ def hierarchical_v3_bootstrap(
         checkpoint_tokens=first.checkpoint_tokens,
         endpoint=endpoint,
         token_identity_sha256=first.token_identity_sha256,
-        level="seed-then-packed-sequence",
+        level="crossed-seed-and-packed-sequence",
     )
     rng = np.random.Generator(np.random.PCG64(seed))
     samples = np.empty(replicates, dtype=np.float64)
+    common_denominator_rows = denominators[0]
     for start in range(0, replicates, chunk_size):
         end = min(start + chunk_size, replicates)
         rows = end - start
@@ -657,40 +728,40 @@ def hierarchical_v3_bootstrap(
             size=(rows, len(SEEDS)),
             endpoint=False,
         )
-        replicate_sum = np.zeros(rows, dtype=np.float64)
+        sequence_draws = rng.integers(
+            0,
+            common_denominator_rows.size,
+            size=(rows, common_denominator_rows.size),
+            endpoint=False,
+        )
+        denominator = common_denominator_rows[sequence_draws].sum(
+            axis=1,
+            dtype=np.float64,
+        )
+        replicate_delta = np.zeros(rows, dtype=np.float64)
         for slot in range(len(SEEDS)):
             selected_seed = seed_draws[:, slot]
-            slot_effect = np.empty(rows, dtype=np.float64)
             for seed_index in range(len(SEEDS)):
                 mask = selected_seed == seed_index
-                count = int(np.count_nonzero(mask))
-                if count == 0:
+                if not np.any(mask):
                     continue
-                denominator_rows = denominators[seed_index]
                 delta_rows = deltas[seed_index]
-                draws = rng.integers(
-                    0,
-                    denominator_rows.size,
-                    size=(count, denominator_rows.size),
-                    endpoint=False,
-                )
-                denominator = denominator_rows[draws].sum(
+                replicate_delta[mask] += delta_rows[
+                    sequence_draws[mask]
+                ].sum(
                     axis=1,
                     dtype=np.float64,
                 )
-                slot_effect[mask] = (
-                    delta_rows[draws].sum(axis=1, dtype=np.float64)
-                    / denominator
-                )
-            replicate_sum += slot_effect
-        samples[start:end] = replicate_sum / len(SEEDS)
+        samples[start:end] = (
+            replicate_delta / len(SEEDS) / denominator
+        )
     lower, upper = np.quantile(samples, (0.025, 0.975), method="linear")
     return {
         "estimate_mean_ev_difference": estimate,
         "ci95_lower": float(lower),
         "ci95_upper": float(upper),
         "confidence_level": CONFIDENCE_LEVEL,
-        "bootstrap_unit": "seed_then_packed_sequence",
+        "bootstrap_unit": _CROSSED_BOOTSTRAP_UNIT,
         "bootstrap_algorithm": HIERARCHICAL_BOOTSTRAP_ALGORITHM,
         "bootstrap_replicates": replicates,
         "bootstrap_seed": seed,
@@ -976,6 +1047,42 @@ def collect_primary_cell_evidence(
     )
 
 
+def _validate_bundle_resource_ownership(
+    evaluation_plan: Mapping[str, Any],
+    training_plan: RoutedLadderV3TrainingPlan,
+    timings: Sequence[BundleTimingEvidence],
+) -> None:
+    """Bind each measured bundle timing to its immutable training-plan owner."""
+
+    timing_grid = {(row.panel, row.seed): row for row in timings}
+    fresh_owner = {
+        (task.panel, task.seed): task.eligible_resource_ids[0]
+        for task in training_plan.trajectories
+    }
+    for bundle in evaluation_plan["bundles"]:
+        identity = (str(bundle["panel"]), int(bundle["seed"]))
+        owner_id = str(bundle["resource_id"])
+        if fresh_owner.get(identity) != owner_id:
+            raise RoutedLadderV3ReportError(
+                f"evaluation bundle owner differs from fresh trajectory: "
+                f"{identity}"
+            )
+        resource = training_plan.resource(owner_id)
+        timing = timing_grid.get(identity)
+        expected_chips = _CHIP_COUNT_BY_ACCELERATOR.get(
+            resource.accelerator_type
+        )
+        if (
+            timing is None
+            or timing.accelerator_type != resource.accelerator_type
+            or timing.chip_count != expected_chips
+        ):
+            raise RoutedLadderV3ReportError(
+                f"evaluation bundle hardware differs from planned owner: "
+                f"{identity}"
+            )
+
+
 def _result_timing_number(
     result: Mapping[str, Any],
     name: str,
@@ -1042,17 +1149,31 @@ def _training_cost_from_result(
     )
     raw_chip_count = chip_seconds / marginal
     chip_count = round(raw_chip_count)
+    expected_chip_count = _CHIP_COUNT_BY_ACCELERATOR.get(accelerator_type)
+    execution_identity = _TRAINING_EXECUTION_BY_ORIGIN.get(origin)
+    execution = (
+        result.get(execution_identity[0])
+        if execution_identity is not None
+        else None
+    )
     if (
         chip_count <= 0
+        or expected_chip_count is None
+        or chip_count != expected_chip_count
         or not math.isclose(
             raw_chip_count,
             chip_count,
             rel_tol=1e-9,
             abs_tol=1e-9,
         )
+        or execution_identity is None
+        or not isinstance(execution, Mapping)
+        or execution.get("schema_version") != execution_identity[1]
+        or execution.get("accelerator_type") != accelerator_type
+        or execution.get("global_chip_count") != expected_chip_count
     ):
         raise RoutedLadderV3ReportError(
-            f"training chip count is nonintegral: "
+            f"training execution hardware differs from its planned owner: "
             f"{panel}/{condition}/seed{seed}"
         )
     scope = result.get("chip_seconds_scope")
@@ -1562,22 +1683,43 @@ def _training_cost_report(
         for seed in SEEDS:
             relu = grid[(panel, RELU_CONDITION, seed)]
             softplus = grid[(panel, SOFTPLUS_CONDITION, seed)]
-            ratio = 100.0 * softplus.chip_seconds / relu.chip_seconds
+            comparable = (
+                relu.accelerator_type == softplus.accelerator_type
+            )
+            ratio = (
+                100.0 * softplus.chip_seconds / relu.chip_seconds
+                if comparable
+                else None
+            )
             relu_values.append(relu.chip_seconds)
             softplus_values.append(softplus.chip_seconds)
-            ratios.append(ratio)
+            if ratio is not None:
+                ratios.append(ratio)
             paired.append(
                 {
                     "panel": panel,
                     "seed": seed,
+                    "relu_accelerator_type": relu.accelerator_type,
+                    "softplus_accelerator_type": (
+                        softplus.accelerator_type
+                    ),
+                    "comparison_status": (
+                        "comparable_same_accelerator_type"
+                        if comparable
+                        else "non_comparable_accelerator_type_mismatch"
+                    ),
                     "relu_chip_seconds": relu.chip_seconds,
                     "softplus_chip_seconds": softplus.chip_seconds,
                     "softplus_minus_relu_chip_seconds": (
                         softplus.chip_seconds - relu.chip_seconds
+                        if comparable
+                        else None
                     ),
                     "softplus_to_relu_chip_seconds_ratio_percent": ratio,
                     "relu_to_softplus_chip_seconds_ratio_percent": (
                         100.0 * relu.chip_seconds / softplus.chip_seconds
+                        if comparable
+                        else None
                     ),
                     "comparison_scope": relu.chip_seconds_scope,
                     "comparison_excludes": list(
@@ -1585,9 +1727,19 @@ def _training_cost_report(
                     ),
                 }
             )
+        all_comparable = len(ratios) == len(SEEDS)
         panels.append(
             {
                 "panel": panel,
+                "comparison_status": (
+                    "comparable_all_seeds_same_accelerator_type"
+                    if all_comparable
+                    else (
+                        "non_comparable_one_or_more_accelerator_type_"
+                        "mismatches"
+                    )
+                ),
+                "comparable_seed_count": len(ratios),
                 "relu_median_chip_seconds": float(
                     np.median(np.asarray(relu_values, dtype=np.float64))
                 ),
@@ -1596,7 +1748,9 @@ def _training_cost_report(
                 ),
                 "median_paired_softplus_to_relu_ratio_percent": float(
                     np.median(np.asarray(ratios, dtype=np.float64))
-                ),
+                )
+                if all_comparable
+                else None,
                 "relu_total_chip_seconds": math.fsum(relu_values),
                 "softplus_total_chip_seconds": math.fsum(softplus_values),
                 "seeds": list(SEEDS),
@@ -1606,6 +1760,7 @@ def _training_cost_report(
         "authority": (
             "immutable marginal SAE/transcoder training-result chip-seconds"
         ),
+        "ratio_policy": "same_accelerator_type_only",
         "shared_harvest_excluded": True,
         "trajectory_costs": trajectory_rows,
         "paired_seed_comparisons": paired,
@@ -1649,6 +1804,379 @@ def _primary_verdict(
             "selected slots; exact positive L0 is measured, not fixed"
         ),
     }
+
+
+def collect_a256_reference_context(
+    manifest: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Validate A256 lineage without admitting A256 quality score rows."""
+
+    if manifest is None:
+        return {
+            "status": "absent_nonblocking",
+            "role": "panel_native_historical_scale_context",
+            "reason": (
+                "optional context is withheld pending an explicit "
+                "historical-config provenance addendum"
+            ),
+            "primary_verdict_blocked": False,
+            "checkpoint_reference_count": 0,
+            "a256_scores_in_primary_inference": False,
+        }
+    try:
+        selected, panels = parse_a256_provenance_addendum(manifest)
+        for panel in panels:
+            validate_a256_addendum_panel(panel)
+    except (
+        OSError,
+        RoutedLadderCampaignPlanError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ) as error:
+        raise RoutedLadderV3ReportError(
+            "optional A256 provenance addendum is invalid"
+        ) from error
+    panel_references: list[dict[str, Any]] = []
+    checkpoint_count = 0
+    for panel in panels:
+        checkpoints = [
+            {
+                "checkpoint_tokens": checkpoint.checkpoint_tokens,
+                "checkpoint_pointer_sha256": (
+                    checkpoint.checkpoint_pointer_sha256
+                ),
+                "checkpoint_pointer_file_sha256": (
+                    checkpoint.checkpoint_pointer.sha256
+                ),
+            }
+            for checkpoint in panel.checkpoints
+        ]
+        checkpoint_count += len(checkpoints)
+        panel_references.append(
+            {
+                "panel": panel.panel,
+                "source_label": panel.source_label,
+                "seed": panel.seed,
+                "encoder_activation": panel.encoder_activation,
+                "selection_policy": panel.selection_policy,
+                "declared_source_config_semantic_sha256": (
+                    panel.declared_source_config_semantic_sha256
+                ),
+                "observed_source_config_semantic_sha256": (
+                    panel.observed_source_config_semantic_sha256
+                ),
+                "observed_source_config_file_sha256": (
+                    panel.observed_source_config_file_sha256
+                ),
+                "declaration_status": panel.declaration_status,
+                "disposition": panel.disposition,
+                "training_source_revision": panel.training_source_revision,
+                "run_contract_sha256": panel.run_contract_sha256,
+                "run_contract_file_sha256": panel.run_contract.sha256,
+                "training_result_sha256": panel.training_result_sha256,
+                "training_result_file_sha256": (
+                    panel.training_result.sha256
+                ),
+                "cost": {
+                    "resource_id": panel.cost.resource_id,
+                    "accelerator_type": panel.cost.accelerator_type,
+                    "chip_count": panel.cost.chip_count,
+                    "marginal_wall_seconds": (
+                        panel.cost.marginal_wall_seconds
+                    ),
+                    "chip_seconds": panel.cost.chip_seconds,
+                    "chip_seconds_scope": panel.cost.chip_seconds_scope,
+                    "chip_seconds_excludes": list(
+                        panel.cost.chip_seconds_excludes
+                    ),
+                },
+                "checkpoint_references": checkpoints,
+            }
+        )
+    return {
+        "status": "available_read_only_checkpoint_context",
+        "role": "panel_native_historical_scale_context",
+        "manifest_sha256": selected["manifest_sha256"],
+        "source_plan_sha256": selected["source_plan_sha256"],
+        "scientific_scope": copy.deepcopy(selected["scientific_scope"]),
+        "panel_reference_count": len(panel_references),
+        "checkpoint_reference_count": checkpoint_count,
+        "panel_references": panel_references,
+        "a256_scores_in_primary_inference": False,
+        "primary_verdict_blocked": False,
+        "statement": _A256_CONTEXT_STATEMENT,
+    }
+
+
+def _validate_a256_report_context(value: Any) -> None:
+    if not isinstance(value, Mapping):
+        raise RoutedLadderV3ReportError(
+            "optional A256 context must be a mapping"
+        )
+    status = value.get("status")
+    if status == "absent_nonblocking":
+        if (
+            set(value)
+            != {
+                "status",
+                "role",
+                "reason",
+                "primary_verdict_blocked",
+                "checkpoint_reference_count",
+                "a256_scores_in_primary_inference",
+            }
+            or value.get("role")
+            != "panel_native_historical_scale_context"
+            or value.get("primary_verdict_blocked") is not False
+            or value.get("checkpoint_reference_count") != 0
+            or value.get("a256_scores_in_primary_inference") is not False
+            or "addendum" not in str(value.get("reason"))
+        ):
+            raise RoutedLadderV3ReportError(
+                "absent A256 context metadata changed"
+            )
+        return
+    expected_fields = {
+        "status",
+        "role",
+        "manifest_sha256",
+        "source_plan_sha256",
+        "scientific_scope",
+        "panel_reference_count",
+        "checkpoint_reference_count",
+        "panel_references",
+        "a256_scores_in_primary_inference",
+        "primary_verdict_blocked",
+        "statement",
+    }
+    if (
+        status != "available_read_only_checkpoint_context"
+        or set(value) != expected_fields
+        or value.get("role")
+        != "panel_native_historical_scale_context"
+        or value.get("scientific_scope") != _A256_CONTEXT_SCOPE
+        or value.get("panel_reference_count") != 2
+        or value.get("checkpoint_reference_count") != 6
+        or value.get("a256_scores_in_primary_inference") is not False
+        or value.get("primary_verdict_blocked") is not False
+        or value.get("statement") != _A256_CONTEXT_STATEMENT
+    ):
+        raise RoutedLadderV3ReportError(
+            "available A256 context identity or scope changed"
+        )
+    _sha256(value.get("manifest_sha256"), "A256 addendum manifest hash")
+    _sha256(value.get("source_plan_sha256"), "A256 source plan hash")
+    references = value.get("panel_references")
+    if not isinstance(references, list) or len(references) != 2:
+        raise RoutedLadderV3ReportError(
+            "available A256 context requires exactly two panels"
+        )
+    expected_panel_fields = {
+        "panel",
+        "source_label",
+        "seed",
+        "encoder_activation",
+        "selection_policy",
+        "declared_source_config_semantic_sha256",
+        "observed_source_config_semantic_sha256",
+        "observed_source_config_file_sha256",
+        "declaration_status",
+        "disposition",
+        "training_source_revision",
+        "run_contract_sha256",
+        "run_contract_file_sha256",
+        "training_result_sha256",
+        "training_result_file_sha256",
+        "cost",
+        "checkpoint_references",
+    }
+    expected_identity = {
+        "sae": {
+            "source_label": A256_NATIVE_LABEL["sae"],
+            "encoder_activation": A256_NATIVE_ACTIVATION["sae"],
+            "selection_policy": A256_NATIVE_SELECTION_POLICY["sae"],
+            "declaration_status": "exact_match",
+            "disposition": "contextual_reference_verified",
+        },
+        "transcoder": {
+            "source_label": A256_NATIVE_LABEL["transcoder"],
+            "encoder_activation": A256_NATIVE_ACTIVATION["transcoder"],
+            "selection_policy": A256_NATIVE_SELECTION_POLICY["transcoder"],
+            "declaration_status": "mismatch",
+            "disposition": (
+                "contextual_reference_corrected_by_observed_lineage"
+            ),
+        },
+    }
+    observed_panels: set[str] = set()
+    revisions: set[str] = set()
+    checkpoint_identities: set[tuple[str, int]] = set()
+    for index, row in enumerate(references):
+        if not isinstance(row, Mapping) or set(row) != expected_panel_fields:
+            raise RoutedLadderV3ReportError(
+                f"A256 panel reference {index} fields changed"
+            )
+        panel = row.get("panel")
+        if panel not in PANELS or panel in observed_panels:
+            raise RoutedLadderV3ReportError(
+                f"A256 panel reference {index} identity changed"
+            )
+        observed_panels.add(str(panel))
+        expected = expected_identity[str(panel)]
+        if (
+            row.get("seed") != 0
+            or any(
+                row.get(name) != expected_value
+                for name, expected_value in expected.items()
+            )
+            or row.get("declared_source_config_semantic_sha256")
+            != A256_NATIVE_CONFIG_SHA256[str(panel)]
+        ):
+            raise RoutedLadderV3ReportError(
+                f"A256 panel reference {panel} treatment changed"
+            )
+        declared = _sha256(
+            row.get("declared_source_config_semantic_sha256"),
+            f"A256 {panel} declared config hash",
+        )
+        observed = _sha256(
+            row.get("observed_source_config_semantic_sha256"),
+            f"A256 {panel} observed config hash",
+        )
+        _sha256(
+            row.get("observed_source_config_file_sha256"),
+            f"A256 {panel} config file hash",
+        )
+        if (
+            (panel == "sae" and observed != declared)
+            or (panel == "transcoder" and observed == declared)
+        ):
+            raise RoutedLadderV3ReportError(
+                f"A256 {panel} declaration status is dishonest"
+            )
+        for name in (
+            "run_contract_sha256",
+            "run_contract_file_sha256",
+            "training_result_sha256",
+            "training_result_file_sha256",
+        ):
+            _sha256(row.get(name), f"A256 {panel} {name}")
+        revision = row.get("training_source_revision")
+        if (
+            not isinstance(revision, str)
+            or len(revision) != 40
+            or any(character not in "0123456789abcdef" for character in revision)
+        ):
+            raise RoutedLadderV3ReportError(
+                f"A256 {panel} training revision is invalid"
+            )
+        revisions.add(revision)
+        cost = row.get("cost")
+        expected_cost_fields = {
+            "resource_id",
+            "accelerator_type",
+            "chip_count",
+            "marginal_wall_seconds",
+            "chip_seconds",
+            "chip_seconds_scope",
+            "chip_seconds_excludes",
+        }
+        if (
+            not isinstance(cost, Mapping)
+            or set(cost) != expected_cost_fields
+            or not isinstance(cost.get("resource_id"), str)
+            or not cost.get("resource_id")
+            or not isinstance(cost.get("accelerator_type"), str)
+            or not cost.get("accelerator_type")
+            or not isinstance(cost.get("chip_seconds_scope"), str)
+            or not cost.get("chip_seconds_scope")
+            or not isinstance(cost.get("chip_seconds_excludes"), list)
+            or not cost.get("chip_seconds_excludes")
+            or not all(
+                isinstance(item, str) and item
+                for item in cost.get("chip_seconds_excludes", [])
+            )
+        ):
+            raise RoutedLadderV3ReportError(
+                f"A256 {panel} measured cost metadata changed"
+            )
+        chip_count = _positive_int(
+            cost.get("chip_count"),
+            f"A256 {panel} chip count",
+        )
+        wall = _finite(
+            cost.get("marginal_wall_seconds"),
+            f"A256 {panel} marginal wall seconds",
+            positive=True,
+        )
+        chip_seconds = _finite(
+            cost.get("chip_seconds"),
+            f"A256 {panel} chip-seconds",
+            positive=True,
+        )
+        if (
+            _CHIP_COUNT_BY_ACCELERATOR.get(
+                str(cost["accelerator_type"])
+            )
+            != chip_count
+            or not math.isclose(
+                chip_seconds,
+                chip_count * wall,
+                rel_tol=1e-9,
+                abs_tol=1e-6,
+            )
+        ):
+            raise RoutedLadderV3ReportError(
+                f"A256 {panel} chip-seconds arithmetic changed"
+            )
+        checkpoints = row.get("checkpoint_references")
+        if not isinstance(checkpoints, list) or len(checkpoints) != 3:
+            raise RoutedLadderV3ReportError(
+                f"A256 {panel} checkpoint inventory changed"
+            )
+        for checkpoint in checkpoints:
+            if (
+                not isinstance(checkpoint, Mapping)
+                or set(checkpoint)
+                != {
+                    "checkpoint_tokens",
+                    "checkpoint_pointer_sha256",
+                    "checkpoint_pointer_file_sha256",
+                }
+                or checkpoint.get("checkpoint_tokens")
+                not in CHECKPOINT_TOKENS
+            ):
+                raise RoutedLadderV3ReportError(
+                    f"A256 {panel} checkpoint reference changed"
+                )
+            identity = (str(panel), int(checkpoint["checkpoint_tokens"]))
+            if identity in checkpoint_identities:
+                raise RoutedLadderV3ReportError(
+                    f"A256 {panel} checkpoint is duplicated"
+                )
+            checkpoint_identities.add(identity)
+            _sha256(
+                checkpoint.get("checkpoint_pointer_sha256"),
+                f"A256 {panel} checkpoint pointer hash",
+            )
+            _sha256(
+                checkpoint.get("checkpoint_pointer_file_sha256"),
+                f"A256 {panel} checkpoint pointer file hash",
+            )
+    expected_checkpoints = {
+        (panel, checkpoint)
+        for panel in PANELS
+        for checkpoint in CHECKPOINT_TOKENS
+    }
+    if (
+        observed_panels != set(PANELS)
+        or len(revisions) != 1
+        or checkpoint_identities != expected_checkpoints
+    ):
+        raise RoutedLadderV3ReportError(
+            "available A256 panel/checkpoint grid changed"
+        )
 
 
 def collect_h_reference_context(
@@ -1741,6 +2269,7 @@ def build_v3_primary_report_from_evidence(
     bundle_timings: Sequence[BundleTimingEvidence],
     training_costs: Sequence[TrainingCostEvidence],
     *,
+    a256_provenance_addendum: Mapping[str, Any] | None = None,
     h_reference_manifest: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the deterministic scientific report from already loaded evidence."""
@@ -1860,15 +2389,9 @@ def build_v3_primary_report_from_evidence(
         "primary_verdict": _primary_verdict(contrast_rows),
         "training_cost_comparison": training,
         "optional_context": {
-            "A256Native": {
-                "status": "absent_nonblocking",
-                "role": "panel_native_historical_scale_context",
-                "reason": (
-                    "optional context is withheld pending an explicit "
-                    "historical-config provenance addendum"
-                ),
-                "primary_verdict_blocked": False,
-            },
+            "A256Native": collect_a256_reference_context(
+                a256_provenance_addendum
+            ),
             "H": collect_h_reference_context(h_reference_manifest),
         },
         "interpretation": {
@@ -1887,7 +2410,8 @@ def build_v3_primary_report_from_evidence(
                 ),
                 (
                     "Per-seed intervals resample packed sequences; the n=3 "
-                    "verdict resamples seeds then packed sequences."
+                    "verdict resamples seeds and one common packed-sequence "
+                    "draw as crossed factors."
                 ),
                 (
                     "Training chip-seconds include preprocessing and "
@@ -1967,8 +2491,9 @@ def _render_v3_primary_markdown_core(value: Mapping[str, Any]) -> str:
         [
             "",
             (
-                "Intervals use 20,000 deterministic seed-then-packed-sequence "
-                "bootstrap replicates. No multiplicity adjustment is applied."
+                "Intervals use 20,000 deterministic crossed seed-by-packed-"
+                "sequence bootstrap replicates. No multiplicity adjustment "
+                "is applied."
             ),
             "",
             "## Learning-curve contrasts",
@@ -2023,19 +2548,38 @@ def _render_v3_primary_markdown_core(value: Mapping[str, Any]) -> str:
             "",
             "## Marginal training cost",
             "",
-            "| panel | seed | ReLU chip-s | Softplus chip-s | Softplus/ReLU |",
-            "|---|---:|---:|---:|---:|",
+            "| panel | seed | ReLU hardware | Softplus hardware | "
+            "ReLU chip-s | Softplus chip-s | Softplus/ReLU | status |",
+            "|---|---:|---|---|---:|---:|---:|---|",
         ]
     )
     for row in value["training_cost_comparison"][
         "paired_seed_comparisons"
     ]:
+        ratio = row["softplus_to_relu_chip_seconds_ratio_percent"]
+        ratio_text = "n/a" if ratio is None else f"{ratio:.2f}%"
         lines.append(
             f"| {row['panel']} | {row['seed']} | "
+            f"{row['relu_accelerator_type']} | "
+            f"{row['softplus_accelerator_type']} | "
             f"{row['relu_chip_seconds']:.3f} | "
             f"{row['softplus_chip_seconds']:.3f} | "
-            f"{row['softplus_to_relu_chip_seconds_ratio_percent']:.2f}% |"
+            f"{ratio_text} | {row['comparison_status']} |"
         )
+    a256_context = value["optional_context"]["A256Native"]
+    a256_sentence = (
+        "Two panel-native historical A256 lineages and six checkpoint "
+        "pointers are attached as read-only context. The SAE source is "
+        "`A256ReLU`; the transcoder source is `A256Softplus`, whose frozen "
+        "v3 declaration differs from its observed historical config. No "
+        "A256 score row enters the v3 A512 contrast."
+        if a256_context["status"]
+        == "available_read_only_checkpoint_context"
+        else (
+            "`A256Native` is absent and nonblocking because its historical "
+            "config provenance requires an explicit addendum."
+        )
+    )
     h_context = value["optional_context"]["H"]
     h_sentence = (
         "Eighteen hash-pinned H checkpoint references are attached as "
@@ -2054,15 +2598,13 @@ def _render_v3_primary_markdown_core(value: Mapping[str, Any]) -> str:
                 "These are marginal training chip-seconds from immutable "
                 "training results. Shared harvesting, compilation, lowering, "
                 "checkpoint serialization, and evaluation are not folded "
-                "into this comparison."
+                "into this comparison. Ratios are emitted only when the "
+                "paired trajectories used the same accelerator type."
             ),
             "",
             "## Optional context",
             "",
-            (
-                "`A256Native` is absent and nonblocking because its historical "
-                "config provenance requires an explicit addendum."
-            ),
+            a256_sentence,
             "",
             h_sentence,
             "",
@@ -2130,7 +2672,12 @@ def _validate_score_summary(
 def validate_v3_primary_report(
     value: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Validate the self-contained report and all recomputable invariants."""
+    """Validate self-contained integrity and recomputable arithmetic only.
+
+    Confidence intervals cannot be authenticated without retained score
+    evidence.  Scientific verification must use
+    :func:`verify_v3_primary_report_from_paths`.
+    """
 
     if not isinstance(value, Mapping):
         raise RoutedLadderV3ReportError("v3 report must be a mapping")
@@ -2254,8 +2801,39 @@ def validate_v3_primary_report(
     if not isinstance(raw_cells, list) or len(raw_cells) != CELL_COUNT:
         raise RoutedLadderV3ReportError("report does not contain 36 cells")
     cell_grid: dict[tuple[str, str, int, int], Mapping[str, Any]] = {}
+    expected_cell_fields = {
+        "panel",
+        "condition",
+        "seed",
+        "checkpoint_tokens",
+        "origin",
+        "training_source_revision",
+        "parent_training_result_sha256",
+        "parent_training_result_file_sha256",
+        "parent_run_contract_sha256",
+        "parent_run_contract_file_sha256",
+        "parent_checkpoint_pointer_sha256",
+        "parent_checkpoint_pointer_file_sha256",
+        "result_path",
+        "result_sha256",
+        "result_file_sha256",
+        "score_artifact_sha256",
+        "score_data_sha256",
+        "score_data_bytes",
+        "evaluation_tokens",
+        "packed_sequences",
+        "token_identity_sha256",
+        "capture_manifest_sha256",
+        "recomposition_sidecar_sha256",
+        "endpoints",
+        "sparsity",
+        "timing",
+    }
     for index, row in enumerate(raw_cells):
-        if not isinstance(row, Mapping):
+        if (
+            not isinstance(row, Mapping)
+            or set(row) != expected_cell_fields
+        ):
             raise RoutedLadderV3ReportError(f"cells[{index}] is invalid")
         identity = (
             row.get("panel"),
@@ -2274,8 +2852,27 @@ def validate_v3_primary_report(
                 f"cell identity is invalid or duplicated: {identity}"
             )
         cell_grid[identity] = row
+        expected_origin = (
+            "fresh_v3"
+            if identity[1] == RELU_CONDITION
+            else "imported_v2_exact_graph"
+        )
+        training_revision = row.get("training_source_revision")
+        _positive_int(
+            row.get("score_data_bytes"),
+            f"{identity} score data bytes",
+        )
         if (
-            row.get("evaluation_tokens") != tokens
+            row.get("origin") != expected_origin
+            or not isinstance(training_revision, str)
+            or len(training_revision) != 40
+            or any(
+                character not in "0123456789abcdef"
+                for character in training_revision
+            )
+            or not isinstance(row.get("result_path"), str)
+            or not row.get("result_path")
+            or row.get("evaluation_tokens") != tokens
             or row.get("packed_sequences") != packed
             or row.get("token_identity_sha256")
             != common["token_identity_sha256"]
@@ -2304,7 +2901,20 @@ def validate_v3_primary_report(
                 ),
             )
         sparsity = row.get("sparsity")
-        if not isinstance(sparsity, Mapping):
+        if (
+            not isinstance(sparsity, Mapping)
+            or set(sparsity)
+            != {
+                "selected_slot_count",
+                "positive_l0_sum",
+                "positive_l0",
+                "zero_selected_slot_fraction",
+                "positive_l0_contract",
+                "dead_rate",
+                "dead_rate_scope",
+                "total_features",
+            }
+        ):
             raise RoutedLadderV3ReportError(
                 f"cell sparsity is invalid: {identity}"
             )
@@ -2321,12 +2931,20 @@ def validate_v3_primary_report(
             sparsity.get("zero_selected_slot_fraction"),
             f"{identity} zero selected fraction",
         )
+        dead_rate = _finite(
+            sparsity.get("dead_rate"),
+            f"{identity} held-out dead rate",
+        )
         if (
             selected_slots != 32
             or isinstance(positive_sum, bool)
             or not isinstance(positive_sum, int)
             or not 0 <= positive_sum <= tokens * selected_slots
             or not 0 <= positive_l0 <= 32
+            or not 0 <= dead_rate <= 1
+            or sparsity.get("total_features") != 65_536
+            or not isinstance(sparsity.get("dead_rate_scope"), str)
+            or not sparsity.get("dead_rate_scope")
             or not math.isclose(
                 positive_l0,
                 positive_sum / tokens,
@@ -2357,7 +2975,22 @@ def validate_v3_primary_report(
                 f"cell sparsity policy changed: {identity}"
             )
         timing = row.get("timing")
-        if not isinstance(timing, Mapping):
+        if (
+            not isinstance(timing, Mapping)
+            or set(timing)
+            != {
+                "cell_evaluation_wall_seconds",
+                "cell_evaluation_chip_seconds",
+                "cell_timing_scope",
+                "bundle_accelerator_type",
+                "bundle_chip_count",
+                "bundle_result_sha256",
+                "bundle_successful_attempt_wall_seconds",
+                "bundle_successful_attempt_chip_seconds",
+                "bundle_timing_scope",
+                "allocation_note",
+            }
+        ):
             raise RoutedLadderV3ReportError(
                 f"cell timing is invalid: {identity}"
             )
@@ -2370,19 +3003,35 @@ def validate_v3_primary_report(
             timing.get("bundle_chip_count"),
             f"{identity} bundle chip count",
         )
-        if not math.isclose(
-            _finite(
-                timing.get("cell_evaluation_chip_seconds"),
-                f"{identity} cell evaluation chip seconds",
-                positive=True,
-            ),
-            wall * chip_count,
-            rel_tol=1e-9,
-            abs_tol=1e-6,
+        accelerator_type = timing.get("bundle_accelerator_type")
+        if (
+            not isinstance(accelerator_type, str)
+            or _CHIP_COUNT_BY_ACCELERATOR.get(accelerator_type)
+            != chip_count
+            or not isinstance(timing.get("cell_timing_scope"), str)
+            or not timing.get("cell_timing_scope")
+            or not isinstance(timing.get("bundle_timing_scope"), str)
+            or not timing.get("bundle_timing_scope")
+            or not isinstance(timing.get("allocation_note"), str)
+            or not timing.get("allocation_note")
+            or not math.isclose(
+                _finite(
+                    timing.get("cell_evaluation_chip_seconds"),
+                    f"{identity} cell evaluation chip seconds",
+                    positive=True,
+                ),
+                wall * chip_count,
+                rel_tol=1e-9,
+                abs_tol=1e-6,
+            )
         ):
             raise RoutedLadderV3ReportError(
                 f"cell timing arithmetic changed: {identity}"
             )
+        _sha256(
+            timing.get("bundle_result_sha256"),
+            f"{identity} cell bundle result hash",
+        )
         for name in (
             "result_sha256",
             "result_file_sha256",
@@ -2412,8 +3061,22 @@ def validate_v3_primary_report(
             "report requires six resident-bundle timing rows"
         )
     bundle_grid: dict[tuple[str, int], Mapping[str, Any]] = {}
+    expected_bundle_fields = {
+        "panel",
+        "seed",
+        "accelerator_type",
+        "chip_count",
+        "successful_attempt_wall_seconds",
+        "successful_attempt_chip_seconds",
+        "timing_scope",
+        "bundle_result_sha256",
+        "bundle_result_file_sha256",
+    }
     for row in raw_bundles:
-        if not isinstance(row, Mapping):
+        if (
+            not isinstance(row, Mapping)
+            or set(row) != expected_bundle_fields
+        ):
             raise RoutedLadderV3ReportError("bundle timing row is invalid")
         identity = (row.get("panel"), row.get("seed"))
         if (
@@ -2434,15 +3097,23 @@ def validate_v3_primary_report(
             row.get("chip_count"),
             f"{identity} bundle chip count",
         )
-        if not math.isclose(
-            _finite(
-                row.get("successful_attempt_chip_seconds"),
-                f"{identity} bundle chip seconds",
-                positive=True,
-            ),
-            wall * chip_count,
-            rel_tol=1e-9,
-            abs_tol=1e-6,
+        accelerator_type = row.get("accelerator_type")
+        if (
+            not isinstance(accelerator_type, str)
+            or _CHIP_COUNT_BY_ACCELERATOR.get(accelerator_type)
+            != chip_count
+            or not isinstance(row.get("timing_scope"), str)
+            or not row.get("timing_scope")
+            or not math.isclose(
+                _finite(
+                    row.get("successful_attempt_chip_seconds"),
+                    f"{identity} bundle chip seconds",
+                    positive=True,
+                ),
+                wall * chip_count,
+                rel_tol=1e-9,
+                abs_tol=1e-6,
+            )
         ):
             raise RoutedLadderV3ReportError(
                 f"bundle timing arithmetic changed: {identity}"
@@ -2459,6 +3130,24 @@ def validate_v3_primary_report(
         (panel, seed) for panel in PANELS for seed in SEEDS
     }:
         raise RoutedLadderV3ReportError("bundle timing grid is incomplete")
+    for cell_identity, cell in cell_grid.items():
+        bundle = bundle_grid[(str(cell_identity[0]), int(cell_identity[2]))]
+        timing = cell["timing"]
+        if (
+            timing["bundle_accelerator_type"] != bundle["accelerator_type"]
+            or timing["bundle_chip_count"] != bundle["chip_count"]
+            or timing["bundle_result_sha256"]
+            != bundle["bundle_result_sha256"]
+            or timing["bundle_successful_attempt_wall_seconds"]
+            != bundle["successful_attempt_wall_seconds"]
+            or timing["bundle_successful_attempt_chip_seconds"]
+            != bundle["successful_attempt_chip_seconds"]
+            or timing["bundle_timing_scope"] != bundle["timing_scope"]
+        ):
+            raise RoutedLadderV3ReportError(
+                f"cell timing is not bound to its resident bundle: "
+                f"{cell_identity}"
+            )
 
     raw_contrasts = report["contrasts"]
     if (
@@ -2469,8 +3158,51 @@ def validate_v3_primary_report(
         raise RoutedLadderV3ReportError("report contrast grid is incomplete")
     seen_contrasts: set[tuple[str, int, str]] = set()
     contrast_grid: dict[tuple[str, int, str], Mapping[str, Any]] = {}
+    expected_contrast_fields = {
+        "panel",
+        "checkpoint_tokens",
+        "endpoint",
+        "contrast",
+        "effect",
+        "per_seed",
+        "across_seed",
+        "verdict",
+    }
+    expected_per_seed_fields = {
+        "seed",
+        "estimate_ev_difference",
+        "ci95_lower",
+        "ci95_upper",
+        "confidence_level",
+        "bootstrap_unit",
+        "bootstrap_algorithm",
+        "bootstrap_replicates",
+        "bootstrap_seed",
+        "evaluation_tokens",
+        "packed_sequences",
+        "token_identity_sha256",
+    }
+    expected_across_seed_fields = {
+        "estimate_mean_ev_difference",
+        "ci95_lower",
+        "ci95_upper",
+        "confidence_level",
+        "bootstrap_unit",
+        "bootstrap_algorithm",
+        "bootstrap_replicates",
+        "bootstrap_seed",
+        "seeds",
+        "positive_seed_count",
+        "seed_effects",
+        "evaluation_tokens_per_seed",
+        "packed_sequences_per_seed",
+        "token_identity_sha256",
+    }
     for row in raw_contrasts:
-        if not isinstance(row, Mapping):
+        if (
+            not isinstance(row, Mapping)
+            or set(row) != expected_contrast_fields
+        ):
             raise RoutedLadderV3ReportError("contrast row is invalid")
         identity = (
             row.get("panel"),
@@ -2483,6 +3215,8 @@ def validate_v3_primary_report(
             or identity[2] not in ENDPOINTS
             or identity in seen_contrasts
             or row.get("contrast") != CONTRAST
+            or row.get("effect")
+            != "EV(A512Softplus) - EV(A512ReLUInclusiveTopK)"
         ):
             raise RoutedLadderV3ReportError(
                 f"contrast identity is invalid: {identity}"
@@ -2496,8 +3230,17 @@ def validate_v3_primary_report(
             )
         observed_effects: list[float] = []
         for seed, effect in zip(SEEDS, per_seed, strict=True):
+            expected_bootstrap_seed = _bootstrap_seed(
+                panel=str(identity[0]),
+                seed=seed,
+                checkpoint_tokens=int(identity[1]),
+                endpoint=str(identity[2]),
+                token_identity_sha256=common["token_identity_sha256"],
+                level="packed-sequence",
+            )
             if (
                 not isinstance(effect, Mapping)
+                or set(effect) != expected_per_seed_fields
                 or effect.get("seed") != seed
                 or effect.get("confidence_level") != CONFIDENCE_LEVEL
                 or effect.get("bootstrap_unit") != "packed_sequence"
@@ -2505,6 +3248,7 @@ def validate_v3_primary_report(
                 != SEED_BOOTSTRAP_ALGORITHM
                 or effect.get("bootstrap_replicates")
                 != BOOTSTRAP_REPLICATES
+                or effect.get("bootstrap_seed") != expected_bootstrap_seed
                 or effect.get("evaluation_tokens") != tokens
                 or effect.get("packed_sequences") != packed
                 or effect.get("token_identity_sha256")
@@ -2557,14 +3301,23 @@ def validate_v3_primary_report(
                 )
             observed_effects.append(estimate)
         across = row.get("across_seed")
+        expected_across_seed = _bootstrap_seed(
+            panel=str(identity[0]),
+            seed=None,
+            checkpoint_tokens=int(identity[1]),
+            endpoint=str(identity[2]),
+            token_identity_sha256=common["token_identity_sha256"],
+            level="crossed-seed-and-packed-sequence",
+        )
         if (
             not isinstance(across, Mapping)
+            or set(across) != expected_across_seed_fields
             or across.get("confidence_level") != CONFIDENCE_LEVEL
-            or across.get("bootstrap_unit")
-            != "seed_then_packed_sequence"
+            or across.get("bootstrap_unit") != _CROSSED_BOOTSTRAP_UNIT
             or across.get("bootstrap_algorithm")
             != HIERARCHICAL_BOOTSTRAP_ALGORITHM
             or across.get("bootstrap_replicates") != BOOTSTRAP_REPLICATES
+            or across.get("bootstrap_seed") != expected_across_seed
             or across.get("seeds") != list(SEEDS)
             or across.get("positive_seed_count")
             != sum(value > 0 for value in observed_effects)
@@ -2646,7 +3399,22 @@ def validate_v3_primary_report(
             )
 
     cost = report["training_cost_comparison"]
-    if not isinstance(cost, Mapping):
+    if (
+        not isinstance(cost, Mapping)
+        or set(cost)
+        != {
+            "authority",
+            "ratio_policy",
+            "shared_harvest_excluded",
+            "trajectory_costs",
+            "paired_seed_comparisons",
+            "panel_summaries",
+        }
+        or cost.get("authority")
+        != "immutable marginal SAE/transcoder training-result chip-seconds"
+        or cost.get("ratio_policy") != "same_accelerator_type_only"
+        or cost.get("shared_harvest_excluded") is not True
+    ):
         raise RoutedLadderV3ReportError("training cost report is invalid")
     trajectory = cost.get("trajectory_costs")
     if not isinstance(trajectory, list) or len(trajectory) != 12:
@@ -2654,15 +3422,47 @@ def validate_v3_primary_report(
             "training cost report requires twelve trajectories"
         )
     cost_grid: dict[tuple[str, str, int], Mapping[str, Any]] = {}
+    expected_trajectory_fields = {
+        "panel",
+        "condition",
+        "seed",
+        "origin",
+        "resource_id",
+        "accelerator_type",
+        "chip_count",
+        "tokens",
+        "marginal_wall_seconds",
+        "chip_seconds",
+        "tokens_per_second",
+        "chip_seconds_scope",
+        "chip_seconds_excludes",
+        "compile_seconds_excluded",
+        "lowering_seconds_excluded",
+        "checkpoint_seconds_excluded",
+        "preprocessing_wall_seconds_included",
+        "optimizer_wall_seconds_included",
+        "training_source_revision",
+        "training_result_sha256",
+        "training_result_file_sha256",
+    }
+    observed_cost_scopes: set[tuple[str, tuple[str, ...]]] = set()
     for row in trajectory:
-        if not isinstance(row, Mapping):
+        if (
+            not isinstance(row, Mapping)
+            or set(row) != expected_trajectory_fields
+        ):
             raise RoutedLadderV3ReportError(
                 "training trajectory cost row is invalid"
             )
         identity = (row.get("panel"), row.get("condition"), row.get("seed"))
-        if identity in cost_grid:
+        if (
+            identity[0] not in PANELS
+            or identity[1] not in CONDITIONS
+            or identity[2] not in SEEDS
+            or identity in cost_grid
+        ):
             raise RoutedLadderV3ReportError(
-                f"duplicate training cost row: {identity}"
+                f"invalid or duplicate training cost row: {identity}"
             )
         cost_grid[identity] = row
         wall = _finite(
@@ -2679,11 +3479,64 @@ def validate_v3_primary_report(
             f"{identity} chip seconds",
             positive=True,
         )
+        rate = _finite(
+            row.get("tokens_per_second"),
+            f"{identity} tokens per second",
+            positive=True,
+        )
+        preprocessing = _finite(
+            row.get("preprocessing_wall_seconds_included"),
+            f"{identity} preprocessing seconds",
+        )
+        optimizer = _finite(
+            row.get("optimizer_wall_seconds_included"),
+            f"{identity} optimizer seconds",
+        )
+        accelerator_type = row.get("accelerator_type")
+        excludes = row.get("chip_seconds_excludes")
+        scope = row.get("chip_seconds_scope")
+        expected_origin = (
+            "fresh_v3"
+            if identity[1] == RELU_CONDITION
+            else "imported_v2_exact_graph"
+        )
+        revision = row.get("training_source_revision")
         if (
-            row.get("tokens") != 10_000_000
+            row.get("origin") != expected_origin
+            or not isinstance(row.get("resource_id"), str)
+            or not row.get("resource_id")
+            or not isinstance(accelerator_type, str)
+            or _CHIP_COUNT_BY_ACCELERATOR.get(accelerator_type)
+            != chip_count
+            or row.get("tokens") != 10_000_000
+            or not isinstance(scope, str)
+            or not scope
+            or not isinstance(excludes, list)
+            or not excludes
+            or not all(isinstance(item, str) and item for item in excludes)
+            or not isinstance(revision, str)
+            or len(revision) != 40
+            or any(
+                character not in "0123456789abcdef"
+                for character in revision
+            )
+            or preprocessing < 0
+            or optimizer < 0
+            or not math.isclose(
+                wall,
+                preprocessing + optimizer,
+                rel_tol=1e-9,
+                abs_tol=1e-6,
+            )
             or not math.isclose(
                 chips,
                 wall * chip_count,
+                rel_tol=1e-9,
+                abs_tol=1e-6,
+            )
+            or not math.isclose(
+                rate,
+                10_000_000 / wall,
                 rel_tol=1e-9,
                 abs_tol=1e-6,
             )
@@ -2691,6 +3544,16 @@ def validate_v3_primary_report(
             raise RoutedLadderV3ReportError(
                 f"training cost arithmetic changed: {identity}"
             )
+        for field in (
+            "compile_seconds_excluded",
+            "lowering_seconds_excluded",
+            "checkpoint_seconds_excluded",
+        ):
+            if _finite(row.get(field), f"{identity} {field}") < 0:
+                raise RoutedLadderV3ReportError(
+                    f"training excluded timing is negative: {identity}"
+                )
+        observed_cost_scopes.add((scope, tuple(excludes)))
         _sha256(
             row.get("training_result_sha256"),
             f"{identity} training result hash",
@@ -2707,45 +3570,268 @@ def validate_v3_primary_report(
     }
     if set(cost_grid) != expected_cost_grid:
         raise RoutedLadderV3ReportError("training cost grid is incomplete")
+    if len(observed_cost_scopes) != 1:
+        raise RoutedLadderV3ReportError(
+            "training trajectories do not share one measured-cost scope"
+        )
     paired_costs = cost.get("paired_seed_comparisons")
     if not isinstance(paired_costs, list) or len(paired_costs) != 6:
         raise RoutedLadderV3ReportError(
             "training cost comparison requires six paired seeds"
         )
+    expected_pair_fields = {
+        "panel",
+        "seed",
+        "relu_accelerator_type",
+        "softplus_accelerator_type",
+        "comparison_status",
+        "relu_chip_seconds",
+        "softplus_chip_seconds",
+        "softplus_minus_relu_chip_seconds",
+        "softplus_to_relu_chip_seconds_ratio_percent",
+        "relu_to_softplus_chip_seconds_ratio_percent",
+        "comparison_scope",
+        "comparison_excludes",
+    }
+    pair_grid: dict[tuple[str, int], Mapping[str, Any]] = {}
     for row in paired_costs:
+        if (
+            not isinstance(row, Mapping)
+            or set(row) != expected_pair_fields
+        ):
+            raise RoutedLadderV3ReportError(
+                "paired training cost row fields changed"
+            )
         panel = row.get("panel")
         seed = row.get("seed")
-        relu = float(cost_grid[(panel, RELU_CONDITION, seed)]["chip_seconds"])
-        softplus = float(
-            cost_grid[(panel, SOFTPLUS_CONDITION, seed)]["chip_seconds"]
+        identity = (panel, seed)
+        if (
+            panel not in PANELS
+            or seed not in SEEDS
+            or identity in pair_grid
+        ):
+            raise RoutedLadderV3ReportError(
+                f"paired training cost identity changed: {identity}"
+            )
+        pair_grid[identity] = row
+        relu_row = cost_grid[(panel, RELU_CONDITION, seed)]
+        softplus_row = cost_grid[(panel, SOFTPLUS_CONDITION, seed)]
+        relu = float(relu_row["chip_seconds"])
+        softplus = float(softplus_row["chip_seconds"])
+        comparable = (
+            relu_row["accelerator_type"]
+            == softplus_row["accelerator_type"]
+        )
+        expected_status = (
+            "comparable_same_accelerator_type"
+            if comparable
+            else "non_comparable_accelerator_type_mismatch"
+        )
+        difference = row.get("softplus_minus_relu_chip_seconds")
+        ratio = row.get("softplus_to_relu_chip_seconds_ratio_percent")
+        inverse_ratio = row.get(
+            "relu_to_softplus_chip_seconds_ratio_percent"
         )
         if (
-            not math.isclose(
-                float(row.get("relu_chip_seconds")),
+            row.get("relu_accelerator_type")
+            != relu_row["accelerator_type"]
+            or row.get("softplus_accelerator_type")
+            != softplus_row["accelerator_type"]
+            or row.get("comparison_status") != expected_status
+            or row.get("comparison_scope") != relu_row["chip_seconds_scope"]
+            or row.get("comparison_excludes")
+            != relu_row["chip_seconds_excludes"]
+            or not math.isclose(
+                _finite(
+                    row.get("relu_chip_seconds"),
+                    f"{identity} ReLU chip seconds",
+                    positive=True,
+                ),
                 relu,
                 rel_tol=0,
                 abs_tol=1e-12,
             )
             or not math.isclose(
-                float(row.get("softplus_chip_seconds")),
+                _finite(
+                    row.get("softplus_chip_seconds"),
+                    f"{identity} Softplus chip seconds",
+                    positive=True,
+                ),
                 softplus,
                 rel_tol=0,
                 abs_tol=1e-12,
             )
-            or not math.isclose(
-                float(
-                    row.get(
-                        "softplus_to_relu_chip_seconds_ratio_percent"
+            or (
+                comparable
+                and (
+                    not math.isclose(
+                        _finite(difference, f"{identity} cost difference"),
+                        softplus - relu,
+                        rel_tol=0,
+                        abs_tol=1e-12,
                     )
-                ),
-                100.0 * softplus / relu,
-                rel_tol=1e-12,
-                abs_tol=1e-12,
+                    or not math.isclose(
+                        _finite(ratio, f"{identity} cost ratio"),
+                        100.0 * softplus / relu,
+                        rel_tol=1e-12,
+                        abs_tol=1e-12,
+                    )
+                    or not math.isclose(
+                        _finite(
+                            inverse_ratio,
+                            f"{identity} inverse cost ratio",
+                        ),
+                        100.0 * relu / softplus,
+                        rel_tol=1e-12,
+                        abs_tol=1e-12,
+                    )
+                )
+            )
+            or (
+                not comparable
+                and (
+                    difference is not None
+                    or ratio is not None
+                    or inverse_ratio is not None
+                )
             )
         ):
             raise RoutedLadderV3ReportError(
                 f"paired training cost arithmetic changed: {panel}/seed{seed}"
             )
+    if set(pair_grid) != {
+        (panel, seed) for panel in PANELS for seed in SEEDS
+    }:
+        raise RoutedLadderV3ReportError(
+            "paired training cost identity grid is incomplete"
+        )
+    panel_summaries = cost.get("panel_summaries")
+    if not isinstance(panel_summaries, list) or len(panel_summaries) != 2:
+        raise RoutedLadderV3ReportError(
+            "training cost report requires two panel summaries"
+        )
+    expected_panel_fields = {
+        "panel",
+        "comparison_status",
+        "comparable_seed_count",
+        "relu_median_chip_seconds",
+        "softplus_median_chip_seconds",
+        "median_paired_softplus_to_relu_ratio_percent",
+        "relu_total_chip_seconds",
+        "softplus_total_chip_seconds",
+        "seeds",
+    }
+    seen_panels: set[str] = set()
+    for row in panel_summaries:
+        if (
+            not isinstance(row, Mapping)
+            or set(row) != expected_panel_fields
+            or row.get("panel") not in PANELS
+            or row.get("panel") in seen_panels
+            or row.get("seeds") != list(SEEDS)
+        ):
+            raise RoutedLadderV3ReportError(
+                "training cost panel summary identity changed"
+            )
+        panel = str(row["panel"])
+        seen_panels.add(panel)
+        relu_values = [
+            float(
+                cost_grid[(panel, RELU_CONDITION, seed)]["chip_seconds"]
+            )
+            for seed in SEEDS
+        ]
+        softplus_values = [
+            float(
+                cost_grid[(panel, SOFTPLUS_CONDITION, seed)]["chip_seconds"]
+            )
+            for seed in SEEDS
+        ]
+        ratios = [
+            pair_grid[(panel, seed)][
+                "softplus_to_relu_chip_seconds_ratio_percent"
+            ]
+            for seed in SEEDS
+            if pair_grid[(panel, seed)]["comparison_status"]
+            == "comparable_same_accelerator_type"
+        ]
+        all_comparable = len(ratios) == len(SEEDS)
+        expected_panel_status = (
+            "comparable_all_seeds_same_accelerator_type"
+            if all_comparable
+            else "non_comparable_one_or_more_accelerator_type_mismatches"
+        )
+        expected_ratio = (
+            float(np.median(np.asarray(ratios, dtype=np.float64)))
+            if all_comparable
+            else None
+        )
+        observed_ratio = row.get(
+            "median_paired_softplus_to_relu_ratio_percent"
+        )
+        if (
+            row.get("comparison_status") != expected_panel_status
+            or row.get("comparable_seed_count") != len(ratios)
+            or not math.isclose(
+                _finite(
+                    row.get("relu_median_chip_seconds"),
+                    f"{panel} median ReLU chip seconds",
+                    positive=True,
+                ),
+                float(np.median(np.asarray(relu_values, dtype=np.float64))),
+                rel_tol=1e-12,
+                abs_tol=1e-12,
+            )
+            or not math.isclose(
+                _finite(
+                    row.get("softplus_median_chip_seconds"),
+                    f"{panel} median Softplus chip seconds",
+                    positive=True,
+                ),
+                float(
+                    np.median(np.asarray(softplus_values, dtype=np.float64))
+                ),
+                rel_tol=1e-12,
+                abs_tol=1e-12,
+            )
+            or not math.isclose(
+                _finite(
+                    row.get("relu_total_chip_seconds"),
+                    f"{panel} total ReLU chip seconds",
+                    positive=True,
+                ),
+                math.fsum(relu_values),
+                rel_tol=1e-12,
+                abs_tol=1e-12,
+            )
+            or not math.isclose(
+                _finite(
+                    row.get("softplus_total_chip_seconds"),
+                    f"{panel} total Softplus chip seconds",
+                    positive=True,
+                ),
+                math.fsum(softplus_values),
+                rel_tol=1e-12,
+                abs_tol=1e-12,
+            )
+            or (
+                all_comparable
+                and not math.isclose(
+                    _finite(observed_ratio, f"{panel} median cost ratio"),
+                    float(expected_ratio),
+                    rel_tol=1e-12,
+                    abs_tol=1e-12,
+                )
+            )
+            or (not all_comparable and observed_ratio is not None)
+        ):
+            raise RoutedLadderV3ReportError(
+                f"training cost panel summary arithmetic changed: {panel}"
+            )
+    if seen_panels != set(PANELS):
+        raise RoutedLadderV3ReportError(
+            "training cost panel summary grid is incomplete"
+        )
     context = report["optional_context"]
     if (
         not isinstance(context, Mapping)
@@ -2754,16 +3840,7 @@ def validate_v3_primary_report(
         raise RoutedLadderV3ReportError(
             "optional A256/H context inventory changed"
         )
-    a256 = context["A256Native"]
-    if (
-        not isinstance(a256, Mapping)
-        or a256.get("status") != "absent_nonblocking"
-        or a256.get("primary_verdict_blocked") is not False
-        or "addendum" not in str(a256.get("reason"))
-    ):
-        raise RoutedLadderV3ReportError(
-            "optional A256 context must be absent and nonblocking"
-        )
+    _validate_a256_report_context(context["A256Native"])
     h_context = context["H"]
     if (
         not isinstance(h_context, Mapping)
@@ -2841,6 +3918,7 @@ def build_v3_primary_report_from_paths(
     evaluation_plan_path: str | Path,
     training_plan_path: str | Path,
     completed_manifest_path: str | Path,
+    a256_provenance_addendum_path: str | Path | None = None,
     h_reference_manifest_path: str | Path | None = None,
 ) -> dict[str, Any]:
     evaluation = load_v3_primary_evaluation_plan(evaluation_plan_path)
@@ -2864,6 +3942,23 @@ def build_v3_primary_report_from_paths(
         raise RoutedLadderV3ReportError(
             "completed Softplus reference manifest must be an object"
         )
+    a256_addendum: Mapping[str, Any] | None = None
+    if a256_provenance_addendum_path is not None:
+        try:
+            loaded_a256 = yaml.safe_load(
+                Path(a256_provenance_addendum_path).read_text(
+                    encoding="utf-8"
+                )
+            )
+        except (OSError, UnicodeDecodeError, yaml.YAMLError) as error:
+            raise RoutedLadderV3ReportError(
+                "cannot read optional A256 provenance addendum"
+            ) from error
+        if not isinstance(loaded_a256, Mapping):
+            raise RoutedLadderV3ReportError(
+                "optional A256 provenance addendum must be an object"
+            )
+        a256_addendum = loaded_a256
     h_reference: Mapping[str, Any] | None = None
     if h_reference_manifest_path is not None:
         try:
@@ -2880,6 +3975,7 @@ def build_v3_primary_report_from_paths(
             )
         h_reference = loaded_h
     cells, timings = collect_primary_cell_evidence(evaluation)
+    _validate_bundle_resource_ownership(evaluation, training, timings)
     costs = collect_training_cost_evidence(
         training,
         completed,
@@ -2892,6 +3988,7 @@ def build_v3_primary_report_from_paths(
         cells,
         timings,
         costs,
+        a256_provenance_addendum=a256_addendum,
         h_reference_manifest=h_reference,
     )
 
@@ -2940,6 +4037,7 @@ def verify_v3_primary_report_from_paths(
     evaluation_plan_path: str | Path,
     training_plan_path: str | Path,
     completed_manifest_path: str | Path,
+    a256_provenance_addendum_path: str | Path | None = None,
     h_reference_manifest_path: str | Path | None = None,
 ) -> dict[str, Any]:
     observed = load_v3_primary_report(report_path)
@@ -2947,6 +4045,7 @@ def verify_v3_primary_report_from_paths(
         evaluation_plan_path=evaluation_plan_path,
         training_plan_path=training_plan_path,
         completed_manifest_path=completed_manifest_path,
+        a256_provenance_addendum_path=a256_provenance_addendum_path,
         h_reference_manifest_path=h_reference_manifest_path,
     )
     if observed != expected:
@@ -2991,6 +4090,7 @@ __all__ = [
     "TrainingCostEvidence",
     "build_v3_primary_report_from_evidence",
     "build_v3_primary_report_from_paths",
+    "collect_a256_reference_context",
     "collect_primary_cell_evidence",
     "collect_training_cost_evidence",
     "hierarchical_v3_bootstrap",
