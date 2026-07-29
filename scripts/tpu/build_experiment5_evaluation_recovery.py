@@ -29,6 +29,28 @@ def _mapping_file(path: Path, *, name: str) -> dict[str, Any]:
     return value
 
 
+def _region_roots(values: list[str]) -> dict[str, Path]:
+    result: dict[str, Path] = {}
+    for value in values:
+        region, separator, raw_path = value.partition("=")
+        if (
+            not separator
+            or not region
+            or not raw_path
+            or region in result
+        ):
+            raise EvaluationRecoveryPlanError(
+                "--result-root-controller must be unique REGION=/absolute/path"
+            )
+        path = Path(raw_path).expanduser()
+        if not path.is_absolute():
+            raise EvaluationRecoveryPlanError(
+                "--result-root-controller path must be absolute"
+            )
+        result[region] = path
+    return result
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--core-plan", required=True, type=Path)
@@ -40,7 +62,16 @@ def _parser() -> argparse.ArgumentParser:
         help="YAML/JSON mapping containing the fresh `resources` list",
     )
     parser.add_argument("--state-root", required=True, type=Path)
-    parser.add_argument("--result-root-controller", required=True, type=Path)
+    parser.add_argument(
+        "--result-root-controller",
+        required=True,
+        action="append",
+        metavar="REGION=/ABSOLUTE/PATH",
+        help=(
+            "repeat once per frozen regional NFS plane; worker-visible "
+            "remote paths remain common"
+        ),
+    )
     parser.add_argument("--result-root-remote", required=True)
     parser.add_argument("--already-spent-usd", required=True, type=float)
     parser.add_argument("--campaign-id")
@@ -76,7 +107,9 @@ def main(argv: list[str] | None = None) -> int:
             evaluation_source_revision=args.evaluation_source_revision,
             resources=resources,
             state_root=args.state_root,
-            result_root_controller=args.result_root_controller,
+            result_roots_controller=_region_roots(
+                args.result_root_controller
+            ),
             result_root_remote=args.result_root_remote,
             already_spent_usd=args.already_spent_usd,
             eligible_resource_ids=eligibility,

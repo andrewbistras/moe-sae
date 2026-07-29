@@ -39,6 +39,7 @@ from moe_sae.experiment5_evaluation_recovery import (
     seal_recovery_handoff,
     validate_recovery_handoff,
 )
+from scripts.tpu.build_experiment5_evaluation_recovery import _region_roots
 
 # Reusing the frozen campaign's own test-plan builder keeps this suite focused
 # on the recovery boundary instead of maintaining a second 24+18 core fixture.
@@ -61,11 +62,61 @@ def _write_json(path: Path, value: dict) -> None:
     )
 
 
-def _core_with_training_barrier(tmp_path: Path) -> tuple[Path, dict]:
+def _core_with_training_barrier(
+    tmp_path: Path,
+    *,
+    two_regions: bool = False,
+) -> tuple[Path, dict]:
     raw = _raw_plan(tmp_path / "core")
     raw["project_commit"] = FROZEN_TRAINING_REVISION
     for resource in raw["resources"]:
         resource["deployed_commit"] = FROZEN_TRAINING_REVISION
+    if two_regions:
+        us_ids = [row["id"] for row in raw["resources"][:3]]
+        us2_ids = [row["id"] for row in raw["resources"][3:]]
+        for resource in raw["resources"][3:]:
+            resource["region"] = "us-test2"
+            resource["zone"] = "us-test2-a"
+        raw["state_root"] = str(tmp_path / "mount-control" / "core-state")
+        for task in raw["trajectories"]:
+            task["eligible_resource_ids"] = (
+                us_ids if task["seed"] == 0 else us2_ids
+            )
+            mount = (
+                tmp_path / "mount-usc"
+                if task["seed"] == 0
+                else tmp_path / "mount-control"
+            )
+            task["completion_path_controller"] = str(
+                mount
+                / "core-results"
+                / "runs"
+                / task["run_id"]
+                / "training-result.json"
+            )
+        for task in raw["evaluations"]:
+            task["eligible_resource_ids"] = (
+                us_ids if task["seed"] == 0 else us2_ids
+            )
+            mount = (
+                tmp_path / "mount-usc"
+                if task["seed"] == 0
+                else tmp_path / "mount-control"
+            )
+            destination = (
+                mount
+                / "core-results"
+                / "evaluation"
+                / task["panel"]
+                / f"seed{task['seed']}"
+                / str(task["milestone_tokens"])
+            )
+            task["completion_path_controller"] = str(
+                destination / "scientific-result.json"
+            )
+            task["paired_scores_path_controller"] = str(
+                destination / "paired-scores.json"
+            )
     core_path = tmp_path / "contracts" / "core.yaml"
     core_path.parent.mkdir(parents=True)
     core_path.write_text(
@@ -135,8 +186,16 @@ def _core_with_training_barrier(tmp_path: Path) -> tuple[Path, dict]:
     return core_path, raw
 
 
-def _recovery_resources(raw_core: dict, count: int = 3) -> list[dict]:
-    resources = copy.deepcopy(raw_core["resources"][:count])
+def _recovery_resources(
+    raw_core: dict,
+    count: int | None = 3,
+) -> list[dict]:
+    selected = (
+        raw_core["resources"]
+        if count is None
+        else raw_core["resources"][:count]
+    )
+    resources = copy.deepcopy(selected)
     # A recovered cell must retain the accelerator generation and regional
     # artifact plane recorded by its frozen training receipts.
     for resource in resources:
@@ -153,7 +212,28 @@ def recovery_raw(tmp_path: Path) -> dict:
         evaluation_source_revision=EVALUATION_REVISION,
         resources=_recovery_resources(raw_core),
         state_root=tmp_path / "recovery" / "state",
-        result_root_controller=tmp_path / "recovery" / "results",
+        result_roots_controller={
+            "us-test1": tmp_path / "recovery" / "results"
+        },
+        result_root_remote="/remote/recovery/evaluation",
+        already_spent_usd=31.64,
+    )
+
+
+def _two_region_recovery_raw(tmp_path: Path) -> dict:
+    core_path, raw_core = _core_with_training_barrier(
+        tmp_path,
+        two_regions=True,
+    )
+    return build_evaluation_recovery_plan(
+        core_plan_path=core_path,
+        evaluation_source_revision=EVALUATION_REVISION,
+        resources=_recovery_resources(raw_core, count=None),
+        state_root=tmp_path / "recovery" / "state",
+        result_roots_controller={
+            "us-test1": tmp_path / "recovery-usc" / "results",
+            "us-test2": tmp_path / "recovery-control" / "results",
+        },
         result_root_remote="/remote/recovery/evaluation",
         already_spent_usd=31.64,
     )
@@ -195,15 +275,76 @@ def test_builder_is_evaluation_only_and_hash_pins_all_training(
     assert plan.project_commit == EVALUATION_REVISION
     assert plan.parent.training_source_revision == FROZEN_TRAINING_REVISION
     assert not plan.state_root.is_relative_to(plan.core_plan.state_root)
-    assert not plan.result_root_controller.is_relative_to(
-        plan.core_plan.state_root
-    )
+    result_roots = plan.result_roots_controller_dict()
+    assert set(result_roots) == {"us-test1"}
+    assert not result_roots["us-test1"].is_relative_to(plan.core_plan.state_root)
     assert all(
         task.completion_path_controller.is_relative_to(
-            plan.result_root_controller
+            result_roots["us-test1"]
         )
         for task in plan.evaluations
     )
+
+
+def test_two_region_builder_and_parser_pin_each_controller_plane(
+    tmp_path: Path,
+) -> None:
+    raw = _two_region_recovery_raw(tmp_path)
+    plan = parse_evaluation_recovery_plan(raw)
+    roots = plan.result_roots_controller_dict()
+    resource_by_id = {
+        resource.resource_id: resource for resource in plan.resources
+    }
+    counts = {"us-test1": 0, "us-test2": 0}
+    for task in plan.evaluations:
+        regions = {
+            resource_by_id[resource_id].region
+            for resource_id in task.eligible_resource_ids
+        }
+        assert len(regions) == 1
+        region = next(iter(regions))
+        counts[region] += 1
+        assert task.completion_path_controller.is_relative_to(roots[region])
+        assert task.paired_scores_path_controller.is_relative_to(roots[region])
+        assert task.result_root_remote.startswith(
+            "/remote/recovery/evaluation/"
+        )
+    assert counts == {"us-test1": 6, "us-test2": 12}
+
+    missing_plane = copy.deepcopy(raw)
+    del missing_plane["result_roots_controller"]["us-test2"]
+    with pytest.raises(
+        EvaluationRecoveryPlanError,
+        match="do not exactly cover frozen regions",
+    ):
+        parse_evaluation_recovery_plan(missing_plane)
+
+
+def test_cli_parses_repeated_regional_controller_roots() -> None:
+    assert _region_roots(
+        [
+            "us-central1=/mnt/moe-sae-usc1/recovery/results",
+            "us-central2=/mnt/moe-sae-control/recovery/results",
+        ]
+    ) == {
+        "us-central1": Path("/mnt/moe-sae-usc1/recovery/results"),
+        "us-central2": Path("/mnt/moe-sae-control/recovery/results"),
+    }
+    with pytest.raises(
+        EvaluationRecoveryPlanError,
+        match="unique REGION=/absolute/path",
+    ):
+        _region_roots(
+            [
+                "us-central1=/mnt/a",
+                "us-central1=/mnt/b",
+            ]
+        )
+    with pytest.raises(
+        EvaluationRecoveryPlanError,
+        match="path must be absolute",
+    ):
+        _region_roots(["us-central1=relative/results"])
 
 
 def test_parent_preflight_reproves_barrier_results_and_pointers(
@@ -233,13 +374,13 @@ def test_parser_rejects_old_or_overlapping_namespaces(
     )
     with pytest.raises(
         EvaluationRecoveryPlanError,
-        match="overlaps the frozen campaign state",
+        match="overlaps a frozen namespace",
     ):
         parse_evaluation_recovery_plan(overlapping_state)
 
     overlapping_result = copy.deepcopy(recovery_raw)
     old = core.evaluations[0].completion_path_controller.parent
-    overlapping_result["result_root_controller"] = str(old)
+    overlapping_result["result_roots_controller"] = {"us-test1": str(old)}
     for task in overlapping_result["evaluations"]:
         destination = (
             old
@@ -255,7 +396,7 @@ def test_parser_rejects_old_or_overlapping_namespaces(
         )
     with pytest.raises(
         EvaluationRecoveryPlanError,
-        match="overlaps the frozen result namespace",
+        match="overlaps a frozen namespace",
     ):
         parse_evaluation_recovery_plan(overlapping_result)
 
@@ -301,7 +442,9 @@ def test_builder_filters_incompatible_resource_from_every_cell(
         evaluation_source_revision=EVALUATION_REVISION,
         resources=resources,
         state_root=tmp_path / "recovery" / "state",
-        result_root_controller=tmp_path / "recovery" / "results",
+        result_roots_controller={
+            "us-test1": tmp_path / "recovery" / "results"
+        },
         result_root_remote="/remote/recovery/evaluation",
         already_spent_usd=31.64,
     )
@@ -513,4 +656,53 @@ def test_recovery_runs_only_evaluations_and_seals_handoff(
     assert handoff["status"] == "recovery_report_sealed"
     assert handoff["training_source_revision"] == FROZEN_TRAINING_REVISION
     assert handoff["evaluation_source_revision"] == EVALUATION_REVISION
+    assert validate_recovery_handoff(handoff, plan=plan) == handoff
+
+
+def test_two_region_recovery_runs_and_seals_outputs_on_both_planes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = parse_evaluation_recovery_plan(
+        _two_region_recovery_raw(tmp_path)
+    )
+    _install_report_stubs(monkeypatch)
+    monkeypatch.setattr(
+        recovery_module,
+        "validate_experiment5_report",
+        lambda value: dict(value),
+    )
+
+    def runner(
+        task_id,
+        _command,
+        _environment,
+        _working_directory,
+        log_path,
+        _stop_event,
+    ):
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text("two-region evaluation complete\n", encoding="utf-8")
+        _write_evaluation_completion(plan, task_id)
+        return AttemptExecution(0)
+
+    final = EvaluationRecoveryCampaign(
+        plan,
+        verify_checkout=False,
+        attempt_runner=runner,
+        resource_readiness_probe=lambda _resource: _ready(),
+    ).run()
+
+    assert final["status"] == "completed"
+    roots = plan.result_roots_controller_dict()
+    completed_by_region = {
+        region: sum(
+            task.completion_path_controller.is_file()
+            and task.completion_path_controller.is_relative_to(root)
+            for task in plan.evaluations
+        )
+        for region, root in roots.items()
+    }
+    assert completed_by_region == {"us-test1": 6, "us-test2": 12}
+    handoff = seal_recovery_handoff(plan)
     assert validate_recovery_handoff(handoff, plan=plan) == handoff

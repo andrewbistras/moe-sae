@@ -92,7 +92,7 @@ from moe_sae.experiment5_report import (
 )
 from moe_sae.horizon_supervisor import classify_failure
 
-PLAN_SCHEMA_VERSION = "gemma4-experiment5-evaluation-recovery-plan-v1"
+PLAN_SCHEMA_VERSION = "gemma4-experiment5-evaluation-recovery-plan-v2"
 PARENT_SCHEMA_VERSION = "gemma4-experiment5-evaluation-recovery-parent-v1"
 REPORT_ENVELOPE_SCHEMA_VERSION = (
     "gemma4-experiment5-evaluation-recovery-report-envelope-v1"
@@ -149,7 +149,7 @@ class RecoveryParent:
 class EvaluationRecoveryPlan:
     campaign_id: str
     state_root: Path
-    result_root_controller: Path
+    result_roots_controller: tuple[tuple[str, Path], ...]
     result_root_remote: str
     handoff_path: Path
     working_directory: Path
@@ -183,6 +183,9 @@ class EvaluationRecoveryPlan:
     def environment_dict(self) -> dict[str, str]:
         return dict(self.environment)
 
+    def result_roots_controller_dict(self) -> dict[str, Path]:
+        return dict(self.result_roots_controller)
+
     def resource(self, resource_id: str) -> CampaignResource:
         for resource in self.resources:
             if resource.resource_id == resource_id:
@@ -192,6 +195,33 @@ class EvaluationRecoveryPlan:
 
 def _paths_overlap(first: Path, second: Path) -> bool:
     return first == second or first in second.parents or second in first.parents
+
+
+def _controller_result_roots(
+    value: Any,
+) -> tuple[tuple[str, Path], ...]:
+    if not isinstance(value, Mapping) or not value:
+        raise EvaluationRecoveryPlanError(
+            "result_roots_controller must be a nonempty region mapping"
+        )
+    if not all(isinstance(region, str) for region in value):
+        raise EvaluationRecoveryPlanError(
+            "controller result-root region keys must be strings"
+        )
+    roots = tuple(
+        (
+            _safe_id(region, f"result_roots_controller[{region!r}]"),
+            _controller_path(
+                str(path), f"result_roots_controller[{region!r}]"
+            ),
+        )
+        for region, path in sorted(value.items())
+    )
+    if len({path for _region, path in roots}) != len(roots):
+        raise EvaluationRecoveryPlanError(
+            "controller result roots must be unique per region"
+        )
+    return roots
 
 
 def _evidence_with_expected_path(
@@ -477,22 +507,55 @@ def _validate_plan_relations(plan: EvaluationRecoveryPlan) -> None:
         raise EvaluationRecoveryPlanError("evaluation matrix is not exact")
     if len({task.task_id for task in plan.evaluations}) != EVALUATION_TASK_COUNT:
         raise EvaluationRecoveryPlanError("evaluation task IDs are not unique")
-    if _paths_overlap(plan.state_root, plan.core_plan.state_root):
+    core_eval = {
+        (task.panel, task.seed, task.milestone_tokens): task
+        for task in plan.core_plan.evaluations
+    }
+    required_regions: set[str] = set()
+    for old in plan.core_plan.evaluations:
+        regions = {
+            plan.core_plan.resource(resource_id).region
+            for resource_id in old.eligible_resource_ids
+        }
+        if len(regions) != 1:
+            raise EvaluationRecoveryPlanError(
+                f"{old.task_id} frozen regional plane is ambiguous"
+            )
+        required_regions.update(regions)
+    result_roots = plan.result_roots_controller_dict()
+    if set(result_roots) != required_regions:
         raise EvaluationRecoveryPlanError(
-            "recovery state root overlaps the frozen campaign state"
+            "controller result roots do not exactly cover frozen regions"
         )
-    if _paths_overlap(plan.result_root_controller, plan.state_root):
+    new_roots = [plan.state_root, *result_roots.values()]
+    if any(
+        _paths_overlap(first, second)
+        for index, first in enumerate(new_roots)
+        for second in new_roots[index + 1 :]
+    ):
         raise EvaluationRecoveryPlanError(
-            "recovery result and controller-state roots must be disjoint"
+            "recovery state and regional result roots must be disjoint"
+        )
+    old_paths = [
+        plan.core_plan.state_root,
+        *(
+            task.completion_path_controller.parent
+            for task in plan.core_plan.trajectories
+        ),
+        *(
+            task.completion_path_controller.parent
+            for task in plan.core_plan.evaluations
+        ),
+    ]
+    if any(
+        _paths_overlap(new, old)
+        for new in new_roots
+        for old in old_paths
+    ):
+        raise EvaluationRecoveryPlanError(
+            "recovery state or result root overlaps a frozen namespace"
         )
     for old in plan.core_plan.evaluations:
-        if _paths_overlap(
-            plan.result_root_controller,
-            old.completion_path_controller.parent,
-        ):
-            raise EvaluationRecoveryPlanError(
-                "recovery result root overlaps the frozen result namespace"
-            )
         if (
             plan.result_root_remote == old.result_root_remote
             or plan.result_root_remote.startswith(old.result_root_remote + "/")
@@ -501,10 +564,6 @@ def _validate_plan_relations(plan: EvaluationRecoveryPlan) -> None:
             raise EvaluationRecoveryPlanError(
                 "recovery remote result root overlaps the frozen result namespace"
             )
-    core_eval = {
-        (task.panel, task.seed, task.milestone_tokens): task
-        for task in plan.core_plan.evaluations
-    }
     parent_runs = {
         (row.panel, row.condition, row.seed): row.run_root_remote
         for row in plan.parent.training_cells
@@ -565,7 +624,7 @@ def _validate_plan_relations(plan: EvaluationRecoveryPlan) -> None:
                 f"{task.task_id} does not read the frozen training plane"
             )
         expected_controller = (
-            plan.result_root_controller
+            result_roots[next(iter(frozen_regions))]
             / task.panel
             / f"seed{task.seed}"
             / str(task.milestone_tokens)
@@ -604,7 +663,7 @@ def parse_evaluation_recovery_plan(value: Any) -> EvaluationRecoveryPlan:
             "protocol_id",
             "campaign_id",
             "state_root",
-            "result_root_controller",
+            "result_roots_controller",
             "result_root_remote",
             "handoff_path",
             "working_directory",
@@ -684,8 +743,8 @@ def parse_evaluation_recovery_plan(value: Any) -> EvaluationRecoveryPlan:
     if retry.maximum_backoff_seconds < retry.initial_backoff_seconds:
         raise EvaluationRecoveryPlanError("retry backoff maximum precedes initial")
     state_root = _controller_path(selected["state_root"], "state_root")
-    result_root = _controller_path(
-        selected["result_root_controller"], "result_root_controller"
+    result_roots = _controller_result_roots(
+        selected["result_roots_controller"]
     )
     handoff_path = _controller_path(
         selected["handoff_path"], "handoff_path"
@@ -695,7 +754,7 @@ def parse_evaluation_recovery_plan(value: Any) -> EvaluationRecoveryPlan:
     plan = EvaluationRecoveryPlan(
         campaign_id=_safe_id(selected["campaign_id"], "campaign_id"),
         state_root=state_root,
-        result_root_controller=result_root,
+        result_roots_controller=result_roots,
         result_root_remote=_remote_path(
             selected["result_root_remote"], "result_root_remote"
         ),
@@ -1549,7 +1608,7 @@ def build_evaluation_recovery_plan(
     evaluation_source_revision: str,
     resources: Sequence[Mapping[str, Any]],
     state_root: str | Path,
-    result_root_controller: str | Path,
+    result_roots_controller: Mapping[str, str | Path],
     result_root_remote: str,
     already_spent_usd: float,
     eligible_resource_ids: Mapping[str, Sequence[str]] | None = None,
@@ -1600,7 +1659,9 @@ def build_evaluation_recovery_plan(
         for index, row in enumerate(raw_resources)
     )
     state = Path(state_root).expanduser().resolve()
-    controller_results = Path(result_root_controller).expanduser().resolve()
+    controller_results = dict(
+        _controller_result_roots(result_roots_controller)
+    )
     remote_results = _remote_path(result_root_remote, "result_root_remote")
     core_eval = sorted(
         core.evaluations,
@@ -1646,8 +1707,14 @@ def build_evaluation_recovery_plan(
             raise EvaluationRecoveryPlanError(
                 f"{old.task_id} has no compatible recovery resource"
             )
+        frozen_region = next(iter(frozen_regions))
+        if frozen_region not in controller_results:
+            raise EvaluationRecoveryPlanError(
+                f"{old.task_id} has no controller result root for "
+                f"{frozen_region}"
+            )
         destination = (
-            controller_results
+            controller_results[frozen_region]
             / old.panel
             / f"seed{old.seed}"
             / str(old.milestone_tokens)
@@ -1697,7 +1764,10 @@ def build_evaluation_recovery_plan(
             or f"gemma4-experiment5-evaluation-recovery-{short}"
         ),
         "state_root": str(state),
-        "result_root_controller": str(controller_results),
+        "result_roots_controller": {
+            region: str(path)
+            for region, path in sorted(controller_results.items())
+        },
         "result_root_remote": remote_results,
         "handoff_path": str(state / "recovery-handoff.json"),
         "working_directory": str(core.working_directory),
