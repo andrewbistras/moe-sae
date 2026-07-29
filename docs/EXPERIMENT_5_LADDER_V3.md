@@ -68,10 +68,29 @@ exact-positive check remain in force.
 `A256Native` means “the historical Experiment-4 A cell native to this panel.”
 It is deliberately not one cross-panel synthetic treatment:
 
-| panel | displayed source | activation | selection history | semantic config SHA-256 |
+| panel | displayed source | activation | selection history | frozen v3 declaration |
 |---|---|---|---|---|
 | SAE | `A256ReLU` | ReLU | strict-positive TopK-2 | `035e1afc91f7351fda3128582ac52e2051fcb0741f6f71913f5141aaa1c7ab59` |
 | transcoder | `A256Softplus` | Softplus | exact-positive TopK-2 | `1742ebc1b7993dffd0b35665695a074c3d10025f5d410021dd66ccb1bb221ec9` |
+
+The transcoder value in the last column is a mistaken declaration in the
+already-trained v3 metadata, not the observed identity of the historical
+finalized config. Do not edit the frozen v3 config to hide that discrepancy.
+Before A256 enters a contextual report, seal a create-only provenance
+addendum from the original horizon plan:
+
+```text
+scripts/tpu/build_experiment5_routed_ladder_v3_a256_provenance_addendum.py \
+  --horizon-plan /path/to/the/sealed/direct-horizon-plan.yaml \
+  --output /new/create-only/a256native-provenance-addendum.yaml
+```
+
+The addendum hashes the real config bytes, derives the real semantic config
+identity, records declared versus observed values, and pins the run contract,
+training result, measured cost, and 2M/5M/10M checkpoint pointers for both
+panels. It requires the SAE declaration to match and the transcoder
+declaration to mismatch. Its scope flags permanently exclude A256 from the
+matched A512 primary inference and estimand.
 
 Only historical seed 0 is available. Both references are read-only, with
 2M/5M/10M checkpoints. They are context points, not substitutes for three
