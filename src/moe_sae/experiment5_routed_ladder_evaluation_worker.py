@@ -3340,6 +3340,7 @@ def run(
             training_source_revision=args.training_source_revision,
             target_manifest_sha256=train_target.manifest_sha256,
             source_manifest_sha256=source_manifest_sha,
+            phase_name=_phase_name(config),
         )
         parent_run_contract = run_contract
         training_contract_sha = run_contract["run_contract_sha256"]

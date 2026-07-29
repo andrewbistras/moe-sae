@@ -22,6 +22,7 @@ from moe_sae.experiment5_routed_ladder_evaluation_worker import (
     RoutedLadderEvaluationError,
     _cached_endpoint_training_means,
     _endpoint_centering_cache_identity,
+    _validate_run_contract,
     load_merged_scores,
     load_process_evidence,
     parse_resident_bundle_spec,
@@ -34,6 +35,10 @@ from moe_sae.experiment5_routed_ladder_evaluation_worker import (
 )
 from moe_sae.contribution_artifacts import canonical_sha256
 from moe_sae.experiment5_routed_ladder import PROTOCOL_ID
+from moe_sae.experiment5_routed_ladder_v3_config import (
+    PHASE_NAME as V3_PHASE_NAME,
+    load_routed_ladder_v3_config,
+)
 
 
 SOURCE_REVISION = "a" * 40
@@ -61,6 +66,54 @@ DIGESTS = {
         start=1,
     )
 }
+
+
+def test_v3_run_contract_requires_the_v3_phase_name(tmp_path: Path) -> None:
+    config_path = (
+        Path(__file__).resolve().parents[1]
+        / "configs"
+        / "gemma4_experiment5_routed_ladder_sae_v3.yaml"
+    )
+    config = load_routed_ladder_v3_config(
+        config_path,
+        expected_panel="sae",
+    )
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+    body = {
+        "project_commit": SOURCE_REVISION,
+        "config_file_sha256": hashlib.sha256(
+            config_path.read_bytes()
+        ).hexdigest(),
+        "phase": V3_PHASE_NAME,
+        "condition": "A512ReLUInclusiveTopK",
+        "seed": 0,
+        "capture_manifest_sha256": TARGET_MANIFEST,
+        "scientific_model": "sae",
+    }
+    (run_root / "run-contract.json").write_text(
+        json.dumps(
+            {
+                **body,
+                "run_contract_sha256": canonical_sha256(body),
+            }
+        ),
+        encoding="ascii",
+    )
+
+    observed = _validate_run_contract(
+        run_root,
+        config_path=config_path,
+        config=config,
+        condition="A512ReLUInclusiveTopK",
+        seed=0,
+        training_source_revision=SOURCE_REVISION,
+        target_manifest_sha256=TARGET_MANIFEST,
+        source_manifest_sha256=None,
+        phase_name=V3_PHASE_NAME,
+    )
+
+    assert observed["phase"] == V3_PHASE_NAME
 
 
 def _endpoint_values(
