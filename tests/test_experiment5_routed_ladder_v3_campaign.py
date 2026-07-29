@@ -9,6 +9,7 @@ import yaml
 
 import scripts.tpu.build_experiment5_routed_ladder_v3_training_plan as build_cli
 import scripts.tpu.run_experiment5_routed_ladder_v3_training_campaign as run_cli
+import moe_sae.experiment5_routed_ladder_v3_campaign as v3_campaign
 from moe_sae.contribution_artifacts import canonical_sha256
 from moe_sae.experiment5_routed_ladder_resources import (
     COHORT_KEYS,
@@ -382,3 +383,20 @@ def test_run_cli_installs_stop_handlers_and_dispatches_training_only(
         run_cli.signal.SIGINT,
         run_cli.signal.SIGTERM,
     }
+
+
+def test_v3_preflight_uses_the_v3_native_checkout_verifier(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = parse_routed_ladder_v3_training_plan(_raw_v3_plan(tmp_path))
+    observed: list[str] = []
+    monkeypatch.setattr(
+        v3_campaign,
+        "_verify_v3_checkout",
+        lambda selected: observed.append(selected.project_commit),
+    )
+
+    v3_campaign._preflight(plan, verify_checkout=True)
+
+    assert observed == [COMMIT]

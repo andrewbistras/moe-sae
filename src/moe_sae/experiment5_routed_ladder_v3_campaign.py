@@ -11,6 +11,8 @@ from __future__ import annotations
 import copy
 import hashlib
 import math
+import os
+import subprocess
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -48,7 +50,6 @@ from moe_sae.experiment5_routed_ladder_campaign import (
     RoutedLadderTrainingTask,
     _attempt_environment,
     _task_environment,
-    _verify_checkout,
 )
 from moe_sae.experiment5_routed_ladder_resources import (
     MAX_RESOURCE_COUNT,
@@ -796,9 +797,55 @@ def build_v3_train_command(
     ]
 
 
+def _verify_v3_checkout(plan: RoutedLadderV3TrainingPlan) -> None:
+    """Verify the controller checkout without invoking the v2 config loader."""
+
+    if (
+        plan.working_directory.is_symlink()
+        or not plan.working_directory.is_dir()
+    ):
+        raise RoutedLadderCampaignStateError("working_directory is not real")
+    if (
+        plan.python_executable.is_symlink()
+        or not plan.python_executable.is_file()
+        or not os.access(plan.python_executable, os.X_OK)
+    ):
+        raise RoutedLadderCampaignStateError(
+            "python_executable is not executable"
+        )
+    try:
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=plan.working_directory,
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout.strip()
+        status = subprocess.run(
+            ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+            cwd=plan.working_directory,
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise RoutedLadderCampaignStateError(
+            "cannot verify controller checkout"
+        ) from error
+    if head != plan.project_commit or status:
+        raise RoutedLadderCampaignStateError(
+            "controller checkout must be clean at project_commit"
+        )
+    trainer = plan.working_directory / "scripts/tpu/train_contribution.py"
+    if trainer.is_symlink() or not trainer.is_file():
+        raise RoutedLadderCampaignStateError(
+            "contribution trainer script is absent"
+        )
+
+
 def _preflight(plan: RoutedLadderV3TrainingPlan, *, verify_checkout: bool) -> None:
     if verify_checkout:
-        _verify_checkout(plan)  # type: ignore[arg-type]
+        _verify_v3_checkout(plan)
     for resource in plan.resources:
         for label, evidence in (
             ("controller mapping", resource.controller_mapping),
