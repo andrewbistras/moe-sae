@@ -98,8 +98,14 @@ V3_RESULT_SCHEMA_VERSION = (
 BUNDLE_SPEC_SCHEMA_VERSION = (
     "gemma4-experiment5-routed-activation-ladder-resident-bundle-spec-v2"
 )
+V3_BUNDLE_SPEC_SCHEMA_VERSION = (
+    "gemma4-experiment5-routed-activation-policy-resident-bundle-spec-v1"
+)
 BUNDLE_RESULT_SCHEMA_VERSION = (
     "gemma4-experiment5-routed-activation-ladder-resident-bundle-result-v2"
+)
+V3_BUNDLE_RESULT_SCHEMA_VERSION = (
+    "gemma4-experiment5-routed-activation-policy-resident-bundle-result-v1"
 )
 BUNDLE_TIMING_SCOPE = (
     "successful_resident_worker_after_cli_parse_through_cell_completion"
@@ -122,6 +128,10 @@ BUNDLE_CONDITIONS = (
     "A512ReLU",
     "A512Softplus",
     "H",
+)
+V3_BUNDLE_CONDITIONS = (
+    "A512ReLUInclusiveTopK",
+    "A512Softplus",
 )
 CHECKPOINT_TOKENS = (2_000_000, 5_000_000, 10_000_000)
 _GIT_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -153,6 +163,43 @@ def _tensor_names(condition: str) -> set[str]:
 
 class RoutedLadderEvaluationError(RuntimeError):
     """One activation-ladder cell cannot produce valid evidence."""
+
+
+def resident_bundle_conditions(
+    protocol_id: str,
+    *,
+    seed: int,
+) -> tuple[str, ...]:
+    """Return the exact ordered condition inventory for one resident bundle."""
+
+    if seed not in (0, 1, 2):
+        raise RoutedLadderEvaluationError("resident bundle seed is invalid")
+    if protocol_id == V2_PROTOCOL_ID:
+        return BUNDLE_CONDITIONS
+    if protocol_id == V3_PROTOCOL_ID:
+        # Keep optional historical A256/H context out of the decisive A512
+        # launch barrier.  In particular, a provenance correction to either
+        # context must never delay the paired primary verdict.
+        return V3_BUNDLE_CONDITIONS
+    raise RoutedLadderEvaluationError(
+        "resident bundle protocol is not routed-ladder v2/v3"
+    )
+
+
+def resident_bundle_spec_schema(protocol_id: str) -> str:
+    if protocol_id == V2_PROTOCOL_ID:
+        return BUNDLE_SPEC_SCHEMA_VERSION
+    if protocol_id == V3_PROTOCOL_ID:
+        return V3_BUNDLE_SPEC_SCHEMA_VERSION
+    raise RoutedLadderEvaluationError("resident bundle protocol is invalid")
+
+
+def resident_bundle_result_schema(protocol_id: str) -> str:
+    if protocol_id == V2_PROTOCOL_ID:
+        return BUNDLE_RESULT_SCHEMA_VERSION
+    if protocol_id == V3_PROTOCOL_ID:
+        return V3_BUNDLE_RESULT_SCHEMA_VERSION
+    raise RoutedLadderEvaluationError("resident bundle protocol is invalid")
 
 
 def _load_routed_ladder_config(
@@ -383,6 +430,7 @@ class ResidentEvaluationCell:
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class ResidentEvaluationBundle:
+    protocol_id: str
     panel: str
     seed: int
     source_revision: str
@@ -443,9 +491,11 @@ def parse_resident_bundle_spec(
         for name in selected
         if name != "bundle_spec_sha256"
     }
+    protocol_id = selected["protocol_id"]
     if (
-        selected["schema_version"] != BUNDLE_SPEC_SCHEMA_VERSION
-        or selected["protocol_id"] != PROTOCOL_ID
+        protocol_id not in PROTOCOL_IDS
+        or selected["schema_version"]
+        != resident_bundle_spec_schema(str(protocol_id))
         or canonical_sha256(unsigned) != claimed
         or selected["panel"] not in PANELS
         or selected["seed"] not in (0, 1, 2)
@@ -466,9 +516,15 @@ def parse_resident_bundle_spec(
         raise RoutedLadderEvaluationError("resident bundle cells must be a list")
     expected_identities = [
         (condition, checkpoint_tokens)
-        for condition in BUNDLE_CONDITIONS
+        for condition in resident_bundle_conditions(
+            str(protocol_id),
+            seed=int(selected["seed"]),
+        )
         for checkpoint_tokens in CHECKPOINT_TOKENS
     ]
+    allowed_conditions = {
+        condition for condition, _checkpoint in expected_identities
+    }
     cells: list[ResidentEvaluationCell] = []
     observed_identities: list[tuple[str, int]] = []
     result_roots: set[str] = set()
@@ -502,7 +558,7 @@ def parse_resident_bundle_spec(
         condition = cell["condition"]
         checkpoint_tokens = cell["checkpoint_tokens"]
         if (
-            condition not in BUNDLE_CONDITIONS
+            condition not in allowed_conditions
             or isinstance(checkpoint_tokens, bool)
             or checkpoint_tokens not in CHECKPOINT_TOKENS
         ):
@@ -514,16 +570,28 @@ def parse_resident_bundle_spec(
             f"cell {index} training_source_revision",
             cell["training_source_revision"],
         )
-        historical_a256 = (
-            selected["panel"] == "sae"
-            and condition == "A256ReLU"
-            and selected["seed"] == 0
+        historical_a256 = selected["seed"] == 0 and (
+            (
+                protocol_id == V2_PROTOCOL_ID
+                and selected["panel"] == "sae"
+                and condition == "A256ReLU"
+            )
+            or (
+                protocol_id == V3_PROTOCOL_ID
+                and condition == "A256Native"
+            )
         )
         expected_reference = (
             "a256"
             if historical_a256
             else "h"
             if condition == "H"
+            else "trained_v3"
+            if (
+                protocol_id == V3_PROTOCOL_ID
+                and condition == "A512ReLUInclusiveTopK"
+                and training_revision != source_revision
+            )
             else "completed"
             if training_revision != source_revision
             else "none"
@@ -575,7 +643,7 @@ def parse_resident_bundle_spec(
                 f"cell {index} parent_run_contract_file_sha256",
                 parent_run_contract_file_sha,
             )
-        if reference_kind in {"none", "completed"}:
+        if reference_kind in {"none", "trained_v3"}:
             if reference_config is not None:
                 raise RoutedLadderEvaluationError(
                     f"resident bundle cell {index} has an unexpected parent config"
@@ -679,6 +747,7 @@ def parse_resident_bundle_spec(
             "bundle result root aliases one cell result root"
         )
     return ResidentEvaluationBundle(
+        protocol_id=str(protocol_id),
         panel=str(selected["panel"]),
         seed=int(selected["seed"]),
         source_revision=source_revision,
@@ -1607,8 +1676,8 @@ def seal_resident_bundle_result(
             )
     selected_timing = _validate_bundle_timing(timing)
     body = {
-        "schema_version": BUNDLE_RESULT_SCHEMA_VERSION,
-        "protocol_id": PROTOCOL_ID,
+        "schema_version": resident_bundle_result_schema(bundle.protocol_id),
+        "protocol_id": bundle.protocol_id,
         "status": "bundle_evaluated",
         "panel": bundle.panel,
         "seed": bundle.seed,
@@ -1689,8 +1758,9 @@ def load_resident_bundle_result(
     }
     if (
         canonical_sha256(unsigned) != claimed
-        or result.get("schema_version") != BUNDLE_RESULT_SCHEMA_VERSION
-        or result.get("protocol_id") != PROTOCOL_ID
+        or result.get("schema_version")
+        != resident_bundle_result_schema(bundle.protocol_id)
+        or result.get("protocol_id") != bundle.protocol_id
         or result.get("status") != "bundle_evaluated"
         or result.get("panel") != bundle.panel
         or result.get("seed") != bundle.seed
@@ -2281,7 +2351,7 @@ def _centering_receipt(
 ) -> dict[str, Any]:
     unsigned = {
         "schema_version": CENTERING_SCHEMA_VERSION,
-        "protocol_id": PROTOCOL_ID,
+        "protocol_id": config.protocol_id,
         "panel": config.panel,
         "config_sha256": config.config_hash,
         "target_manifest_sha256": target_manifest_sha256,
@@ -2431,6 +2501,9 @@ def _validate_args(args: argparse.Namespace) -> RoutedLadderConfig:
     )
     h_config_arg = getattr(args, "h_config", None)
     a256_config_arg = getattr(args, "a256_config", None)
+    completed_config_arg = getattr(args, "completed_config", None)
+    reference_kind = getattr(args, "reference_kind", None)
+    completed_reference = reference_kind == "completed"
     reference_run_contract_sha = getattr(
         args,
         "reference_run_contract_sha256",
@@ -2526,6 +2599,20 @@ def _validate_args(args: argparse.Namespace) -> RoutedLadderConfig:
     if not historical_a256 and a256_config_arg is not None:
         raise RoutedLadderEvaluationError(
             "--a256-config is valid only for historical panel-native A256 seed 0"
+        )
+    if completed_reference:
+        if (
+            config.protocol_id != V3_PROTOCOL_ID
+            or args.condition != "A512Softplus"
+            or completed_config_arg is None
+            or historical_a256
+        ):
+            raise RoutedLadderEvaluationError(
+                "completed reference is not an exact v2 Softplus import"
+            )
+    elif completed_config_arg is not None:
+        raise RoutedLadderEvaluationError(
+            "--completed-config is valid only for an imported v2 trajectory"
         )
     if historical_a256:
         _require_sha256(
@@ -3048,6 +3135,7 @@ def run(
         args.seed,
     )
     historical_a256 = a256_reference is not None
+    completed_reference = getattr(args, "reference_kind", None) == "completed"
     if args.condition == "H":
         h_config_path = Path(args.h_config).expanduser().resolve()
         h_config = load_experiment5_config(
@@ -3182,6 +3270,54 @@ def run(
             )
         training_contract_sha = run_contract["run_contract_sha256"]
         training_optimizer_source = a256_config
+    elif completed_reference:
+        completed_config_path = Path(
+            args.completed_config
+        ).expanduser().resolve()
+        completed_config = _load_routed_ladder_config(
+            completed_config_path,
+            expected_panel=config.panel,
+        )
+        imports = {
+            item.condition: item for item in config.v2_condition_imports
+        }
+        imported = imports.get(args.condition)
+        if (
+            completed_config.protocol_id != V2_PROTOCOL_ID
+            or imported is None
+            or imported.source_condition != args.condition
+            or imported.source_config_sha256
+            != completed_config.config_hash
+        ):
+            raise RoutedLadderEvaluationError(
+                "imported Softplus config differs from the frozen v3 mapping"
+            )
+        plan = TrainingWorkerPlan.from_config(
+            completed_config,
+            phase=V2_PHASE_NAME,
+            condition=args.condition,
+            seed=args.seed,
+        )
+        result, pointer = _load_run(
+            run_root,
+            plan,
+            args.checkpoint_payload_root,
+            checkpoint_target_tokens=args.checkpoint_tokens,
+        )
+        run_contract = _validate_run_contract(
+            run_root,
+            config_path=completed_config_path,
+            config=completed_config,
+            condition=args.condition,
+            seed=args.seed,
+            training_source_revision=args.training_source_revision,
+            target_manifest_sha256=train_target.manifest_sha256,
+            source_manifest_sha256=source_manifest_sha,
+            phase_name=V2_PHASE_NAME,
+        )
+        parent_run_contract = run_contract
+        training_contract_sha = run_contract["run_contract_sha256"]
+        training_optimizer_source = completed_config
     else:
         plan = TrainingWorkerPlan.from_config(
             config,
@@ -3953,9 +4089,17 @@ def run_resident_bundle(args: argparse.Namespace) -> int:
         raise RoutedLadderEvaluationError(
             "resident bundle CLI identity differs from its spec"
         )
-    if tuple(V2_CONDITIONS) != BUNDLE_CONDITIONS[:-1]:
+    if (
+        tuple(
+            resident_bundle_conditions(
+                bundle.protocol_id,
+                seed=bundle.seed,
+            )
+        )
+        != tuple(dict.fromkeys(cell.condition for cell in bundle.cells))
+    ):
         raise RoutedLadderEvaluationError(
-            "resident bundle requires the exact three-A v2 config"
+            "resident bundle conditions differ from its immutable config"
         )
     initialize_jax_distributed()
     require_accelerator_runtime(
@@ -4034,6 +4178,11 @@ def run_resident_bundle(args: argparse.Namespace) -> int:
                         "a256_config": (
                             cell.reference_config
                             if cell.reference_kind == "a256"
+                            else None
+                        ),
+                        "completed_config": (
+                            cell.reference_config
+                            if cell.reference_kind == "completed"
                             else None
                         ),
                         "reference_kind": cell.reference_kind,
@@ -4159,6 +4308,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--h-config")
     parser.add_argument("--a256-config")
+    parser.add_argument("--completed-config")
     parser.add_argument("--reference-run-contract-sha256")
     parser.add_argument("--reference-run-contract-file-sha256")
     parser.add_argument("--parent-training-result-sha256")
@@ -4214,6 +4364,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.condition,
             args.h_config,
             args.a256_config,
+            args.completed_config,
             args.reference_run_contract_sha256,
             args.reference_run_contract_file_sha256,
             args.parent_training_result_sha256,
@@ -4268,6 +4419,9 @@ __all__ = [
     "RESULT_SCHEMA_VERSION",
     "V3_PROCESS_EVIDENCE_SCHEMA_VERSION",
     "V3_RESULT_SCHEMA_VERSION",
+    "V3_BUNDLE_CONDITIONS",
+    "V3_BUNDLE_RESULT_SCHEMA_VERSION",
+    "V3_BUNDLE_SPEC_SCHEMA_VERSION",
     "RoutedLadderEvaluationError",
     "ResidentEvaluationBundle",
     "ResidentEvaluationCell",
@@ -4277,6 +4431,9 @@ __all__ = [
     "main",
     "merge_process_evidence",
     "parse_resident_bundle_spec",
+    "resident_bundle_conditions",
+    "resident_bundle_result_schema",
+    "resident_bundle_spec_schema",
     "run_resident_bundle",
     "seal_resident_bundle_result",
     "run",

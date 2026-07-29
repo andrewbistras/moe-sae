@@ -113,6 +113,10 @@ from moe_sae.experiment5_routed_ladder_v2_config import (
     RoutedLadderV2ConfigError,
     load_routed_ladder_v2_config,
 )
+from moe_sae.experiment5_routed_ladder_v3_config import (
+    PROTOCOL_ID as V3_PROTOCOL_ID,
+    V2_CONFIG_SHA256,
+)
 from moe_sae.experiment5_routed_ladder_resources import (
     MAX_RESOURCE_COUNT,
     MIN_RESOURCE_COUNT,
@@ -133,6 +137,10 @@ H_REFERENCE_MANIFEST_SCHEMA_VERSION = (
 )
 A256_REFERENCE_MANIFEST_SCHEMA_VERSION = (
     "gemma4-experiment5-routed-activation-ladder-a256-reference-manifest-v1"
+)
+COMPLETED_TRAJECTORY_REFERENCE_MANIFEST_SCHEMA_VERSION = (
+    "gemma4-experiment5-routed-activation-ladder-completed-trajectory-"
+    "reference-manifest-v1"
 )
 EVALUATION_SCORE_SCHEMA_VERSION = SCORE_SCHEMA_VERSION
 REPORT_INPUT_SCHEMA_VERSION = (
@@ -365,6 +373,48 @@ class A256CheckpointReference:
     @property
     def identity(self) -> tuple[str, str, int, int]:
         return "sae", "A256ReLU", 0, self.checkpoint_tokens
+
+
+@dataclass(frozen=True, slots=True)
+class CompletedTrajectoryCheckpointReference:
+    """One immutable milestone imported from an earlier ladder campaign."""
+
+    panel: str
+    source_condition: str
+    target_condition: str
+    seed: int
+    checkpoint_tokens: int
+    training_source_revision: str
+    config_remote: str
+    config_sha256: str
+    config_file_sha256: str
+    run_root_remote: str
+    checkpoint_payload_root_gcs: str
+    run_contract: EvidencePath
+    run_contract_sha256: str
+    training_result: EvidencePath
+    training_result_sha256: str
+    checkpoint_pointer: EvidencePath
+    checkpoint_pointer_sha256: str
+    resource_id: str
+    accelerator_type: str
+
+    @property
+    def identity(self) -> tuple[str, str, int, int]:
+        return (
+            self.panel,
+            self.target_condition,
+            self.seed,
+            self.checkpoint_tokens,
+        )
+
+    @property
+    def trajectory_identity(self) -> tuple[str, str, int]:
+        return self.panel, self.target_condition, self.seed
+
+    @property
+    def source_identity(self) -> tuple[str, str, int]:
+        return self.panel, self.source_condition, self.seed
 
 
 @dataclass(frozen=True, slots=True)
@@ -1202,6 +1252,248 @@ def parse_a256_reference_manifest(
     )
 
 
+def parse_completed_trajectory_reference_manifest(
+    value: Any,
+) -> tuple[
+    Mapping[str, Any],
+    tuple[CompletedTrajectoryCheckpointReference, ...],
+]:
+    """Validate completed v2 trajectories imported read-only into recovery.
+
+    The manifest is intentionally milestone-granular.  Every imported
+    trajectory must contribute all three evaluation checkpoints and all
+    lineage files are pinned by both their file hashes and scientific
+    self-hashes.
+    """
+
+    selected = _exact_mapping(
+        value,
+        {
+            "schema_version",
+            "source_protocol_id",
+            "target_protocol_id",
+            "source_campaign_id",
+            "source_plan_sha256",
+            "cells",
+            "manifest_sha256",
+        },
+        "completed_trajectory_reference_manifest",
+    )
+    if (
+        selected["schema_version"]
+        != COMPLETED_TRAJECTORY_REFERENCE_MANIFEST_SCHEMA_VERSION
+        or selected["source_protocol_id"] != PROTOCOL_ID
+        or selected["target_protocol_id"] != V3_PROTOCOL_ID
+    ):
+        raise RoutedLadderCampaignPlanError(
+            "completed-trajectory reference manifest identity changed"
+        )
+    _safe_id(
+        selected["source_campaign_id"],
+        "completed_trajectory_reference_manifest.source_campaign_id",
+    )
+    _sha256(
+        selected["source_plan_sha256"],
+        "completed_trajectory_reference_manifest.source_plan_sha256",
+    )
+    body = {
+        key: selected[key] for key in selected if key != "manifest_sha256"
+    }
+    claimed = _sha256(
+        selected["manifest_sha256"],
+        "completed_trajectory_reference_manifest.manifest_sha256",
+    )
+    if canonical_sha256(body) != claimed:
+        raise RoutedLadderCampaignPlanError(
+            "completed-trajectory reference manifest self-hash changed"
+        )
+    raw_cells = selected["cells"]
+    if not isinstance(raw_cells, list) or not raw_cells:
+        raise RoutedLadderCampaignPlanError(
+            "completed-trajectory reference cells must be a nonempty list"
+        )
+    cells: list[CompletedTrajectoryCheckpointReference] = []
+    for index, raw in enumerate(raw_cells):
+        name = f"completed_trajectory_reference_manifest.cells[{index}]"
+        row = _exact_mapping(
+            raw,
+            {
+                "panel",
+                "source_condition",
+                "target_condition",
+                "seed",
+                "checkpoint_tokens",
+                "training_source_revision",
+                "config_remote",
+                "config_sha256",
+                "config_file_sha256",
+                "run_root_remote",
+                "checkpoint_payload_root_gcs",
+                "run_contract",
+                "run_contract_sha256",
+                "training_result",
+                "training_result_sha256",
+                "checkpoint_pointer",
+                "checkpoint_pointer_sha256",
+                "resource_id",
+                "accelerator_type",
+            },
+            name,
+        )
+        source_role = (
+            row["panel"],
+            row["source_condition"],
+            row["seed"],
+        )
+        target_role = (
+            row["panel"],
+            row["target_condition"],
+            row["seed"],
+        )
+        milestone = row["checkpoint_tokens"]
+        if (
+            source_role not in EXPECTED_TRAINING_ROLES
+            or source_role[1] != "A512Softplus"
+            or target_role != source_role
+            or milestone not in MILESTONES
+            or row["config_sha256"] != V2_CONFIG_SHA256.get(str(row["panel"]))
+        ):
+            raise RoutedLadderCampaignPlanError(
+                f"{name} is not an exact A512Softplus v2-to-v3 import"
+            )
+        accelerator_type = row["accelerator_type"]
+        if accelerator_type not in _CHIP_COUNT_BY_ACCELERATOR:
+            raise RoutedLadderCampaignPlanError(
+                f"{name} has an unsupported training accelerator"
+            )
+        cells.append(
+            CompletedTrajectoryCheckpointReference(
+                panel=str(row["panel"]),
+                source_condition=str(row["source_condition"]),
+                target_condition=str(row["target_condition"]),
+                seed=int(row["seed"]),
+                checkpoint_tokens=int(milestone),
+                training_source_revision=_git_sha(
+                    row["training_source_revision"],
+                    f"{name}.training_source_revision",
+                ),
+                config_remote=_remote_path(
+                    row["config_remote"], f"{name}.config_remote"
+                ),
+                config_sha256=_sha256(
+                    row["config_sha256"], f"{name}.config_sha256"
+                ),
+                config_file_sha256=_sha256(
+                    row["config_file_sha256"],
+                    f"{name}.config_file_sha256",
+                ),
+                run_root_remote=_remote_path(
+                    row["run_root_remote"], f"{name}.run_root_remote"
+                ),
+                checkpoint_payload_root_gcs=_gcs_prefix(
+                    row["checkpoint_payload_root_gcs"],
+                    f"{name}.checkpoint_payload_root_gcs",
+                ),
+                run_contract=_evidence(
+                    row["run_contract"], f"{name}.run_contract"
+                ),
+                run_contract_sha256=_sha256(
+                    row["run_contract_sha256"],
+                    f"{name}.run_contract_sha256",
+                ),
+                training_result=_evidence(
+                    row["training_result"], f"{name}.training_result"
+                ),
+                training_result_sha256=_sha256(
+                    row["training_result_sha256"],
+                    f"{name}.training_result_sha256",
+                ),
+                checkpoint_pointer=_evidence(
+                    row["checkpoint_pointer"], f"{name}.checkpoint_pointer"
+                ),
+                checkpoint_pointer_sha256=_sha256(
+                    row["checkpoint_pointer_sha256"],
+                    f"{name}.checkpoint_pointer_sha256",
+                ),
+                resource_id=_safe_id(
+                    row["resource_id"], f"{name}.resource_id"
+                ),
+                accelerator_type=str(accelerator_type),
+            )
+        )
+    identities = {cell.identity for cell in cells}
+    if len(identities) != len(cells):
+        raise RoutedLadderCampaignPlanError(
+            "completed-trajectory reference cells contain duplicates"
+        )
+    roles = {cell.trajectory_identity for cell in cells}
+    expected_roles = {
+        (panel, "A512Softplus", seed)
+        for panel in PANELS
+        for seed in SEEDS
+    }
+    if (
+        roles != expected_roles
+        or len(cells) != len(roles) * len(MILESTONES)
+        or identities
+        != {
+            (*role, milestone)
+            for role in roles
+            for milestone in MILESTONES
+        }
+    ):
+        raise RoutedLadderCampaignPlanError(
+            "completed-trajectory references require all six Softplus "
+            "trajectories at exactly 2M/5M/10M"
+        )
+    for role in roles:
+        trajectory = [
+            cell for cell in cells if cell.trajectory_identity == role
+        ]
+        shared = {
+            (
+                cell.training_source_revision,
+                cell.config_remote,
+                cell.config_sha256,
+                cell.config_file_sha256,
+                cell.run_root_remote,
+                cell.checkpoint_payload_root_gcs,
+                cell.run_contract,
+                cell.run_contract_sha256,
+                cell.training_result,
+                cell.training_result_sha256,
+                cell.resource_id,
+                cell.accelerator_type,
+            )
+            for cell in trajectory
+        }
+        if len(shared) != 1:
+            raise RoutedLadderCampaignPlanError(
+                f"imported {role} milestones do not share one trajectory"
+            )
+        if (
+            len({cell.checkpoint_pointer for cell in trajectory})
+            != len(MILESTONES)
+            or len(
+                {
+                    cell.checkpoint_pointer_sha256
+                    for cell in trajectory
+                }
+            )
+            != len(MILESTONES)
+        ):
+            raise RoutedLadderCampaignPlanError(
+                f"imported {role} checkpoint pointers are not unique"
+            )
+    if len({cell.training_source_revision for cell in cells}) != 1:
+        raise RoutedLadderCampaignPlanError(
+            "completed-trajectory references must come from one source revision"
+        )
+    return copy.deepcopy(selected), tuple(
+        sorted(cells, key=lambda item: item.identity)
+    )
+
+
 def parse_routed_ladder_campaign_plan(value: Any) -> RoutedLadderCampaignPlan:
     """Validate and freeze one exact routed-activation campaign plan."""
 
@@ -1638,6 +1930,21 @@ def load_a256_reference_manifest(path: str | Path) -> Mapping[str, Any]:
     return manifest
 
 
+def load_completed_trajectory_reference_manifest(
+    path: str | Path,
+) -> Mapping[str, Any]:
+    selected = Path(path).expanduser().resolve()
+    try:
+        value = yaml.safe_load(selected.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as error:
+        raise RoutedLadderCampaignPlanError(
+            "cannot read completed-trajectory reference manifest: "
+            f"{selected}"
+        ) from error
+    manifest, _cells = parse_completed_trajectory_reference_manifest(value)
+    return manifest
+
+
 def _expected_milestone_progress(
     result: Mapping[str, Any],
     checkpoint_tokens: int,
@@ -1802,6 +2109,94 @@ def _validate_a256_checkpoint_lineage(
     ):
         raise RoutedLadderCampaignStateError(
             f"historical SAE A256 checkpoint progress changed: {cell.identity}"
+        )
+    return result, checked_pointer
+
+
+def validate_completed_checkpoint_lineage(
+    cell: CompletedTrajectoryCheckpointReference,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Validate one imported v2 milestone without rebinding its identity."""
+
+    run_contract, contract_payload = _read_self_hashed_json(
+        cell.run_contract.controller_path,
+        hash_field="run_contract_sha256",
+    )
+    result, result_payload = _read_self_hashed_json(
+        cell.training_result.controller_path,
+        hash_field="result_sha256",
+    )
+    pointer, pointer_payload = _read_self_hashed_json(
+        cell.checkpoint_pointer.controller_path,
+        hash_field="pointer_sha256",
+    )
+    identity = result.get("run_identity")
+    run_plan = identity.get("plan") if isinstance(identity, Mapping) else None
+    if (
+        hashlib.sha256(contract_payload).hexdigest()
+        != cell.run_contract.sha256
+        or hashlib.sha256(result_payload).hexdigest()
+        != cell.training_result.sha256
+        or hashlib.sha256(pointer_payload).hexdigest()
+        != cell.checkpoint_pointer.sha256
+        or cell.config_sha256 != V2_CONFIG_SHA256[cell.panel]
+        or result.get("schema_version")
+        != "gemma4-contribution-sae-training-result-v1"
+        or result.get("status") not in {"completed", "already_complete"}
+        or result.get("tokens") != TRAIN_TOKENS
+        or result.get("source_revision") != cell.training_source_revision
+        or result.get("result_sha256") != cell.training_result_sha256
+        or not isinstance(identity, Mapping)
+        or not isinstance(run_plan, Mapping)
+        or run_plan.get("phase_name") != PHASE_NAME
+        or run_plan.get("condition") != cell.source_condition
+        or run_plan.get("seed") != cell.seed
+        or run_plan.get("total_tokens") != TRAIN_TOKENS
+        or run_contract.get("run_contract_sha256")
+        != cell.run_contract_sha256
+        or run_contract.get("project_commit")
+        != cell.training_source_revision
+        or run_contract.get("phase") != PHASE_NAME
+        or run_contract.get("scientific_model") != cell.panel
+        or run_contract.get("condition") != cell.source_condition
+        or run_contract.get("seed") != cell.seed
+        or run_contract.get("config_file_sha256")
+        != cell.config_file_sha256
+        or run_contract.get("checkpoint_payload_root")
+        != cell.checkpoint_payload_root_gcs
+    ):
+        raise RoutedLadderCampaignStateError(
+            f"completed trajectory lineage changed: {cell.identity}"
+        )
+    _training_cost(
+        result=result,
+        resource_id=cell.resource_id,
+        accelerator_type=cell.accelerator_type,
+    )
+    expected_step, expected_tokens = _expected_milestone_progress(
+        result,
+        cell.checkpoint_tokens,
+    )
+    try:
+        checked_pointer = validate_pointer(
+            pointer,
+            expected_kind="latest",
+            payload_root=cell.checkpoint_payload_root_gcs,
+            run_identity=identity,
+        )
+    except (RuntimeError, TypeError, ValueError) as error:
+        raise RoutedLadderCampaignStateError(
+            f"completed trajectory checkpoint is invalid: {cell.identity}"
+        ) from error
+    if (
+        checked_pointer["pointer_sha256"]
+        != cell.checkpoint_pointer_sha256
+        or checked_pointer["step"] != expected_step
+        or checked_pointer["tokens_seen"] != expected_tokens
+    ):
+        raise RoutedLadderCampaignStateError(
+            f"completed trajectory checkpoint progress changed: "
+            f"{cell.identity}"
         )
     return result, checked_pointer
 
@@ -2144,6 +2539,209 @@ def write_a256_reference_manifest(
         encoding="utf-8",
     )
     return parsed, cells, cost
+
+
+def build_completed_trajectory_reference_manifest(
+    source_plan: RoutedLadderCampaignPlan,
+    *,
+    roles: set[tuple[str, str, int]] | None = None,
+) -> dict[str, Any]:
+    """Inventory completed new trajectories from a prior immutable campaign.
+
+    Incomplete, failed, and merely checkpointed trajectories are never
+    imported.  Protocol v3 requires the exact six completed Softplus
+    trajectories; ``roles`` exists only so callers can state that requirement
+    explicitly and cannot be used to authorize a subset.
+    """
+
+    importable_roles = {
+        (panel, "A512Softplus", seed)
+        for panel in PANELS
+        for seed in SEEDS
+    }
+    requested = None if roles is None else set(roles)
+    if requested is not None and requested != importable_roles:
+        raise RoutedLadderCampaignPlanError(
+            "completed-trajectory import roles are invalid"
+        )
+    selected_tasks: list[RoutedLadderTrainingTask] = []
+    for task in source_plan.trajectories:
+        role = task.panel, task.condition, task.seed
+        if role not in importable_roles:
+            continue
+        if requested is not None and role not in requested:
+            continue
+        completion = inspect_training_completion(source_plan, task)
+        if completion is None:
+            if requested is not None:
+                raise RoutedLadderCampaignPlanError(
+                    f"requested completed trajectory is incomplete: {role}"
+                )
+            continue
+        selected_tasks.append(task)
+    selected_roles = {
+        (task.panel, task.condition, task.seed) for task in selected_tasks
+    }
+    if requested is not None and selected_roles != requested:
+        raise RoutedLadderCampaignPlanError(
+            "requested completed trajectories are absent from source plan"
+        )
+    if not selected_tasks:
+        raise RoutedLadderCampaignPlanError(
+            "source campaign has no completed trajectories to import"
+        )
+
+    cells: list[dict[str, Any]] = []
+    for task in sorted(
+        selected_tasks,
+        key=lambda row: (row.panel, row.condition, row.seed),
+    ):
+        result, result_payload = _read_self_hashed_json(
+            task.completion_path_controller,
+            hash_field="result_sha256",
+        )
+        run_root_remote = str(
+            PurePosixPath(task.control_root_remote) / "runs" / task.run_id
+        )
+        run_contract_path = (
+            task.completion_path_controller.parent / "run-contract.json"
+        )
+        run_contract, run_contract_payload = _read_self_hashed_json(
+            run_contract_path,
+            hash_field="run_contract_sha256",
+        )
+        config_path = (
+            source_plan.working_directory
+            / "configs"
+            / _CONFIG_NAMES[task.panel]
+        )
+        try:
+            config_payload = config_path.read_bytes()
+        except OSError as error:
+            raise RoutedLadderCampaignPlanError(
+                f"cannot read source config for {task.task_id}"
+            ) from error
+        config_file_sha = hashlib.sha256(config_payload).hexdigest()
+        if (
+            run_contract.get("project_commit")
+            != source_plan.project_commit
+            or run_contract.get("config_file_sha256") != config_file_sha
+            or run_contract.get("phase") != PHASE_NAME
+            or run_contract.get("scientific_model") != task.panel
+            or run_contract.get("condition") != task.condition
+            or run_contract.get("seed") != task.seed
+            or run_contract.get("checkpoint_payload_root")
+            != task.checkpoint_root_gcs
+        ):
+            raise RoutedLadderCampaignPlanError(
+                f"completed source run contract changed: {task.task_id}"
+            )
+        resource = source_plan.resource(task.eligible_resource_ids[0])
+        controller_checkpoint_root = (
+            task.completion_path_controller.parent / "checkpoints"
+        )
+        remote_checkpoint_root = str(
+            PurePosixPath(run_root_remote) / "checkpoints"
+        )
+        common = {
+            "panel": task.panel,
+            "source_condition": task.condition,
+            "target_condition": task.condition,
+            "seed": task.seed,
+            "training_source_revision": source_plan.project_commit,
+            "config_remote": task.config_remote,
+            "config_sha256": task.config_sha256,
+            "config_file_sha256": config_file_sha,
+            "run_root_remote": run_root_remote,
+            "checkpoint_payload_root_gcs": task.checkpoint_root_gcs,
+            "run_contract": {
+                "controller_path": str(run_contract_path),
+                "remote_path": str(
+                    PurePosixPath(run_root_remote) / "run-contract.json"
+                ),
+                "sha256": hashlib.sha256(
+                    run_contract_payload
+                ).hexdigest(),
+            },
+            "run_contract_sha256": run_contract["run_contract_sha256"],
+            "training_result": {
+                "controller_path": str(task.completion_path_controller),
+                "remote_path": str(
+                    PurePosixPath(run_root_remote) / "training-result.json"
+                ),
+                "sha256": hashlib.sha256(result_payload).hexdigest(),
+            },
+            "training_result_sha256": result["result_sha256"],
+            "resource_id": resource.resource_id,
+            "accelerator_type": resource.accelerator_type,
+        }
+        for milestone in MILESTONES:
+            pointer_path = milestone_pointer_path(
+                controller_checkpoint_root,
+                milestone,
+            )
+            pointer, pointer_payload = _read_self_hashed_json(
+                pointer_path,
+                hash_field="pointer_sha256",
+            )
+            cells.append(
+                {
+                    **common,
+                    "checkpoint_tokens": milestone,
+                    "checkpoint_pointer": {
+                        "controller_path": str(pointer_path),
+                        "remote_path": str(
+                            milestone_pointer_path(
+                                remote_checkpoint_root,
+                                milestone,
+                            )
+                        ),
+                        "sha256": hashlib.sha256(
+                            pointer_payload
+                        ).hexdigest(),
+                    },
+                    "checkpoint_pointer_sha256": pointer["pointer_sha256"],
+                }
+            )
+    body = {
+        "schema_version": (
+            COMPLETED_TRAJECTORY_REFERENCE_MANIFEST_SCHEMA_VERSION
+        ),
+        "source_protocol_id": str(source_plan.source["protocol_id"]),
+        "target_protocol_id": V3_PROTOCOL_ID,
+        "source_campaign_id": source_plan.campaign_id,
+        "source_plan_sha256": source_plan.plan_sha256,
+        "cells": cells,
+    }
+    manifest = {**body, "manifest_sha256": canonical_sha256(body)}
+    _parsed, references = parse_completed_trajectory_reference_manifest(
+        manifest
+    )
+    for cell in references:
+        validate_completed_checkpoint_lineage(cell)
+    return manifest
+
+
+def write_completed_trajectory_reference_manifest(
+    path: str | Path,
+    manifest: Mapping[str, Any],
+) -> tuple[
+    Mapping[str, Any],
+    tuple[CompletedTrajectoryCheckpointReference, ...],
+]:
+    parsed, cells = parse_completed_trajectory_reference_manifest(manifest)
+    selected = Path(path).expanduser().resolve()
+    selected.parent.mkdir(parents=True, exist_ok=True)
+    if selected.exists():
+        raise RoutedLadderCampaignPlanError(
+            "refusing to overwrite completed-trajectory reference manifest: "
+            f"{selected}"
+        )
+    selected.write_text(
+        yaml.safe_dump(dict(manifest), sort_keys=False, default_flow_style=False),
+        encoding="utf-8",
+    )
+    return parsed, cells
 
 
 def inspect_training_completion(
@@ -2597,7 +3195,6 @@ def _evaluation_parent_pins(
                 parent.checkpoint_pointer.sha256
             ),
         }
-
     training_by_role = {
         (row.panel, row.condition, row.seed): row
         for row in plan.trajectories
@@ -4614,6 +5211,8 @@ def write_routed_ladder_campaign_plan(
 
 
 __all__ = [
+    "COMPLETED_TRAJECTORY_REFERENCE_MANIFEST_SCHEMA_VERSION",
+    "CompletedTrajectoryCheckpointReference",
     "CONDITIONS",
     "EVALUATION_TASK_COUNT",
     "H_REFERENCE_COUNT",
@@ -4629,6 +5228,7 @@ __all__ = [
     "RoutedLadderTrainingTask",
     "SEEDS",
     "TRAINING_TASK_COUNT",
+    "build_completed_trajectory_reference_manifest",
     "build_evaluation_command",
     "build_h_reference_manifest",
     "build_routed_ladder_campaign_plan",
@@ -4636,10 +5236,14 @@ __all__ = [
     "inspect_evaluation_completion",
     "inspect_training_completion",
     "load_h_reference_manifest",
+    "load_completed_trajectory_reference_manifest",
     "load_routed_ladder_campaign_plan",
     "parse_h_reference_manifest",
+    "parse_completed_trajectory_reference_manifest",
     "parse_routed_ladder_campaign_plan",
     "routed_ladder_campaign_status",
+    "validate_completed_checkpoint_lineage",
     "write_h_reference_manifest",
+    "write_completed_trajectory_reference_manifest",
     "write_routed_ladder_campaign_plan",
 ]

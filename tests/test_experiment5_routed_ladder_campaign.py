@@ -28,6 +28,7 @@ from moe_sae.experiment5_plan_builder import (
 from moe_sae.experiment5_routed_ladder import PROTOCOL_ID
 from moe_sae.experiment5_routed_ladder_campaign import (
     A256_REFERENCE_MANIFEST_SCHEMA_VERSION,
+    COMPLETED_TRAJECTORY_REFERENCE_MANIFEST_SCHEMA_VERSION,
     EVALUATION_BUNDLE_COUNT,
     EVALUATION_TASK_COUNT,
     H_REFERENCE_MANIFEST_SCHEMA_VERSION,
@@ -43,6 +44,7 @@ from moe_sae.experiment5_routed_ladder_campaign import (
     _evaluation_bundles,
     _evaluation_parent_pins,
     _operator_bundle_manifest,
+    build_completed_trajectory_reference_manifest,
     build_evaluation_bundle_command,
     build_evaluation_command,
     build_h_reference_manifest,
@@ -50,7 +52,9 @@ from moe_sae.experiment5_routed_ladder_campaign import (
     build_train_command,
     inspect_evaluation_bundle_completion,
     inspect_evaluation_completion,
+    parse_completed_trajectory_reference_manifest,
     parse_routed_ladder_campaign_plan,
+    validate_completed_checkpoint_lineage,
 )
 from moe_sae.experiment5_routed_ladder_config import H_CONFIG_SHA256
 from moe_sae.experiment5_routed_ladder_evaluation_worker import (
@@ -777,6 +781,100 @@ def _seal_training_completion(plan, task) -> None:
             json.dumps(pointer, sort_keys=True, separators=(",", ":"))
             + "\n",
             encoding="ascii",
+        )
+
+
+def test_completed_softplus_import_is_exact_hash_pinned_six_by_three(
+    tmp_path: Path,
+) -> None:
+    plan = parse_routed_ladder_campaign_plan(_raw_plan(tmp_path))
+    required = {
+        (panel, "A512Softplus", seed)
+        for panel in PANELS
+        for seed in SEEDS
+    }
+    for task in plan.trajectories:
+        if (task.panel, task.condition, task.seed) in required:
+            _seal_training_completion(plan, task)
+
+    manifest = build_completed_trajectory_reference_manifest(
+        plan,
+        roles=required,
+    )
+    parsed, cells = parse_completed_trajectory_reference_manifest(manifest)
+
+    assert (
+        parsed["schema_version"]
+        == COMPLETED_TRAJECTORY_REFERENCE_MANIFEST_SCHEMA_VERSION
+    )
+    assert parsed["source_plan_sha256"] == plan.plan_sha256
+    assert len(cells) == 18
+    assert {cell.identity for cell in cells} == {
+        (panel, "A512Softplus", seed, milestone)
+        for panel in PANELS
+        for seed in SEEDS
+        for milestone in MILESTONES
+    }
+    for cell in cells:
+        validate_completed_checkpoint_lineage(cell)
+
+    partial = copy.deepcopy(manifest)
+    partial["cells"] = [
+        row
+        for row in partial["cells"]
+        if not (
+            row["panel"] == "transcoder"
+            and row["seed"] == 2
+        )
+    ]
+    partial["manifest_sha256"] = canonical_sha256(
+        {
+            key: value
+            for key, value in partial.items()
+            if key != "manifest_sha256"
+        }
+    )
+    with pytest.raises(
+        RoutedLadderCampaignPlanError,
+        match="all six Softplus trajectories",
+    ):
+        parse_completed_trajectory_reference_manifest(partial)
+
+    first = cells[0]
+    first.checkpoint_pointer.controller_path.write_text(
+        first.checkpoint_pointer.controller_path.read_text(encoding="ascii")
+        + " ",
+        encoding="ascii",
+    )
+    with pytest.raises(
+        RoutedLadderCampaignStateError,
+        match="completed trajectory lineage changed",
+    ):
+        validate_completed_checkpoint_lineage(first)
+
+
+def test_completed_softplus_import_refuses_one_missing_role(
+    tmp_path: Path,
+) -> None:
+    plan = parse_routed_ladder_campaign_plan(_raw_plan(tmp_path))
+    required = {
+        (panel, "A512Softplus", seed)
+        for panel in PANELS
+        for seed in SEEDS
+    }
+    missing = ("transcoder", "A512Softplus", 2)
+    for task in plan.trajectories:
+        role = task.panel, task.condition, task.seed
+        if role in required and role != missing:
+            _seal_training_completion(plan, task)
+
+    with pytest.raises(
+        RoutedLadderCampaignPlanError,
+        match="requested completed trajectory is incomplete",
+    ):
+        build_completed_trajectory_reference_manifest(
+            plan,
+            roles=required,
         )
 
 

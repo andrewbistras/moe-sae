@@ -18,10 +18,14 @@ from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 
 from moe_sae.contribution_artifacts import canonical_sha256
-from moe_sae.experiment5_routed_ladder import PROTOCOL_ID
+from moe_sae.experiment5_routed_ladder import PROTOCOL_ID as V2_PROTOCOL_ID
 from moe_sae.experiment5_routed_ladder_v2_config import (
-    CONDITIONS,
+    CONDITIONS as V2_CONDITIONS,
     PHASE_NAME,
+)
+from moe_sae.experiment5_routed_ladder_v3_config import (
+    ANALYZED_CONDITIONS as V3_ANALYZED_CONDITIONS,
+    PROTOCOL_ID as V3_PROTOCOL_ID,
 )
 from moe_sae.experiment5_routed_ladder_evaluation_worker import (
     BUNDLE_CONDITIONS,
@@ -29,8 +33,12 @@ from moe_sae.experiment5_routed_ladder_evaluation_worker import (
     BUNDLE_SPEC_SCHEMA_VERSION,
     CHECKPOINT_TOKENS,
     RESULT_SCHEMA_VERSION,
+    V3_RESULT_SCHEMA_VERSION,
     load_merged_scores,
     parse_resident_bundle_spec,
+    resident_bundle_conditions,
+    resident_bundle_result_schema,
+    resident_bundle_spec_schema,
 )
 from moe_sae.runtime import (
     REGIONAL_ACCELERATOR_TYPES,
@@ -43,11 +51,18 @@ from moe_sae.runtime import (
 
 PROCESS_COUNT = 4
 PANELS = ("sae", "transcoder")
-EVALUATED_CONDITIONS = (*CONDITIONS, "H")
+PROTOCOL_ID = V2_PROTOCOL_ID
+PROTOCOL_IDS = (V2_PROTOCOL_ID, V3_PROTOCOL_ID)
+EVALUATED_CONDITIONS = tuple(
+    dict.fromkeys((*V2_CONDITIONS, *V3_ANALYZED_CONDITIONS, "H"))
+)
 REGIONAL_PROCESS_CACHE_MAX_BYTES = 160 * 1024**3
 WORKER_TIMEOUT_SECONDS = 7_500
 OPERATOR_BUNDLE_MANIFEST_SCHEMA_VERSION = (
     "gemma4-experiment5-routed-activation-ladder-operator-bundle-manifest-v1"
+)
+V3_OPERATOR_BUNDLE_MANIFEST_SCHEMA_VERSION = (
+    "gemma4-experiment5-routed-activation-policy-operator-bundle-manifest-v1"
 )
 _GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -56,6 +71,14 @@ _SAFE_SSH_USER = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 
 class OperatorError(RuntimeError):
     """One activation-ladder cell cannot be safely orchestrated."""
+
+
+def _operator_bundle_manifest_schema(protocol_id: str) -> str:
+    if protocol_id == V2_PROTOCOL_ID:
+        return OPERATOR_BUNDLE_MANIFEST_SCHEMA_VERSION
+    if protocol_id == V3_PROTOCOL_ID:
+        return V3_OPERATOR_BUNDLE_MANIFEST_SCHEMA_VERSION
+    raise OperatorError("resident bundle protocol is invalid")
 
 
 def _required(environment: Mapping[str, str], name: str) -> str:
@@ -162,6 +185,7 @@ class BundlePublication:
 @dataclass(frozen=True, slots=True)
 class BundleSettings:
     base: Settings
+    protocol_id: str
     manifest_sha256: str
     worker_spec: dict
     worker_spec_sha256: str
@@ -470,12 +494,14 @@ def _bundle_settings(
     unsigned = {
         name: raw[name] for name in raw if name != "manifest_sha256"
     }
+    protocol_id = raw["protocol_id"]
     if (
         not isinstance(claimed, str)
         or _SHA256.fullmatch(claimed) is None
         or canonical_sha256(unsigned) != claimed
-        or raw["schema_version"] != OPERATOR_BUNDLE_MANIFEST_SCHEMA_VERSION
-        or raw["protocol_id"] != PROTOCOL_ID
+        or protocol_id not in PROTOCOL_IDS
+        or raw["schema_version"]
+        != _operator_bundle_manifest_schema(str(protocol_id))
         or raw["panel"] != args.panel
         or raw["seed"] != args.seed
         or raw["source_revision"] != args.source_revision
@@ -492,7 +518,10 @@ def _bundle_settings(
         raise OperatorError("resident bundle cells must be a list")
     expected_identities = [
         (condition, checkpoint_tokens)
-        for condition in BUNDLE_CONDITIONS
+        for condition in resident_bundle_conditions(
+            str(protocol_id),
+            seed=int(raw["seed"]),
+        )
         for checkpoint_tokens in CHECKPOINT_TOKENS
     ]
     observed_identities: list[tuple[object, object]] = []
@@ -621,10 +650,15 @@ def _bundle_settings(
 
     # Reuse the single-cell environment validator with a known extension-owned
     # A512 cell. Per-cell checkpoint and publication roots remain manifest-bound.
+    probe_condition = (
+        "A512ReLUInclusiveTopK"
+        if protocol_id == V3_PROTOCOL_ID
+        else "A512ReLU"
+    )
     probe_index = next(
         index
         for index, cell in enumerate(worker_cells)
-        if cell["condition"] == "A512ReLU"
+        if cell["condition"] == probe_condition
         and cell["checkpoint_tokens"] == CHECKPOINT_TOKENS[0]
     )
     probe = worker_cells[probe_index]
@@ -639,7 +673,7 @@ def _bundle_settings(
     probe_args = argparse.Namespace(
         panel=args.panel,
         config=args.config,
-        condition="A512ReLU",
+        condition=probe_condition,
         seed=args.seed,
         checkpoint_tokens=CHECKPOINT_TOKENS[0],
         source_revision=args.source_revision,
@@ -669,8 +703,8 @@ def _bundle_settings(
     )
     base = _settings(probe_args, probe_environment)
     worker_unsigned = {
-        "schema_version": BUNDLE_SPEC_SCHEMA_VERSION,
-        "protocol_id": PROTOCOL_ID,
+        "schema_version": resident_bundle_spec_schema(str(protocol_id)),
+        "protocol_id": protocol_id,
         "panel": args.panel,
         "seed": args.seed,
         "source_revision": args.source_revision,
@@ -691,6 +725,7 @@ def _bundle_settings(
         ) from error
     return BundleSettings(
         base=base,
+        protocol_id=str(protocol_id),
         manifest_sha256=claimed,
         worker_spec=worker_spec,
         worker_spec_sha256=parsed.bundle_spec_sha256,
@@ -1147,6 +1182,8 @@ def _bundle_terminal_status(
 def _validated_result_envelope(
     settings: Settings,
     payload: bytes,
+    *,
+    protocol_id: str = V2_PROTOCOL_ID,
 ) -> tuple[dict, str]:
     try:
         value = json.loads(payload)
@@ -1161,8 +1198,13 @@ def _validated_result_envelope(
         not isinstance(claimed, str)
         or _SHA256.fullmatch(claimed) is None
         or canonical_sha256(unsigned) != claimed
-        or value.get("schema_version") != RESULT_SCHEMA_VERSION
-        or value.get("protocol_id") != PROTOCOL_ID
+        or value.get("schema_version")
+        != (
+            V3_RESULT_SCHEMA_VERSION
+            if protocol_id == V3_PROTOCOL_ID
+            else RESULT_SCHEMA_VERSION
+        )
+        or value.get("protocol_id") != protocol_id
         or value.get("status") != "cell_evaluated"
         or value.get("panel") != settings.panel
         or value.get("condition") != settings.condition
@@ -1254,8 +1296,9 @@ def _validated_bundle_result(
         not isinstance(claimed, str)
         or _SHA256.fullmatch(claimed) is None
         or canonical_sha256(unsigned) != claimed
-        or result.get("schema_version") != BUNDLE_RESULT_SCHEMA_VERSION
-        or result.get("protocol_id") != PROTOCOL_ID
+        or result.get("schema_version")
+        != resident_bundle_result_schema(settings.protocol_id)
+        or result.get("protocol_id") != settings.protocol_id
         or result.get("status") != "bundle_evaluated"
         or result.get("panel") != base.panel
         or result.get("seed") != base.seed
@@ -1355,7 +1398,7 @@ def _run_bundle_operator(
                     "bundle_spec_sha256": settings.worker_spec_sha256,
                     "cells": len(settings.publications),
                     "panel": base.panel,
-                    "protocol_id": PROTOCOL_ID,
+                    "protocol_id": settings.protocol_id,
                     "seed": base.seed,
                     "worker_process_zero": _bundle_worker(settings, 0),
                 },
@@ -1465,6 +1508,7 @@ def _run_bundle_operator(
         result, relative = _validated_result_envelope(
             cell_settings,
             result_payload,
+            protocol_id=settings.protocol_id,
         )
         score_payload = _remote_bytes(
             base,
