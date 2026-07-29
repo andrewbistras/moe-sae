@@ -1082,6 +1082,8 @@ def test_public_config_override_is_absolute_and_forwarded(
     tmp_path: Path,
 ) -> None:
     historical = _settings(operator, tmp_path)
+    controller_config = tmp_path / "controller-config.yaml"
+    controller_config.write_bytes(CONFIG_PATH.read_bytes())
     environment = {
         "GCP_PROJECT": historical.gcp_project,
         "TPU_NAME": historical.tpu_name,
@@ -1103,6 +1105,8 @@ def test_public_config_override_is_absolute_and_forwarded(
         "qualify",
         "--config",
         "/nfs/contracts/finalized-contribution-horizon.yaml",
+        "--controller-config",
+        str(controller_config),
         "--phase",
         historical.phase,
         "--condition",
@@ -1124,7 +1128,10 @@ def test_public_config_override_is_absolute_and_forwarded(
         selected.config_path
         == "/nfs/contracts/finalized-contribution-horizon.yaml"
     )
-    assert selected.config_path in " ".join(operator._init_command(selected))
+    assert selected.controller_config_path == controller_config
+    remote_command = " ".join(operator._init_command(selected))
+    assert selected.config_path in remote_command
+    assert str(controller_config) not in remote_command
     with pytest.raises(operator.OperatorError, match="absolute POSIX path"):
         operator._settings(
             environment,
@@ -1136,6 +1143,59 @@ def test_public_config_override_is_absolute_and_forwarded(
                 ]
             ),
         )
+
+
+def test_controller_config_rejects_symlink_and_binds_remote_config_hash(
+    operator,
+    tmp_path: Path,
+) -> None:
+    controller_config = tmp_path / "controller-config.yaml"
+    controller_config.write_bytes(CONFIG_PATH.read_bytes())
+    linked = tmp_path / "linked.yaml"
+    linked.symlink_to(controller_config)
+    with pytest.raises(operator.OperatorError, match="symlink"):
+        operator._absolute_file(str(linked), name="controller config")
+
+    settings = replace(
+        _settings(operator, tmp_path),
+        selected_config_path="/home/worker/moe-sae/configs/config.yaml",
+        controller_config_path=controller_config,
+    )
+    body = {
+        "schema_version": operator.ATTEMPT_PLAN_SCHEMA_VERSION,
+        "action": settings.action,
+        "attempt_id": settings.attempt_id,
+        "attempt_root": settings.attempt_root,
+        "run_root": settings.run_root,
+        "run_contract_sha256": "a" * 64,
+        "config": settings.config_path,
+        "config_file_sha256": hashlib.sha256(
+            controller_config.read_bytes()
+        ).hexdigest(),
+        "admission_mode": settings.admission_mode,
+        "controller_to_jax_process_index": [
+            {"controller_index": 0, "process_index": 2},
+            {"controller_index": 1, "process_index": 0},
+            {"controller_index": 2, "process_index": 3},
+            {"controller_index": 3, "process_index": 1},
+        ],
+        "maximum_runtime_seconds": settings.maximum_runtime_seconds,
+        "qualification_hard_deadline_seconds": 600,
+        "prefetch_hard_deadline_seconds": settings.prefetch_hard_deadline_seconds,
+        "terminal_policy": (
+            "four_mapped_prefetches_then_four_concurrent_supervised_workers"
+        ),
+    }
+    plan = {**body, "attempt_plan_sha256": canonical_sha256(body)}
+    operator._validate_attempt_plan(plan, settings)
+
+    mismatched_body = {**body, "config_file_sha256": "b" * 64}
+    mismatched = {
+        **mismatched_body,
+        "attempt_plan_sha256": canonical_sha256(mismatched_body),
+    }
+    with pytest.raises(operator.OperatorError, match="differ by SHA-256"):
+        operator._validate_attempt_plan(mismatched, settings)
 
 
 def test_dry_run_is_read_only_and_declares_the_four_mapped_stages(

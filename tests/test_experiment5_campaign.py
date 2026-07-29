@@ -386,8 +386,13 @@ def test_exact_matrix_and_commands(tmp_path: Path) -> None:
     assert train[train.index("--maximum-runtime-seconds") + 1] == str(
         CONTINUOUS_RUNTIME_SECONDS
     )
+    assert train[train.index("--config") + 1].startswith("/remote/")
+    assert train[train.index("--controller-config") + 1] == str(
+        plan.working_directory / "configs" / "gemma4_hybrid_sae_v1.yaml"
+    )
     evaluation = build_evaluation_command(plan, plan.evaluations[0])
     assert "evaluate_experiment5.py" in evaluation[1]
+    assert "--controller-config" not in evaluation
     for condition in CONDITIONS:
         assert f"--run-root-{condition.lower()}" in evaluation
 

@@ -131,6 +131,7 @@ class Settings:
     fresh_controller_mapping: str | None = None
     local_cache_inventory: str | None = None
     selected_config_path: str | None = None
+    controller_config_path: Path | None = None
     internal_ip: bool = False
     ssh_user: str | None = None
     v5litepod_device_kind: str | None = None
@@ -145,6 +146,14 @@ class Settings:
             else "gemma4_contribution_v1.yaml"
         )
         return f"{self.project_root}/configs/{filename}"
+
+    @property
+    def policy_config_path(self) -> str:
+        """Controller-visible config used only for local policy inspection."""
+
+        if self.controller_config_path is not None:
+            return str(self.controller_config_path)
+        return self.config_path
 
     @property
     def run_root(self) -> str:
@@ -188,7 +197,7 @@ class Settings:
     @property
     def prefetch_hard_deadline_seconds(self) -> int:
         return prefetch_runtime_limit_seconds(
-            config_path=self.config_path,
+            config_path=self.policy_config_path,
             accelerator_type=self.accelerator_type,
             phase=self.phase,
         )
@@ -196,7 +205,7 @@ class Settings:
     @property
     def direct_runtime_limit_seconds(self) -> int:
         return direct_resident_runtime_limit_seconds(
-            config_path=self.config_path,
+            config_path=self.policy_config_path,
             phase=self.phase,
             accelerator_type=self.accelerator_type,
         )
@@ -408,6 +417,22 @@ def _settings(
         )
     except RuntimeDependencyError as error:
         raise OperatorError(str(error)) from error
+    project_root = _absolute_remote_path(
+        "TPU_PROJECT_ROOT",
+        _required(environment, "TPU_PROJECT_ROOT"),
+    )
+    explicit_config = getattr(args, "config", None)
+    selected_config_path = (
+        _absolute_remote_path("--config", explicit_config)
+        if explicit_config is not None
+        else None
+    )
+    controller_config_raw = getattr(args, "controller_config", None)
+    controller_config_path = (
+        _absolute_file(controller_config_raw, name="controller config")
+        if controller_config_raw is not None
+        else None
+    )
     regional_mirror = environment.get("CONTRIBUTION_REGIONAL_MIRROR_SEAL")
     fresh_mapping = environment.get("CONTRIBUTION_FRESH_CONTROLLER_MAPPING")
     cache_inventory = environment.get("CONTRIBUTION_LOCAL_CACHE_INVENTORY")
@@ -433,14 +458,13 @@ def _settings(
         environment,
         accelerator_type=accelerator_type,
     )
-    explicit_config = getattr(args, "config", None)
     direct_fresh_only = (
         explicit_config is not None
         and _is_horizon_direct(
             action=args.action,
             maximum_runtime_seconds=maximum,
             accelerator_type=accelerator_type,
-            config_path=explicit_config,
+            config_path=str(controller_config_path or selected_config_path),
             phase=args.phase,
         )
     )
@@ -462,10 +486,7 @@ def _settings(
         tpu_name=tpu_name,
         tpu_zone=zone,
         project_commit=commit,
-        project_root=_absolute_remote_path(
-            "TPU_PROJECT_ROOT",
-            _required(environment, "TPU_PROJECT_ROOT"),
-        ),
+        project_root=project_root,
         remote_uv=_absolute_remote_path(
             "REMOTE_UV",
             _required(environment, "REMOTE_UV"),
@@ -547,11 +568,8 @@ def _settings(
             if cache_inventory
             else None
         ),
-        selected_config_path=(
-            _absolute_remote_path("--config", getattr(args, "config", None))
-            if getattr(args, "config", None) is not None
-            else None
-        ),
+        selected_config_path=selected_config_path,
+        controller_config_path=controller_config_path,
         internal_ip=internal_ip,
         ssh_user=ssh_user,
         v5litepod_device_kind=v5litepod_device_kind,
@@ -650,8 +668,10 @@ def _absolute_file(value: str, *, name: str) -> Path:
     path = Path(value).expanduser()
     if not path.is_absolute():
         raise OperatorError(f"{name} must be absolute")
+    if path.is_symlink():
+        raise OperatorError(f"{name} is missing, non-regular, or a symlink")
     selected = path.resolve()
-    if not selected.is_file() or selected.is_symlink():
+    if not selected.is_file():
         raise OperatorError(f"{name} is missing, non-regular, or a symlink")
     return selected
 
@@ -1390,6 +1410,14 @@ def _validate_attempt_plan(
         != settings.prefetch_hard_deadline_seconds
     ):
         raise OperatorError("remote SAE attempt plan differs from this request")
+    if settings.controller_config_path is not None:
+        controller_config_sha256 = hashlib.sha256(
+            settings.controller_config_path.read_bytes()
+        ).hexdigest()
+        if unsigned.get("config_file_sha256") != controller_config_sha256:
+            raise OperatorError(
+                "controller and TPU config files differ by SHA-256"
+            )
     mapping = _controller_mapping(unsigned)
     if settings.accelerator_type in REGIONAL_ACCELERATOR_TYPES:
         _validate_execution_attestation(
@@ -2065,6 +2093,11 @@ def _dry_run(settings: Settings) -> int:
         "condition": settings.condition,
         "seed": settings.seed,
         "config": settings.config_path,
+        "controller_config": (
+            str(settings.controller_config_path)
+            if settings.controller_config_path is not None
+            else None
+        ),
         "qualification_hard_deadline_seconds": QUALIFICATION_SECONDS,
         "admission_mode": settings.admission_mode,
         "prefetch_hard_deadline_seconds": (
@@ -2243,6 +2276,14 @@ def _public_parser() -> argparse.ArgumentParser:
         help=(
             "absolute config path on every TPU VM; defaults to the historical "
             "SAE/transcoder config under TPU_PROJECT_ROOT"
+        ),
+    )
+    parser.add_argument(
+        "--controller-config",
+        help=(
+            "absolute regular config file in the controller checkout, used "
+            "only for local execution-policy inspection; --config remains "
+            "the TPU-visible path"
         ),
     )
     parser.add_argument("--phase", required=True)

@@ -1377,6 +1377,16 @@ def _verify_checkout(plan: Experiment5CampaignPlan) -> None:
         raise Experiment5CampaignStateError(
             "controller checkout must be clean at project_commit"
         )
+    for panel in PANELS:
+        config = (
+            plan.working_directory
+            / "configs"
+            / f"gemma4_hybrid_{panel}_v1.yaml"
+        )
+        if config.is_symlink() or not config.is_file():
+            raise Experiment5CampaignStateError(
+                f"{panel} controller config is not a regular file"
+            )
 
 
 def _preflight(
@@ -1651,6 +1661,12 @@ def build_train_command(
         task.panel,
         "--config",
         task.config_remote,
+        "--controller-config",
+        str(
+            plan.working_directory
+            / "configs"
+            / f"gemma4_hybrid_{task.panel}_v1.yaml"
+        ),
         "--phase",
         PHASE_NAME,
         "--condition",
