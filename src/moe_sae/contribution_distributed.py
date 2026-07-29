@@ -410,6 +410,7 @@ def _merge_local_candidates(
     k: int,
     *,
     feature_axis: str,
+    require_strictly_positive: bool = True,
 ) -> Selection:
     gathered_values = jax.lax.all_gather(
         values,
@@ -426,7 +427,12 @@ def _merge_local_candidates(
     # A local shard may emit sentinel IDs when it has fewer than k positive
     # features.  Those sentinels sit between shards after all-gather, so this
     # tiny ``feature_shards × k`` merge retains its deterministic sort.
-    return merge_feature_shard_topk(gathered_values, gathered_ids, k)
+    return merge_feature_shard_topk(
+        gathered_values,
+        gathered_ids,
+        k,
+        require_strictly_positive=require_strictly_positive,
+    )
 
 
 def _decode_selected_columns_default_precision(
@@ -468,6 +474,7 @@ def _local_grouped_candidates(
     feature_axis: str,
     capacity: int,
     encoder_activation: str = "relu",
+    topk_requires_strictly_positive: bool = True,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Take local TopK after a fixed-capacity whole-bank A/R GEMM."""
 
@@ -539,6 +546,7 @@ def _local_grouped_candidates(
         candidate_ids,
         layout.k_per_contribution,
         ids_are_sorted=True,
+        require_strictly_positive=topk_requires_strictly_positive,
     )
 
     gathered_values = local.values[destination]
@@ -564,6 +572,7 @@ def _local_rank_candidates(
     *,
     feature_axis: str,
     encoder_activation: str = "relu",
+    topk_requires_strictly_positive: bool = True,
 ) -> tuple[jax.Array, jax.Array]:
     """Take local TopK for complete B/F router-rank banks."""
 
@@ -616,6 +625,7 @@ def _local_rank_candidates(
         candidate_ids.reshape(local_banks * tokens, layout.bank_width),
         layout.k_per_contribution,
         ids_are_sorted=True,
+        require_strictly_positive=topk_requires_strictly_positive,
     )
 
     global_rows = (
@@ -679,6 +689,7 @@ def _build_contribution_mapped_objective(
     parameter_dtype: str,
     rematerialize_microbatch: bool,
     encoder_activation: str,
+    topk_requires_strictly_positive: bool,
 ):
     data_axis = distributed.data_axis
     feature_axis = distributed.feature_axis
@@ -751,6 +762,9 @@ def _build_contribution_mapped_objective(
                     feature_axis=feature_axis,
                     capacity=capacity,
                     encoder_activation=encoder_activation,
+                    topk_requires_strictly_positive=(
+                        topk_requires_strictly_positive
+                    ),
                 )
             else:
                 local_values, local_ids = _local_rank_candidates(
@@ -760,6 +774,9 @@ def _build_contribution_mapped_objective(
                     layout,
                     feature_axis=feature_axis,
                     encoder_activation=encoder_activation,
+                    topk_requires_strictly_positive=(
+                        topk_requires_strictly_positive
+                    ),
                 )
                 overflow_here = jnp.asarray(False)
             selection = _merge_local_candidates(
@@ -767,6 +784,7 @@ def _build_contribution_mapped_objective(
                 local_ids,
                 layout.k_per_contribution,
                 feature_axis=feature_axis,
+                require_strictly_positive=topk_requires_strictly_positive,
             )
             reconstruction = _decode_selected_columns_default_precision(
                 params.decoder,
@@ -953,6 +971,7 @@ class ContributionDistributedTrainer:
         bank_capacity: int | None = None,
         rematerialize_microbatch: bool = True,
         encoder_activation: str = "relu",
+        topk_requires_strictly_positive: bool = True,
     ) -> None:
         self.mesh = mesh
         self.layout = layout
@@ -964,8 +983,20 @@ class ContributionDistributedTrainer:
             raise TypeError("rematerialize_microbatch must be boolean")
         if encoder_activation not in {"relu", "softplus"}:
             raise ValueError("encoder_activation must be 'relu' or 'softplus'")
+        if type(topk_requires_strictly_positive) is not bool:
+            raise TypeError("topk_requires_strictly_positive must be boolean")
+        if (
+            encoder_activation == "softplus"
+            and not topk_requires_strictly_positive
+        ):
+            raise ValueError(
+                "softplus must retain the strict-positive TopK contract"
+            )
         self.rematerialize_microbatch = rematerialize_microbatch
         self.encoder_activation = encoder_activation
+        self.topk_requires_strictly_positive = (
+            topk_requires_strictly_positive
+        )
         _validate_contribution_mesh(mesh, layout, self.distributed)
         mapped_objective = _build_contribution_mapped_objective(
             mesh,
@@ -975,6 +1006,7 @@ class ContributionDistributedTrainer:
             self.optimizer.parameter_dtype,
             rematerialize_microbatch,
             encoder_activation,
+            topk_requires_strictly_positive,
         )
 
         def complete_step(
@@ -1159,11 +1191,17 @@ class ContributionDistributedTrainer:
                 "distributed contribution component count differs from source "
                 "token count"
             )
-        _validate_exact_distributed_l0(
-            l0_sum=int(l0_sum),
-            valid_tokens=token_count,
-            k=self.layout.total_l0,
-        )
+        if self.topk_requires_strictly_positive:
+            _validate_exact_distributed_l0(
+                l0_sum=int(l0_sum),
+                valid_tokens=token_count,
+                k=self.layout.total_l0,
+            )
+        elif not 0 <= int(l0_sum) <= token_count * self.layout.total_l0:
+            raise RuntimeError(
+                "inclusive-zero ReLU positive L0 is outside its nominal "
+                "TopK slot budget"
+            )
         if not bool(metrics_finite):
             raise RuntimeError(
                 "non-finite distributed contribution update; no update was accepted"
@@ -1186,6 +1224,7 @@ def _trainer_key(
     distributed: DistributedConfig,
     bank_capacity: int | None,
     rematerialize_microbatch: bool,
+    topk_requires_strictly_positive: bool,
 ) -> tuple[Any, ...]:
     devices = tuple(int(device.id) for device in np.asarray(mesh.devices).reshape(-1))
     return (
@@ -1196,6 +1235,7 @@ def _trainer_key(
         distributed,
         bank_capacity,
         rematerialize_microbatch,
+        topk_requires_strictly_positive,
     )
 
 
@@ -1211,6 +1251,7 @@ def distributed_contribution_train_step(
     bank_capacity: int | None = None,
     process_local: bool = False,
     rematerialize_microbatch: bool = True,
+    topk_requires_strictly_positive: bool = True,
 ) -> tuple[TrainState, StepMetrics]:
     """Cached functional wrapper around the compiled contribution trainer."""
 
@@ -1223,6 +1264,7 @@ def distributed_contribution_train_step(
         selected_distributed,
         bank_capacity,
         rematerialize_microbatch,
+        topk_requires_strictly_positive,
     )
     trainer = _TRAINER_CACHE.get(key)
     if trainer is None:
@@ -1233,6 +1275,9 @@ def distributed_contribution_train_step(
             selected_distributed,
             bank_capacity=bank_capacity,
             rematerialize_microbatch=rematerialize_microbatch,
+            topk_requires_strictly_positive=(
+                topk_requires_strictly_positive
+            ),
         )
         _TRAINER_CACHE[key] = trainer
     return trainer.step(

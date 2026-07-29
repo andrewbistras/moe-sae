@@ -15,6 +15,8 @@ from moe_sae.sae import (
     learning_rate,
     local_topk_candidates,
     make_grouping_plan,
+    merge_feature_shard_topk,
+    nonnegative_topk,
     positive_topk,
     train_step,
 )
@@ -59,6 +61,34 @@ def test_positive_topk_is_strict_and_breaks_cutoff_ties_by_global_id() -> None:
     np.testing.assert_array_equal(invalid.values, [[0.0, 0.0]])
 
 
+def test_nonnegative_topk_keeps_genuine_relu_zeros_and_excludes_sentinels() -> None:
+    sentinel = np.iinfo(np.int32).max
+    scores = jnp.asarray([[0.0, 2.0, 0.0, -jnp.inf, 0.0]], jnp.float32)
+    ids = jnp.asarray([[7, 9, 3, 1, sentinel]], jnp.int32)
+    selected = nonnegative_topk(scores, ids, 3)
+
+    assert bool(selected.valid[0])
+    np.testing.assert_array_equal(selected.latent_ids, [[3, 7, 9]])
+    np.testing.assert_array_equal(selected.values, [[0.0, 0.0, 2.0]])
+
+    local_values = jnp.asarray(
+        [[[0.0, 2.0]], [[0.0, 0.0]]],
+        jnp.float32,
+    )
+    local_ids = jnp.asarray(
+        [[[3, 9]], [[7, sentinel]]],
+        jnp.int32,
+    )
+    merged = merge_feature_shard_topk(
+        local_values,
+        local_ids,
+        3,
+        require_strictly_positive=False,
+    )
+    np.testing.assert_array_equal(merged.latent_ids, [[3, 7, 9]])
+    np.testing.assert_array_equal(merged.values, [[0.0, 0.0, 2.0]])
+
+
 def test_feature_sharded_topk_matches_unsharded_membership() -> None:
     scores = jnp.asarray(
         [
@@ -77,8 +107,6 @@ def test_feature_sharded_topk_matches_unsharded_membership() -> None:
         # selected candidates through an artificial two-shard merge below.
         local_values.append(selected.values)
         local_ids.append(selected.latent_ids)
-    from moe_sae.sae import merge_feature_shard_topk
-
     actual = merge_feature_shard_topk(jnp.stack(local_values), jnp.stack(local_ids), 3)
     np.testing.assert_array_equal(actual.latent_ids, expected.latent_ids)
     np.testing.assert_allclose(actual.values, expected.values)

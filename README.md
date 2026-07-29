@@ -13,9 +13,10 @@ diagnostic extension:
 3. source-only contribution transcoders.
 
 Experiment 5 tests a routed/shared hybrid on the exact full FFN output. Its
-corrected protocol-v2 activation ladder compares routed-only `A256ReLU`,
-`A512ReLU`, and `A512Softplus`, with the existing hybrid `H` as read-only
-context, without altering the frozen H/R/B/F campaign.
+activation-policy v3 compares full-sized `A512ReLUInclusiveTopK` and
+`A512Softplus` at matched geometry and maximum selected slots, while retaining
+panel-native `A256Native` and hybrid `H` as read-only context. V2 remains
+immutable terminal evidence for the infeasible strict-positive ReLU policy.
 
 ## Current result
 
@@ -51,13 +52,19 @@ the active tree. It is preserved at Git tag
 - [`configs/gemma4_experiment5_routed_ladder_sae_v2.yaml`](configs/gemma4_experiment5_routed_ladder_sae_v2.yaml)
   and
   [`configs/gemma4_experiment5_routed_ladder_transcoder_v2.yaml`](configs/gemma4_experiment5_routed_ladder_transcoder_v2.yaml)
-  — strict A256ReLU/A512ReLU/A512Softplus activation-ladder contracts.
+  — immutable strict-positive ReLU feasibility-attempt contracts.
+- [`configs/gemma4_experiment5_routed_ladder_sae_v3.yaml`](configs/gemma4_experiment5_routed_ladder_sae_v3.yaml)
+  and
+  [`configs/gemma4_experiment5_routed_ladder_transcoder_v3.yaml`](configs/gemma4_experiment5_routed_ladder_transcoder_v3.yaml)
+  — active ReLU-inclusive/Softplus activation-policy contracts.
 - [`EXPERIMENT_2.md`](EXPERIMENT_2.md) and
   [`EXPERIMENT_3.md`](EXPERIMENT_3.md) — frozen scientific contracts and
   execution records.
 - [`docs/EXPERIMENT_5.md`](docs/EXPERIMENT_5.md) — frozen H/R/B/F contract;
   [`docs/EXPERIMENT_5_LADDER_V2.md`](docs/EXPERIMENT_5_LADDER_V2.md) — the
-  corrected post-launch A256ReLU/A512ReLU/A512Softplus/H ladder.
+  immutable strict-positive feasibility attempt; and
+  [`docs/EXPERIMENT_5_LADDER_V3.md`](docs/EXPERIMENT_5_LADDER_V3.md) — the
+  active panel-native activation-policy reset.
 - `moe-sae` — the single CLI, with `stage-c4`, `qualify-storage`,
   `qualify-sae-storage`, `preflight`,
   `convert-checkpoint`, `benchmark-harvest`, `harvest`, `activation-farm`,

@@ -26,6 +26,7 @@ from moe_sae.contribution_training_worker import (
     RestoredTrainingState,
     TrainingLoopDependencies,
     TrainingWorkerPlan,
+    _metric_record,
     _stablehlo_manifest,
     _parser,
     _prove_prefetch_for_plan,
@@ -48,6 +49,31 @@ TRANSCODER_HORIZON_TEMPLATE = (
     / "configs"
     / "gemma4_transcoder_horizon_v1.yaml"
 )
+
+
+def test_metric_record_allows_variable_positive_l0_only_when_explicit() -> None:
+    metric = {
+        "loss": 1.0,
+        "sse": 2.0,
+        "sst": 2.0,
+        "l0": 0.0,
+        "valid_tokens": 4,
+        "topk_valid": True,
+        "grad_norm": 0.0,
+        "learning_rate": 1.0e-4,
+    }
+    with pytest.raises(
+        ContributionTrainingWorkerError,
+        match="L0 differs",
+    ):
+        _metric_record(metric, expected_l0=16)
+
+    accepted = _metric_record(
+        metric,
+        expected_l0=16,
+        require_exact_l0=False,
+    )
+    assert accepted["l0"] == 0.0
 EXPERIMENT5_SAE_CONFIG = (
     Path(__file__).parents[1] / "configs" / "gemma4_hybrid_sae_v1.yaml"
 )
@@ -56,6 +82,51 @@ ROUTED_LADDER_V2_SAE_CONFIG = (
     / "configs"
     / "gemma4_experiment5_routed_ladder_sae_v2.yaml"
 )
+ROUTED_LADDER_V3_CONFIGS = {
+    panel: (
+        Path(__file__).parents[1]
+        / "configs"
+        / f"gemma4_experiment5_routed_ladder_{panel}_v3.yaml"
+    )
+    for panel in ("sae", "transcoder")
+}
+
+
+@pytest.mark.parametrize(
+    ("panel", "config_path"),
+    ROUTED_LADDER_V3_CONFIGS.items(),
+)
+def test_v3_worker_authorizes_all_fresh_relu_seeds_and_no_softplus_retraining(
+    panel: str,
+    config_path: Path,
+) -> None:
+    from moe_sae.experiment5_routed_ladder_v3_config import (
+        PHASE_NAME,
+        SEEDS,
+        load_routed_ladder_v3_config,
+    )
+
+    config = load_routed_ladder_v3_config(config_path, expected_panel=panel)
+    for seed in SEEDS:
+        plan = TrainingWorkerPlan.from_config(
+            config,
+            phase=PHASE_NAME,
+            condition="A512ReLUInclusiveTopK",
+            seed=seed,
+        )
+        assert plan.total_tokens == 10_000_000
+        assert plan.planned_updates == 611
+
+    with pytest.raises(
+        ContributionTrainingWorkerError,
+        match="read-only historical reference",
+    ):
+        TrainingWorkerPlan.from_config(
+            config,
+            phase=PHASE_NAME,
+            condition="A512Softplus",
+            seed=0,
+        )
 
 
 def test_stablehlo_manifest_explicitly_binds_scientific_model() -> None:

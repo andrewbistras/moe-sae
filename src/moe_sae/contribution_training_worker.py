@@ -73,6 +73,12 @@ ROUTED_LADDER_V2_TRAINING_CONTEXT_SCHEMA_VERSION = (
 ROUTED_LADDER_V2_TRAINING_EXECUTION_SCHEMA_VERSION = (
     "gemma4-experiment5-routed-activation-ladder-training-execution-v1"
 )
+ROUTED_LADDER_V3_TRAINING_CONTEXT_SCHEMA_VERSION = (
+    "gemma4-experiment5-routed-activation-policy-v3-training-context-v1"
+)
+ROUTED_LADDER_V3_TRAINING_EXECUTION_SCHEMA_VERSION = (
+    "gemma4-experiment5-routed-activation-policy-v3-training-execution-v1"
+)
 PREFETCH_RECEIPT_SCHEMA_VERSION = "gemma4-contribution-sae-process-lane-prefetch-v1"
 TRANSCODER_PREFETCH_RECEIPT_SCHEMA_VERSION = (
     "gemma4-contribution-transcoder-paired-process-lane-prefetch-v1"
@@ -82,13 +88,21 @@ HORIZON_PREFETCH_MAX_SECONDS = 1_800
 HORIZON_DIRECT_ACCELERATOR_TYPES = frozenset(
     {"v4-32", "v6e-16", "v5litepod-16"}
 )
-ROUTED_LADDER_CONDITIONS = ("A256ReLU", "A512ReLU", "A512Softplus")
+ROUTED_LADDER_V2_CONDITIONS = ("A256ReLU", "A512ReLU", "A512Softplus")
+ROUTED_LADDER_V3_CONDITIONS = (
+    "A512ReLUInclusiveTopK",
+    "A512Softplus",
+)
+ROUTED_LADDER_CONDITIONS = tuple(
+    dict.fromkeys((*ROUTED_LADDER_V2_CONDITIONS, *ROUTED_LADDER_V3_CONDITIONS))
+)
 LONG_HORIZON_PHASES = frozenset(
     {
         "learning_horizon_10m",
         "routed_shared_hybrid_10m",
         "experiment5_routed_activation_ladder_10m",
         "experiment5_routed_activation_ladder_v2_10m",
+        "experiment5_routed_activation_ladder_v3_10m",
     }
 )
 CHIP_SECONDS_SCOPE = (
@@ -119,6 +133,18 @@ def _finalized_horizon_config(config_path: str | Path) -> Any | None:
         return None
 
     schema = raw.get("schema_version")
+    if schema == "gemma4-experiment5-routed-activation-ladder-run-config-v3":
+        from moe_sae.experiment5_routed_ladder_v3_config import (
+            RoutedLadderV3ConfigError,
+            load_routed_ladder_v3_config,
+        )
+
+        try:
+            return load_routed_ladder_v3_config(selected)
+        except RoutedLadderV3ConfigError as error:
+            raise ContributionTrainingWorkerError(
+                "Experiment-5 routed-ladder v3 execution requires its strict config"
+            ) from error
     if schema == "gemma4-experiment5-routed-activation-ladder-run-config-v2":
         from moe_sae.experiment5_routed_ladder_v2_config import (
             RoutedLadderV2ConfigError,
@@ -810,7 +836,12 @@ def chosen_mode_evidence(
     return mode, identity, dict(candidate["qualification_receipt"])
 
 
-def _metric_record(value: Mapping[str, Any], *, expected_l0: int) -> dict[str, Any]:
+def _metric_record(
+    value: Mapping[str, Any],
+    *,
+    expected_l0: int,
+    require_exact_l0: bool = True,
+) -> dict[str, Any]:
     required = {
         "loss",
         "sse",
@@ -835,13 +866,24 @@ def _metric_record(value: Mapping[str, Any], *, expected_l0: int) -> dict[str, A
         result[name] = selected
     tokens = _positive_int("metric valid_tokens", result["valid_tokens"])
     result["valid_tokens"] = tokens
+    if type(require_exact_l0) is not bool:
+        raise TypeError("require_exact_l0 must be boolean")
     if type(result["topk_valid"]) is not bool or not result["topk_valid"]:
         raise ContributionTrainingWorkerError(
-            "training update violated exact positive TopK"
+            "training update violated its TopK eligibility contract"
         )
-    if not math.isclose(float(result["l0"]), expected_l0, abs_tol=1e-5):
+    l0 = float(result["l0"])
+    if require_exact_l0 and not math.isclose(
+        l0,
+        expected_l0,
+        abs_tol=1e-5,
+    ):
         raise ContributionTrainingWorkerError(
             "training update L0 differs from the frozen layout"
+        )
+    if not require_exact_l0 and not 0.0 <= l0 <= float(expected_l0):
+        raise ContributionTrainingWorkerError(
+            "training update positive L0 exceeds its nominal TopK slot budget"
         )
     if result["sst"] <= 0.0:
         raise ContributionTrainingWorkerError("training update SST is not positive")
@@ -986,6 +1028,7 @@ def run_qualified_training(
     *,
     expected_l0: int,
     maximum_runtime_seconds: int,
+    require_exact_l0: bool = True,
     metric_sink: Callable[[Mapping[str, Any]], None] | None = None,
     direct_bounded_resident: bool = False,
     direct_runtime_max_seconds: int = MAX_UNGATED_ACCELERATOR_SECONDS,
@@ -1014,6 +1057,8 @@ def run_qualified_training(
             "training source update count differs from the phase plan"
         )
     _positive_int("expected_l0", expected_l0)
+    if type(require_exact_l0) is not bool:
+        raise TypeError("require_exact_l0 must be boolean")
     maximum = _positive_int("maximum_runtime_seconds", maximum_runtime_seconds)
     direct_maximum = _positive_int(
         "direct_runtime_max_seconds",
@@ -1258,7 +1303,11 @@ def run_qualified_training(
             local_seconds=input_seconds + (dependencies.clock() - step_started),
         )
         optimizer_seconds += elapsed
-        metric = _metric_record(raw_metric, expected_l0=expected_l0)
+        metric = _metric_record(
+            raw_metric,
+            expected_l0=expected_l0,
+            require_exact_l0=require_exact_l0,
+        )
         step, tokens = dependencies.progress(state)
         if step != previous_step + 1:
             raise ContributionTrainingWorkerError(
@@ -2204,6 +2253,7 @@ class _PreparedHandle:
 class _ProductionWorkload:
     scientific_model: ScientificModel
     encoder_activation: str
+    topk_requires_strictly_positive: bool
     source: Any
     mean: Any
     routed_layout: Any | None
@@ -2616,6 +2666,9 @@ class _ProductionEngine:
                 bank_capacity=self.workload.bank_capacity,
                 rematerialize_microbatch=rematerialize,
                 encoder_activation=self.workload.encoder_activation,
+                topk_requires_strictly_positive=(
+                    self.workload.topk_requires_strictly_positive
+                ),
             )
         elif self.workload.routed_layout is not None:
             from moe_sae.contribution_distributed import (
@@ -2630,6 +2683,9 @@ class _ProductionEngine:
                 bank_capacity=self.workload.bank_capacity,
                 rematerialize_microbatch=rematerialize,
                 encoder_activation=self.workload.encoder_activation,
+                topk_requires_strictly_positive=(
+                    self.workload.topk_requires_strictly_positive
+                ),
             )
         else:
             from moe_sae.contribution_shared import SharedQDistributedTrainer
@@ -3362,6 +3418,7 @@ def _build_experiment5_workload(
     return _ProductionWorkload(
         scientific_model=scientific_model,
         encoder_activation=str(config.encoder_activation),
+        topk_requires_strictly_positive=True,
         source=input_source,
         mean=centering,
         routed_layout=layout,
@@ -3510,6 +3567,26 @@ def _build_production_workload(
     if encoder_activation not in {"relu", "softplus"}:
         raise ContributionTrainingWorkerError(
             "selected layout does not freeze a supported encoder activation"
+        )
+    topk_requires_strictly_positive = getattr(
+        selected_layout,
+        "topk_requires_strictly_positive",
+        None,
+    )
+    if topk_requires_strictly_positive is None:
+        runtime = getattr(config, "runtime", None)
+        topk_requires_strictly_positive = getattr(
+            runtime,
+            "topk_requires_strictly_positive",
+            True,
+        )
+    if type(topk_requires_strictly_positive) is not bool:
+        raise ContributionTrainingWorkerError(
+            "selected layout does not freeze a boolean TopK eligibility policy"
+        )
+    if encoder_activation == "softplus" and not topk_requires_strictly_positive:
+        raise ContributionTrainingWorkerError(
+            "softplus must retain strict-positive TopK eligibility"
         )
     routed_layout: Any | None = None
     q_config: Any | None = None
@@ -3741,6 +3818,10 @@ def _build_production_workload(
         "bank_capacity": bank_capacity,
         "resident_cache_policy": "resident_only_no_refill",
     }
+    if hasattr(selected_layout, "topk_requires_strictly_positive"):
+        workload_context["topk_requires_strictly_positive"] = (
+            topk_requires_strictly_positive
+        )
     if expected_context is not None and workload_context != dict(expected_context):
         raise ContributionTrainingWorkerError(
             "resident v2 input/capacity/centering context drifted after qualification"
@@ -3758,6 +3839,7 @@ def _build_production_workload(
     return _ProductionWorkload(
         scientific_model=scientific_model,
         encoder_activation=encoder_activation,
+        topk_requires_strictly_positive=topk_requires_strictly_positive,
         source=source,
         mean=mean,
         routed_layout=routed_layout,
@@ -3832,12 +3914,18 @@ def _run_production_qualification(
                 metric = _metric_record(
                     raw_metric,
                     expected_l0=workload.expected_l0,
+                    require_exact_l0=(
+                        workload.topk_requires_strictly_positive
+                    ),
                 )
                 scientific_tokens += int(metric["valid_tokens"])
-                exact_l0 = exact_l0 and math.isclose(
-                    float(metric["l0"]),
-                    workload.expected_l0,
-                    abs_tol=1e-5,
+                exact_l0 = exact_l0 and (
+                    not workload.topk_requires_strictly_positive
+                    or math.isclose(
+                        float(metric["l0"]),
+                        workload.expected_l0,
+                        abs_tol=1e-5,
+                    )
                 )
             engine.synchronize(transition)
             measured_seconds = _collective_max_seconds(
@@ -3851,6 +3939,9 @@ def _run_production_qualification(
                 _metric_record(
                     raw_metric,
                     expected_l0=workload.expected_l0,
+                    require_exact_l0=(
+                        workload.topk_requires_strictly_positive
+                    ),
                 )
             engine.synchronize(replay)
             replay_step, replay_tokens = engine.progress(replay)
@@ -3982,6 +4073,11 @@ def _run_production_training(
         dependencies,
         expected_l0=workload.expected_l0,
         maximum_runtime_seconds=maximum_runtime_seconds,
+        require_exact_l0=getattr(
+            workload,
+            "topk_requires_strictly_positive",
+            True,
+        ),
         metric_sink=metric_sink,
         direct_bounded_resident=direct_bounded_resident,
         direct_runtime_max_seconds=direct_runtime_max_seconds,
@@ -3989,9 +4085,15 @@ def _run_production_training(
         global_chip_count=int(np.asarray(workload.mesh.devices, dtype=object).size),
     )
     from moe_sae.experiment5_routed_ladder_v2_config import RoutedLadderV2Config
+    from moe_sae.experiment5_routed_ladder_v3_config import RoutedLadderV3Config
 
     is_routed_ladder_v2 = isinstance(config, RoutedLadderV2Config)
-    if workload.experiment5_recomposition is None and not is_routed_ladder_v2:
+    is_routed_ladder_v3 = isinstance(config, RoutedLadderV3Config)
+    if (
+        workload.experiment5_recomposition is None
+        and not is_routed_ladder_v2
+        and not is_routed_ladder_v3
+    ):
         return result
     unsigned = dict(result)
     unsigned.pop("result_sha256")
@@ -4005,6 +4107,11 @@ def _run_production_training(
             seed=plan.seed,
         )
         layout = config.layout_for_condition(plan.condition)
+        layout_topk_requires_strictly_positive = getattr(
+            layout,
+            "topk_requires_strictly_positive",
+            True,
+        )
         if (
             plan != expected_plan
             or config.panel != config.scientific_model
@@ -4013,6 +4120,12 @@ def _run_production_training(
             or workload.workload_context.get("scientific_model")
             != config.scientific_model
             or workload.encoder_activation != layout.encoder_activation
+            or getattr(
+                workload,
+                "topk_requires_strictly_positive",
+                True,
+            )
+            != layout_topk_requires_strictly_positive
         ):
             raise ContributionTrainingWorkerError(
                 "routed-ladder v2 production workload differs from its config"
@@ -4031,6 +4144,62 @@ def _run_production_training(
         }
         unsigned["routed_ladder_v2_execution"] = {
             "schema_version": ROUTED_LADDER_V2_TRAINING_EXECUTION_SCHEMA_VERSION,
+            "accelerator_type": accelerator_type,
+            "peak_flops_per_second": int(peak_flops_per_second),
+            "global_chip_count": int(
+                np.asarray(workload.mesh.devices, dtype=object).size
+            ),
+        }
+        return {
+            **unsigned,
+            "result_sha256": canonical_sha256(unsigned),
+        }
+    if is_routed_ladder_v3:
+        config.validate()
+        expected_plan = TrainingWorkerPlan.from_config(
+            config,
+            phase=plan.phase_name,
+            condition=plan.condition,
+            seed=plan.seed,
+        )
+        layout = config.layout_for_condition(plan.condition)
+        layout_topk_requires_strictly_positive = (
+            layout.topk_requires_strictly_positive
+        )
+        if (
+            plan != expected_plan
+            or config.panel != config.scientific_model
+            or workload.experiment5_recomposition is not None
+            or workload.scientific_model != config.scientific_model
+            or workload.workload_context.get("scientific_model")
+            != config.scientific_model
+            or workload.encoder_activation != layout.encoder_activation
+            or workload.topk_requires_strictly_positive
+            != layout_topk_requires_strictly_positive
+        ):
+            raise ContributionTrainingWorkerError(
+                "routed-ladder v3 production workload differs from its config"
+            )
+        unsigned["routed_ladder_v3_context"] = {
+            "schema_version": ROUTED_LADDER_V3_TRAINING_CONTEXT_SCHEMA_VERSION,
+            "protocol_id": config.protocol_id,
+            "config_sha256": config.config_hash,
+            "panel": config.panel,
+            "scientific_model": config.scientific_model,
+            "phase_name": plan.phase_name,
+            "condition": plan.condition,
+            "seed": plan.seed,
+            "encoder_activation": layout.encoder_activation,
+            "selection_policy": layout.selection_policy,
+            "selected_slots_per_token": layout.selected_slots_per_token,
+            "positive_l0_contract": layout.positive_l0_contract,
+            "topk_requires_strictly_positive": (
+                layout_topk_requires_strictly_positive
+            ),
+            "workload_context": dict(workload.workload_context),
+        }
+        unsigned["routed_ladder_v3_execution"] = {
+            "schema_version": ROUTED_LADDER_V3_TRAINING_EXECUTION_SCHEMA_VERSION,
             "accelerator_type": accelerator_type,
             "peak_flops_per_second": int(peak_flops_per_second),
             "global_chip_count": int(
@@ -4100,6 +4269,19 @@ def _load_worker_config(
         from moe_sae.experiment5_config import load_experiment5_config
 
         return load_experiment5_config(
+            selected,
+            expected_panel=scientific_model,
+        )
+    if (
+        isinstance(raw, Mapping)
+        and raw.get("schema_version")
+        == "gemma4-experiment5-routed-activation-ladder-run-config-v3"
+    ):
+        from moe_sae.experiment5_routed_ladder_v3_config import (
+            load_routed_ladder_v3_config,
+        )
+
+        return load_routed_ladder_v3_config(
             selected,
             expected_panel=scientific_model,
         )

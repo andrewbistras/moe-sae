@@ -147,11 +147,13 @@ class TrainState(NamedTuple):
 
 
 class Selection(NamedTuple):
-    """Exactly-k selected positive features for each token.
+    """Exactly-k selected eligible features for each token.
 
-    If ``valid[row]`` is false, fewer than k scores were strictly positive for
-    that row.  The ids/values in that row are placeholders and callers must
-    fail the step (masked padding rows are the sole exception).
+    Historical callers define eligibility as strict positivity.  The explicit
+    inclusive-zero ReLU path defines it as finite nonnegativity.  If
+    ``valid[row]`` is false, fewer than k eligible scores were present; the
+    ids/values in that row are placeholders and callers must fail the step
+    (masked padding rows are the sole exception).
     """
 
     values: jax.Array  # [tokens, k], float32
@@ -316,8 +318,12 @@ def learning_rate(step: int | jax.Array, config: SAEConfig) -> jax.Array:
     )
 
 
-def _positive_topk_sorted_ids(
-    scores: jax.Array, sorted_ids: jax.Array, k: int
+def _eligible_topk_sorted_ids(
+    scores: jax.Array,
+    sorted_ids: jax.Array,
+    k: int,
+    *,
+    require_strictly_positive: bool,
 ) -> Selection:
     """TopK where candidate ids are strictly ascending on every row.
 
@@ -325,8 +331,15 @@ def _positive_topk_sorted_ids(
     tied cutoff is then reconstructed explicitly: scores above the cutoff win,
     followed by the lowest global latent ids equal to the cutoff.  This avoids
     backend-dependent tie behavior without perturbing floating-point scores.
+
+    Strict-positive selection is the historical default.  A caller may
+    explicitly admit exact zeros for a genuine ReLU graph.  Sentinel ids and
+    non-finite scores are never eligible, so zero-valued padding cannot become
+    a scientific selection.
     """
 
+    if type(require_strictly_positive) is not bool:
+        raise TypeError("require_strictly_positive must be boolean")
     scores32 = jnp.asarray(scores, jnp.float32)
     ids = jnp.asarray(sorted_ids, jnp.int32)
     if scores32.ndim != 2 or ids.shape != scores32.shape:
@@ -334,15 +347,24 @@ def _positive_topk_sorted_ids(
     if k <= 0 or k > scores32.shape[1]:
         raise ValueError("k must be in [1, number of candidates]")
 
-    positive = scores32 > 0.0
-    ranked = jnp.where(positive, scores32, -jnp.inf)
+    eligible = (
+        (scores32 > 0.0)
+        if require_strictly_positive
+        else (scores32 >= 0.0)
+    )
+    eligible = (
+        eligible
+        & jnp.isfinite(scores32)
+        & (ids != jnp.iinfo(jnp.int32).max)
+    )
+    ranked = jnp.where(eligible, scores32, -jnp.inf)
     cutoff = jax.lax.top_k(ranked, k)[0][:, -1]
     above = ranked > cutoff[:, None]
-    tied = positive & (ranked == cutoff[:, None])
+    tied = eligible & (ranked == cutoff[:, None])
     needed = k - jnp.sum(above, axis=1)
     tie_rank = jnp.cumsum(tied.astype(jnp.int32), axis=1)
     selected_mask = above | (tied & (tie_rank <= needed[:, None]))
-    valid = jnp.sum(positive, axis=1) >= k
+    valid = jnp.sum(eligible, axis=1) >= k
 
     # IDs are already ascending, so nonzero returns selected membership in the
     # deterministic global-id order.  Invalid rows are placeholders.
@@ -353,6 +375,19 @@ def _positive_topk_sorted_ids(
     selected_ids = jnp.take_along_axis(ids, positions, axis=1)
     selected_values = jnp.where(valid[:, None], selected_values, 0.0)
     return Selection(selected_values, selected_ids, valid)
+
+
+def _positive_topk_sorted_ids(
+    scores: jax.Array, sorted_ids: jax.Array, k: int
+) -> Selection:
+    """Historical exact-positive TopK on already sorted global ids."""
+
+    return _eligible_topk_sorted_ids(
+        scores,
+        sorted_ids,
+        k,
+        require_strictly_positive=True,
+    )
 
 
 def positive_topk(scores: jax.Array, latent_ids: jax.Array, k: int) -> Selection:
@@ -378,17 +413,49 @@ def positive_topk(scores: jax.Array, latent_ids: jax.Array, k: int) -> Selection
     return _positive_topk_sorted_ids(sorted_scores, sorted_ids, k)
 
 
+def nonnegative_topk(
+    scores: jax.Array,
+    latent_ids: jax.Array,
+    k: int,
+) -> Selection:
+    """Deterministic TopK that admits exact-zero ReLU activations.
+
+    This is not an epsilon floor: selected zero values remain exactly zero and
+    therefore do not fire, contribute to reconstruction, or count toward the
+    observed positive L0.
+    """
+
+    scores = jnp.asarray(scores)
+    ids = jnp.asarray(latent_ids, jnp.int32)
+    if ids.ndim == 1:
+        ids = jnp.broadcast_to(ids[None, :], scores.shape)
+    if scores.ndim != 2 or ids.shape != scores.shape:
+        raise ValueError(
+            "scores must be [tokens, candidates] and ids must broadcast to it"
+        )
+    order = jnp.argsort(ids, axis=1, stable=True)
+    sorted_ids = jnp.take_along_axis(ids, order, axis=1)
+    sorted_scores = jnp.take_along_axis(scores, order, axis=1)
+    return _eligible_topk_sorted_ids(
+        sorted_scores,
+        sorted_ids,
+        k,
+        require_strictly_positive=False,
+    )
+
+
 def local_topk_candidates(
     local_scores: jax.Array,
     global_latent_ids: jax.Array,
     k: int,
     *,
     ids_are_sorted: bool = False,
+    require_strictly_positive: bool = True,
 ) -> Selection:
     """Return up to k deterministic candidates from one feature shard.
 
     Invalid slots are encoded as zero values with the largest int32 id.  A
-    local shard is allowed to have fewer than k positive features; validity is
+    local shard is allowed to have fewer than k eligible features; validity is
     checked only after all shards are merged.
     """
 
@@ -403,11 +470,22 @@ def local_topk_candidates(
         ids = jnp.take_along_axis(ids, order, axis=1)
         scores = jnp.take_along_axis(scores, order, axis=1)
 
-    positive = scores > 0.0
-    ranked = jnp.where(positive, scores, -jnp.inf)
+    if type(require_strictly_positive) is not bool:
+        raise TypeError("require_strictly_positive must be boolean")
+    eligible = (
+        (scores > 0.0)
+        if require_strictly_positive
+        else (scores >= 0.0)
+    )
+    eligible = (
+        eligible
+        & jnp.isfinite(scores)
+        & (ids != jnp.iinfo(jnp.int32).max)
+    )
+    ranked = jnp.where(eligible, scores, -jnp.inf)
     cutoff = jax.lax.top_k(ranked, k)[0][:, -1]
     above = ranked > cutoff[:, None]
-    tied = positive & (ranked == cutoff[:, None])
+    tied = eligible & (ranked == cutoff[:, None])
     needed = k - jnp.sum(above, axis=1)
     mask = above | (
         tied & (jnp.cumsum(tied.astype(jnp.int32), axis=1) <= needed[:, None])
@@ -415,7 +493,7 @@ def local_topk_candidates(
     positions = jax.vmap(lambda row: jnp.nonzero(row, size=k, fill_value=0)[0])(mask)
     values = jnp.take_along_axis(scores, positions, axis=1)
     selected_ids = jnp.take_along_axis(ids, positions, axis=1)
-    count = jnp.minimum(jnp.sum(positive, axis=1), k)
+    count = jnp.minimum(jnp.sum(eligible, axis=1), k)
     slot_valid = jnp.arange(k)[None, :] < count[:, None]
     values = jnp.where(slot_valid, values, 0.0)
     selected_ids = jnp.where(slot_valid, selected_ids, jnp.iinfo(jnp.int32).max)
@@ -428,6 +506,7 @@ def merge_feature_shard_topk(
     k: int,
     *,
     ids_are_sorted: bool = False,
+    require_strictly_positive: bool = True,
 ) -> Selection:
     """Merge ``[shards, tokens, k]`` local candidates into exact global TopK."""
 
@@ -442,8 +521,17 @@ def merge_feature_shard_topk(
     # in ascending ID order, the shard-major flatten is already globally
     # sorted and the expensive second argsort is unnecessary.
     if ids_are_sorted:
-        return _positive_topk_sorted_ids(values, ids, k)
-    return positive_topk(values, ids, k)
+        return _eligible_topk_sorted_ids(
+            values,
+            ids,
+            k,
+            require_strictly_positive=require_strictly_positive,
+        )
+    return (
+        positive_topk(values, ids, k)
+        if require_strictly_positive
+        else nonnegative_topk(values, ids, k)
+    )
 
 
 def feature_sharded_topk(
@@ -452,6 +540,7 @@ def feature_sharded_topk(
     k: int,
     *,
     axis_name: str | None = None,
+    require_strictly_positive: bool = True,
 ) -> Selection:
     """Feature-sharded exact TopK helper suitable for ``shard_map``.
 
@@ -460,14 +549,24 @@ def feature_sharded_topk(
     With no axis name it is equivalent to single-shard ``positive_topk``.
     """
 
-    local = local_topk_candidates(local_scores, global_latent_ids, k)
+    local = local_topk_candidates(
+        local_scores,
+        global_latent_ids,
+        k,
+        require_strictly_positive=require_strictly_positive,
+    )
     if axis_name is None:
         values = local.values[None, ...]
         ids = local.latent_ids[None, ...]
     else:
         values = jax.lax.all_gather(local.values, axis_name, axis=0, tiled=False)
         ids = jax.lax.all_gather(local.latent_ids, axis_name, axis=0, tiled=False)
-    return merge_feature_shard_topk(values, ids, k)
+    return merge_feature_shard_topk(
+        values,
+        ids,
+        k,
+        require_strictly_positive=require_strictly_positive,
+    )
 
 
 def _condition_a_scores(
@@ -919,6 +1018,7 @@ __all__ = [
     "loss_and_grad_sums",
     "make_grouping_plan",
     "merge_feature_shard_topk",
+    "nonnegative_topk",
     "normalized_sse_loss",
     "positive_topk",
     "train_step",

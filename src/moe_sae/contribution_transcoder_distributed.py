@@ -344,6 +344,7 @@ def _build_mapped_objective(
     parameter_dtype: str,
     rematerialize_microbatch: bool,
     encoder_activation: str,
+    topk_requires_strictly_positive: bool,
 ):
     data_axis = distributed.data_axis
     feature_axis = distributed.feature_axis
@@ -423,6 +424,9 @@ def _build_mapped_objective(
                     feature_axis=feature_axis,
                     capacity=capacity,
                     encoder_activation=encoder_activation,
+                    topk_requires_strictly_positive=(
+                        topk_requires_strictly_positive
+                    ),
                 )
             else:
                 local_values, local_ids = _local_rank_candidates(
@@ -432,6 +436,9 @@ def _build_mapped_objective(
                     layout,
                     feature_axis=feature_axis,
                     encoder_activation=encoder_activation,
+                    topk_requires_strictly_positive=(
+                        topk_requires_strictly_positive
+                    ),
                 )
                 overflow_here = jnp.asarray(False)
             selection = _merge_local_candidates(
@@ -439,6 +446,7 @@ def _build_mapped_objective(
                 local_ids,
                 layout.k_per_contribution,
                 feature_axis=feature_axis,
+                require_strictly_positive=topk_requires_strictly_positive,
             )
             reconstruction = _decode_selected_columns_default_precision(
                 params.decoder,
@@ -618,6 +626,7 @@ class ContributionTranscoderDistributedTrainer:
         bank_capacity: int | None = None,
         rematerialize_microbatch: bool = True,
         encoder_activation: str = ENCODER_ACTIVATION,
+        topk_requires_strictly_positive: bool = True,
     ) -> None:
         self.mesh = mesh
         self.layout = layout
@@ -629,8 +638,20 @@ class ContributionTranscoderDistributedTrainer:
             raise TypeError("rematerialize_microbatch must be boolean")
         if encoder_activation not in {"relu", "softplus"}:
             raise ValueError("encoder_activation must be 'relu' or 'softplus'")
+        if type(topk_requires_strictly_positive) is not bool:
+            raise TypeError("topk_requires_strictly_positive must be boolean")
+        if (
+            encoder_activation == "softplus"
+            and not topk_requires_strictly_positive
+        ):
+            raise ValueError(
+                "softplus must retain the strict-positive TopK contract"
+            )
         self.rematerialize_microbatch = rematerialize_microbatch
         self.encoder_activation = encoder_activation
+        self.topk_requires_strictly_positive = (
+            topk_requires_strictly_positive
+        )
         _validate_contribution_mesh(mesh, layout, self.distributed)
         mapped = _build_mapped_objective(
             mesh,
@@ -640,6 +661,7 @@ class ContributionTranscoderDistributedTrainer:
             self.optimizer.parameter_dtype,
             rematerialize_microbatch,
             encoder_activation,
+            topk_requires_strictly_positive,
         )
 
         def complete_step(
@@ -853,11 +875,17 @@ class ContributionTranscoderDistributedTrainer:
             raise RuntimeError(
                 "transcoder component count differs from source token count"
             )
-        _validate_exact_distributed_l0(
-            l0_sum=int(l0_sum),
-            valid_tokens=token_count,
-            k=self.layout.total_l0,
-        )
+        if self.topk_requires_strictly_positive:
+            _validate_exact_distributed_l0(
+                l0_sum=int(l0_sum),
+                valid_tokens=token_count,
+                k=self.layout.total_l0,
+            )
+        elif not 0 <= int(l0_sum) <= token_count * self.layout.total_l0:
+            raise RuntimeError(
+                "inclusive-zero ReLU positive L0 is outside its nominal "
+                "TopK slot budget"
+            )
         if not bool(metrics_finite) or not bool(state_finite):
             raise RuntimeError("transcoder update produced non-finite metric or state")
         return new_state, metrics
