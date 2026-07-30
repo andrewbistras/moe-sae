@@ -16,6 +16,7 @@ import fcntl
 import gzip
 import hashlib
 import json
+import math
 import os
 import re
 import subprocess
@@ -45,6 +46,10 @@ from moe_sae.component_closure_evaluation import (
 )
 from moe_sae.component_closure_references import load_a_reference_manifest
 from moe_sae.component_closure_report import (
+    COMMON_SST_POLICY,
+    REPORT_SCHEMA_VERSION,
+    SST_AGGREGATE_RELATIVE_TOLERANCE,
+    SST_NORMALIZED_L1_TOLERANCE,
     build_closure_report,
     load_score_grid,
     render_markdown,
@@ -53,6 +58,22 @@ from moe_sae.contribution_artifacts import canonical_sha256
 
 
 SCHEMA_VERSION = "gemma4-a512-component-closure-end-to-end-v1"
+PUBLICATION_RECOVERY_SCHEMA_VERSION = (
+    "gemma4-component-closure-publication-recovery-v1"
+)
+REPORT_RECOVERY_SCHEMA_VERSION = (
+    "gemma4-a512-component-closure-report-recovery-v1"
+)
+REPORT_RECOVERY_REASON = (
+    "condition_graph_and_accelerator_fp32_sst_reduction_order"
+)
+PUBLICATION_RECOVERY_REASON = (
+    "fresh gcloud TPU SSH subprocesses returned transport code 1 "
+    "after emitting exact per-worker terminal status 0"
+)
+PUBLICATION_RECOVERY_SCRIPT_SHA256 = (
+    "53bf897bdce644c4d0bffe51eaccc2579cfd850c739242b7f883c9d5e10f72a1"
+)
 MAXIMUM_WALL_SECONDS = 43_200
 MAXIMUM_EVALUATION_ATTEMPTS = 4
 MAXIMUM_COMPACT_ARCHIVE_BYTES = 256 * 1024 * 1024
@@ -107,6 +128,10 @@ class DriverPaths:
         return self.state_root / "terminal-completion.json"
 
     @property
+    def report_recovery_receipt(self) -> Path:
+        return self.state_root / "report-recovery" / "receipt.json"
+
+    @property
     def evaluation_state(self) -> Path:
         return self.state_root / "evaluation"
 
@@ -126,6 +151,21 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-root", required=True, type=Path)
     parser.add_argument("--state-root", required=True, type=Path)
     parser.add_argument("--project-commit", required=True)
+    parser.add_argument(
+        "--report-recovery-commit",
+        help=(
+            "clean report-generator revision for a report-only recovery; "
+            "requires already-sealed training and evaluation stages"
+        ),
+    )
+    parser.add_argument(
+        "--report-recovery-script",
+        type=Path,
+        help=(
+            "exact controller publication-recovery script; required with "
+            "--report-recovery-commit"
+        ),
+    )
     parser.add_argument("--archive-gcs-prefix", required=True)
     parser.add_argument(
         "--maximum-wall-seconds",
@@ -398,6 +438,72 @@ def _validate_checkout(training: Any) -> None:
     if head != training.project_commit or dirty:
         raise ComponentClosureEndToEndError(
             "controller checkout must be clean at the training-plan commit"
+        )
+
+
+def _validate_report_recovery_checkout(
+    training: Any,
+    *,
+    report_recovery_commit: str,
+) -> None:
+    if (
+        _GIT_RE.fullmatch(report_recovery_commit) is None
+        or report_recovery_commit == training.project_commit
+    ):
+        raise ComponentClosureEndToEndError(
+            "report recovery requires one distinct full lowercase Git SHA"
+        )
+    if (
+        training.working_directory.is_symlink()
+        or not training.working_directory.is_dir()
+        or training.python_executable.is_symlink()
+        or not training.python_executable.is_file()
+        or not os.access(training.python_executable, os.X_OK)
+    ):
+        raise ComponentClosureEndToEndError(
+            "controller checkout or Python executable is invalid"
+        )
+    try:
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=training.working_directory,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        dirty = subprocess.run(
+            [
+                "git",
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+            ],
+            cwd=training.working_directory,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        ancestry = subprocess.run(
+            [
+                "git",
+                "merge-base",
+                "--is-ancestor",
+                training.project_commit,
+                report_recovery_commit,
+            ],
+            cwd=training.working_directory,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise ComponentClosureEndToEndError(
+            "cannot validate the report-recovery Git checkout"
+        ) from error
+    if head != report_recovery_commit or dirty or ancestry.returncode != 0:
+        raise ComponentClosureEndToEndError(
+            "report-recovery checkout must be a clean descendant of the "
+            "scientific commit"
         )
 
 
@@ -676,6 +782,528 @@ def _validate_evaluation_completions(evaluation: Mapping[str, Any]) -> list[Path
     return paths
 
 
+def _require_stage_outputs(
+    stage: Mapping[str, Any],
+    *,
+    expected: Sequence[Path],
+    label: str,
+) -> None:
+    if stage.get("outputs") != [_artifact_row(path) for path in expected]:
+        raise ComponentClosureEndToEndError(f"{label} stage outputs changed")
+
+
+def _publication_log_terminal_status(
+    path: Path,
+    *,
+    controller: int,
+    process: int,
+) -> int:
+    prefix = (
+        "terminal action=component-closure-evaluate-bundle "
+        f"controller={controller} process={process} status="
+    ).encode("ascii")
+    rows = [
+        line
+        for line in path.read_bytes().splitlines()
+        if line.startswith(prefix)
+    ]
+    if (
+        len(rows) != 1
+        or re.fullmatch(
+            rb"(?:0|[1-9][0-9]{0,2})",
+            rows[0][len(prefix) :],
+        )
+        is None
+    ):
+        raise ComponentClosureEndToEndError(
+            f"publication log lacks one exact terminal marker: {path}"
+        )
+    return int(rows[0][len(prefix) :])
+
+
+def _validate_publication_recovery_receipts(
+    evaluation: Mapping[str, Any],
+    *,
+    recovery_script: Path,
+) -> list[dict[str, Any]]:
+    script_sha, script_size = _sha256_path(recovery_script)
+    if script_sha != PUBLICATION_RECOVERY_SCRIPT_SHA256:
+        raise ComponentClosureEndToEndError(
+            "publication-recovery script identity changed"
+        )
+    state_root = Path(str(evaluation["state_root"]))
+    receipt_root = state_root / "publication-recovery"
+    completions = _validate_evaluation_completions(evaluation)
+    expected_names = {
+        f"{bundle['panel']}-seed{bundle['seed']}.json"
+        for bundle in evaluation["bundles"]
+    }
+    observed_names = (
+        {path.name for path in receipt_root.glob("*.json")}
+        if receipt_root.is_dir() and not receipt_root.is_symlink()
+        else set()
+    )
+    if len(expected_names) != 6 or observed_names != expected_names:
+        raise ComponentClosureEndToEndError(
+            "report recovery requires exactly the six derived publication receipts"
+        )
+
+    validated: list[dict[str, Any]] = []
+    for bundle_index, (bundle, completion_path) in enumerate(
+        zip(evaluation["bundles"], completions, strict=True)
+    ):
+        panel = str(bundle["panel"])
+        seed = int(bundle["seed"])
+        recovery_id = f"controller-publish-recovery-{panel}-seed{seed}"
+        completion = _validate_self_hash(
+            _load_json(
+                completion_path,
+                label=f"{panel} seed {seed} evaluation completion",
+            ),
+            hash_field="completion_sha256",
+            label=f"{panel} seed {seed} evaluation completion",
+        )
+        if (
+            set(completion)
+            != {
+                "schema_version",
+                "status",
+                "plan_sha256",
+                "bundle_sha256",
+                "resource_id",
+                "panel",
+                "seed",
+                "attempt_id",
+                "cells",
+                "completion_sha256",
+            }
+            or completion["schema_version"]
+            != "gemma4-component-closure-evaluation-operator-v1"
+            or completion["status"] != "bundle_published"
+            or completion["plan_sha256"] != evaluation["plan_sha256"]
+            or completion["bundle_sha256"] != bundle["bundle_sha256"]
+            or completion["resource_id"] != bundle["resource_id"]
+            or completion["panel"] != panel
+            or completion["seed"] != seed
+            or completion["attempt_id"] != recovery_id
+            or not isinstance(completion["cells"], list)
+            or len(completion["cells"]) != 12
+        ):
+            raise ComponentClosureEndToEndError(
+                f"{panel} seed {seed} completion is not publication-recovered"
+            )
+
+        path = receipt_root / f"{panel}-seed{seed}.json"
+        if path.is_symlink() or not path.is_file():
+            raise ComponentClosureEndToEndError(
+                f"publication-recovery receipt is unavailable: {path}"
+            )
+        value = _validate_self_hash(
+            _load_json(path, label="publication-recovery receipt"),
+            hash_field="receipt_sha256",
+            label="publication-recovery receipt",
+        )
+        if set(value) != {
+            "schema_version",
+            "status",
+            "project_commit",
+            "plan_sha256",
+            "bundle_sha256",
+            "bundle_index",
+            "panel",
+            "seed",
+            "resource_id",
+            "recovery_id",
+            "source_log_root",
+            "source_logs",
+            "completion_path",
+            "completion_sha256",
+            "recovery_script_file_sha256",
+            "reason",
+            "receipt_sha256",
+        }:
+            raise ComponentClosureEndToEndError(
+                f"publication-recovery receipt fields changed: {path}"
+            )
+        if (
+            value["schema_version"] != PUBLICATION_RECOVERY_SCHEMA_VERSION
+            or value["status"]
+            != "bundle_published_after_conclusive_terminal_success"
+            or value["project_commit"] != evaluation["evaluation_source_revision"]
+            or value["plan_sha256"] != evaluation["plan_sha256"]
+            or value["bundle_sha256"] != bundle["bundle_sha256"]
+            or value["bundle_index"] != bundle_index
+            or value["panel"] != panel
+            or value["seed"] != seed
+            or value["resource_id"] != bundle["resource_id"]
+            or value["recovery_id"] != recovery_id
+            or value["completion_path"] != str(completion_path)
+            or value["completion_sha256"] != completion["completion_sha256"]
+            or value["reason"] != PUBLICATION_RECOVERY_REASON
+            or value["recovery_script_file_sha256"] != script_sha
+        ):
+            raise ComponentClosureEndToEndError(
+                f"publication-recovery receipt identity changed: {path}"
+            )
+
+        expected_parent = (
+            state_root / "operator-logs" / f"{panel}-seed{seed}"
+        ).resolve()
+        source_root = Path(str(value["source_log_root"]))
+        if (
+            not source_root.is_absolute()
+            or source_root.is_symlink()
+            or not source_root.is_dir()
+            or source_root != source_root.resolve()
+            or source_root.parent != expected_parent
+        ):
+            raise ComponentClosureEndToEndError(
+                f"publication-recovery log root escaped its bundle: {path}"
+            )
+        source_logs = value["source_logs"]
+        if not isinstance(source_logs, list) or len(source_logs) != 4:
+            raise ComponentClosureEndToEndError(
+                f"publication-recovery log inventory changed: {path}"
+            )
+        controllers: set[int] = set()
+        processes: set[int] = set()
+        validated_logs: list[dict[str, Any]] = []
+        for row in source_logs:
+            if not isinstance(row, Mapping) or set(row) != {
+                "controller",
+                "process",
+                "path",
+                "file_sha256",
+                "terminal_status",
+            }:
+                raise ComponentClosureEndToEndError(
+                    f"publication-recovery log fields changed: {path}"
+                )
+            controller = row["controller"]
+            process = row["process"]
+            if (
+                isinstance(controller, bool)
+                or not isinstance(controller, int)
+                or isinstance(process, bool)
+                or not isinstance(process, int)
+                or controller not in range(4)
+                or process not in range(4)
+                or row["terminal_status"] != 0
+            ):
+                raise ComponentClosureEndToEndError(
+                    f"publication-recovery terminal evidence changed: {path}"
+                )
+            log_path = source_root / (
+                f"bundle-c{controller:05d}-p{process:05d}.log"
+            )
+            if (
+                row["path"] != str(log_path)
+                or not isinstance(row["file_sha256"], str)
+                or _SHA_RE.fullmatch(row["file_sha256"]) is None
+                or _sha256_path(log_path)[0] != row["file_sha256"]
+                or _publication_log_terminal_status(
+                    log_path,
+                    controller=controller,
+                    process=process,
+                )
+                != 0
+            ):
+                raise ComponentClosureEndToEndError(
+                    f"publication-recovery source log changed: {path}"
+                )
+            controllers.add(controller)
+            processes.add(process)
+            validated_logs.append(
+                {
+                    "archive_name": (
+                        "state/evaluation/publication-recovery/logs/"
+                        f"{panel}-seed{seed}/"
+                        f"bundle-c{controller:05d}-p{process:05d}.log"
+                    ),
+                    "path": log_path,
+                    "controller": controller,
+                    "process": process,
+                    "sha256": row["file_sha256"],
+                    "size_bytes": _sha256_path(log_path)[1],
+                    "terminal_status": 0,
+                }
+            )
+        if controllers != set(range(4)) or processes != set(range(4)):
+            raise ComponentClosureEndToEndError(
+                f"publication-recovery worker mapping changed: {path}"
+            )
+        file_sha, size = _sha256_path(path)
+        validated.append(
+            {
+                "archive_name": (
+                    "state/evaluation/publication-recovery/"
+                    f"{panel}-seed{seed}.json"
+                ),
+                "path": path,
+                "panel": panel,
+                "seed": seed,
+                "receipt_sha256": value["receipt_sha256"],
+                "completion_sha256": completion["completion_sha256"],
+                "file_sha256": file_sha,
+                "size_bytes": size,
+                "terminal_logs": sorted(
+                    validated_logs,
+                    key=lambda row: int(row["controller"]),
+                ),
+                "recovery_script": {
+                    "path": recovery_script,
+                    "sha256": script_sha,
+                    "size_bytes": script_size,
+                },
+            }
+        )
+    return validated
+
+
+def _validated_nullable_sha256(value: Any, *, label: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or _SHA_RE.fullmatch(value) is None:
+        raise ComponentClosureEndToEndError(
+            f"{label} must be one lowercase SHA-256 or null"
+        )
+    return value
+
+
+def _validate_evaluation_metadata_artifacts(
+    evaluation: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    artifacts: list[dict[str, Any]] = []
+    roles: set[tuple[str, int, str, int]] = set()
+    completions = _validate_evaluation_completions(evaluation)
+    expected_centering_fields = {
+        "schema_version",
+        "protocol_id",
+        "panel",
+        "config_sha256",
+        "target_manifest_sha256",
+        "source_manifest_sha256",
+        "recomposition_sidecar_sha256",
+        "target_mean_sha256",
+        "source_mean_sha256",
+        "routed_mean_sha256",
+        "oracle_shared_mean_sha256",
+        "endpoint_receipt_sha256",
+        "endpoint_cache_key_sha256",
+        "receipt_sha256",
+    }
+    for bundle, completion_path in zip(
+        evaluation["bundles"],
+        completions,
+        strict=True,
+    ):
+        completion = _validate_self_hash(
+            _load_json(
+                completion_path,
+                label="evaluation bundle completion",
+            ),
+            hash_field="completion_sha256",
+            label="evaluation bundle completion",
+        )
+        completion_cells = {
+            (
+                row.get("logical_condition"),
+                row.get("checkpoint_tokens"),
+            ): row
+            for row in completion["cells"]
+            if isinstance(row, Mapping)
+        }
+        if len(completion_cells) != 12:
+            raise ComponentClosureEndToEndError(
+                "evaluation completion cell inventory changed"
+            )
+        for cell in bundle["cells"]:
+            panel = str(bundle["panel"])
+            seed = int(bundle["seed"])
+            condition = str(cell["logical_condition"])
+            checkpoint = int(cell["checkpoint_tokens"])
+            role = (panel, seed, condition, checkpoint)
+            if role in roles:
+                raise ComponentClosureEndToEndError(
+                    f"evaluation metadata role repeated: {role}"
+                )
+            roles.add(role)
+            completion_cell = completion_cells.get((condition, checkpoint))
+            root = Path(str(cell["result_root_controller"]))
+            result_path = root / "evaluation-result.json"
+            centering_path = root / "centering-receipt.json"
+            result = _validate_self_hash(
+                _load_json(result_path, label="evaluation result"),
+                hash_field="result_sha256",
+                label="evaluation result",
+            )
+            centering = _validate_self_hash(
+                _load_json(centering_path, label="centering receipt"),
+                hash_field="receipt_sha256",
+                label="centering receipt",
+            )
+            result_file_sha, result_size = _sha256_path(result_path)
+            centering_file_sha, centering_size = _sha256_path(centering_path)
+            result_source_manifest = _validated_nullable_sha256(
+                result.get("source_manifest_sha256"),
+                label="evaluation source manifest",
+            )
+            centering_source_manifest = _validated_nullable_sha256(
+                centering.get("source_manifest_sha256"),
+                label="centering source manifest",
+            )
+            if (
+                not isinstance(completion_cell, Mapping)
+                or completion_cell.get("result_sha256")
+                != result["result_sha256"]
+                or completion_cell.get("result_file_sha256")
+                != result_file_sha
+                or result.get("status") != "cell_evaluated"
+                or result.get("protocol_id") != cell["source_protocol_id"]
+                or result.get("panel") != panel
+                or result.get("condition") != cell["source_condition"]
+                or result.get("seed") != seed
+                or result.get("checkpoint_tokens") != checkpoint
+                or result.get("source_revision") != bundle["source_revision"]
+                or result.get("parent_training_result_sha256")
+                != cell["parent_training_result_sha256"]
+                or result.get("parent_checkpoint_pointer_sha256")
+                != cell["parent_checkpoint_pointer_sha256"]
+                or set(centering) != expected_centering_fields
+                or centering.get("receipt_sha256")
+                != result.get("centering_receipt_sha256")
+                or centering.get("protocol_id") != result.get("protocol_id")
+                or centering.get("panel") != panel
+                or centering.get("recomposition_sidecar_sha256")
+                != result.get("recomposition_sidecar_sha256")
+            ):
+                raise ComponentClosureEndToEndError(
+                    f"evaluation metadata identity changed: {role}"
+                )
+            prefix = (
+                "state/evaluation/cells/"
+                f"{panel}/seed{seed}/{condition}/tokens-{checkpoint:08d}"
+            )
+            artifacts.extend(
+                (
+                    {
+                        "archive_name": f"{prefix}/evaluation-result.json",
+                        "path": result_path,
+                        "sha256": result_file_sha,
+                        "size_bytes": result_size,
+                        "semantic_sha256": result["result_sha256"],
+                        "source_manifest_sha256": result_source_manifest,
+                        "role": role,
+                    },
+                    {
+                        "archive_name": f"{prefix}/centering-receipt.json",
+                        "path": centering_path,
+                        "sha256": centering_file_sha,
+                        "size_bytes": centering_size,
+                        "semantic_sha256": centering["receipt_sha256"],
+                        "source_manifest_sha256": centering_source_manifest,
+                        "role": role,
+                    },
+                )
+            )
+    if len(roles) != 72 or len(artifacts) != 144:
+        raise ComponentClosureEndToEndError(
+            "report recovery requires 72 exact evaluation metadata pairs"
+        )
+    return artifacts
+
+
+def _load_sealed_report_recovery_inputs(
+    *,
+    training: Any,
+    paths: DriverPaths,
+    project_commit: str,
+    input_sha256: Mapping[str, str],
+    recovery_script: Path,
+) -> tuple[
+    dict[str, Any],
+    dict[str, dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+]:
+    barrier = _validate_training_barrier(training)
+    training_stage = _load_stage(
+        paths.stage("training"),
+        name="training",
+        project_commit=project_commit,
+        input_sha256=input_sha256,
+    )
+    if training_stage is None:
+        raise ComponentClosureEndToEndError(
+            "report recovery requires a sealed training stage"
+        )
+    _require_stage_outputs(
+        training_stage,
+        expected=[barrier],
+        label="training",
+    )
+
+    evaluation_plan_stage = _load_stage(
+        paths.stage("evaluation-plan"),
+        name="evaluation-plan",
+        project_commit=project_commit,
+        input_sha256=input_sha256,
+    )
+    if evaluation_plan_stage is None:
+        raise ComponentClosureEndToEndError(
+            "report recovery requires a sealed evaluation-plan stage"
+        )
+    _require_stage_outputs(
+        evaluation_plan_stage,
+        expected=[paths.evaluation_plan],
+        label="evaluation-plan",
+    )
+    evaluation = load_evaluation_plan(paths.evaluation_plan)
+    if (
+        evaluation["evaluation_source_revision"] != project_commit
+        or evaluation["training_plan_sha256"] != training.plan_sha256
+        or Path(str(evaluation["state_root"])).resolve()
+        != paths.evaluation_state.resolve()
+        or evaluation_plan_stage["metadata"].get("evaluation_plan_sha256")
+        != evaluation["plan_sha256"]
+    ):
+        raise ComponentClosureEndToEndError(
+            "sealed evaluation plan does not belong to this recovery"
+        )
+
+    completions = _validate_evaluation_completions(evaluation)
+    evaluation_stage = _load_stage(
+        paths.stage("evaluation"),
+        name="evaluation",
+        project_commit=project_commit,
+        input_sha256=input_sha256,
+    )
+    if evaluation_stage is None:
+        raise ComponentClosureEndToEndError(
+            "report recovery requires a sealed evaluation stage"
+        )
+    _require_stage_outputs(
+        evaluation_stage,
+        expected=completions,
+        label="evaluation",
+    )
+    receipts = _validate_publication_recovery_receipts(
+        evaluation,
+        recovery_script=recovery_script,
+    )
+    evaluation_artifacts = _validate_evaluation_metadata_artifacts(evaluation)
+    return (
+        evaluation,
+        {
+            "training": training_stage,
+            "evaluation-plan": evaluation_plan_stage,
+            "evaluation": evaluation_stage,
+        },
+        receipts,
+        evaluation_artifacts,
+    )
+
+
 def _run_evaluation(
     *,
     training_plan_path: Path,
@@ -771,6 +1399,199 @@ def _run_evaluation(
     )
 
 
+def _expected_report_recovery_receipt(
+    *,
+    evaluation: Mapping[str, Any],
+    project_commit: str,
+    report_recovery_commit: str,
+    paths: DriverPaths,
+    input_sha256: Mapping[str, str],
+    bootstrap_replicates: int,
+    recovery_stages: Mapping[str, Mapping[str, Any]],
+    publication_receipts: Sequence[Mapping[str, Any]],
+    recovery_script: Path,
+    evaluation_artifacts: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    stage_rows = []
+    for name in ("training", "evaluation-plan", "evaluation"):
+        stage = recovery_stages.get(name)
+        if not isinstance(stage, Mapping):
+            raise ComponentClosureEndToEndError(
+                f"report recovery lacks its sealed {name} stage"
+            )
+        stage_rows.append(
+            {
+                "stage": name,
+                "stage_sha256": stage["stage_sha256"],
+                "stage_file": _artifact_row(paths.stage(name)),
+                "outputs": copy.deepcopy(stage["outputs"]),
+            }
+        )
+    publication_rows = [
+        {
+            "panel": row["panel"],
+            "seed": row["seed"],
+            "archive_name": row["archive_name"],
+            "receipt_sha256": row["receipt_sha256"],
+            "completion_sha256": row["completion_sha256"],
+            "receipt_file": _artifact_row(Path(row["path"])),
+            "terminal_logs": [
+                {
+                    "archive_name": log["archive_name"],
+                    "controller": log["controller"],
+                    "process": log["process"],
+                    "terminal_status": log["terminal_status"],
+                    "file": _artifact_row(Path(log["path"])),
+                }
+                for log in row["terminal_logs"]
+            ],
+        }
+        for row in publication_receipts
+    ]
+    if any(
+        row["receipt_file"]["sha256"] != source["file_sha256"]
+        or row["receipt_file"]["size_bytes"] != source["size_bytes"]
+        for row, source in zip(
+            publication_rows,
+            publication_receipts,
+            strict=True,
+        )
+    ):
+        raise ComponentClosureEndToEndError(
+            "publication-recovery receipt changed during report recovery"
+        )
+    if len(publication_rows) != 6:
+        raise ComponentClosureEndToEndError(
+            "report recovery receipt requires six publication receipts"
+        )
+    if sum(len(row["terminal_logs"]) for row in publication_rows) != 24:
+        raise ComponentClosureEndToEndError(
+            "report recovery receipt requires 24 terminal logs"
+        )
+    recovery_script_row = _artifact_row(recovery_script)
+    if recovery_script_row["sha256"] != PUBLICATION_RECOVERY_SCRIPT_SHA256:
+        raise ComponentClosureEndToEndError(
+            "report recovery script changed before receipt sealing"
+        )
+    evaluation_rows = [
+        {
+            "archive_name": row["archive_name"],
+            "role": list(row["role"]),
+            "semantic_sha256": row["semantic_sha256"],
+            "file": _artifact_row(Path(row["path"])),
+        }
+        for row in evaluation_artifacts
+    ]
+    if (
+        len(evaluation_rows) != 144
+        or any(
+            observed["file"]["sha256"] != source["sha256"]
+            or observed["file"]["size_bytes"] != source["size_bytes"]
+            for observed, source in zip(
+                evaluation_rows,
+                evaluation_artifacts,
+                strict=True,
+            )
+        )
+    ):
+        raise ComponentClosureEndToEndError(
+            "evaluation metadata changed during report recovery"
+        )
+    grid = load_score_grid(paths.score_grid)
+    report = _validate_self_hash(
+        _load_json(paths.report_json, label="closure report"),
+        hash_field="report_sha256",
+        label="closure report",
+    )
+    body = {
+        "schema_version": REPORT_RECOVERY_SCHEMA_VERSION,
+        "record_type": "report_recovery_receipt",
+        "status": "report_recovered_from_sealed_training_and_evaluation",
+        "scientific_project_commit": project_commit,
+        "report_generator_commit": report_recovery_commit,
+        "commit_ancestry": {
+            "ancestor": project_commit,
+            "descendant": report_recovery_commit,
+            "command": "git merge-base --is-ancestor",
+            "verified": True,
+        },
+        "reason": REPORT_RECOVERY_REASON,
+        "input_sha256": dict(input_sha256),
+        "evaluation_plan_sha256": evaluation["plan_sha256"],
+        "report_policy": {
+            "policy": COMMON_SST_POLICY,
+            "reference_condition": "A",
+            "aggregate_relative_tolerance": SST_AGGREGATE_RELATIVE_TOLERANCE,
+            "normalized_l1_tolerance": SST_NORMALIZED_L1_TOLERANCE,
+            "report_schema_version": REPORT_SCHEMA_VERSION,
+        },
+        "bootstrap_replicates": bootstrap_replicates,
+        "sealed_stages": stage_rows,
+        "publication_recovery_receipts": publication_rows,
+        "publication_recovery_script": recovery_script_row,
+        "evaluation_metadata_artifacts": evaluation_rows,
+        "score_grid_evidence_sha256": grid["evidence_sha256"],
+        "report_sha256": report["report_sha256"],
+        "outputs": [
+            _artifact_row(path)
+            for path in (
+                paths.training_costs,
+                paths.score_grid,
+                paths.report_json,
+                paths.report_markdown,
+            )
+        ],
+    }
+    return {**body, "receipt_sha256": canonical_sha256(body)}
+
+
+def _seal_report_recovery_receipt(
+    *,
+    evaluation: Mapping[str, Any],
+    project_commit: str,
+    report_recovery_commit: str,
+    paths: DriverPaths,
+    input_sha256: Mapping[str, str],
+    bootstrap_replicates: int,
+    recovery_stages: Mapping[str, Mapping[str, Any]],
+    publication_receipts: Sequence[Mapping[str, Any]],
+    recovery_script: Path,
+    evaluation_artifacts: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    expected = _expected_report_recovery_receipt(
+        evaluation=evaluation,
+        project_commit=project_commit,
+        report_recovery_commit=report_recovery_commit,
+        paths=paths,
+        input_sha256=input_sha256,
+        bootstrap_replicates=bootstrap_replicates,
+        recovery_stages=recovery_stages,
+        publication_receipts=publication_receipts,
+        recovery_script=recovery_script,
+        evaluation_artifacts=evaluation_artifacts,
+    )
+    if paths.report_recovery_receipt.exists():
+        observed = _validate_self_hash(
+            _load_json(
+                paths.report_recovery_receipt,
+                label="report-recovery receipt",
+            ),
+            hash_field="receipt_sha256",
+            label="report-recovery receipt",
+        )
+        if observed != expected:
+            raise ComponentClosureEndToEndError(
+                "report-recovery receipt differs from sealed evidence"
+            )
+        return observed
+    _seal_json(
+        paths.report_recovery_receipt,
+        expected,
+        label="report-recovery receipt",
+    )
+    return expected
+
+
 def _collect_and_report(
     *,
     training_plan: Mapping[str, Any],
@@ -780,18 +1601,67 @@ def _collect_and_report(
     paths: DriverPaths,
     input_sha256: Mapping[str, str],
     bootstrap_replicates: int,
+    report_recovery_commit: str | None = None,
+    recovery_stages: Mapping[str, Mapping[str, Any]] | None = None,
+    publication_receipts: Sequence[Mapping[str, Any]] = (),
+    recovery_script: Path | None = None,
+    evaluation_artifacts: Sequence[Mapping[str, Any]] = (),
 ) -> None:
     stage_name = "scientific-report"
-    if (
-        _load_stage(
-            paths.stage(stage_name),
-            name=stage_name,
-            project_commit=project_commit,
-            input_sha256=input_sha256,
-        )
-        is not None
-    ):
+    existing = _load_stage(
+        paths.stage(stage_name),
+        name=stage_name,
+        project_commit=project_commit,
+        input_sha256=input_sha256,
+    )
+    if existing is not None:
         _verify_scientific_outputs(paths, bootstrap_replicates=bootstrap_replicates)
+        if report_recovery_commit is not None:
+            if (
+                recovery_stages is None
+                or recovery_script is None
+                or not paths.report_recovery_receipt.exists()
+            ):
+                raise ComponentClosureEndToEndError(
+                    "sealed recovered report lacks its recovery receipt"
+                )
+            receipt = _seal_report_recovery_receipt(
+                evaluation=evaluation,
+                project_commit=project_commit,
+                report_recovery_commit=report_recovery_commit,
+                paths=paths,
+                input_sha256=input_sha256,
+                bootstrap_replicates=bootstrap_replicates,
+                recovery_stages=recovery_stages,
+                publication_receipts=publication_receipts,
+                recovery_script=recovery_script,
+                evaluation_artifacts=evaluation_artifacts,
+            )
+            expected_outputs = [
+                paths.training_costs,
+                paths.score_grid,
+                paths.report_json,
+                paths.report_markdown,
+                paths.report_recovery_receipt,
+            ]
+            _require_stage_outputs(
+                existing,
+                expected=expected_outputs,
+                label=stage_name,
+            )
+            if existing["metadata"] != {
+                "bootstrap_replicates": bootstrap_replicates,
+                "report_sha256": _load_json(
+                    paths.report_json,
+                    label="closure report",
+                )["report_sha256"],
+                "report_generator_commit": report_recovery_commit,
+                "report_policy": COMMON_SST_POLICY,
+                "report_recovery_receipt_sha256": receipt["receipt_sha256"],
+            }:
+                raise ComponentClosureEndToEndError(
+                    "scientific-report recovery metadata changed"
+                )
         return
     costs = collect_training_costs(training_plan, a_references)
     _seal_json(paths.training_costs, {"costs": costs}, label="training costs")
@@ -809,21 +1679,48 @@ def _collect_and_report(
     markdown = (render_markdown(report) + "\n").encode("utf-8")
     _seal_exact_bytes(paths.report_markdown, markdown, label="closure Markdown")
     _verify_scientific_outputs(paths, bootstrap_replicates=bootstrap_replicates)
+    outputs = [
+        paths.training_costs,
+        paths.score_grid,
+        paths.report_json,
+        paths.report_markdown,
+    ]
+    metadata = {
+        "bootstrap_replicates": bootstrap_replicates,
+        "report_sha256": report["report_sha256"],
+    }
+    if report_recovery_commit is not None:
+        if recovery_stages is None or recovery_script is None:
+            raise ComponentClosureEndToEndError(
+                "report recovery lacks its sealed-stage inventory"
+            )
+        receipt = _seal_report_recovery_receipt(
+            evaluation=evaluation,
+            project_commit=project_commit,
+            report_recovery_commit=report_recovery_commit,
+            paths=paths,
+            input_sha256=input_sha256,
+            bootstrap_replicates=bootstrap_replicates,
+            recovery_stages=recovery_stages,
+            publication_receipts=publication_receipts,
+            recovery_script=recovery_script,
+            evaluation_artifacts=evaluation_artifacts,
+        )
+        outputs.append(paths.report_recovery_receipt)
+        metadata.update(
+            {
+                "report_generator_commit": report_recovery_commit,
+                "report_policy": COMMON_SST_POLICY,
+                "report_recovery_receipt_sha256": receipt["receipt_sha256"],
+            }
+        )
     _seal_stage(
         paths.stage(stage_name),
         name=stage_name,
         project_commit=project_commit,
         input_sha256=input_sha256,
-        outputs=[
-            paths.training_costs,
-            paths.score_grid,
-            paths.report_json,
-            paths.report_markdown,
-        ],
-        metadata={
-            "bootstrap_replicates": bootstrap_replicates,
-            "report_sha256": report["report_sha256"],
-        },
+        outputs=outputs,
+        metadata=metadata,
     )
 
 
@@ -863,6 +1760,10 @@ def _archive_sources(
     training_state_root: Path,
     evaluation: Mapping[str, Any],
     paths: DriverPaths,
+    publication_receipts: Sequence[Mapping[str, Any]] = (),
+    report_recovery_receipt: Path | None = None,
+    recovery_script: Path | None = None,
+    evaluation_artifacts: Sequence[Mapping[str, Any]] = (),
 ) -> list[tuple[str, Path]]:
     sources = [
         ("inputs/training-plan" + training_plan_path.suffix, training_plan_path),
@@ -894,6 +1795,31 @@ def _archive_sources(
                 "state/evaluation/"
                 f"{bundle['panel']}-seed{bundle['seed']}-completion.json",
                 completion,
+            )
+        )
+    for receipt in publication_receipts:
+        sources.append((str(receipt["archive_name"]), Path(receipt["path"])))
+        for log in receipt["terminal_logs"]:
+            sources.append((str(log["archive_name"]), Path(log["path"])))
+    if recovery_script is not None:
+        sources.append(
+            (
+                "state/evaluation/publication-recovery/recovery-script.py",
+                recovery_script,
+            )
+        )
+    for artifact in evaluation_artifacts:
+        sources.append(
+            (
+                str(artifact["archive_name"]),
+                Path(artifact["path"]),
+            )
+        )
+    if report_recovery_receipt is not None:
+        sources.append(
+            (
+                "state/report-recovery/receipt.json",
+                report_recovery_receipt,
             )
         )
     for stage in (
@@ -1173,6 +2099,85 @@ def _upload_gcs_object(
     )
 
 
+def _compact_source_inventory(
+    sources: Sequence[tuple[str, Path]],
+) -> tuple[list[dict[str, Any]], str]:
+    rows = []
+    names: set[str] = set()
+    for name, path in sources:
+        if (
+            name.startswith("/")
+            or ".." in Path(name).parts
+            or name in names
+        ):
+            raise ComponentClosureEndToEndError(
+                f"unsafe compact source inventory member: {name}"
+            )
+        names.add(name)
+        digest, size = _sha256_path(path)
+        rows.append(
+            {
+                "name": name,
+                "size_bytes": size,
+                "sha256": digest,
+            }
+        )
+    return rows, canonical_sha256({"entries": rows})
+
+
+def _validate_compact_archive_against_inventory(
+    *,
+    archive: Path,
+    index_path: Path,
+    inventory: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    index = _validate_self_hash(
+        _load_json(index_path, label="compact archive index"),
+        hash_field="index_sha256",
+        label="compact archive index",
+    )
+    if index.get("entries") != list(inventory):
+        raise ComponentClosureEndToEndError(
+            "compact archive index differs from current source inventory"
+        )
+    expected_names = [str(row["name"]) for row in inventory]
+    expected = {str(row["name"]): row for row in inventory}
+    try:
+        with tarfile.open(archive, "r:gz") as handle:
+            if handle.getnames() != [*expected_names, "archive-index.json"]:
+                raise ComponentClosureEndToEndError(
+                    "compact archive member inventory changed"
+                )
+            for name in expected_names:
+                member = handle.extractfile(name)
+                if member is None:
+                    raise ComponentClosureEndToEndError(
+                        f"compact archive member is unavailable: {name}"
+                    )
+                payload = member.read()
+                row = expected[name]
+                if (
+                    len(payload) != row["size_bytes"]
+                    or hashlib.sha256(payload).hexdigest() != row["sha256"]
+                ):
+                    raise ComponentClosureEndToEndError(
+                        f"compact archive member changed: {name}"
+                    )
+            index_member = handle.extractfile("archive-index.json")
+            if (
+                index_member is None
+                or index_member.read() != index_path.read_bytes()
+            ):
+                raise ComponentClosureEndToEndError(
+                    "embedded compact archive index changed"
+                )
+    except (OSError, tarfile.TarError) as error:
+        raise ComponentClosureEndToEndError(
+            "cannot validate compact archive contents"
+        ) from error
+    return index
+
+
 def _archive_and_upload(
     *,
     sources: Sequence[tuple[str, Path]],
@@ -1183,8 +2188,27 @@ def _archive_and_upload(
     paths: DriverPaths,
     clock: Mapping[str, Any],
     input_sha256: Mapping[str, str],
+    report_recovery_commit: str | None = None,
+    report_recovery_receipt: Path | None = None,
 ) -> tuple[dict[str, Any], Path]:
     stage_name = "compact-archive"
+    source_inventory, source_inventory_sha256 = _compact_source_inventory(
+        sources
+    )
+    recovery_receipt = None
+    if report_recovery_commit is not None:
+        if report_recovery_receipt is None:
+            raise ComponentClosureEndToEndError(
+                "compact recovery lacks its report-recovery receipt"
+            )
+        recovery_receipt = _validate_self_hash(
+            _load_json(
+                report_recovery_receipt,
+                label="report-recovery receipt",
+            ),
+            hash_field="receipt_sha256",
+            label="report-recovery receipt",
+        )
     existing = _load_stage(
         paths.stage(stage_name),
         name=stage_name,
@@ -1205,7 +2229,33 @@ def _archive_and_upload(
             raise ComponentClosureEndToEndError(
                 "local archive differs from its upload manifest"
             )
+        index = _validate_compact_archive_against_inventory(
+            archive=archive,
+            index_path=paths.archive_index,
+            inventory=source_inventory,
+        )
         metadata = existing["metadata"]
+        if report_recovery_commit is not None:
+            assert recovery_receipt is not None
+            if (
+                metadata.get("source_inventory_sha256")
+                != source_inventory_sha256
+                or metadata.get("archive_index_sha256")
+                != index["index_sha256"]
+                or metadata.get("report_generator_commit")
+                != report_recovery_commit
+                or metadata.get("report_recovery_receipt_sha256")
+                != recovery_receipt["receipt_sha256"]
+                or manifest.get("source_inventory_sha256")
+                != source_inventory_sha256
+                or manifest.get("report_generator_commit")
+                != report_recovery_commit
+                or manifest.get("report_recovery_receipt_sha256")
+                != recovery_receipt["receipt_sha256"]
+            ):
+                raise ComponentClosureEndToEndError(
+                    "sealed compact recovery identity changed"
+                )
         for name, path in (
             ("archive_object", archive),
             ("manifest_object", paths.upload_manifest),
@@ -1249,6 +2299,10 @@ def _archive_and_upload(
         project_commit=project_commit,
         paths=paths,
     )
+    if index["entries"] != source_inventory:
+        raise ComponentClosureEndToEndError(
+            "new compact archive differs from current source inventory"
+        )
     archive_sha, archive_size = _sha256_path(archive)
     prefix = archive_gcs_prefix.rstrip("/")
     archive_uri = f"{prefix}/component-closure-{archive_sha}.tar.gz"
@@ -1273,6 +2327,17 @@ def _archive_and_upload(
         "archive_index_sha256": index["index_sha256"],
         "report_sha256": report["report_sha256"],
     }
+    if report_recovery_commit is not None:
+        assert recovery_receipt is not None
+        body.update(
+            {
+                "source_inventory_sha256": source_inventory_sha256,
+                "report_generator_commit": report_recovery_commit,
+                "report_recovery_receipt_sha256": (
+                    recovery_receipt["receipt_sha256"]
+                ),
+            }
+        )
     manifest = {**body, "manifest_sha256": canonical_sha256(body)}
     _seal_json(paths.upload_manifest, manifest, label="upload manifest")
     manifest_sha, _ = _sha256_path(paths.upload_manifest)
@@ -1284,18 +2349,31 @@ def _archive_and_upload(
         project=project,
         timeout_seconds=_remaining_seconds(clock),
     )
+    metadata = {
+        "archive_object": archive_object,
+        "manifest_object": manifest_object,
+        "manifest_file_sha256": manifest_sha,
+        "uploaded_bulk_data": False,
+    }
+    if report_recovery_commit is not None:
+        assert recovery_receipt is not None
+        metadata.update(
+            {
+                "source_inventory_sha256": source_inventory_sha256,
+                "archive_index_sha256": index["index_sha256"],
+                "report_generator_commit": report_recovery_commit,
+                "report_recovery_receipt_sha256": (
+                    recovery_receipt["receipt_sha256"]
+                ),
+            }
+        )
     _seal_stage(
         paths.stage(stage_name),
         name=stage_name,
         project_commit=project_commit,
         input_sha256=input_sha256,
         outputs=[archive, paths.archive_index, paths.upload_manifest],
-        metadata={
-            "archive_object": archive_object,
-            "manifest_object": manifest_object,
-            "manifest_file_sha256": manifest_sha,
-            "uploaded_bulk_data": False,
-        },
+        metadata=metadata,
     )
     return manifest, archive
 
@@ -1303,16 +2381,48 @@ def _archive_and_upload(
 def _validate_terminal(
     path: Path,
     *,
+    paths: DriverPaths,
     project_commit: str,
     input_sha256: Mapping[str, str],
+    report_recovery_commit: str | None = None,
+    report_recovery_receipt: Path | None = None,
 ) -> dict[str, Any]:
     value = _validate_self_hash(
         _load_json(path, label="terminal completion"),
         hash_field="completion_sha256",
         label="terminal completion",
     )
+    normal_fields = {
+        "schema_version",
+        "record_type",
+        "status",
+        "project_commit",
+        "input_sha256",
+        "clock_sha256",
+        "maximum_wall_seconds",
+        "elapsed_wall_seconds",
+        "report_sha256",
+        "archive_manifest_sha256",
+        "archive_object",
+        "manifest_object",
+        "bulk_capture_or_checkpoint_data_uploaded",
+        "outputs",
+        "completed_at",
+        "completion_sha256",
+    }
+    recovery_fields = {
+        *normal_fields,
+        "report_generator_commit",
+        "report_recovery_receipt_sha256",
+    }
+    expected_fields = (
+        recovery_fields
+        if report_recovery_commit is not None
+        else normal_fields
+    )
     if (
-        value.get("schema_version") != SCHEMA_VERSION
+        set(value) != expected_fields
+        or value.get("schema_version") != SCHEMA_VERSION
         or value.get("record_type") != "terminal_completion"
         or value.get("status") != "completed"
         or value.get("project_commit") != project_commit
@@ -1320,11 +2430,104 @@ def _validate_terminal(
         or value.get("bulk_capture_or_checkpoint_data_uploaded") is not False
     ):
         raise ComponentClosureEndToEndError("terminal completion identity changed")
-    _validate_artifact_rows(value.get("outputs"), label="terminal completion")
-    if not isinstance(value.get("archive_object"), Mapping) or not isinstance(
-        value.get("manifest_object"), Mapping
+    report = _validate_self_hash(
+        _load_json(paths.report_json, label="closure report"),
+        hash_field="report_sha256",
+        label="closure report",
+    )
+    manifest = _validate_self_hash(
+        _load_json(paths.upload_manifest, label="upload manifest"),
+        hash_field="manifest_sha256",
+        label="upload manifest",
+    )
+    clock = _validate_self_hash(
+        _load_json(paths.clock, label="run clock"),
+        hash_field="clock_sha256",
+        label="run clock",
+    )
+    archive_stage = _load_stage(
+        paths.stage("compact-archive"),
+        name="compact-archive",
+        project_commit=project_commit,
+        input_sha256=input_sha256,
+    )
+    if archive_stage is None:
+        raise ComponentClosureEndToEndError(
+            "terminal completion lacks a compact-archive stage"
+        )
+    archive = Path(str(manifest.get("archive", {}).get("local_path")))
+    _require_stage_outputs(
+        archive_stage,
+        expected=[archive, paths.archive_index, paths.upload_manifest],
+        label="compact-archive",
+    )
+    metadata = archive_stage["metadata"]
+    expected_outputs = [
+        _artifact_row(output)
+        for output in (
+            paths.evaluation_plan,
+            paths.training_costs,
+            paths.score_grid,
+            paths.report_json,
+            paths.report_markdown,
+            paths.archive_index,
+            archive,
+            paths.upload_manifest,
+        )
+    ]
+    if report_recovery_commit is not None:
+        if report_recovery_receipt is None:
+            raise ComponentClosureEndToEndError(
+                "terminal recovery lacks its receipt path"
+            )
+        receipt = _validate_self_hash(
+            _load_json(
+                report_recovery_receipt,
+                label="report-recovery receipt",
+            ),
+            hash_field="receipt_sha256",
+            label="report-recovery receipt",
+        )
+        expected_outputs.append(_artifact_row(report_recovery_receipt))
+        if (
+            value.get("report_generator_commit")
+            != report_recovery_commit
+            or value.get("report_recovery_receipt_sha256")
+            != receipt["receipt_sha256"]
+            or receipt.get("report_generator_commit")
+            != report_recovery_commit
+            or receipt.get("report_sha256") != report["report_sha256"]
+            or metadata.get("report_generator_commit")
+            != report_recovery_commit
+            or metadata.get("report_recovery_receipt_sha256")
+            != receipt["receipt_sha256"]
+            or manifest.get("report_generator_commit")
+            != report_recovery_commit
+            or manifest.get("report_recovery_receipt_sha256")
+            != receipt["receipt_sha256"]
+        ):
+            raise ComponentClosureEndToEndError(
+                "terminal completion lacks its report-recovery receipt"
+            )
+    if (
+        value["clock_sha256"] != clock["clock_sha256"]
+        or value["maximum_wall_seconds"] != clock["maximum_wall_seconds"]
+        or value["report_sha256"] != report["report_sha256"]
+        or value["archive_manifest_sha256"] != manifest["manifest_sha256"]
+        or manifest.get("report_sha256") != report["report_sha256"]
+        or value["archive_object"] != metadata.get("archive_object")
+        or value["manifest_object"] != metadata.get("manifest_object")
+        or value["outputs"] != expected_outputs
+        or not isinstance(value["elapsed_wall_seconds"], (int, float))
+        or isinstance(value["elapsed_wall_seconds"], bool)
+        or not math.isfinite(float(value["elapsed_wall_seconds"]))
+        or value["elapsed_wall_seconds"] < 0
+        or not isinstance(value["completed_at"], str)
     ):
-        raise ComponentClosureEndToEndError("terminal GCS evidence changed")
+        raise ComponentClosureEndToEndError(
+            "terminal semantic linkage changed"
+        )
+    _validate_artifact_rows(value["outputs"], label="terminal completion")
     return value
 
 
@@ -1337,6 +2540,8 @@ def _seal_terminal(
     archive_manifest: Mapping[str, Any],
     archive: Path,
     archive_stage: Mapping[str, Any],
+    report_recovery_commit: str | None = None,
+    report_recovery_receipt: Path | None = None,
 ) -> dict[str, Any]:
     metadata = archive_stage["metadata"]
     body = {
@@ -1372,12 +2577,31 @@ def _seal_terminal(
         ],
         "completed_at": _timestamp(),
     }
+    if report_recovery_commit is not None:
+        if report_recovery_receipt is None:
+            raise ComponentClosureEndToEndError(
+                "terminal recovery lacks its receipt"
+            )
+        receipt = _validate_self_hash(
+            _load_json(
+                report_recovery_receipt,
+                label="report-recovery receipt",
+            ),
+            hash_field="receipt_sha256",
+            label="report-recovery receipt",
+        )
+        body["report_generator_commit"] = report_recovery_commit
+        body["report_recovery_receipt_sha256"] = receipt["receipt_sha256"]
+        body["outputs"].append(_artifact_row(report_recovery_receipt))
     value = {**body, "completion_sha256": canonical_sha256(body)}
     _seal_json(paths.terminal_completion, value, label="terminal completion")
     return _validate_terminal(
         paths.terminal_completion,
+        paths=paths,
         project_commit=project_commit,
         input_sha256=input_sha256,
+        report_recovery_commit=report_recovery_commit,
+        report_recovery_receipt=report_recovery_receipt,
     )
 
 
@@ -1442,7 +2666,24 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     training = parse_training_campaign(training_plan)
     a_references = load_a_reference_manifest(a_references_path)
     project, archive_prefix = _validate_cli_identity(args, training=training)
-    _validate_checkout(training)
+    report_recovery_commit = getattr(args, "report_recovery_commit", None)
+    raw_recovery_script = getattr(args, "report_recovery_script", None)
+    if (report_recovery_commit is None) is not (raw_recovery_script is None):
+        raise ComponentClosureEndToEndError(
+            "report recovery commit and script must be supplied together"
+        )
+    report_recovery_script = (
+        raw_recovery_script.expanduser().resolve()
+        if raw_recovery_script is not None
+        else None
+    )
+    if report_recovery_commit is None:
+        _validate_checkout(training)
+    else:
+        _validate_report_recovery_checkout(
+            training,
+            report_recovery_commit=report_recovery_commit,
+        )
     try:
         runtime = yaml.safe_load(evaluation_runtime_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, yaml.YAMLError) as error:
@@ -1468,37 +2709,79 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             maximum_wall_seconds=args.maximum_wall_seconds,
             input_sha256=input_sha256,
         )
-        if paths.terminal_completion.exists():
-            return _validate_terminal(
-                paths.terminal_completion,
-                project_commit=args.project_commit,
+        recovery_stages: dict[str, dict[str, Any]] | None = None
+        publication_receipts: list[dict[str, Any]] = []
+        evaluation_artifacts: list[dict[str, Any]] = []
+        if report_recovery_commit is None:
+            if paths.terminal_completion.exists():
+                return _validate_terminal(
+                    paths.terminal_completion,
+                    paths=paths,
+                    project_commit=args.project_commit,
+                    input_sha256=input_sha256,
+                )
+            _remaining_seconds(clock)
+            _run_training(
+                training_plan_path=training_plan_path,
+                training=training,
+                paths=paths,
+                clock=clock,
                 input_sha256=input_sha256,
             )
-        _remaining_seconds(clock)
-        _run_training(
-            training_plan_path=training_plan_path,
-            training=training,
-            paths=paths,
-            clock=clock,
-            input_sha256=input_sha256,
-        )
-        evaluation = _build_eval_plan(
-            training_plan=training_plan,
-            a_references=a_references,
-            runtime=runtime,
-            project_commit=args.project_commit,
-            paths=paths,
-            input_sha256=input_sha256,
-        )
-        _run_evaluation(
-            training_plan_path=training_plan_path,
-            evaluation_plan_path=paths.evaluation_plan,
-            evaluation=evaluation,
-            training=training,
-            paths=paths,
-            clock=clock,
-            input_sha256=input_sha256,
-        )
+            evaluation = _build_eval_plan(
+                training_plan=training_plan,
+                a_references=a_references,
+                runtime=runtime,
+                project_commit=args.project_commit,
+                paths=paths,
+                input_sha256=input_sha256,
+            )
+            _run_evaluation(
+                training_plan_path=training_plan_path,
+                evaluation_plan_path=paths.evaluation_plan,
+                evaluation=evaluation,
+                training=training,
+                paths=paths,
+                clock=clock,
+                input_sha256=input_sha256,
+            )
+        else:
+            (
+                evaluation,
+                recovery_stages,
+                publication_receipts,
+                evaluation_artifacts,
+            ) = _load_sealed_report_recovery_inputs(
+                training=training,
+                paths=paths,
+                project_commit=args.project_commit,
+                input_sha256=input_sha256,
+                recovery_script=report_recovery_script,
+            )
+            if paths.terminal_completion.exists():
+                _collect_and_report(
+                    training_plan=training_plan,
+                    a_references=a_references,
+                    evaluation=evaluation,
+                    project_commit=args.project_commit,
+                    paths=paths,
+                    input_sha256=input_sha256,
+                    bootstrap_replicates=args.bootstrap_replicates,
+                    report_recovery_commit=report_recovery_commit,
+                    recovery_stages=recovery_stages,
+                    publication_receipts=publication_receipts,
+                    recovery_script=report_recovery_script,
+                    evaluation_artifacts=evaluation_artifacts,
+                )
+                return _validate_terminal(
+                    paths.terminal_completion,
+                    paths=paths,
+                    project_commit=args.project_commit,
+                    input_sha256=input_sha256,
+                    report_recovery_commit=report_recovery_commit,
+                    report_recovery_receipt=paths.report_recovery_receipt,
+                )
+            _remaining_seconds(clock)
         _collect_and_report(
             training_plan=training_plan,
             a_references=a_references,
@@ -1507,6 +2790,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             paths=paths,
             input_sha256=input_sha256,
             bootstrap_replicates=args.bootstrap_replicates,
+            report_recovery_commit=report_recovery_commit,
+            recovery_stages=recovery_stages,
+            publication_receipts=publication_receipts,
+            recovery_script=report_recovery_script,
+            evaluation_artifacts=evaluation_artifacts,
         )
         sources = _archive_sources(
             training_plan_path=training_plan_path,
@@ -1515,6 +2803,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             training_state_root=training.state_root,
             evaluation=evaluation,
             paths=paths,
+            publication_receipts=publication_receipts,
+            report_recovery_receipt=(
+                paths.report_recovery_receipt
+                if report_recovery_commit is not None
+                else None
+            ),
+            recovery_script=report_recovery_script,
+            evaluation_artifacts=evaluation_artifacts,
         )
         archive_manifest, archive = _archive_and_upload(
             sources=sources,
@@ -1525,6 +2821,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             paths=paths,
             clock=clock,
             input_sha256=input_sha256,
+            report_recovery_commit=report_recovery_commit,
+            report_recovery_receipt=(
+                paths.report_recovery_receipt
+                if report_recovery_commit is not None
+                else None
+            ),
         )
         archive_stage = _load_stage(
             paths.stage("compact-archive"),
@@ -1542,6 +2844,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             archive_manifest=archive_manifest,
             archive=archive,
             archive_stage=archive_stage,
+            report_recovery_commit=report_recovery_commit,
+            report_recovery_receipt=(
+                paths.report_recovery_receipt
+                if report_recovery_commit is not None
+                else None
+            ),
         )
 
 
