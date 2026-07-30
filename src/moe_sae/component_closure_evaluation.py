@@ -173,6 +173,27 @@ def _validated_runtime(
     return selected
 
 
+def _canonical_cell_result_roots(
+    runtime: Mapping[str, Any],
+    *,
+    panel: str,
+    seed: int,
+    condition: str,
+    checkpoint: int,
+) -> tuple[str, str]:
+    """Return the panel-qualified remote and controller roots for one cell."""
+
+    suffix = (panel, f"seed{seed}", condition.lower(), str(checkpoint))
+    remote = PurePosixPath(str(runtime["result_root_remote"])).joinpath(*suffix)
+    controller = (
+        Path(str(runtime["result_root_controller"]))
+        .expanduser()
+        .resolve()
+        .joinpath(*suffix)
+    )
+    return str(remote), str(controller)
+
+
 def _read_self_hashed(path: Path, field: str) -> tuple[dict[str, Any], str]:
     try:
         payload = path.read_bytes()
@@ -313,6 +334,9 @@ def validate_evaluation_plan(value: Any) -> dict[str, Any]:
     expected_bundles = [(panel, seed) for panel in PANELS for seed in SEEDS]
     roles: list[tuple[str, int]] = []
     all_cells: list[tuple[str, int, str, int]] = []
+    result_roots_remote: list[str] = []
+    result_roots_controller: list[str] = []
+    expected_result_roots: list[tuple[str, str, str, str]] = []
     for index, bundle in enumerate(bundles):
         if not isinstance(bundle, Mapping) or set(bundle) != {
             "schema_version",
@@ -365,15 +389,43 @@ def validate_evaluation_plan(value: Any) -> dict[str, Any]:
         ]
         if (
             not isinstance(cells, list)
+            or not all(isinstance(cell, Mapping) for cell in cells)
             or [
                 (cell.get("logical_condition"), cell.get("checkpoint_tokens"))
                 for cell in cells
-                if isinstance(cell, Mapping)
             ]
             != expected_cells
         ):
             raise ComponentClosureEvaluationError(
                 f"evaluation bundle {index} cell matrix changed"
+            )
+        for cell, (condition, checkpoint) in zip(cells, expected_cells, strict=True):
+            remote = cell.get("result_root")
+            controller = cell.get("result_root_controller")
+            remote_path = PurePosixPath(str(remote))
+            controller_path = Path(str(controller))
+            if (
+                not isinstance(remote, str)
+                or not remote_path.is_absolute()
+                or ".." in remote_path.parts
+                or not isinstance(controller, str)
+                or not controller_path.is_absolute()
+                or ".." in controller_path.parts
+            ):
+                raise ComponentClosureEvaluationError(
+                    f"evaluation bundle {index} cell result root is invalid"
+                )
+            expected_remote, expected_controller = _canonical_cell_result_roots(
+                runtime_value,
+                panel=str(panel),
+                seed=int(seed),
+                condition=condition,
+                checkpoint=checkpoint,
+            )
+            result_roots_remote.append(remote)
+            result_roots_controller.append(controller)
+            expected_result_roots.append(
+                (remote, controller, expected_remote, expected_controller)
             )
         all_cells.extend(
             (panel, seed, condition, checkpoint)
@@ -381,6 +433,23 @@ def validate_evaluation_plan(value: Any) -> dict[str, Any]:
         )
     if roles != expected_bundles or len(all_cells) != CELL_COUNT:
         raise ComponentClosureEvaluationError("evaluation matrix is not exact")
+    if (
+        len(result_roots_remote) != CELL_COUNT
+        or len(set(result_roots_remote)) != CELL_COUNT
+        or len(result_roots_controller) != CELL_COUNT
+        or len(set(result_roots_controller)) != CELL_COUNT
+    ):
+        raise ComponentClosureEvaluationError("evaluation cell result roots collide")
+    for (
+        remote,
+        controller,
+        expected_remote,
+        expected_controller,
+    ) in expected_result_roots:
+        if remote != expected_remote or controller != expected_controller:
+            raise ComponentClosureEvaluationError(
+                "evaluation cell result root is not canonically panel-qualified"
+            )
     return {**selected, "plan_sha256": claimed}
 
 
@@ -532,28 +601,17 @@ def build_evaluation_plan(
                         }
                     else:
                         cell = fresh[(panel, seed, condition, checkpoint)]
-                    result_parent = PurePosixPath(
-                        str(panel_runtime["result_root_remote"])
-                    )
-                    result_parent_controller = (
-                        Path(str(panel_runtime["result_root_controller"]))
-                        .expanduser()
-                        .resolve()
+                    result_root, result_root_controller = _canonical_cell_result_roots(
+                        panel_runtime,
+                        panel=panel,
+                        seed=seed,
+                        condition=condition,
+                        checkpoint=checkpoint,
                     )
                     cell = {
                         **cell,
-                        "result_root": str(
-                            result_parent
-                            / f"seed{seed}"
-                            / condition.lower()
-                            / str(checkpoint)
-                        ),
-                        "result_root_controller": str(
-                            result_parent_controller
-                            / f"seed{seed}"
-                            / condition.lower()
-                            / str(checkpoint)
-                        ),
+                        "result_root": result_root,
+                        "result_root_controller": result_root_controller,
                     }
                     cells.append(cell)
             bundle_body = {

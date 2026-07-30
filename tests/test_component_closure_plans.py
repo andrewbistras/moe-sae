@@ -30,6 +30,7 @@ from moe_sae.component_closure_config import (
 from moe_sae.component_closure_evaluation import (
     BUNDLE_SCHEMA_VERSION,
     PLAN_SCHEMA_VERSION as EVAL_PLAN_SCHEMA_VERSION,
+    ComponentClosureEvaluationError,
     build_evaluation_plan,
     validate_evaluation_plan,
 )
@@ -320,18 +321,42 @@ def test_training_plan_has_exact_18_fresh_roles(tmp_path: Path) -> None:
         validate_training_plan(changed)
 
 
-def test_evaluation_validator_requires_six_twelve_cell_bundles(tmp_path: Path) -> None:
+def _shared_result_base_evaluation_plan(tmp_path: Path) -> dict:
     bundles = []
+    shared_remote_root = "/remote/shared/evaluation"
+    shared_controller_root = tmp_path / "shared" / "evaluation"
     for panel in PANELS:
         for seed in SEEDS:
             cells = [
                 {
                     "logical_condition": condition,
                     "checkpoint_tokens": checkpoint,
+                    "result_root": str(
+                        Path(shared_remote_root)
+                        / panel
+                        / f"seed{seed}"
+                        / condition.lower()
+                        / str(checkpoint)
+                    ),
+                    "result_root_controller": str(
+                        shared_controller_root
+                        / panel
+                        / f"seed{seed}"
+                        / condition.lower()
+                        / str(checkpoint)
+                    ),
                 }
                 for condition in ("A", "R", "B", "F")
                 for checkpoint in CHECKPOINT_TOKENS
             ]
+            runtime = _evaluation_runtime(
+                tmp_path,
+                panel=panel,
+                resource_id=f"{panel}-{seed}",
+                accelerator_type="v5litepod-16",
+            )
+            runtime["result_root_remote"] = shared_remote_root
+            runtime["result_root_controller"] = str(shared_controller_root)
             body = {
                 "schema_version": BUNDLE_SCHEMA_VERSION,
                 "protocol_id": PROTOCOL_ID,
@@ -339,12 +364,7 @@ def test_evaluation_validator_requires_six_twelve_cell_bundles(tmp_path: Path) -
                 "panel": panel,
                 "seed": seed,
                 "source_revision": REVISION,
-                "runtime": _evaluation_runtime(
-                    tmp_path,
-                    panel=panel,
-                    resource_id=f"{panel}-{seed}",
-                    accelerator_type="v5litepod-16",
-                ),
+                "runtime": runtime,
                 "cells": cells,
             }
             bundles.append({**body, "bundle_sha256": canonical_sha256(body)})
@@ -357,8 +377,57 @@ def test_evaluation_validator_requires_six_twelve_cell_bundles(tmp_path: Path) -
         "state_root": str(tmp_path),
         "bundles": bundles,
     }
-    plan = {**body, "plan_sha256": canonical_sha256(body)}
-    assert len(validate_evaluation_plan(plan)["bundles"]) == 6
+    return {**body, "plan_sha256": canonical_sha256(body)}
+
+
+def test_evaluation_validator_panel_qualifies_shared_result_bases(
+    tmp_path: Path,
+) -> None:
+    plan = _shared_result_base_evaluation_plan(tmp_path)
+    checked = validate_evaluation_plan(plan)
+    remote_roots = [
+        cell["result_root"] for bundle in checked["bundles"] for cell in bundle["cells"]
+    ]
+    controller_roots = [
+        cell["result_root_controller"]
+        for bundle in checked["bundles"]
+        for cell in bundle["cells"]
+    ]
+    assert len(checked["bundles"]) == 6
+    assert len(set(remote_roots)) == 72
+    assert len(set(controller_roots)) == 72
+    assert all(
+        f"/{bundle['panel']}/seed{bundle['seed']}/" in cell["result_root"]
+        for bundle in checked["bundles"]
+        for cell in bundle["cells"]
+    )
+
+
+def test_evaluation_validator_rejects_rehashed_duplicate_result_roots(
+    tmp_path: Path,
+) -> None:
+    plan = _shared_result_base_evaluation_plan(tmp_path)
+    duplicate = copy.deepcopy(plan)
+    duplicate["bundles"][3]["cells"][0]["result_root"] = duplicate["bundles"][0][
+        "cells"
+    ][0]["result_root"]
+    duplicate["bundles"][3]["cells"][0]["result_root_controller"] = duplicate[
+        "bundles"
+    ][0]["cells"][0]["result_root_controller"]
+    duplicate_bundle = duplicate["bundles"][3]
+    duplicate_bundle_body = {
+        key: value for key, value in duplicate_bundle.items() if key != "bundle_sha256"
+    }
+    duplicate_bundle["bundle_sha256"] = canonical_sha256(duplicate_bundle_body)
+    duplicate_body = {
+        key: value for key, value in duplicate.items() if key != "plan_sha256"
+    }
+    duplicate["plan_sha256"] = canonical_sha256(duplicate_body)
+    with pytest.raises(
+        ComponentClosureEvaluationError,
+        match="result roots collide",
+    ):
+        validate_evaluation_plan(duplicate)
 
 
 def test_evaluation_bundles_follow_resource_specific_v5_v4_planes(
@@ -440,6 +509,26 @@ def test_evaluation_bundles_follow_resource_specific_v5_v4_planes(
     assert observed[("transcoder", 1)][1] == "v4-32"
     assert observed[("transcoder", 2)][1] == "v4-32"
     assert all(observed[("sae", seed)][1] == "v5litepod-16" for seed in SEEDS)
+    remote_roots = [
+        cell["result_root"] for bundle in plan["bundles"] for cell in bundle["cells"]
+    ]
+    controller_roots = [
+        cell["result_root_controller"]
+        for bundle in plan["bundles"]
+        for cell in bundle["cells"]
+    ]
+    assert len(set(remote_roots)) == 72
+    assert len(set(controller_roots)) == 72
+    assert all(
+        cell["result_root"].startswith(
+            f"{bundle['runtime']['result_root_remote']}/{bundle['panel']}/"
+        )
+        and cell["result_root_controller"].startswith(
+            f"{bundle['runtime']['result_root_controller']}/{bundle['panel']}/"
+        )
+        for bundle in plan["bundles"]
+        for cell in bundle["cells"]
+    )
 
 
 def test_training_scheduler_binds_command_environment_and_planes(
