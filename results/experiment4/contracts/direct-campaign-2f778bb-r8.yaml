@@ -1,0 +1,338 @@
+schema_version: gemma4-horizon-direct-campaign-plan-v1
+campaign_id: gemma4-horizon-10m-2f778bb-r8
+state_root: /mnt/moe-sae-control/horizon-10m/direct-controller/2f778bb-r8
+working_directory: /home/tpuops/src/moe-sae
+python_executable: /home/tpuops/src/moe-sae/.venv/bin/python-direct
+remote_project_root: /home/abistras/moe-sae
+remote_uv: /home/abistras/.local/bin/uv
+project_commit: 2f778bb0c28cf4496f159311e4e68325810810fc
+max_parallel_train: 8
+max_parallel_eval: 2
+retry_policy:
+  max_transient_attempts: 8
+  initial_backoff_seconds: 30
+  maximum_backoff_seconds: 600
+
+environment:
+  ARTIFACT_ROOT: /home/abistras/moe-sae/artifacts/gemma4_v1/production
+  BULK_GCS_ROOT: gs://moe-sae-bucket/moe-sae/gemma4_v1
+  CONTRIBUTION_TRAIN_CAPTURE_ROOT: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment2/contributions/direct-b9c54aa7dce5/phase3_full_width_pilot/train
+  CONTRIBUTION_EVAL_CAPTURE_ROOT: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment2/contributions/direct-b9c54aa7dce5/phase2_mechanism_pilot/eval
+  CONTRIBUTION_OBJECT_PREFIX: gs://moe-sae-bucket/moe-sae/gemma4_v1/experiment2/contributions/train
+  CONTRIBUTION_EVAL_OBJECT_PREFIX: gs://moe-sae-bucket/moe-sae/gemma4_v1/experiment2/contributions/eval
+  CONTRIBUTION_SOURCE_OVERLAY_ROOT: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/captures/transcoder-overlay/train
+  CONTRIBUTION_EVAL_SOURCE_OVERLAY_ROOT: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment3/routed-input-overlay/eval
+  CONTRIBUTION_SOURCE_OVERLAY_PREFIX: gs://moe-sae-bucket/moe-sae/gemma4_v1/horizon-10m/transcoder-overlay/train
+  CONTRIBUTION_EVAL_SOURCE_OVERLAY_PREFIX: gs://moe-sae-bucket/moe-sae/gemma4_v1/experiment3/routed-input-overlay/eval
+  CONTRIBUTION_RECOMPOSITION_SIDECAR: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment2/qualification/20260725T085844Z-e5d2b6250ec1/b128-ep8-fsdp2/recomposition-sidecar.json
+  CONTRIBUTION_SAE_CACHE_ROOT: /dev/shm/moe-sae-local/horizon-10m/cache
+  CONTRIBUTION_SAE_CACHE_MAX_BYTES: "171798691840"
+  TRAINING_PROJECT_COMMIT: fa141831645e21b8adc5eb13d576bbc03a5ce1e0
+  TRANSCODER_HARVEST_CHIP_SECONDS: "8987.674096607989"
+
+resources:
+  - id: slice-sae-a
+    project: neural-dragnet
+    tpu_name: gemma4-horizon-v5e-usc-a
+    zone: us-central1-a
+    region: us-central1
+    accelerator_type: v5litepod-16
+    internal_ip: true
+    ssh_user: abistras
+    evidence:
+      controller_mapping:
+        controller_path: /mnt/moe-sae-usc1/horizon-10m/topology/gemma4-horizon-v5e-usc-a/assignments/c11369d-sae-a/probes/probe-c11369d-sae-a-r2/controller-mapping.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/topology/gemma4-horizon-v5e-usc-a/assignments/c11369d-sae-a/probes/probe-c11369d-sae-a-r2/controller-mapping.json
+        sha256: 40c2c9cbb0a4547d06fe535f1dedfad4fbd384d6c21ee80a93dcccb1ae9a6bbd
+      cache_inventory:
+        controller_path: /mnt/moe-sae-usc1/horizon-10m/topology/gemma4-horizon-v5e-usc-a/assignments/c11369d-sae-a/probes/probe-c11369d-sae-a-r2/cache-inventory.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/topology/gemma4-horizon-v5e-usc-a/assignments/c11369d-sae-a/probes/probe-c11369d-sae-a-r2/cache-inventory.json
+        sha256: f95b6dfd03df3a4628fc8121b61ce8a061930112c74bff0366891dd51b64cc56
+      mirror_seal: &usc_mirror
+        controller_path: /mnt/moe-sae-usc1/horizon-10m/regional/us-central1/mirror-seal.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/regional/us-central1/mirror-seal.json
+        sha256: db689d9910a43f7db3aaf4aadcce53b650524880dba021783025adf43e48573e
+    environment:
+      BULK_GCS_ROOT: gs://moe-sae-horizon-usc1-neural-dragnet/horizon-10m
+      MOE_SAE_V5LITEPOD_DEVICE_KIND: TPU v5 lite
+
+  - id: slice-sae-r
+    project: neural-dragnet
+    tpu_name: gemma4-horizon-v5e-euw2-f
+    zone: europe-west4-b
+    region: europe-west4
+    accelerator_type: v5litepod-16
+    internal_ip: true
+    ssh_user: abistras
+    evidence:
+      controller_mapping:
+        controller_path: /mnt/moe-sae-ew4/horizon-10m/topology/gemma4-horizon-v5e-euw2-f/assignments/c11369d-sae-r/probes/probe-c11369d-sae-r/controller-mapping.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/topology/gemma4-horizon-v5e-euw2-f/assignments/c11369d-sae-r/probes/probe-c11369d-sae-r/controller-mapping.json
+        sha256: 3728c7d5b08cd97e3e386302e36c15be9ac338abd31f4694b82e027f41586804
+      cache_inventory:
+        controller_path: /mnt/moe-sae-ew4/horizon-10m/topology/gemma4-horizon-v5e-euw2-f/assignments/c11369d-sae-r/probes/probe-c11369d-sae-r/cache-inventory.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/topology/gemma4-horizon-v5e-euw2-f/assignments/c11369d-sae-r/probes/probe-c11369d-sae-r/cache-inventory.json
+        sha256: 42d9b5f7fd662741e521276ce733c70c71a392838e791ac29a34bd08cdc9b2c8
+      mirror_seal: &eu_mirror
+        controller_path: /mnt/moe-sae-ew4/horizon-10m/regional/europe-west4/mirror-seal.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/regional/europe-west4/mirror-seal.json
+        sha256: d4d70c132474cf9ade6338ea921115b69fe2274c316e9b92d1503127add3f6e2
+    environment:
+      BULK_GCS_ROOT: gs://moe-sae-horizon-ew4-neural-dragnet/horizon-10m
+      MOE_SAE_V5LITEPOD_DEVICE_KIND: TPU v5 lite
+
+  - id: slice-sae-b
+    project: neural-dragnet
+    tpu_name: gemma4-horizon-harvest-0728
+    zone: us-central2-b
+    region: us-central2
+    accelerator_type: v4-32
+    internal_ip: true
+    ssh_user: abistras
+    evidence:
+      controller_mapping:
+        controller_path: /mnt/moe-sae-control/horizon-10m/topology/gemma4-horizon-harvest-0728/assignments/c11369d-sae-b/probes/probe-c11369d-sae-b/controller-mapping.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/topology/gemma4-horizon-harvest-0728/assignments/c11369d-sae-b/probes/probe-c11369d-sae-b/controller-mapping.json
+        sha256: 7e39285475c8cd222c3e9aaf4acc35d6461a0d4baaa5b8d47dafa9bae8bd920d
+      cache_inventory:
+        controller_path: /mnt/moe-sae-control/horizon-10m/topology/gemma4-horizon-harvest-0728/assignments/c11369d-sae-b/probes/probe-c11369d-sae-b/cache-inventory.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/topology/gemma4-horizon-harvest-0728/assignments/c11369d-sae-b/probes/probe-c11369d-sae-b/cache-inventory.json
+        sha256: e1b8d0b5f220aabbc7fb6e72c6896296a11794fc7997e590d776ff30b0b7b614
+      mirror_seal: null
+    environment: {}
+
+  - id: slice-sae-f
+    project: neural-dragnet
+    tpu_name: gemma4-horizon-v5e-usc-b
+    zone: us-central1-a
+    region: us-central1
+    accelerator_type: v5litepod-16
+    internal_ip: true
+    ssh_user: abistras
+    evidence:
+      controller_mapping:
+        controller_path: /mnt/moe-sae-usc1/horizon-10m/topology/gemma4-horizon-v5e-usc-b/assignments/c11369d-sae-f/probes/probe-c11369d-sae-f/controller-mapping.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/topology/gemma4-horizon-v5e-usc-b/assignments/c11369d-sae-f/probes/probe-c11369d-sae-f/controller-mapping.json
+        sha256: a767b6e4daae2ead6d1025f2f3b4adf86e2d5ce1f0d5ec422c4a1593879c45cf
+      cache_inventory:
+        controller_path: /mnt/moe-sae-usc1/horizon-10m/topology/gemma4-horizon-v5e-usc-b/assignments/c11369d-sae-f/probes/probe-c11369d-sae-f/cache-inventory.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/topology/gemma4-horizon-v5e-usc-b/assignments/c11369d-sae-f/probes/probe-c11369d-sae-f/cache-inventory.json
+        sha256: 68ad845c518b7771ebf5345061a6ca62423f517f34e529e0c2ec0ff61171ac41
+      mirror_seal: *usc_mirror
+    environment:
+      BULK_GCS_ROOT: gs://moe-sae-horizon-usc1-neural-dragnet/horizon-10m
+      MOE_SAE_V5LITEPOD_DEVICE_KIND: TPU v5 lite
+
+  - id: slice-transcoder-a
+    project: neural-dragnet
+    tpu_name: gemma4-horizon-v5e-euw-a
+    zone: europe-west4-b
+    region: europe-west4
+    accelerator_type: v5litepod-16
+    internal_ip: true
+    ssh_user: abistras
+    evidence:
+      controller_mapping:
+        controller_path: /mnt/moe-sae-ew4/horizon-10m/topology/gemma4-horizon-v5e-euw-a/assignments/fa14183-transcoder-a/probes/probe-fa14183-transcoder-a/controller-mapping.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/topology/gemma4-horizon-v5e-euw-a/assignments/fa14183-transcoder-a/probes/probe-fa14183-transcoder-a/controller-mapping.json
+        sha256: cda83d3142dc5ce5645dba7c5d25472ba205ac16563709b16b0b27d941f27d15
+      cache_inventory:
+        controller_path: /mnt/moe-sae-ew4/horizon-10m/topology/gemma4-horizon-v5e-euw-a/assignments/fa14183-transcoder-a/probes/probe-fa14183-transcoder-a/cache-inventory.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/topology/gemma4-horizon-v5e-euw-a/assignments/fa14183-transcoder-a/probes/probe-fa14183-transcoder-a/cache-inventory.json
+        sha256: cf15404da1e101d2b9d29d4f644cdb750c8052927e6e313758be6255959758aa
+      mirror_seal: *eu_mirror
+    environment:
+      BULK_GCS_ROOT: gs://moe-sae-horizon-ew4-neural-dragnet/horizon-10m
+      MOE_SAE_V5LITEPOD_DEVICE_KIND: TPU v5 lite
+
+  - id: slice-transcoder-r
+    project: neural-dragnet
+    tpu_name: gemma4-horizon-v5e-euw-r
+    zone: europe-west4-b
+    region: europe-west4
+    accelerator_type: v5litepod-16
+    internal_ip: true
+    ssh_user: abistras
+    evidence:
+      controller_mapping:
+        controller_path: /mnt/moe-sae-ew4/horizon-10m/topology/gemma4-horizon-v5e-euw-r/assignments/fa14183-transcoder-r/probes/probe-fa14183-transcoder-r-r2/controller-mapping.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/topology/gemma4-horizon-v5e-euw-r/assignments/fa14183-transcoder-r/probes/probe-fa14183-transcoder-r-r2/controller-mapping.json
+        sha256: 2b8d59699a7b535ac154bd77af76836a25ff1734e01b38c347eb808f6d4f386e
+      cache_inventory:
+        controller_path: /mnt/moe-sae-ew4/horizon-10m/topology/gemma4-horizon-v5e-euw-r/assignments/fa14183-transcoder-r/probes/probe-fa14183-transcoder-r-r2/cache-inventory.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/topology/gemma4-horizon-v5e-euw-r/assignments/fa14183-transcoder-r/probes/probe-fa14183-transcoder-r-r2/cache-inventory.json
+        sha256: d333b7a0728357c8d5fb5bedbbeca684b5454de7ed7b1462a79cc1d084f5e8da
+      mirror_seal: *eu_mirror
+    environment:
+      BULK_GCS_ROOT: gs://moe-sae-horizon-ew4-neural-dragnet/horizon-10m
+      MOE_SAE_V5LITEPOD_DEVICE_KIND: TPU v5 lite
+
+  - id: slice-transcoder-b
+    project: neural-dragnet
+    tpu_name: gemma4-horizon-v4-spot-trans-b
+    zone: us-central2-b
+    region: us-central2
+    accelerator_type: v4-32
+    internal_ip: true
+    ssh_user: abistras
+    evidence:
+      controller_mapping:
+        controller_path: /mnt/moe-sae-control/horizon-10m/topology/gemma4-horizon-v4-spot-trans-b/assignments/fa14183-transcoder-b/probes/probe-fa14183-transcoder-b/controller-mapping.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/topology/gemma4-horizon-v4-spot-trans-b/assignments/fa14183-transcoder-b/probes/probe-fa14183-transcoder-b/controller-mapping.json
+        sha256: bae4c617ce3dedd9660a9a130cbc56d08a164f2140b27f9b07c43a18c972363e
+      cache_inventory:
+        controller_path: /mnt/moe-sae-control/horizon-10m/topology/gemma4-horizon-v4-spot-trans-b/assignments/fa14183-transcoder-b/probes/probe-fa14183-transcoder-b/cache-inventory.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/topology/gemma4-horizon-v4-spot-trans-b/assignments/fa14183-transcoder-b/probes/probe-fa14183-transcoder-b/cache-inventory.json
+        sha256: 1eda42d0f5a501f962ca9475c20ee66abdf70e8db135f5bc87377493c2fc8579
+      mirror_seal: null
+    environment: {}
+
+  - id: slice-transcoder-f
+    project: neural-dragnet
+    tpu_name: gemma4-horizon-v5e-euw2-b
+    zone: europe-west4-b
+    region: europe-west4
+    accelerator_type: v5litepod-16
+    internal_ip: true
+    ssh_user: abistras
+    evidence:
+      controller_mapping:
+        controller_path: /mnt/moe-sae-ew4/horizon-10m/topology/gemma4-horizon-v5e-euw2-b/assignments/fa14183-transcoder-f/probes/probe-fa14183-transcoder-f/controller-mapping.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/topology/gemma4-horizon-v5e-euw2-b/assignments/fa14183-transcoder-f/probes/probe-fa14183-transcoder-f/controller-mapping.json
+        sha256: 5c23fc3bdfb287b14b5be995688831f6798b6726139abd3b1238535acc5cb889
+      cache_inventory:
+        controller_path: /mnt/moe-sae-ew4/horizon-10m/topology/gemma4-horizon-v5e-euw2-b/assignments/fa14183-transcoder-f/probes/probe-fa14183-transcoder-f/cache-inventory.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/topology/gemma4-horizon-v5e-euw2-b/assignments/fa14183-transcoder-f/probes/probe-fa14183-transcoder-f/cache-inventory.json
+        sha256: 24aec3c759c59a5afbc5f61da56dc0b1ac9dcafaf827d26d13cbc8e12ed2fbd8
+      mirror_seal: *eu_mirror
+    environment:
+      BULK_GCS_ROOT: gs://moe-sae-horizon-ew4-neural-dragnet/horizon-10m
+      MOE_SAE_V5LITEPOD_DEVICE_KIND: TPU v5 lite
+
+trajectories:
+  - &sae_a
+    id: train-sae-a
+    scientific_model: sae
+    condition: A
+    seed: 0
+    resource_id: slice-sae-a
+    run_id: horizon10m-sae-a-seed0
+    config_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/contracts/sae.yaml
+    phase: learning_horizon_10m
+    control_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/runs/sae
+    checkpoint_root_gcs: gs://moe-sae-horizon-usc1-neural-dragnet/horizon-10m/checkpoints/sae
+    completion_path_controller: /mnt/moe-sae-usc1/horizon-10m/runs/sae/runs/horizon10m-sae-a-seed0/training-result.json
+    environment: {}
+  - <<: *sae_a
+    id: train-sae-r
+    condition: R
+    resource_id: slice-sae-r
+    run_id: horizon10m-sae-r-seed0
+    completion_path_controller: /mnt/moe-sae-ew4/horizon-10m/runs/sae/runs/horizon10m-sae-r-seed0/training-result.json
+  - <<: *sae_a
+    id: train-sae-b
+    condition: B
+    resource_id: slice-sae-b
+    run_id: horizon10m-sae-b-seed0
+    completion_path_controller: /mnt/moe-sae-control/horizon-10m/runs/sae/runs/horizon10m-sae-b-seed0/training-result.json
+  - <<: *sae_a
+    id: train-sae-f
+    condition: F
+    resource_id: slice-sae-f
+    run_id: horizon10m-sae-f-seed0
+    completion_path_controller: /mnt/moe-sae-usc1/horizon-10m/runs/sae/runs/horizon10m-sae-f-seed0/training-result.json
+
+  - &transcoder_a
+    id: train-transcoder-a
+    scientific_model: transcoder
+    condition: A
+    seed: 0
+    resource_id: slice-transcoder-a
+    run_id: horizon10m-transcoder-a-seed0
+    config_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/contracts/transcoder.yaml
+    phase: learning_horizon_10m
+    control_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/runs/transcoder
+    checkpoint_root_gcs: gs://moe-sae-horizon-ew4-neural-dragnet/horizon-10m/checkpoints/transcoder
+    completion_path_controller: /mnt/moe-sae-ew4/horizon-10m/runs/transcoder/runs/horizon10m-transcoder-a-seed0/training-result.json
+    environment: {}
+  - <<: *transcoder_a
+    id: train-transcoder-r
+    condition: R
+    resource_id: slice-transcoder-r
+    run_id: horizon10m-transcoder-r-seed0
+    completion_path_controller: /mnt/moe-sae-ew4/horizon-10m/runs/transcoder/runs/horizon10m-transcoder-r-seed0/training-result.json
+  - <<: *transcoder_a
+    id: train-transcoder-b
+    condition: B
+    resource_id: slice-transcoder-b
+    run_id: horizon10m-transcoder-b-seed0
+    completion_path_controller: /mnt/moe-sae-control/horizon-10m/runs/transcoder/runs/horizon10m-transcoder-b-seed0/training-result.json
+  - <<: *transcoder_a
+    id: train-transcoder-f
+    condition: F
+    resource_id: slice-transcoder-f
+    run_id: horizon10m-transcoder-f-seed0
+    completion_path_controller: /mnt/moe-sae-ew4/horizon-10m/runs/transcoder/runs/horizon10m-transcoder-f-seed0/training-result.json
+
+evaluations:
+  - &sae_eval
+    id: eval-sae-2000000
+    scientific_model: sae
+    milestone_tokens: 2000000
+    seed: 0
+    resource_id: slice-sae-a
+    config_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/contracts/sae.yaml
+    phase: learning_horizon_10m
+    control_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/runs/sae
+    checkpoint_root_gcs: gs://moe-sae-horizon-usc1-neural-dragnet/horizon-10m/checkpoints/sae
+    result_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/evaluation/sae/2000000
+    completion_path_controller: /mnt/moe-sae-usc1/horizon-10m/evaluation/sae/2000000/scientific-result.json
+    run_roots_remote: &sae_runs
+      A: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/runs/sae/runs/horizon10m-sae-a-seed0
+      R: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/runs/sae/runs/horizon10m-sae-r-seed0
+      B: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/runs/sae/runs/horizon10m-sae-b-seed0
+      F: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/runs/sae/runs/horizon10m-sae-f-seed0
+    environment: {}
+  - <<: *sae_eval
+    id: eval-sae-5000000
+    milestone_tokens: 5000000
+    result_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/evaluation/sae/5000000
+    completion_path_controller: /mnt/moe-sae-usc1/horizon-10m/evaluation/sae/5000000/scientific-result.json
+    run_roots_remote: *sae_runs
+  - <<: *sae_eval
+    id: eval-sae-10000000
+    milestone_tokens: 10000000
+    result_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/evaluation/sae/10000000
+    completion_path_controller: /mnt/moe-sae-usc1/horizon-10m/evaluation/sae/10000000/scientific-result.json
+    run_roots_remote: *sae_runs
+
+  - &transcoder_eval
+    id: eval-transcoder-2000000
+    scientific_model: transcoder
+    milestone_tokens: 2000000
+    seed: 0
+    resource_id: slice-transcoder-a
+    config_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/contracts/transcoder.yaml
+    phase: learning_horizon_10m
+    control_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/runs/transcoder
+    checkpoint_root_gcs: gs://moe-sae-horizon-ew4-neural-dragnet/horizon-10m/checkpoints/transcoder
+    result_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/evaluation/transcoder/2000000
+    completion_path_controller: /mnt/moe-sae-ew4/horizon-10m/evaluation/transcoder/2000000/scientific-result.json
+    run_roots_remote: &transcoder_runs
+      A: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/runs/transcoder/runs/horizon10m-transcoder-a-seed0
+      R: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/runs/transcoder/runs/horizon10m-transcoder-r-seed0
+      B: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/runs/transcoder/runs/horizon10m-transcoder-b-seed0
+      F: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/runs/transcoder/runs/horizon10m-transcoder-f-seed0
+    environment: {}
+  - <<: *transcoder_eval
+    id: eval-transcoder-5000000
+    milestone_tokens: 5000000
+    result_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/evaluation/transcoder/5000000
+    completion_path_controller: /mnt/moe-sae-ew4/horizon-10m/evaluation/transcoder/5000000/scientific-result.json
+    run_roots_remote: *transcoder_runs
+  - <<: *transcoder_eval
+    id: eval-transcoder-10000000
+    milestone_tokens: 10000000
+    result_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/evaluation/transcoder/10000000
+    completion_path_controller: /mnt/moe-sae-ew4/horizon-10m/evaluation/transcoder/10000000/scientific-result.json
+    run_roots_remote: *transcoder_runs

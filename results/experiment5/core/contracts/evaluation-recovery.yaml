@@ -1,0 +1,1246 @@
+schema_version: gemma4-experiment5-evaluation-recovery-plan-v2
+protocol_id: gemma4-routed-shared-hybrid-v1-20260728
+campaign_id: gemma4-experiment5-evaluation-recovery-15a5f264245e-a2
+state_root: /mnt/moe-sae-control/experiment5/recovery/evaluation-v1/15a5f264245e-a2/state
+result_roots_controller:
+  us-central1: /mnt/moe-sae-usc1/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results
+  us-central2: /mnt/moe-sae-control/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results
+result_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results
+handoff_path: /mnt/moe-sae-control/experiment5/recovery/evaluation-v1/15a5f264245e-a2/state/recovery-handoff.json
+working_directory: /home/tpuops/src/moe-sae
+python_executable: /home/tpuops/src/moe-sae/.venv/bin/python-direct
+remote_project_root: /home/abistras/moe-sae
+remote_uv: /home/abistras/.local/bin/uv
+project_commit: 15a5f264245e7e93815a97d21076156109bafc91
+max_parallel_eval: 3
+retry_policy:
+  max_transient_attempts: 8
+  initial_backoff_seconds: 15.0
+  maximum_backoff_seconds: 300.0
+cost_policy:
+  hard_limit_usd: 50.0
+  contingency_usd: 5.0
+  already_spent_usd: 39.12
+  fixed_cost_reserve_usd: 1.0
+  training_attempt_reserve_usd: 0.0
+  evaluation_attempt_reserve_usd: 0.2
+environment:
+  ARTIFACT_ROOT: /home/abistras/moe-sae/artifacts/gemma4_v1/production
+  BULK_GCS_ROOT: gs://moe-sae-bucket/moe-sae/gemma4_v1
+  CONTRIBUTION_EVAL_CAPTURE_ROOT: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment2/contributions/direct-b9c54aa7dce5/phase2_mechanism_pilot/eval
+  CONTRIBUTION_EVAL_OBJECT_PREFIX: gs://moe-sae-bucket/moe-sae/gemma4_v1/experiment2/contributions/eval
+  CONTRIBUTION_OBJECT_PREFIX: gs://moe-sae-bucket/moe-sae/gemma4_v1/experiment2/contributions/train
+  CONTRIBUTION_RECOMPOSITION_SIDECAR: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment2/qualification/20260725T085844Z-e5d2b6250ec1/b128-ep8-fsdp2/recomposition-sidecar.json
+  CONTRIBUTION_SAE_CACHE_MAX_BYTES: '171798691840'
+  CONTRIBUTION_SAE_CACHE_ROOT: /dev/shm/moe-sae-local/horizon-10m/cache
+  CONTRIBUTION_TRAIN_CAPTURE_ROOT: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment2/contributions/direct-b9c54aa7dce5/phase3_full_width_pilot/train
+  TRANSCODER_HARVEST_CHIP_SECONDS: '8987.674096607989'
+  EXPERIMENT5_RECOVERY_TRAINING_SOURCE_REVISION: 674cecbb19ba9130a81a4e27249c9862de08ad17
+  EXPERIMENT5_RECOVERY_TRAINING_BARRIER_SHA256: a0d4d94a4d1c29f96ba61cd706cb248dd3e9dd58846db6849ddbd33a641aec80
+resources:
+- accelerator_type: v5litepod-16
+  cache_profile: paired
+  deployed_commit: 15a5f264245e7e93815a97d21076156109bafc91
+  environment:
+    BULK_GCS_ROOT: gs://moe-sae-horizon-usc1-neural-dragnet/horizon-10m
+    MOE_SAE_V5LITEPOD_DEVICE_KIND: TPU v5 lite
+  evidence:
+    cache_inventory:
+      controller_path: /mnt/moe-sae-usc1/horizon-10m/topology/gemma4-horizon-v5e-usc-a/assignments/experiment5-ready-three-v1-674cecbb19ba-a1-slice-sae-a/probes/probe-experiment5-ready-three-v1-674cecbb19ba-a1-slice-sae-a/cache-inventory.json
+      remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/topology/gemma4-horizon-v5e-usc-a/assignments/experiment5-ready-three-v1-674cecbb19ba-a1-slice-sae-a/probes/probe-experiment5-ready-three-v1-674cecbb19ba-a1-slice-sae-a/cache-inventory.json
+      sha256: 1916ff2bf261070f3fda783d1af8d251ef96f64ec8fdeff55cab16370c57c0a6
+    controller_mapping:
+      controller_path: /mnt/moe-sae-usc1/horizon-10m/topology/gemma4-horizon-v5e-usc-a/assignments/experiment5-ready-three-v1-674cecbb19ba-a1-slice-sae-a/probes/probe-experiment5-ready-three-v1-674cecbb19ba-a1-slice-sae-a/controller-mapping.json
+      remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/topology/gemma4-horizon-v5e-usc-a/assignments/experiment5-ready-three-v1-674cecbb19ba-a1-slice-sae-a/probes/probe-experiment5-ready-three-v1-674cecbb19ba-a1-slice-sae-a/controller-mapping.json
+      sha256: ae7f07f2841ddc5ecadb4ecbc97a763c82bde089fe929c3191503a20b0af00dd
+    mirror_seal:
+      controller_path: /mnt/moe-sae-usc1/horizon-10m/regional/us-central1/mirror-seal.json
+      remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/regional/us-central1/mirror-seal.json
+      sha256: db689d9910a43f7db3aaf4aadcce53b650524880dba021783025adf43e48573e
+  id: slice-sae-a
+  internal_ip: true
+  project: neural-dragnet
+  region: us-central1
+  ssh_user: abistras
+  tpu_name: gemma4-horizon-v5e-usc-a
+  zone: us-central1-a
+- accelerator_type: v4-32
+  cache_profile: paired
+  deployed_commit: 15a5f264245e7e93815a97d21076156109bafc91
+  environment: {}
+  evidence:
+    cache_inventory:
+      controller_path: /mnt/moe-sae-control/horizon-10m/topology/gemma4-horizon-harvest-0728/assignments/experiment5-ready-three-v1-674cecbb19ba-a1-slice-sae-b/probes/probe-experiment5-ready-three-v1-674cecbb19ba-a1-slice-sae-b/cache-inventory.json
+      remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/topology/gemma4-horizon-harvest-0728/assignments/experiment5-ready-three-v1-674cecbb19ba-a1-slice-sae-b/probes/probe-experiment5-ready-three-v1-674cecbb19ba-a1-slice-sae-b/cache-inventory.json
+      sha256: 1d7f591e5380d23b27d682b388fe3aec633b6b0d1b44db9e8d0a4d000155bd23
+    controller_mapping:
+      controller_path: /mnt/moe-sae-control/horizon-10m/topology/gemma4-horizon-harvest-0728/assignments/experiment5-ready-three-v1-674cecbb19ba-a1-slice-sae-b/probes/probe-experiment5-ready-three-v1-674cecbb19ba-a1-slice-sae-b/controller-mapping.json
+      remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/topology/gemma4-horizon-harvest-0728/assignments/experiment5-ready-three-v1-674cecbb19ba-a1-slice-sae-b/probes/probe-experiment5-ready-three-v1-674cecbb19ba-a1-slice-sae-b/controller-mapping.json
+      sha256: 8daa9801e02a9ec2df2b8247d1972a506aee2b3a8daaac6c5e31765ca91eb955
+    mirror_seal: null
+  id: slice-sae-b
+  internal_ip: true
+  project: neural-dragnet
+  region: us-central2
+  ssh_user: abistras
+  tpu_name: gemma4-horizon-harvest-0728
+  zone: us-central2-b
+- accelerator_type: v4-32
+  cache_profile: paired
+  deployed_commit: 15a5f264245e7e93815a97d21076156109bafc91
+  environment: {}
+  evidence:
+    cache_inventory:
+      controller_path: /mnt/moe-sae-control/horizon-10m/topology/gemma4-horizon-v4-spot-trans-b/assignments/experiment5-ready-three-v1-674cecbb19ba-a1-slice-transcoder-b/probes/probe-experiment5-ready-three-v1-674cecbb19ba-a1-slice-transcoder-b/cache-inventory.json
+      remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/topology/gemma4-horizon-v4-spot-trans-b/assignments/experiment5-ready-three-v1-674cecbb19ba-a1-slice-transcoder-b/probes/probe-experiment5-ready-three-v1-674cecbb19ba-a1-slice-transcoder-b/cache-inventory.json
+      sha256: c60cc6e2ccd7d0d73df449a1159801b42b941379a06b22f2b6aa95ae0b48d2e0
+    controller_mapping:
+      controller_path: /mnt/moe-sae-control/horizon-10m/topology/gemma4-horizon-v4-spot-trans-b/assignments/experiment5-ready-three-v1-674cecbb19ba-a1-slice-transcoder-b/probes/probe-experiment5-ready-three-v1-674cecbb19ba-a1-slice-transcoder-b/controller-mapping.json
+      remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/topology/gemma4-horizon-v4-spot-trans-b/assignments/experiment5-ready-three-v1-674cecbb19ba-a1-slice-transcoder-b/probes/probe-experiment5-ready-three-v1-674cecbb19ba-a1-slice-transcoder-b/controller-mapping.json
+      sha256: 21204cea562096b50eddd37ffb96a39326742bee499699ba7728783a845a88e3
+    mirror_seal: null
+  id: slice-transcoder-b
+  internal_ip: true
+  project: neural-dragnet
+  region: us-central2
+  ssh_user: abistras
+  tpu_name: gemma4-horizon-v4-spot-trans-b
+  zone: us-central2-b
+evaluations:
+- id: eval-sae-seed0-2000000
+  panel: sae
+  seed: 0
+  milestone_tokens: 2000000
+  eligible_resource_ids:
+  - slice-sae-a
+  config_remote: /home/abistras/moe-sae/configs/gemma4_hybrid_sae_v1.yaml
+  phase: routed_shared_hybrid_10m
+  control_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed0
+  checkpoint_root_gcs: gs://moe-sae-horizon-usc1-neural-dragnet/experiment5/ready-three-v1/674cecbb19ba/checkpoints/sae/seed0
+  train_source_root_remote: null
+  eval_source_root_remote: null
+  train_source_object_prefix_gcs: null
+  eval_source_object_prefix_gcs: null
+  result_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results/sae/seed0/2000000
+  completion_path_controller: /mnt/moe-sae-usc1/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results/sae/seed0/2000000/scientific-result.json
+  paired_scores_path_controller: /mnt/moe-sae-usc1/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results/sae/seed0/2000000/paired-scores.json
+  run_roots_remote:
+    H: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed0/runs/experiment5-sae-h-seed0
+    R: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed0/runs/experiment5-sae-r-seed0
+    B: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed0/runs/experiment5-sae-b-seed0
+    F: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed0/runs/experiment5-sae-f-seed0
+  environment: {}
+- id: eval-sae-seed0-5000000
+  panel: sae
+  seed: 0
+  milestone_tokens: 5000000
+  eligible_resource_ids:
+  - slice-sae-a
+  config_remote: /home/abistras/moe-sae/configs/gemma4_hybrid_sae_v1.yaml
+  phase: routed_shared_hybrid_10m
+  control_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed0
+  checkpoint_root_gcs: gs://moe-sae-horizon-usc1-neural-dragnet/experiment5/ready-three-v1/674cecbb19ba/checkpoints/sae/seed0
+  train_source_root_remote: null
+  eval_source_root_remote: null
+  train_source_object_prefix_gcs: null
+  eval_source_object_prefix_gcs: null
+  result_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results/sae/seed0/5000000
+  completion_path_controller: /mnt/moe-sae-usc1/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results/sae/seed0/5000000/scientific-result.json
+  paired_scores_path_controller: /mnt/moe-sae-usc1/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results/sae/seed0/5000000/paired-scores.json
+  run_roots_remote:
+    H: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed0/runs/experiment5-sae-h-seed0
+    R: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed0/runs/experiment5-sae-r-seed0
+    B: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed0/runs/experiment5-sae-b-seed0
+    F: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed0/runs/experiment5-sae-f-seed0
+  environment: {}
+- id: eval-sae-seed0-10000000
+  panel: sae
+  seed: 0
+  milestone_tokens: 10000000
+  eligible_resource_ids:
+  - slice-sae-a
+  config_remote: /home/abistras/moe-sae/configs/gemma4_hybrid_sae_v1.yaml
+  phase: routed_shared_hybrid_10m
+  control_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed0
+  checkpoint_root_gcs: gs://moe-sae-horizon-usc1-neural-dragnet/experiment5/ready-three-v1/674cecbb19ba/checkpoints/sae/seed0
+  train_source_root_remote: null
+  eval_source_root_remote: null
+  train_source_object_prefix_gcs: null
+  eval_source_object_prefix_gcs: null
+  result_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results/sae/seed0/10000000
+  completion_path_controller: /mnt/moe-sae-usc1/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results/sae/seed0/10000000/scientific-result.json
+  paired_scores_path_controller: /mnt/moe-sae-usc1/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results/sae/seed0/10000000/paired-scores.json
+  run_roots_remote:
+    H: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed0/runs/experiment5-sae-h-seed0
+    R: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed0/runs/experiment5-sae-r-seed0
+    B: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed0/runs/experiment5-sae-b-seed0
+    F: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed0/runs/experiment5-sae-f-seed0
+  environment: {}
+- id: eval-sae-seed1-2000000
+  panel: sae
+  seed: 1
+  milestone_tokens: 2000000
+  eligible_resource_ids:
+  - slice-sae-b
+  - slice-transcoder-b
+  config_remote: /home/abistras/moe-sae/configs/gemma4_hybrid_sae_v1.yaml
+  phase: routed_shared_hybrid_10m
+  control_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed1
+  checkpoint_root_gcs: gs://moe-sae-bucket/moe-sae/gemma4_v1/experiment5/ready-three-v1/674cecbb19ba/checkpoints/sae/seed1
+  train_source_root_remote: null
+  eval_source_root_remote: null
+  train_source_object_prefix_gcs: null
+  eval_source_object_prefix_gcs: null
+  result_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results/sae/seed1/2000000
+  completion_path_controller: /mnt/moe-sae-control/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results/sae/seed1/2000000/scientific-result.json
+  paired_scores_path_controller: /mnt/moe-sae-control/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results/sae/seed1/2000000/paired-scores.json
+  run_roots_remote:
+    H: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed1/runs/experiment5-sae-h-seed1
+    R: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed1/runs/experiment5-sae-r-seed1
+    B: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed1/runs/experiment5-sae-b-seed1
+    F: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed1/runs/experiment5-sae-f-seed1
+  environment: {}
+- id: eval-sae-seed1-5000000
+  panel: sae
+  seed: 1
+  milestone_tokens: 5000000
+  eligible_resource_ids:
+  - slice-sae-b
+  - slice-transcoder-b
+  config_remote: /home/abistras/moe-sae/configs/gemma4_hybrid_sae_v1.yaml
+  phase: routed_shared_hybrid_10m
+  control_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed1
+  checkpoint_root_gcs: gs://moe-sae-bucket/moe-sae/gemma4_v1/experiment5/ready-three-v1/674cecbb19ba/checkpoints/sae/seed1
+  train_source_root_remote: null
+  eval_source_root_remote: null
+  train_source_object_prefix_gcs: null
+  eval_source_object_prefix_gcs: null
+  result_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results/sae/seed1/5000000
+  completion_path_controller: /mnt/moe-sae-control/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results/sae/seed1/5000000/scientific-result.json
+  paired_scores_path_controller: /mnt/moe-sae-control/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results/sae/seed1/5000000/paired-scores.json
+  run_roots_remote:
+    H: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed1/runs/experiment5-sae-h-seed1
+    R: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed1/runs/experiment5-sae-r-seed1
+    B: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed1/runs/experiment5-sae-b-seed1
+    F: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed1/runs/experiment5-sae-f-seed1
+  environment: {}
+- id: eval-sae-seed1-10000000
+  panel: sae
+  seed: 1
+  milestone_tokens: 10000000
+  eligible_resource_ids:
+  - slice-sae-b
+  - slice-transcoder-b
+  config_remote: /home/abistras/moe-sae/configs/gemma4_hybrid_sae_v1.yaml
+  phase: routed_shared_hybrid_10m
+  control_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed1
+  checkpoint_root_gcs: gs://moe-sae-bucket/moe-sae/gemma4_v1/experiment5/ready-three-v1/674cecbb19ba/checkpoints/sae/seed1
+  train_source_root_remote: null
+  eval_source_root_remote: null
+  train_source_object_prefix_gcs: null
+  eval_source_object_prefix_gcs: null
+  result_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results/sae/seed1/10000000
+  completion_path_controller: /mnt/moe-sae-control/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results/sae/seed1/10000000/scientific-result.json
+  paired_scores_path_controller: /mnt/moe-sae-control/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results/sae/seed1/10000000/paired-scores.json
+  run_roots_remote:
+    H: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed1/runs/experiment5-sae-h-seed1
+    R: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed1/runs/experiment5-sae-r-seed1
+    B: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed1/runs/experiment5-sae-b-seed1
+    F: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed1/runs/experiment5-sae-f-seed1
+  environment: {}
+- id: eval-sae-seed2-2000000
+  panel: sae
+  seed: 2
+  milestone_tokens: 2000000
+  eligible_resource_ids:
+  - slice-sae-b
+  - slice-transcoder-b
+  config_remote: /home/abistras/moe-sae/configs/gemma4_hybrid_sae_v1.yaml
+  phase: routed_shared_hybrid_10m
+  control_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed2
+  checkpoint_root_gcs: gs://moe-sae-bucket/moe-sae/gemma4_v1/experiment5/ready-three-v1/674cecbb19ba/checkpoints/sae/seed2
+  train_source_root_remote: null
+  eval_source_root_remote: null
+  train_source_object_prefix_gcs: null
+  eval_source_object_prefix_gcs: null
+  result_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results/sae/seed2/2000000
+  completion_path_controller: /mnt/moe-sae-control/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results/sae/seed2/2000000/scientific-result.json
+  paired_scores_path_controller: /mnt/moe-sae-control/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results/sae/seed2/2000000/paired-scores.json
+  run_roots_remote:
+    H: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed2/runs/experiment5-sae-h-seed2
+    R: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed2/runs/experiment5-sae-r-seed2
+    B: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed2/runs/experiment5-sae-b-seed2
+    F: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed2/runs/experiment5-sae-f-seed2
+  environment: {}
+- id: eval-sae-seed2-5000000
+  panel: sae
+  seed: 2
+  milestone_tokens: 5000000
+  eligible_resource_ids:
+  - slice-sae-b
+  - slice-transcoder-b
+  config_remote: /home/abistras/moe-sae/configs/gemma4_hybrid_sae_v1.yaml
+  phase: routed_shared_hybrid_10m
+  control_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed2
+  checkpoint_root_gcs: gs://moe-sae-bucket/moe-sae/gemma4_v1/experiment5/ready-three-v1/674cecbb19ba/checkpoints/sae/seed2
+  train_source_root_remote: null
+  eval_source_root_remote: null
+  train_source_object_prefix_gcs: null
+  eval_source_object_prefix_gcs: null
+  result_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results/sae/seed2/5000000
+  completion_path_controller: /mnt/moe-sae-control/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results/sae/seed2/5000000/scientific-result.json
+  paired_scores_path_controller: /mnt/moe-sae-control/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results/sae/seed2/5000000/paired-scores.json
+  run_roots_remote:
+    H: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed2/runs/experiment5-sae-h-seed2
+    R: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed2/runs/experiment5-sae-r-seed2
+    B: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed2/runs/experiment5-sae-b-seed2
+    F: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed2/runs/experiment5-sae-f-seed2
+  environment: {}
+- id: eval-sae-seed2-10000000
+  panel: sae
+  seed: 2
+  milestone_tokens: 10000000
+  eligible_resource_ids:
+  - slice-sae-b
+  - slice-transcoder-b
+  config_remote: /home/abistras/moe-sae/configs/gemma4_hybrid_sae_v1.yaml
+  phase: routed_shared_hybrid_10m
+  control_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed2
+  checkpoint_root_gcs: gs://moe-sae-bucket/moe-sae/gemma4_v1/experiment5/ready-three-v1/674cecbb19ba/checkpoints/sae/seed2
+  train_source_root_remote: null
+  eval_source_root_remote: null
+  train_source_object_prefix_gcs: null
+  eval_source_object_prefix_gcs: null
+  result_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results/sae/seed2/10000000
+  completion_path_controller: /mnt/moe-sae-control/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results/sae/seed2/10000000/scientific-result.json
+  paired_scores_path_controller: /mnt/moe-sae-control/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results/sae/seed2/10000000/paired-scores.json
+  run_roots_remote:
+    H: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed2/runs/experiment5-sae-h-seed2
+    R: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed2/runs/experiment5-sae-r-seed2
+    B: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed2/runs/experiment5-sae-b-seed2
+    F: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed2/runs/experiment5-sae-f-seed2
+  environment: {}
+- id: eval-transcoder-seed0-2000000
+  panel: transcoder
+  seed: 0
+  milestone_tokens: 2000000
+  eligible_resource_ids:
+  - slice-sae-a
+  config_remote: /home/abistras/moe-sae/configs/gemma4_hybrid_transcoder_v1.yaml
+  phase: routed_shared_hybrid_10m
+  control_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed0
+  checkpoint_root_gcs: gs://moe-sae-horizon-usc1-neural-dragnet/experiment5/ready-three-v1/674cecbb19ba/checkpoints/transcoder/seed0
+  train_source_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/captures/transcoder-overlay/train
+  eval_source_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment3/routed-input-overlay/eval
+  train_source_object_prefix_gcs: gs://moe-sae-bucket/moe-sae/gemma4_v1/horizon-10m/transcoder-overlay/train
+  eval_source_object_prefix_gcs: gs://moe-sae-bucket/moe-sae/gemma4_v1/experiment3/routed-input-overlay/eval
+  result_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results/transcoder/seed0/2000000
+  completion_path_controller: /mnt/moe-sae-usc1/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results/transcoder/seed0/2000000/scientific-result.json
+  paired_scores_path_controller: /mnt/moe-sae-usc1/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results/transcoder/seed0/2000000/paired-scores.json
+  run_roots_remote:
+    H: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed0/runs/experiment5-transcoder-h-seed0
+    R: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed0/runs/experiment5-transcoder-r-seed0
+    B: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed0/runs/experiment5-transcoder-b-seed0
+    F: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed0/runs/experiment5-transcoder-f-seed0
+  environment: {}
+- id: eval-transcoder-seed0-5000000
+  panel: transcoder
+  seed: 0
+  milestone_tokens: 5000000
+  eligible_resource_ids:
+  - slice-sae-a
+  config_remote: /home/abistras/moe-sae/configs/gemma4_hybrid_transcoder_v1.yaml
+  phase: routed_shared_hybrid_10m
+  control_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed0
+  checkpoint_root_gcs: gs://moe-sae-horizon-usc1-neural-dragnet/experiment5/ready-three-v1/674cecbb19ba/checkpoints/transcoder/seed0
+  train_source_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/captures/transcoder-overlay/train
+  eval_source_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment3/routed-input-overlay/eval
+  train_source_object_prefix_gcs: gs://moe-sae-bucket/moe-sae/gemma4_v1/horizon-10m/transcoder-overlay/train
+  eval_source_object_prefix_gcs: gs://moe-sae-bucket/moe-sae/gemma4_v1/experiment3/routed-input-overlay/eval
+  result_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results/transcoder/seed0/5000000
+  completion_path_controller: /mnt/moe-sae-usc1/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results/transcoder/seed0/5000000/scientific-result.json
+  paired_scores_path_controller: /mnt/moe-sae-usc1/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results/transcoder/seed0/5000000/paired-scores.json
+  run_roots_remote:
+    H: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed0/runs/experiment5-transcoder-h-seed0
+    R: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed0/runs/experiment5-transcoder-r-seed0
+    B: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed0/runs/experiment5-transcoder-b-seed0
+    F: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed0/runs/experiment5-transcoder-f-seed0
+  environment: {}
+- id: eval-transcoder-seed0-10000000
+  panel: transcoder
+  seed: 0
+  milestone_tokens: 10000000
+  eligible_resource_ids:
+  - slice-sae-a
+  config_remote: /home/abistras/moe-sae/configs/gemma4_hybrid_transcoder_v1.yaml
+  phase: routed_shared_hybrid_10m
+  control_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed0
+  checkpoint_root_gcs: gs://moe-sae-horizon-usc1-neural-dragnet/experiment5/ready-three-v1/674cecbb19ba/checkpoints/transcoder/seed0
+  train_source_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/captures/transcoder-overlay/train
+  eval_source_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment3/routed-input-overlay/eval
+  train_source_object_prefix_gcs: gs://moe-sae-bucket/moe-sae/gemma4_v1/horizon-10m/transcoder-overlay/train
+  eval_source_object_prefix_gcs: gs://moe-sae-bucket/moe-sae/gemma4_v1/experiment3/routed-input-overlay/eval
+  result_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results/transcoder/seed0/10000000
+  completion_path_controller: /mnt/moe-sae-usc1/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results/transcoder/seed0/10000000/scientific-result.json
+  paired_scores_path_controller: /mnt/moe-sae-usc1/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results/transcoder/seed0/10000000/paired-scores.json
+  run_roots_remote:
+    H: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed0/runs/experiment5-transcoder-h-seed0
+    R: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed0/runs/experiment5-transcoder-r-seed0
+    B: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed0/runs/experiment5-transcoder-b-seed0
+    F: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed0/runs/experiment5-transcoder-f-seed0
+  environment: {}
+- id: eval-transcoder-seed1-2000000
+  panel: transcoder
+  seed: 1
+  milestone_tokens: 2000000
+  eligible_resource_ids:
+  - slice-sae-b
+  - slice-transcoder-b
+  config_remote: /home/abistras/moe-sae/configs/gemma4_hybrid_transcoder_v1.yaml
+  phase: routed_shared_hybrid_10m
+  control_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed1
+  checkpoint_root_gcs: gs://moe-sae-bucket/moe-sae/gemma4_v1/experiment5/ready-three-v1/674cecbb19ba/checkpoints/transcoder/seed1
+  train_source_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/captures/transcoder-overlay/train
+  eval_source_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment3/routed-input-overlay/eval
+  train_source_object_prefix_gcs: gs://moe-sae-bucket/moe-sae/gemma4_v1/horizon-10m/transcoder-overlay/train
+  eval_source_object_prefix_gcs: gs://moe-sae-bucket/moe-sae/gemma4_v1/experiment3/routed-input-overlay/eval
+  result_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results/transcoder/seed1/2000000
+  completion_path_controller: /mnt/moe-sae-control/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results/transcoder/seed1/2000000/scientific-result.json
+  paired_scores_path_controller: /mnt/moe-sae-control/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results/transcoder/seed1/2000000/paired-scores.json
+  run_roots_remote:
+    H: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed1/runs/experiment5-transcoder-h-seed1
+    R: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed1/runs/experiment5-transcoder-r-seed1
+    B: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed1/runs/experiment5-transcoder-b-seed1
+    F: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed1/runs/experiment5-transcoder-f-seed1
+  environment: {}
+- id: eval-transcoder-seed1-5000000
+  panel: transcoder
+  seed: 1
+  milestone_tokens: 5000000
+  eligible_resource_ids:
+  - slice-sae-b
+  - slice-transcoder-b
+  config_remote: /home/abistras/moe-sae/configs/gemma4_hybrid_transcoder_v1.yaml
+  phase: routed_shared_hybrid_10m
+  control_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed1
+  checkpoint_root_gcs: gs://moe-sae-bucket/moe-sae/gemma4_v1/experiment5/ready-three-v1/674cecbb19ba/checkpoints/transcoder/seed1
+  train_source_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/captures/transcoder-overlay/train
+  eval_source_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment3/routed-input-overlay/eval
+  train_source_object_prefix_gcs: gs://moe-sae-bucket/moe-sae/gemma4_v1/horizon-10m/transcoder-overlay/train
+  eval_source_object_prefix_gcs: gs://moe-sae-bucket/moe-sae/gemma4_v1/experiment3/routed-input-overlay/eval
+  result_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results/transcoder/seed1/5000000
+  completion_path_controller: /mnt/moe-sae-control/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results/transcoder/seed1/5000000/scientific-result.json
+  paired_scores_path_controller: /mnt/moe-sae-control/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results/transcoder/seed1/5000000/paired-scores.json
+  run_roots_remote:
+    H: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed1/runs/experiment5-transcoder-h-seed1
+    R: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed1/runs/experiment5-transcoder-r-seed1
+    B: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed1/runs/experiment5-transcoder-b-seed1
+    F: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed1/runs/experiment5-transcoder-f-seed1
+  environment: {}
+- id: eval-transcoder-seed1-10000000
+  panel: transcoder
+  seed: 1
+  milestone_tokens: 10000000
+  eligible_resource_ids:
+  - slice-sae-b
+  - slice-transcoder-b
+  config_remote: /home/abistras/moe-sae/configs/gemma4_hybrid_transcoder_v1.yaml
+  phase: routed_shared_hybrid_10m
+  control_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed1
+  checkpoint_root_gcs: gs://moe-sae-bucket/moe-sae/gemma4_v1/experiment5/ready-three-v1/674cecbb19ba/checkpoints/transcoder/seed1
+  train_source_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/captures/transcoder-overlay/train
+  eval_source_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment3/routed-input-overlay/eval
+  train_source_object_prefix_gcs: gs://moe-sae-bucket/moe-sae/gemma4_v1/horizon-10m/transcoder-overlay/train
+  eval_source_object_prefix_gcs: gs://moe-sae-bucket/moe-sae/gemma4_v1/experiment3/routed-input-overlay/eval
+  result_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results/transcoder/seed1/10000000
+  completion_path_controller: /mnt/moe-sae-control/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results/transcoder/seed1/10000000/scientific-result.json
+  paired_scores_path_controller: /mnt/moe-sae-control/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results/transcoder/seed1/10000000/paired-scores.json
+  run_roots_remote:
+    H: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed1/runs/experiment5-transcoder-h-seed1
+    R: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed1/runs/experiment5-transcoder-r-seed1
+    B: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed1/runs/experiment5-transcoder-b-seed1
+    F: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed1/runs/experiment5-transcoder-f-seed1
+  environment: {}
+- id: eval-transcoder-seed2-2000000
+  panel: transcoder
+  seed: 2
+  milestone_tokens: 2000000
+  eligible_resource_ids:
+  - slice-sae-b
+  - slice-transcoder-b
+  config_remote: /home/abistras/moe-sae/configs/gemma4_hybrid_transcoder_v1.yaml
+  phase: routed_shared_hybrid_10m
+  control_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed2
+  checkpoint_root_gcs: gs://moe-sae-bucket/moe-sae/gemma4_v1/experiment5/ready-three-v1/674cecbb19ba/checkpoints/transcoder/seed2
+  train_source_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/captures/transcoder-overlay/train
+  eval_source_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment3/routed-input-overlay/eval
+  train_source_object_prefix_gcs: gs://moe-sae-bucket/moe-sae/gemma4_v1/horizon-10m/transcoder-overlay/train
+  eval_source_object_prefix_gcs: gs://moe-sae-bucket/moe-sae/gemma4_v1/experiment3/routed-input-overlay/eval
+  result_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results/transcoder/seed2/2000000
+  completion_path_controller: /mnt/moe-sae-control/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results/transcoder/seed2/2000000/scientific-result.json
+  paired_scores_path_controller: /mnt/moe-sae-control/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results/transcoder/seed2/2000000/paired-scores.json
+  run_roots_remote:
+    H: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed2/runs/experiment5-transcoder-h-seed2
+    R: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed2/runs/experiment5-transcoder-r-seed2
+    B: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed2/runs/experiment5-transcoder-b-seed2
+    F: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed2/runs/experiment5-transcoder-f-seed2
+  environment: {}
+- id: eval-transcoder-seed2-5000000
+  panel: transcoder
+  seed: 2
+  milestone_tokens: 5000000
+  eligible_resource_ids:
+  - slice-sae-b
+  - slice-transcoder-b
+  config_remote: /home/abistras/moe-sae/configs/gemma4_hybrid_transcoder_v1.yaml
+  phase: routed_shared_hybrid_10m
+  control_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed2
+  checkpoint_root_gcs: gs://moe-sae-bucket/moe-sae/gemma4_v1/experiment5/ready-three-v1/674cecbb19ba/checkpoints/transcoder/seed2
+  train_source_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/captures/transcoder-overlay/train
+  eval_source_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment3/routed-input-overlay/eval
+  train_source_object_prefix_gcs: gs://moe-sae-bucket/moe-sae/gemma4_v1/horizon-10m/transcoder-overlay/train
+  eval_source_object_prefix_gcs: gs://moe-sae-bucket/moe-sae/gemma4_v1/experiment3/routed-input-overlay/eval
+  result_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results/transcoder/seed2/5000000
+  completion_path_controller: /mnt/moe-sae-control/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results/transcoder/seed2/5000000/scientific-result.json
+  paired_scores_path_controller: /mnt/moe-sae-control/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results/transcoder/seed2/5000000/paired-scores.json
+  run_roots_remote:
+    H: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed2/runs/experiment5-transcoder-h-seed2
+    R: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed2/runs/experiment5-transcoder-r-seed2
+    B: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed2/runs/experiment5-transcoder-b-seed2
+    F: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed2/runs/experiment5-transcoder-f-seed2
+  environment: {}
+- id: eval-transcoder-seed2-10000000
+  panel: transcoder
+  seed: 2
+  milestone_tokens: 10000000
+  eligible_resource_ids:
+  - slice-sae-b
+  - slice-transcoder-b
+  config_remote: /home/abistras/moe-sae/configs/gemma4_hybrid_transcoder_v1.yaml
+  phase: routed_shared_hybrid_10m
+  control_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed2
+  checkpoint_root_gcs: gs://moe-sae-bucket/moe-sae/gemma4_v1/experiment5/ready-three-v1/674cecbb19ba/checkpoints/transcoder/seed2
+  train_source_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/captures/transcoder-overlay/train
+  eval_source_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment3/routed-input-overlay/eval
+  train_source_object_prefix_gcs: gs://moe-sae-bucket/moe-sae/gemma4_v1/horizon-10m/transcoder-overlay/train
+  eval_source_object_prefix_gcs: gs://moe-sae-bucket/moe-sae/gemma4_v1/experiment3/routed-input-overlay/eval
+  result_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results/transcoder/seed2/10000000
+  completion_path_controller: /mnt/moe-sae-control/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results/transcoder/seed2/10000000/scientific-result.json
+  paired_scores_path_controller: /mnt/moe-sae-control/experiment5/recovery/evaluation-v1/15a5f264245e-a2/results/transcoder/seed2/10000000/paired-scores.json
+  run_roots_remote:
+    H: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed2/runs/experiment5-transcoder-h-seed2
+    R: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed2/runs/experiment5-transcoder-r-seed2
+    B: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed2/runs/experiment5-transcoder-b-seed2
+    F: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed2/runs/experiment5-transcoder-f-seed2
+  environment: {}
+parent:
+  schema_version: gemma4-experiment5-evaluation-recovery-parent-v1
+  core_campaign_id: gemma4-experiment5-ready-three-v1-674cecbb19ba
+  core_plan:
+    controller_path: /mnt/moe-sae-control/experiment5/contracts/campaign-ready-three-v1-674cecbb19ba-a1.yaml
+    remote_path: /mnt/moe-sae-control/experiment5/contracts/campaign-ready-three-v1-674cecbb19ba-a1.yaml
+    sha256: d44ebcf480103aef12da76010d4d951b33b66ee8d3c6f058c2773d900497dc35
+  core_plan_sha256: d4c2005e1ad76e0b97ec5bd02d7da7216a470e28abd34f9bdf8a0e6d91c442bb
+  training_barrier:
+    controller_path: /mnt/moe-sae-control/experiment5/controller/ready-three-v1/674cecbb19ba/training-complete.json
+    remote_path: /mnt/moe-sae-control/experiment5/controller/ready-three-v1/674cecbb19ba/training-complete.json
+    sha256: 8e6b28cbfa96b4bc7e1831ad198821961618a1110eee7973a42a7e50f11c9dee
+  training_barrier_record_sha256: a0d4d94a4d1c29f96ba61cd706cb248dd3e9dd58846db6849ddbd33a641aec80
+  training_source_revision: 674cecbb19ba9130a81a4e27249c9862de08ad17
+  training_cells:
+  - task_id: train-sae-b-seed0
+    panel: sae
+    condition: B
+    seed: 0
+    run_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed0/runs/experiment5-sae-b-seed0
+    training_result:
+      controller_path: /mnt/moe-sae-usc1/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed0/runs/experiment5-sae-b-seed0/training-result.json
+      remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed0/runs/experiment5-sae-b-seed0/training-result.json
+      sha256: 5a0e06db7173537b8c9e64a76e2905cae6dc77d240aad533811965ea5f1f538a
+    training_result_sha256: c0a04fdae4ede666a95a3c8fde63e462f6cfaa861e3b284e43b0c85aec5d598f
+    checkpoint_pointers:
+    - milestone_tokens: 2000000
+      artifact:
+        controller_path: /mnt/moe-sae-usc1/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed0/runs/experiment5-sae-b-seed0/checkpoints/milestones/target-tokens-000002000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed0/runs/experiment5-sae-b-seed0/checkpoints/milestones/target-tokens-000002000000.json
+        sha256: 5040e0e32acea82f43ee05c5f3b1f1125dd650768bc3523b1ccb8a00f66c3be3
+      pointer_sha256: 367367cbd4931a86bb72a0bb3c93f15bc5806651394ff0543c3dd5aeb405fd26
+    - milestone_tokens: 5000000
+      artifact:
+        controller_path: /mnt/moe-sae-usc1/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed0/runs/experiment5-sae-b-seed0/checkpoints/milestones/target-tokens-000005000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed0/runs/experiment5-sae-b-seed0/checkpoints/milestones/target-tokens-000005000000.json
+        sha256: 458c202129f614fc6533dfc25faee8ef71cd795eca6492919c0e5f4e48ff06f4
+      pointer_sha256: 03220453fee7c624f5bee75adec44a2408c51b9f9d074aa00f2698e0be0fcdb2
+    - milestone_tokens: 10000000
+      artifact:
+        controller_path: /mnt/moe-sae-usc1/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed0/runs/experiment5-sae-b-seed0/checkpoints/milestones/target-tokens-000010000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed0/runs/experiment5-sae-b-seed0/checkpoints/milestones/target-tokens-000010000000.json
+        sha256: 527d2af4aee6374074c91e7ef532a0bc16b170f9da68826af63b2487fbf44b25
+      pointer_sha256: 8733c0abaa2530081036387605e5d89cce56911e50aa16474192847a6e6a5d1c
+  - task_id: train-sae-b-seed1
+    panel: sae
+    condition: B
+    seed: 1
+    run_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed1/runs/experiment5-sae-b-seed1
+    training_result:
+      controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed1/runs/experiment5-sae-b-seed1/training-result.json
+      remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed1/runs/experiment5-sae-b-seed1/training-result.json
+      sha256: 5e5c336eb65129c2898eee00a324f8880303e06993018c6f32ec6b8007a6fff3
+    training_result_sha256: 965ac5a14df2adcdb1602891f84977d444419574ebc856cd4db0dc8a78ca043f
+    checkpoint_pointers:
+    - milestone_tokens: 2000000
+      artifact:
+        controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed1/runs/experiment5-sae-b-seed1/checkpoints/milestones/target-tokens-000002000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed1/runs/experiment5-sae-b-seed1/checkpoints/milestones/target-tokens-000002000000.json
+        sha256: c7636650633c224254b0da73da880c2555a92fbedacea723602babcb1e249fcb
+      pointer_sha256: e9f94ba2d93e6e5dab974ebb32d3efcc417b50e8d1319848ea1c5a908f3abb48
+    - milestone_tokens: 5000000
+      artifact:
+        controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed1/runs/experiment5-sae-b-seed1/checkpoints/milestones/target-tokens-000005000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed1/runs/experiment5-sae-b-seed1/checkpoints/milestones/target-tokens-000005000000.json
+        sha256: ed795df2c9cb0fe219902d2b0097066b6093e39b525a627af2bf2242f0b821c6
+      pointer_sha256: 141242f876dfb73d1f7d60c9dfe6423bcc2cb1dc8fbc869e2be7060ec5aeceef
+    - milestone_tokens: 10000000
+      artifact:
+        controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed1/runs/experiment5-sae-b-seed1/checkpoints/milestones/target-tokens-000010000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed1/runs/experiment5-sae-b-seed1/checkpoints/milestones/target-tokens-000010000000.json
+        sha256: f636f614d29d916fe26bcfaea70148bc3dbc91fc991dc85d5205f6d659af1961
+      pointer_sha256: b05fca2b71a64e883f6f610ffd2b8ca9cf94954674993882caa77031c9336a4e
+  - task_id: train-sae-b-seed2
+    panel: sae
+    condition: B
+    seed: 2
+    run_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed2/runs/experiment5-sae-b-seed2
+    training_result:
+      controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed2/runs/experiment5-sae-b-seed2/training-result.json
+      remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed2/runs/experiment5-sae-b-seed2/training-result.json
+      sha256: cba960139e1013c8df36fbd8b56f61c3216d94bcb2ea987ea84bf17845d75942
+    training_result_sha256: 479da593bd7545d09ccf58f363b04f7275d04fb5e0ac6fb9c4c465a1d3af8196
+    checkpoint_pointers:
+    - milestone_tokens: 2000000
+      artifact:
+        controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed2/runs/experiment5-sae-b-seed2/checkpoints/milestones/target-tokens-000002000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed2/runs/experiment5-sae-b-seed2/checkpoints/milestones/target-tokens-000002000000.json
+        sha256: 0509fa267b60feea00e8d06c88dea685a80aa2fa54705d63f8eccee171f37cac
+      pointer_sha256: 01bf87fd4b19a5309b33d1eb87ce23a63912ad79dc55bdfb9bf64a18ecf3600d
+    - milestone_tokens: 5000000
+      artifact:
+        controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed2/runs/experiment5-sae-b-seed2/checkpoints/milestones/target-tokens-000005000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed2/runs/experiment5-sae-b-seed2/checkpoints/milestones/target-tokens-000005000000.json
+        sha256: ee565fe394586be472e9f553aca4d4deb01f597f6303c3bfe17dbff8d774d3e0
+      pointer_sha256: 7b007aab631dfcbcb2774609f6dcb61a5a56dd8c2c589dcfcadc2e4a073929aa
+    - milestone_tokens: 10000000
+      artifact:
+        controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed2/runs/experiment5-sae-b-seed2/checkpoints/milestones/target-tokens-000010000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed2/runs/experiment5-sae-b-seed2/checkpoints/milestones/target-tokens-000010000000.json
+        sha256: 33df1ef7c8c7df7f6da3cf424973d0e6b6335f076aef825e7059c6d5e88ddc57
+      pointer_sha256: 4d246548e1ee9926c36c7d3da6b6632e70243c7a5e54fa43bddc026d22c45fd9
+  - task_id: train-sae-f-seed0
+    panel: sae
+    condition: F
+    seed: 0
+    run_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed0/runs/experiment5-sae-f-seed0
+    training_result:
+      controller_path: /mnt/moe-sae-usc1/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed0/runs/experiment5-sae-f-seed0/training-result.json
+      remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed0/runs/experiment5-sae-f-seed0/training-result.json
+      sha256: 45168b17593ce61a136ee9fab1a1ada04aec938fae9ba4a17a2d49a6ddf88a6c
+    training_result_sha256: ebae4fb809a99d3967e824eb42450e26b4e2cbfb2cca9d7caba01c7374892d8e
+    checkpoint_pointers:
+    - milestone_tokens: 2000000
+      artifact:
+        controller_path: /mnt/moe-sae-usc1/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed0/runs/experiment5-sae-f-seed0/checkpoints/milestones/target-tokens-000002000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed0/runs/experiment5-sae-f-seed0/checkpoints/milestones/target-tokens-000002000000.json
+        sha256: 60f59ad524d70bc71f22d29ad3d7f2e9a9adfe1f68f22e62e78ac031fa4cc6e6
+      pointer_sha256: c09cc95acf88dd2a9bbc1ca7a2c76533fe97a97b61007bf21482f494c258b3fa
+    - milestone_tokens: 5000000
+      artifact:
+        controller_path: /mnt/moe-sae-usc1/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed0/runs/experiment5-sae-f-seed0/checkpoints/milestones/target-tokens-000005000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed0/runs/experiment5-sae-f-seed0/checkpoints/milestones/target-tokens-000005000000.json
+        sha256: 661e8a30d7fc0db93863d5cadac46a86941acf2a24bb6eb1a5c098ff8fa123ca
+      pointer_sha256: 618a41d72bfc425feed0f74c77eafd4e2e14d5686181e52e7c8e48ad96027c0c
+    - milestone_tokens: 10000000
+      artifact:
+        controller_path: /mnt/moe-sae-usc1/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed0/runs/experiment5-sae-f-seed0/checkpoints/milestones/target-tokens-000010000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed0/runs/experiment5-sae-f-seed0/checkpoints/milestones/target-tokens-000010000000.json
+        sha256: a8d66f48fe0ee2c9fee38b9230ec07e32a6ae12edce66b428069a17ae3b6c89f
+      pointer_sha256: fe4096b0e1c5291a7026ea84c67041c269eb963af345dc7f6d7c197fba4f9cca
+  - task_id: train-sae-f-seed1
+    panel: sae
+    condition: F
+    seed: 1
+    run_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed1/runs/experiment5-sae-f-seed1
+    training_result:
+      controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed1/runs/experiment5-sae-f-seed1/training-result.json
+      remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed1/runs/experiment5-sae-f-seed1/training-result.json
+      sha256: ff6bc323211f80b3d7735500951e1f3f1aca9a442161ffdd12c075dd0eae5acb
+    training_result_sha256: 05fbc1bb337bd1de92e240e2c650201785284553ebc7007222afb795eb3714a9
+    checkpoint_pointers:
+    - milestone_tokens: 2000000
+      artifact:
+        controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed1/runs/experiment5-sae-f-seed1/checkpoints/milestones/target-tokens-000002000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed1/runs/experiment5-sae-f-seed1/checkpoints/milestones/target-tokens-000002000000.json
+        sha256: 32943069dfeeb0432a808a37f648fa6798822e4ccbbe8219f306e827b53901dd
+      pointer_sha256: 5dfa478518698ace320a256b14542b5e82a79df773e2878b9b132bcd9980fd2a
+    - milestone_tokens: 5000000
+      artifact:
+        controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed1/runs/experiment5-sae-f-seed1/checkpoints/milestones/target-tokens-000005000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed1/runs/experiment5-sae-f-seed1/checkpoints/milestones/target-tokens-000005000000.json
+        sha256: b7a0382f34f131098ecfe2f7380ee430f848fe28faec065bd43219f622b37f46
+      pointer_sha256: 6793e380c5145320b38cd30d94fb31fef9f32d3ee5b44bc9f520d38c111ad177
+    - milestone_tokens: 10000000
+      artifact:
+        controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed1/runs/experiment5-sae-f-seed1/checkpoints/milestones/target-tokens-000010000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed1/runs/experiment5-sae-f-seed1/checkpoints/milestones/target-tokens-000010000000.json
+        sha256: 5103278e1bb54e5003c6100954784d027c2128f37cf336f33505e0b21842d964
+      pointer_sha256: d1f4eb14dce016a2c3217bd28694bd2ffea0eccc7471e16973ed0b6895c8dc02
+  - task_id: train-sae-f-seed2
+    panel: sae
+    condition: F
+    seed: 2
+    run_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed2/runs/experiment5-sae-f-seed2
+    training_result:
+      controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed2/runs/experiment5-sae-f-seed2/training-result.json
+      remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed2/runs/experiment5-sae-f-seed2/training-result.json
+      sha256: f781ccbdf872a89a03bad7092d5520c1743ce4e207082e3695a151fc98a11fae
+    training_result_sha256: 556c72cb5fb7f800cd8bb8af65f1b4564483c5e92d88c0213ffcb3956d9056c5
+    checkpoint_pointers:
+    - milestone_tokens: 2000000
+      artifact:
+        controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed2/runs/experiment5-sae-f-seed2/checkpoints/milestones/target-tokens-000002000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed2/runs/experiment5-sae-f-seed2/checkpoints/milestones/target-tokens-000002000000.json
+        sha256: c4059c26b051cede5e9aea9b84d09bd9ebe59f31bc09adb406fd48912e25492b
+      pointer_sha256: f1ce9b98ad291a78d77c12f6b263e1cc5d8bec33ea51846ab9fd474a0950be54
+    - milestone_tokens: 5000000
+      artifact:
+        controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed2/runs/experiment5-sae-f-seed2/checkpoints/milestones/target-tokens-000005000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed2/runs/experiment5-sae-f-seed2/checkpoints/milestones/target-tokens-000005000000.json
+        sha256: 272bce1d68ecb81a9557a03fd184f1ccb9dcd2bc1bd234ed3fd0f0e0d8ed6d7c
+      pointer_sha256: 24a383ff1f3aa39ae83361b498dd53ac1e41ee800c2afa50cbab973e6ed55e0e
+    - milestone_tokens: 10000000
+      artifact:
+        controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed2/runs/experiment5-sae-f-seed2/checkpoints/milestones/target-tokens-000010000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed2/runs/experiment5-sae-f-seed2/checkpoints/milestones/target-tokens-000010000000.json
+        sha256: 08d8f81cd75555a74022e7f9f0a1dcfa902bef95ed7b87eb45f4ad6bab589d62
+      pointer_sha256: 263f1c32d855b59c600a6874e3774e56ab81cd752944f9c00d508ad3348b61b8
+  - task_id: train-sae-h-seed0
+    panel: sae
+    condition: H
+    seed: 0
+    run_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed0/runs/experiment5-sae-h-seed0
+    training_result:
+      controller_path: /mnt/moe-sae-usc1/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed0/runs/experiment5-sae-h-seed0/training-result.json
+      remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed0/runs/experiment5-sae-h-seed0/training-result.json
+      sha256: 8e5d891e39d64cbfb0a72fac7c7fa4439072f50b99bac14f3772417f9417e30d
+    training_result_sha256: 5b15ac9275014c80799fa418fde7aab7afe57ef5885da0483a91392acbbe2d02
+    checkpoint_pointers:
+    - milestone_tokens: 2000000
+      artifact:
+        controller_path: /mnt/moe-sae-usc1/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed0/runs/experiment5-sae-h-seed0/checkpoints/milestones/target-tokens-000002000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed0/runs/experiment5-sae-h-seed0/checkpoints/milestones/target-tokens-000002000000.json
+        sha256: cda7248bb839d04e3526cae2fa4e7fcef50cb1c696b816b2db150fa243fd0786
+      pointer_sha256: 8e2f1b7682e23ad0e3d58fa5255490eeb8a7276505e792d015dd9fadd4c23942
+    - milestone_tokens: 5000000
+      artifact:
+        controller_path: /mnt/moe-sae-usc1/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed0/runs/experiment5-sae-h-seed0/checkpoints/milestones/target-tokens-000005000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed0/runs/experiment5-sae-h-seed0/checkpoints/milestones/target-tokens-000005000000.json
+        sha256: 4a0286da0a441bbf90009af8a7e4c5e3363d3b90d2874511a9dcc6f55c952ec7
+      pointer_sha256: 59137b1b6f523086db284653c4c7841497d6742721c9b5e9693a2890294a3e52
+    - milestone_tokens: 10000000
+      artifact:
+        controller_path: /mnt/moe-sae-usc1/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed0/runs/experiment5-sae-h-seed0/checkpoints/milestones/target-tokens-000010000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed0/runs/experiment5-sae-h-seed0/checkpoints/milestones/target-tokens-000010000000.json
+        sha256: aa03225a225d7036960faea39dcdbac578e60ad50403f67c505d1e6045ae743d
+      pointer_sha256: cccfa59ca556678dbe39f5d9105ce67083b082cfff142da65ac96984046f98b1
+  - task_id: train-sae-h-seed1
+    panel: sae
+    condition: H
+    seed: 1
+    run_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed1/runs/experiment5-sae-h-seed1
+    training_result:
+      controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed1/runs/experiment5-sae-h-seed1/training-result.json
+      remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed1/runs/experiment5-sae-h-seed1/training-result.json
+      sha256: 99353484c1ad614bf135a18f15b17c507c38f610b1815d153ef97adaf83a50ed
+    training_result_sha256: e7fbe86b37c6275a9993e92615f93dae283ca54e3abe366081189df05749491d
+    checkpoint_pointers:
+    - milestone_tokens: 2000000
+      artifact:
+        controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed1/runs/experiment5-sae-h-seed1/checkpoints/milestones/target-tokens-000002000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed1/runs/experiment5-sae-h-seed1/checkpoints/milestones/target-tokens-000002000000.json
+        sha256: 2975ea492b51cc654c7cd045c21483757e09fba8093bc62a84252480d5587b11
+      pointer_sha256: 9ce55d4457a102ccb65650be7b3c7bb1c01ad1a2da7e9136eb2f46cf6a0506e5
+    - milestone_tokens: 5000000
+      artifact:
+        controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed1/runs/experiment5-sae-h-seed1/checkpoints/milestones/target-tokens-000005000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed1/runs/experiment5-sae-h-seed1/checkpoints/milestones/target-tokens-000005000000.json
+        sha256: a3c1f517dd34df97c7fba116aa6d333c0834900b75485366c31c8121ba565e5f
+      pointer_sha256: dd932f86f85f031b4f667836cce13c2376b102a472526dbd9f363a5ce6211e92
+    - milestone_tokens: 10000000
+      artifact:
+        controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed1/runs/experiment5-sae-h-seed1/checkpoints/milestones/target-tokens-000010000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed1/runs/experiment5-sae-h-seed1/checkpoints/milestones/target-tokens-000010000000.json
+        sha256: 5ed15f11d62b2d1354a19a7a9a362a6e3d665bae38eff4c64dd54f4383618e2c
+      pointer_sha256: d27bbc7ac6314239322a2264924399106424576edb71701856118ea7fef25cf6
+  - task_id: train-sae-h-seed2
+    panel: sae
+    condition: H
+    seed: 2
+    run_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed2/runs/experiment5-sae-h-seed2
+    training_result:
+      controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed2/runs/experiment5-sae-h-seed2/training-result.json
+      remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed2/runs/experiment5-sae-h-seed2/training-result.json
+      sha256: 8c3adde80ce1dbb209e5f22397f14f3cedc652b62eac2b2ea4c171448c9b721a
+    training_result_sha256: 1aa345b7f012f8dd0a462e1f06817424b552cde07d98c98cf7908589b3ad9d20
+    checkpoint_pointers:
+    - milestone_tokens: 2000000
+      artifact:
+        controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed2/runs/experiment5-sae-h-seed2/checkpoints/milestones/target-tokens-000002000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed2/runs/experiment5-sae-h-seed2/checkpoints/milestones/target-tokens-000002000000.json
+        sha256: 7a172ffdfd55cd846833f006c1affbdef1bb1f65f2cf408fff65d1cd6228b6a1
+      pointer_sha256: 1e457e3a4a0be45e2ee2568fe5e8ea8db390786faa223ecd05b0cb8015ccda6b
+    - milestone_tokens: 5000000
+      artifact:
+        controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed2/runs/experiment5-sae-h-seed2/checkpoints/milestones/target-tokens-000005000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed2/runs/experiment5-sae-h-seed2/checkpoints/milestones/target-tokens-000005000000.json
+        sha256: ea3a97d981d91de15f245db5c222ffb2ebc421bb783d7fea5334a7be9ac96e42
+      pointer_sha256: 7861b8eb371f40c0db9ec1e982827e086636522336bafe783cccc305a6c191c2
+    - milestone_tokens: 10000000
+      artifact:
+        controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed2/runs/experiment5-sae-h-seed2/checkpoints/milestones/target-tokens-000010000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed2/runs/experiment5-sae-h-seed2/checkpoints/milestones/target-tokens-000010000000.json
+        sha256: 53417d7bb30d2a84f5a6a438d11b822478bc500718de56197c1a6475c30e1791
+      pointer_sha256: 94c9c75f1dca53a0d985a0d3cc9367a63d9bdef57dee52f287267d84db962cb2
+  - task_id: train-sae-r-seed0
+    panel: sae
+    condition: R
+    seed: 0
+    run_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed0/runs/experiment5-sae-r-seed0
+    training_result:
+      controller_path: /mnt/moe-sae-usc1/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed0/runs/experiment5-sae-r-seed0/training-result.json
+      remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed0/runs/experiment5-sae-r-seed0/training-result.json
+      sha256: a984908e100712d65915ac7f68625eaff1ee3a7394002e9d066bc7c845c11237
+    training_result_sha256: d98341e53e491f1ae0b2681bd224faa3c0309e22de9859aa54ae46a55b8113d7
+    checkpoint_pointers:
+    - milestone_tokens: 2000000
+      artifact:
+        controller_path: /mnt/moe-sae-usc1/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed0/runs/experiment5-sae-r-seed0/checkpoints/milestones/target-tokens-000002000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed0/runs/experiment5-sae-r-seed0/checkpoints/milestones/target-tokens-000002000000.json
+        sha256: ac200021b521890e3cce301e855426c9bfa73370f3c7ee37774f4e4af4075cf1
+      pointer_sha256: f467ff1bff09d05fa1426d1a02c4dc3bbd21bf5b4cd3347839d9a40209076e29
+    - milestone_tokens: 5000000
+      artifact:
+        controller_path: /mnt/moe-sae-usc1/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed0/runs/experiment5-sae-r-seed0/checkpoints/milestones/target-tokens-000005000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed0/runs/experiment5-sae-r-seed0/checkpoints/milestones/target-tokens-000005000000.json
+        sha256: 3ea2a6e031644e97307a57a66be92b53aa1a45a4a97730e45744caacd87f7981
+      pointer_sha256: b5da3f50d7cd9de33c048b84a3457ea23730975f5f9e1d5e526b021bc70b1064
+    - milestone_tokens: 10000000
+      artifact:
+        controller_path: /mnt/moe-sae-usc1/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed0/runs/experiment5-sae-r-seed0/checkpoints/milestones/target-tokens-000010000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed0/runs/experiment5-sae-r-seed0/checkpoints/milestones/target-tokens-000010000000.json
+        sha256: 828ce4d5374ba0229ab40461f8b04f52c14f26cc728dd1dbd02eca0aeba42888
+      pointer_sha256: ded6bd6716c13aa666d30e3c799fb570fa94f8f2267ba5e1928b7d2700cffa31
+  - task_id: train-sae-r-seed1
+    panel: sae
+    condition: R
+    seed: 1
+    run_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed1/runs/experiment5-sae-r-seed1
+    training_result:
+      controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed1/runs/experiment5-sae-r-seed1/training-result.json
+      remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed1/runs/experiment5-sae-r-seed1/training-result.json
+      sha256: ce8a6fdbb90afd0343f6231bb82ad37da03867cef3d0f634a6134c40454b232e
+    training_result_sha256: e33f729dc323fd2f0e86b6825ee1559096260572a332de0d0691b819e40dd814
+    checkpoint_pointers:
+    - milestone_tokens: 2000000
+      artifact:
+        controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed1/runs/experiment5-sae-r-seed1/checkpoints/milestones/target-tokens-000002000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed1/runs/experiment5-sae-r-seed1/checkpoints/milestones/target-tokens-000002000000.json
+        sha256: 1a9628a6ebe47b1a7dfd11305988497844027b9595b17c0c1794c5addf89289d
+      pointer_sha256: 816176fb0ab41c229c02822414d0c14ecd327c426d05066127387e6f0a5d6c50
+    - milestone_tokens: 5000000
+      artifact:
+        controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed1/runs/experiment5-sae-r-seed1/checkpoints/milestones/target-tokens-000005000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed1/runs/experiment5-sae-r-seed1/checkpoints/milestones/target-tokens-000005000000.json
+        sha256: 8d73841f533a2b6952465afd5b74e5cf8a57966a3f0aa85d462affffa20620d0
+      pointer_sha256: 32ff1cb1cc23c885cfd89dd33d02c74266f4310dd5a24b3937784abbda38d511
+    - milestone_tokens: 10000000
+      artifact:
+        controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed1/runs/experiment5-sae-r-seed1/checkpoints/milestones/target-tokens-000010000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed1/runs/experiment5-sae-r-seed1/checkpoints/milestones/target-tokens-000010000000.json
+        sha256: fc6d1da9da1c413bfd72528dc00675f93d70dcf4e7e59bb3dc8ceaa9cf2eed68
+      pointer_sha256: 35752c692de28dbd50f7714dfb3c00ccec94dd0d37a09498001e814a40e1dd4d
+  - task_id: train-sae-r-seed2
+    panel: sae
+    condition: R
+    seed: 2
+    run_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed2/runs/experiment5-sae-r-seed2
+    training_result:
+      controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed2/runs/experiment5-sae-r-seed2/training-result.json
+      remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed2/runs/experiment5-sae-r-seed2/training-result.json
+      sha256: 2c93b8c06b8a4fcba98b6487022149af9817ba672ef088e92b51d68a33e7de80
+    training_result_sha256: 16029d940cbcbf74a4843d90e7caa267b9b91067e0e536f998979bb547e0b7ae
+    checkpoint_pointers:
+    - milestone_tokens: 2000000
+      artifact:
+        controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed2/runs/experiment5-sae-r-seed2/checkpoints/milestones/target-tokens-000002000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed2/runs/experiment5-sae-r-seed2/checkpoints/milestones/target-tokens-000002000000.json
+        sha256: 939c39de17e5fb4ec9246a0888a3325478f3d91e53420f8b6033b6b45f0ea140
+      pointer_sha256: 21b6135da37bc8be0c4afea7bfdda0d52f25e73c2a37111ff7ce67bb64ba55a6
+    - milestone_tokens: 5000000
+      artifact:
+        controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed2/runs/experiment5-sae-r-seed2/checkpoints/milestones/target-tokens-000005000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed2/runs/experiment5-sae-r-seed2/checkpoints/milestones/target-tokens-000005000000.json
+        sha256: 6553133c38f1b081ab788f17f9164fcb0198b1a3f4579b7fca8829109be8e6b8
+      pointer_sha256: e4e4cab45d4a2c78d384dd653600c2f7e0c2a0a7f4bfc262d8e0a122b51a2b8a
+    - milestone_tokens: 10000000
+      artifact:
+        controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed2/runs/experiment5-sae-r-seed2/checkpoints/milestones/target-tokens-000010000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/sae/seed2/runs/experiment5-sae-r-seed2/checkpoints/milestones/target-tokens-000010000000.json
+        sha256: b6aadea22d93961101dc0b5c7655ae7da80671047614c192c1002cded215f24e
+      pointer_sha256: c628f1ed2d6849971668a894aab3dc3bee58ac7b5a29f1aed655e299b4a18a16
+  - task_id: train-transcoder-b-seed0
+    panel: transcoder
+    condition: B
+    seed: 0
+    run_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed0/runs/experiment5-transcoder-b-seed0
+    training_result:
+      controller_path: /mnt/moe-sae-usc1/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed0/runs/experiment5-transcoder-b-seed0/training-result.json
+      remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed0/runs/experiment5-transcoder-b-seed0/training-result.json
+      sha256: f9129ac413bb24b8343c63cecc2bdad70b84510a7c009acf54903a4f4707d848
+    training_result_sha256: b52af95741f08a969c63f1c37f3deed9f2ab43375b120448381bc0d5e4498b4d
+    checkpoint_pointers:
+    - milestone_tokens: 2000000
+      artifact:
+        controller_path: /mnt/moe-sae-usc1/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed0/runs/experiment5-transcoder-b-seed0/checkpoints/milestones/target-tokens-000002000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed0/runs/experiment5-transcoder-b-seed0/checkpoints/milestones/target-tokens-000002000000.json
+        sha256: 9bac2659cca5eb36db173fbda3b8d919c4c3d2bfe2c8bee36b937786bbf2239e
+      pointer_sha256: 1a1ca5f1841ddee77396eb3ecd1d032a7724fe2b4fc2e5033d5172250ed13fb5
+    - milestone_tokens: 5000000
+      artifact:
+        controller_path: /mnt/moe-sae-usc1/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed0/runs/experiment5-transcoder-b-seed0/checkpoints/milestones/target-tokens-000005000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed0/runs/experiment5-transcoder-b-seed0/checkpoints/milestones/target-tokens-000005000000.json
+        sha256: e4265f0720fe2add739311fb6a6b55f482db7261295c24e28c007003c96cf53e
+      pointer_sha256: 8197848f1c5e1c16b058a1c6ad9733748b6eb77bf4827e7914bc72fff8adcd16
+    - milestone_tokens: 10000000
+      artifact:
+        controller_path: /mnt/moe-sae-usc1/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed0/runs/experiment5-transcoder-b-seed0/checkpoints/milestones/target-tokens-000010000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed0/runs/experiment5-transcoder-b-seed0/checkpoints/milestones/target-tokens-000010000000.json
+        sha256: f8901825e893d739400e0aa05602a53e28a21a0a4a4a5fbad9fb2f0540ecf8a6
+      pointer_sha256: 3d37290a4c1f229c8ffe3bbc7729ba47f4b8b3cb8b7f5ed302bdc1eb72abf93b
+  - task_id: train-transcoder-b-seed1
+    panel: transcoder
+    condition: B
+    seed: 1
+    run_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed1/runs/experiment5-transcoder-b-seed1
+    training_result:
+      controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed1/runs/experiment5-transcoder-b-seed1/training-result.json
+      remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed1/runs/experiment5-transcoder-b-seed1/training-result.json
+      sha256: 71e28b479b0d602e8c79d8e4518f2479ba055b1d5b4cd0a5059c556f95d058df
+    training_result_sha256: e8124b86ade27b4dcd8735946becd1f694729f0426906d0a8d3adde088d2736c
+    checkpoint_pointers:
+    - milestone_tokens: 2000000
+      artifact:
+        controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed1/runs/experiment5-transcoder-b-seed1/checkpoints/milestones/target-tokens-000002000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed1/runs/experiment5-transcoder-b-seed1/checkpoints/milestones/target-tokens-000002000000.json
+        sha256: ccff31312ee29eb9e06a9dd2af5b253919b3b096848a0738a365816d1865616d
+      pointer_sha256: d3bc0a397bffdf2476b567bd1d55a3ce15e67b24d7ccd8b278e2951719e4228e
+    - milestone_tokens: 5000000
+      artifact:
+        controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed1/runs/experiment5-transcoder-b-seed1/checkpoints/milestones/target-tokens-000005000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed1/runs/experiment5-transcoder-b-seed1/checkpoints/milestones/target-tokens-000005000000.json
+        sha256: 67d677e326e656750492c0642dc796743f5e015dad383ba83c7cc6f9bfda0a3d
+      pointer_sha256: bb08cb818186a125315bb317da4af5a4467b077f060e1f6af09479f2e3cd7591
+    - milestone_tokens: 10000000
+      artifact:
+        controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed1/runs/experiment5-transcoder-b-seed1/checkpoints/milestones/target-tokens-000010000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed1/runs/experiment5-transcoder-b-seed1/checkpoints/milestones/target-tokens-000010000000.json
+        sha256: 94f19e8312fd47f101aa0fc1e33a24ce76452e8a2b53fd4dbbde4ba17dd3968b
+      pointer_sha256: 1942ae95ef41489e00f925fd979bd15ec5274e359de34918015a92782ab4b288
+  - task_id: train-transcoder-b-seed2
+    panel: transcoder
+    condition: B
+    seed: 2
+    run_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed2/runs/experiment5-transcoder-b-seed2
+    training_result:
+      controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed2/runs/experiment5-transcoder-b-seed2/training-result.json
+      remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed2/runs/experiment5-transcoder-b-seed2/training-result.json
+      sha256: dec152fe0e60a9e6ee6ae1517228f52271a923630288d9a530f46124ba036d45
+    training_result_sha256: 21d89dc96559226c9df18b27052c6232761a9dd17d346c669e19697d863278f2
+    checkpoint_pointers:
+    - milestone_tokens: 2000000
+      artifact:
+        controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed2/runs/experiment5-transcoder-b-seed2/checkpoints/milestones/target-tokens-000002000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed2/runs/experiment5-transcoder-b-seed2/checkpoints/milestones/target-tokens-000002000000.json
+        sha256: 01f0282d3b337e3a248ea70fccf8bb58dc74d15574585aa75b10f5d9904f668e
+      pointer_sha256: 2a11d957b7d8e76468ed9555e4562f1c79a7f4e83a0b6a566a397d7ec7e70aa8
+    - milestone_tokens: 5000000
+      artifact:
+        controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed2/runs/experiment5-transcoder-b-seed2/checkpoints/milestones/target-tokens-000005000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed2/runs/experiment5-transcoder-b-seed2/checkpoints/milestones/target-tokens-000005000000.json
+        sha256: 8b6e7aac33ce7ddad73c50fc058e57f6b8f45914bef19cda686420452703daa3
+      pointer_sha256: 06fe3bb20c71eefa926542f939bac5b377bd75d0461206385cfa9c29f1be6acb
+    - milestone_tokens: 10000000
+      artifact:
+        controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed2/runs/experiment5-transcoder-b-seed2/checkpoints/milestones/target-tokens-000010000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed2/runs/experiment5-transcoder-b-seed2/checkpoints/milestones/target-tokens-000010000000.json
+        sha256: f2cb0a17cf5b36adea3779f4d2fcc3e5e92a0f72216cea212bfc7bf4202d1b19
+      pointer_sha256: a4bb777f7e0190077cffac19915c978977a1e26b30e6a10d70d292467b947734
+  - task_id: train-transcoder-f-seed0
+    panel: transcoder
+    condition: F
+    seed: 0
+    run_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed0/runs/experiment5-transcoder-f-seed0
+    training_result:
+      controller_path: /mnt/moe-sae-usc1/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed0/runs/experiment5-transcoder-f-seed0/training-result.json
+      remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed0/runs/experiment5-transcoder-f-seed0/training-result.json
+      sha256: 258efdac68b3085c35ef528f1a97cd5695885d266f0015ea9754b16e08633936
+    training_result_sha256: 682022caf3b091fb82ae13c522c1c3e2e642ae35632f0c1e575adc0a33c7982b
+    checkpoint_pointers:
+    - milestone_tokens: 2000000
+      artifact:
+        controller_path: /mnt/moe-sae-usc1/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed0/runs/experiment5-transcoder-f-seed0/checkpoints/milestones/target-tokens-000002000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed0/runs/experiment5-transcoder-f-seed0/checkpoints/milestones/target-tokens-000002000000.json
+        sha256: 0d15963388f3de0a9f8b81cbe9c3b6e3f7f0619ebe890bce6bc58835ad0ab5e2
+      pointer_sha256: aa8e65d4fb53855ea08b8417ac972ccf1c41000d81f2e89f1338bc80c19f2555
+    - milestone_tokens: 5000000
+      artifact:
+        controller_path: /mnt/moe-sae-usc1/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed0/runs/experiment5-transcoder-f-seed0/checkpoints/milestones/target-tokens-000005000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed0/runs/experiment5-transcoder-f-seed0/checkpoints/milestones/target-tokens-000005000000.json
+        sha256: cf46d7a97e34c0b41f0967c3830596acca3176bb78008461bcc3eef3a450e409
+      pointer_sha256: c2ba6ec5c700b112571a68f86b0c0c70dd096084c6f5fc33c1c5bb7be4ecd00b
+    - milestone_tokens: 10000000
+      artifact:
+        controller_path: /mnt/moe-sae-usc1/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed0/runs/experiment5-transcoder-f-seed0/checkpoints/milestones/target-tokens-000010000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed0/runs/experiment5-transcoder-f-seed0/checkpoints/milestones/target-tokens-000010000000.json
+        sha256: 461bbc52a089ff7ca86c49a6acf4c0cf0320dcad825ca9913d29965588f96961
+      pointer_sha256: 54553061deb782cf7bb39ab24cdc86b4f42519f0c20783400e8507d16be351f7
+  - task_id: train-transcoder-f-seed1
+    panel: transcoder
+    condition: F
+    seed: 1
+    run_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed1/runs/experiment5-transcoder-f-seed1
+    training_result:
+      controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed1/runs/experiment5-transcoder-f-seed1/training-result.json
+      remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed1/runs/experiment5-transcoder-f-seed1/training-result.json
+      sha256: 0727bb18247dcb5a63e0a2efba0c1e098014d3e64edeeca0eb65557bf13ff2bb
+    training_result_sha256: a92a9ca6c184ef5c43f66ebf5cf55abfd5a02f5ba18ea566bf5839e0b100961f
+    checkpoint_pointers:
+    - milestone_tokens: 2000000
+      artifact:
+        controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed1/runs/experiment5-transcoder-f-seed1/checkpoints/milestones/target-tokens-000002000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed1/runs/experiment5-transcoder-f-seed1/checkpoints/milestones/target-tokens-000002000000.json
+        sha256: 6138a3ee885e84d596c3e0532ae315b743bbb91399e89960ed3ee6bf3227bb37
+      pointer_sha256: 9300d403ebb6e97573ee333d7fa422139ec1b3829bc96b65259123ac974f7075
+    - milestone_tokens: 5000000
+      artifact:
+        controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed1/runs/experiment5-transcoder-f-seed1/checkpoints/milestones/target-tokens-000005000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed1/runs/experiment5-transcoder-f-seed1/checkpoints/milestones/target-tokens-000005000000.json
+        sha256: ff137a4a5777280e12ec99d95c9ee3df57ea4526334673189647acfc670540de
+      pointer_sha256: d2c1bf0757a6123c9056d98f06950decf59d0edd5c98a67030399335e2bb71f4
+    - milestone_tokens: 10000000
+      artifact:
+        controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed1/runs/experiment5-transcoder-f-seed1/checkpoints/milestones/target-tokens-000010000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed1/runs/experiment5-transcoder-f-seed1/checkpoints/milestones/target-tokens-000010000000.json
+        sha256: bea38af2994edc87187e9a816d1f9782a5475c1397408c1a67503fc260f1429a
+      pointer_sha256: aba32c30a78fcd9a58daf26ce8182efa765b82d3b8560e2615aab3d5a679f1bd
+  - task_id: train-transcoder-f-seed2
+    panel: transcoder
+    condition: F
+    seed: 2
+    run_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed2/runs/experiment5-transcoder-f-seed2
+    training_result:
+      controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed2/runs/experiment5-transcoder-f-seed2/training-result.json
+      remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed2/runs/experiment5-transcoder-f-seed2/training-result.json
+      sha256: 123c47b3da19922df861948be2f6cdbc914c30296b74ff040b123577ede02cbc
+    training_result_sha256: a50819b30f12158d2e953ded2a1824a3f09c18affdd0e81a11047ed1d3af480c
+    checkpoint_pointers:
+    - milestone_tokens: 2000000
+      artifact:
+        controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed2/runs/experiment5-transcoder-f-seed2/checkpoints/milestones/target-tokens-000002000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed2/runs/experiment5-transcoder-f-seed2/checkpoints/milestones/target-tokens-000002000000.json
+        sha256: a87b5a23ca993a4a934587dd5fd818256a34429259b153b201ceb4be045aee6e
+      pointer_sha256: 3b58bd2a92fcd0e01c21431852a26055b7aa97b10abfcd9fa0fd33f6fee24847
+    - milestone_tokens: 5000000
+      artifact:
+        controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed2/runs/experiment5-transcoder-f-seed2/checkpoints/milestones/target-tokens-000005000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed2/runs/experiment5-transcoder-f-seed2/checkpoints/milestones/target-tokens-000005000000.json
+        sha256: c3206a1ccaa68541f2d691cfbb283337b5e90c681a74a243e0f7bc34d440086b
+      pointer_sha256: b1c791a0204a24cf68d578402a31b9a717d995198667b5e5a54331ce59b55371
+    - milestone_tokens: 10000000
+      artifact:
+        controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed2/runs/experiment5-transcoder-f-seed2/checkpoints/milestones/target-tokens-000010000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed2/runs/experiment5-transcoder-f-seed2/checkpoints/milestones/target-tokens-000010000000.json
+        sha256: 7ea447320b08c07278571f817bd933551e9fa7b7e1719feaf9eb09834ed0c590
+      pointer_sha256: 119a2319abb98ca21b255ff82431318ef4c00e7534c374396986cd1d88f51e64
+  - task_id: train-transcoder-h-seed0
+    panel: transcoder
+    condition: H
+    seed: 0
+    run_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed0/runs/experiment5-transcoder-h-seed0
+    training_result:
+      controller_path: /mnt/moe-sae-usc1/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed0/runs/experiment5-transcoder-h-seed0/training-result.json
+      remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed0/runs/experiment5-transcoder-h-seed0/training-result.json
+      sha256: 0980e227cafe79a857dff50f2e8ddf1ae977637ab0c4f5e020655ab09df91a25
+    training_result_sha256: 1c46e3aadef77328ca73e039be2e98a8962700413ecd4224bbe8d9c35049edc9
+    checkpoint_pointers:
+    - milestone_tokens: 2000000
+      artifact:
+        controller_path: /mnt/moe-sae-usc1/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed0/runs/experiment5-transcoder-h-seed0/checkpoints/milestones/target-tokens-000002000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed0/runs/experiment5-transcoder-h-seed0/checkpoints/milestones/target-tokens-000002000000.json
+        sha256: f8a226223d697d3ea82d7c307063b7230b97053bf93c445be0708a7fa965bcca
+      pointer_sha256: 70f51d9a86534f701583bd5da67e0a6078c720be910c47c18486980be62be3be
+    - milestone_tokens: 5000000
+      artifact:
+        controller_path: /mnt/moe-sae-usc1/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed0/runs/experiment5-transcoder-h-seed0/checkpoints/milestones/target-tokens-000005000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed0/runs/experiment5-transcoder-h-seed0/checkpoints/milestones/target-tokens-000005000000.json
+        sha256: c8dad51749f5711ef69a23150282e8cc0ef1147f53fd5f942f290960c1d3aeea
+      pointer_sha256: ce89f03950365286c5fd08dcbdb3ec2ab0d884edb4f9d15def48de62c50ff124
+    - milestone_tokens: 10000000
+      artifact:
+        controller_path: /mnt/moe-sae-usc1/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed0/runs/experiment5-transcoder-h-seed0/checkpoints/milestones/target-tokens-000010000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed0/runs/experiment5-transcoder-h-seed0/checkpoints/milestones/target-tokens-000010000000.json
+        sha256: 4e6f210a8c3eb731e18e322d78e821c23cc077180153a184d0e26de9aec7cdc5
+      pointer_sha256: 3dc61e9b212d1e5209b00ab00970b8f119fba4887e5ea3e323014b997fae1241
+  - task_id: train-transcoder-h-seed1
+    panel: transcoder
+    condition: H
+    seed: 1
+    run_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed1/runs/experiment5-transcoder-h-seed1
+    training_result:
+      controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed1/runs/experiment5-transcoder-h-seed1/training-result.json
+      remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed1/runs/experiment5-transcoder-h-seed1/training-result.json
+      sha256: 36375b8f01899cfcd978facba3bacbe54b5f9258f5373cac62e79fe57341b76e
+    training_result_sha256: 1a435c91d081e9222054b296de86fa4a8198f98ce18db1a8441ea73090aa2f28
+    checkpoint_pointers:
+    - milestone_tokens: 2000000
+      artifact:
+        controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed1/runs/experiment5-transcoder-h-seed1/checkpoints/milestones/target-tokens-000002000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed1/runs/experiment5-transcoder-h-seed1/checkpoints/milestones/target-tokens-000002000000.json
+        sha256: c887207c6939fa82a84019a1610779500509523c88aa9eb4d951310e8a86c4ff
+      pointer_sha256: d72818bbed49743236fea55762823e32c884c6c206503688f7389c6f031b42e2
+    - milestone_tokens: 5000000
+      artifact:
+        controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed1/runs/experiment5-transcoder-h-seed1/checkpoints/milestones/target-tokens-000005000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed1/runs/experiment5-transcoder-h-seed1/checkpoints/milestones/target-tokens-000005000000.json
+        sha256: e4d061f3b7360f15b39d0bd3df9852ea231e8ef8c0b57c2918853fbdd12fdade
+      pointer_sha256: d8bbcea344c474cdeaaa3e3b2b14547854fce684feefb1d8d3a05f427b7f6b9f
+    - milestone_tokens: 10000000
+      artifact:
+        controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed1/runs/experiment5-transcoder-h-seed1/checkpoints/milestones/target-tokens-000010000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed1/runs/experiment5-transcoder-h-seed1/checkpoints/milestones/target-tokens-000010000000.json
+        sha256: 5f9d4a108b038b61ea6ab17923b7a44e9ced1f69d7c4b5a742e8ac9edd6b7bc0
+      pointer_sha256: ebad50df5a9394cbe23138ed5789960926f1e04af10689afe821862650af645a
+  - task_id: train-transcoder-h-seed2
+    panel: transcoder
+    condition: H
+    seed: 2
+    run_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed2/runs/experiment5-transcoder-h-seed2
+    training_result:
+      controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed2/runs/experiment5-transcoder-h-seed2/training-result.json
+      remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed2/runs/experiment5-transcoder-h-seed2/training-result.json
+      sha256: 0935e2e75aa19c9a9eda6cc4e9b210a3b9f2d1bd398e7b5e0eff7101293bc4c8
+    training_result_sha256: ff6f07af72b432bd12304e8c118a01c86b2f6ef117361529eaf41a6cdb6f350a
+    checkpoint_pointers:
+    - milestone_tokens: 2000000
+      artifact:
+        controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed2/runs/experiment5-transcoder-h-seed2/checkpoints/milestones/target-tokens-000002000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed2/runs/experiment5-transcoder-h-seed2/checkpoints/milestones/target-tokens-000002000000.json
+        sha256: e4b50c0e9d35de52123ddd38a1462c4a336da040e6fcce34588cd69f82a2f6ed
+      pointer_sha256: 37ef5b23c4a94e8e8d5929c4c80324f148d6fa6d3b80de647c9a975a6280c918
+    - milestone_tokens: 5000000
+      artifact:
+        controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed2/runs/experiment5-transcoder-h-seed2/checkpoints/milestones/target-tokens-000005000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed2/runs/experiment5-transcoder-h-seed2/checkpoints/milestones/target-tokens-000005000000.json
+        sha256: 7c75b6f0c546e0af41afffe1c14da37cc018dda19c6032eeb833909a84ac880c
+      pointer_sha256: fee64da2ad5806812e5d8caf7d5c87427e3ceecdd7681eb4196e91d1aca10f3a
+    - milestone_tokens: 10000000
+      artifact:
+        controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed2/runs/experiment5-transcoder-h-seed2/checkpoints/milestones/target-tokens-000010000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed2/runs/experiment5-transcoder-h-seed2/checkpoints/milestones/target-tokens-000010000000.json
+        sha256: 0b9a4dc319a9b8bf7e1fbbc31c70a9d560fba6f954f1c4b9eefeb1bad73c1ded
+      pointer_sha256: f1c421cb064b432068927c49346cd01e51b54d483c8002bebbb3342d4954b408
+  - task_id: train-transcoder-r-seed0
+    panel: transcoder
+    condition: R
+    seed: 0
+    run_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed0/runs/experiment5-transcoder-r-seed0
+    training_result:
+      controller_path: /mnt/moe-sae-usc1/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed0/runs/experiment5-transcoder-r-seed0/training-result.json
+      remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed0/runs/experiment5-transcoder-r-seed0/training-result.json
+      sha256: a66d2098366dfab81c8e8b9e3d4ddb4f119e22216baac81eafb35783871101aa
+    training_result_sha256: ecdd4b3085e196263e36968e424230fe09a0759ef7dec4574419e4c36c05f1ba
+    checkpoint_pointers:
+    - milestone_tokens: 2000000
+      artifact:
+        controller_path: /mnt/moe-sae-usc1/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed0/runs/experiment5-transcoder-r-seed0/checkpoints/milestones/target-tokens-000002000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed0/runs/experiment5-transcoder-r-seed0/checkpoints/milestones/target-tokens-000002000000.json
+        sha256: 492f4ffb8a74c11343c1b4031e53378be766dcff09f5e95c08c8b50e077c2125
+      pointer_sha256: 2769c0064a14d26f708abdaaccb9971012e04cadb1cfa29cfe9b94c6285d208d
+    - milestone_tokens: 5000000
+      artifact:
+        controller_path: /mnt/moe-sae-usc1/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed0/runs/experiment5-transcoder-r-seed0/checkpoints/milestones/target-tokens-000005000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed0/runs/experiment5-transcoder-r-seed0/checkpoints/milestones/target-tokens-000005000000.json
+        sha256: 8a0d9113d6435aead26eae3842d323c4120ecb6e1b3d7cbd5773ab737080f743
+      pointer_sha256: 196d455145f2c13958aa10a73e6849e1c75690b6af95392dab35d2d1f364461a
+    - milestone_tokens: 10000000
+      artifact:
+        controller_path: /mnt/moe-sae-usc1/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed0/runs/experiment5-transcoder-r-seed0/checkpoints/milestones/target-tokens-000010000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed0/runs/experiment5-transcoder-r-seed0/checkpoints/milestones/target-tokens-000010000000.json
+        sha256: 4634702901c1bfb9847be9230bdb57c223a23d235971f3c2a5342f5584b0e190
+      pointer_sha256: 0fea4d8098c0d9da1ef6286ee2f0d835fc49629a313849328cb524ce8c1de300
+  - task_id: train-transcoder-r-seed1
+    panel: transcoder
+    condition: R
+    seed: 1
+    run_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed1/runs/experiment5-transcoder-r-seed1
+    training_result:
+      controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed1/runs/experiment5-transcoder-r-seed1/training-result.json
+      remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed1/runs/experiment5-transcoder-r-seed1/training-result.json
+      sha256: c26b46680e0d6e0fe27777fa227f7c2ceed4f10c928156765ada35a3d659d4ff
+    training_result_sha256: 9edd56ec81c8f7edce5011da55e8bed7b5292e0bf1088d7f1e5546eaee3c2915
+    checkpoint_pointers:
+    - milestone_tokens: 2000000
+      artifact:
+        controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed1/runs/experiment5-transcoder-r-seed1/checkpoints/milestones/target-tokens-000002000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed1/runs/experiment5-transcoder-r-seed1/checkpoints/milestones/target-tokens-000002000000.json
+        sha256: 2dee2865f79e10a60944260f45a19fde905584ac069fa6f889914c71ec716b04
+      pointer_sha256: e492c0ea6075af255ace34143529a776eed1817cea3931b37ec4785ba92f968d
+    - milestone_tokens: 5000000
+      artifact:
+        controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed1/runs/experiment5-transcoder-r-seed1/checkpoints/milestones/target-tokens-000005000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed1/runs/experiment5-transcoder-r-seed1/checkpoints/milestones/target-tokens-000005000000.json
+        sha256: 8afa5e6d75086e803f761087732234aa549a93316d5d11f6c94ddfa07df1ffdb
+      pointer_sha256: 45385cc74379410a9fd93d5258404c18d00b8c8e9dee4dceed0e8a28bdbaa337
+    - milestone_tokens: 10000000
+      artifact:
+        controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed1/runs/experiment5-transcoder-r-seed1/checkpoints/milestones/target-tokens-000010000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed1/runs/experiment5-transcoder-r-seed1/checkpoints/milestones/target-tokens-000010000000.json
+        sha256: 60d57355fcc064003bdec8f056a022c2c1d7bec4fcc6b8111541ad1b5ee5aa56
+      pointer_sha256: 95c2f1153e153a5dd9357a6ae07af2dbfd2701d8da5ae2c173a030d70924618d
+  - task_id: train-transcoder-r-seed2
+    panel: transcoder
+    condition: R
+    seed: 2
+    run_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed2/runs/experiment5-transcoder-r-seed2
+    training_result:
+      controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed2/runs/experiment5-transcoder-r-seed2/training-result.json
+      remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed2/runs/experiment5-transcoder-r-seed2/training-result.json
+      sha256: 78dbf829150854f31f5ea428ce64597a4e842b15f3632fd06a4f42442266b442
+    training_result_sha256: c29316584214ecd1e69c1d44b01f4c39ef2cbce7647bac9950eb07c5320bf450
+    checkpoint_pointers:
+    - milestone_tokens: 2000000
+      artifact:
+        controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed2/runs/experiment5-transcoder-r-seed2/checkpoints/milestones/target-tokens-000002000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed2/runs/experiment5-transcoder-r-seed2/checkpoints/milestones/target-tokens-000002000000.json
+        sha256: 8db5d8b09d12788e42eb4f030322205e438fb428d8e11bfc233502b98066366d
+      pointer_sha256: 26490cb3748f5b34d3c442a13bd69a6bfc95f0462a31747de4f94ae957735ae3
+    - milestone_tokens: 5000000
+      artifact:
+        controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed2/runs/experiment5-transcoder-r-seed2/checkpoints/milestones/target-tokens-000005000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed2/runs/experiment5-transcoder-r-seed2/checkpoints/milestones/target-tokens-000005000000.json
+        sha256: a3f9b7fdfb89f89332a6a238c2bbc185b748b9fbcc1a7c7420c21e5d5e756d5c
+      pointer_sha256: 5f6d7d75e69e9a6ae5ecec35593c6ad9004ba6d3072266929a32b89286200780
+    - milestone_tokens: 10000000
+      artifact:
+        controller_path: /mnt/moe-sae-control/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed2/runs/experiment5-transcoder-r-seed2/checkpoints/milestones/target-tokens-000010000000.json
+        remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/ready-three-v1/674cecbb19ba/runs/transcoder/seed2/runs/experiment5-transcoder-r-seed2/checkpoints/milestones/target-tokens-000010000000.json
+        sha256: e7c77c01903085076b3d0e7f49d4dd11475ce2d7f93966b6f944fd4aa98f6316
+      pointer_sha256: e994335f1c4f209ce395f7aa468b83964ec2bffa61ba66392bbec1530bd81db4

@@ -1,0 +1,129 @@
+artifacts:
+  eval_source_overlay_manifest_sha256: f68e2fe6e4cf568e694925697dd5d65fe10160a52d357c641892de85ee5c3da7
+  eval_target_manifest_sha256: 31454e5ce8693521c41a2a95f2ef88d40c5d26c726a0efac5c26d882ed341f5e
+  eval_tokens: 250000
+  recomposition_sidecar_schema_version: gemma4-contribution-recomposition-v1
+  source_overlay_capture_contract_sha256: fe0b004ca6e48c9eb8163237a5ea20f45b33acdbd9a3a267a9fb4e670ed2c954
+  source_overlay_schema_version: gemma4-routed-input-overlay-v1
+  target_schema_version: gemma4-expert-contribution-v2
+  train_source_overlay_manifest_sha256: 8f27dcf9c1dc0c7f3ffa2e2941daec13d8a72c7204077f09420e15aacb02ffe0
+  train_target_manifest_sha256: f29aaf45d9ff93be08cc3d175cdcea9fa4aecc37fc0e256d09720e88e1ae838c
+  train_tokens: 10000000
+evaluation:
+  bootstrap_replicates: 20000
+  bootstrap_unit: packed_sequence
+  checkpoint_tokens:
+  - 2000000
+  - 5000000
+  - 10000000
+  common_target_sst: true
+  paired_confidence_level: 0.95
+  primary_contrasts:
+  - A-R
+  - A-B
+  - A-F
+  - F-B
+  relative_quality_gates: []
+execution:
+  accelerator_min_useful_mfu: 0.1
+  accelerator_qualification_max_seconds: 600
+  direct_runtime_max_seconds: 43200
+  restart_checkpoint_tokens:
+  - 1000000
+  - 2000000
+  - 3000000
+  - 4000000
+  - 5000000
+  - 6000000
+  - 7000000
+  - 8000000
+  - 9000000
+  - 10000000
+layouts:
+- bank_count: 128
+  bank_identity: true_expert_id
+  bank_width: 256
+  components_per_token: 8
+  condition: A
+  target: raw_selected_expert_output
+  topk_per_component: 2
+- bank_count: 128
+  bank_identity: per_sequence_randomized_expert_id
+  bank_width: 256
+  components_per_token: 8
+  condition: R
+  target: raw_selected_expert_output
+  topk_per_component: 2
+- bank_count: 8
+  bank_identity: router_rank
+  bank_width: 256
+  components_per_token: 8
+  condition: B
+  target: raw_selected_expert_output
+  topk_per_component: 2
+- bank_count: 8
+  bank_identity: router_rank
+  bank_width: 4096
+  components_per_token: 8
+  condition: F
+  target: raw_selected_expert_output
+  topk_per_component: 2
+model:
+  experts_per_token: 8
+  hidden_size: 2816
+  num_routed_experts: 128
+  target_layer_one_indexed: 15
+optimizer:
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1.0e-08
+  decoder_column_renormalization: true
+  decoder_init: unit_norm_columns
+  encoder_bias_init: zeros
+  encoder_init: decoder_transpose
+  global_gradient_clip: 1.0
+  matmul_dtype: bfloat16
+  minimum_learning_rate: 3.0e-05
+  moment_dtype: float32
+  parameter_dtype: bfloat16
+  peak_learning_rate: 0.0003
+  reduction_dtype: float32
+  schedule: linear_warmup_cosine_decay
+  tangent_decoder_gradient_projection: true
+  weight_decay: 0.0
+parent_protocol_id: gemma4-contribution-transcoder-v2-20260727
+protocol_id: gemma4-pilot-learning-horizon-v1-20260728
+provenance:
+  dataset_config: en
+  dataset_name: allenai/c4
+  dataset_revision: 1588ec454efa1a09f29cd18ddd04fe05fc8653a2
+  eval_split: validation
+  maxtext_base_commit: 48c7da3e28e8f57fe36ddf09d00eec53072a2ea0
+  maxtext_fork_commit: 73bafe53569eb17dc18542f2568dd591a8db9e28
+  model_id: google/gemma-4-26B-A4B
+  model_revision: 24548b62aa021d562695c04aaf7758a1ea47990b
+  train_split: train
+schema_version: gemma4-pilot-learning-horizon-run-config-v1
+scientific_model: transcoder
+training:
+  capacity_margin_fraction: 0.1
+  capacity_overflow_policy: hard_error
+  contribution_loss: normalized_router_weighted_sse
+  effective_batch_tokens: 16384
+  encoder_activation: softplus
+  eval_tokens: 250000
+  initialization: from_scratch
+  layout_set: pilot
+  microbatch_tokens: 4096
+  output_bias: none
+  phase_name: learning_horizon_10m
+  planned_updates: 611
+  router_weight_math_dtype: float32
+  seed: 0
+  source_centering: one_global_routed_input_mean
+  tail_mask_tokens: 10624
+  target_centering: one_pooled_raw_expert_output_mean
+  topk_requires_strictly_positive: true
+  topk_tie_break: global_latent_id_ascending
+  train_tokens: 10000000
+  warmup_updates: 61

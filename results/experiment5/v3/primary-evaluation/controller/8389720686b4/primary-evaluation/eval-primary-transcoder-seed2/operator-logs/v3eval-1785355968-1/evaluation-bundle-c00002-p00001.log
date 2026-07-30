@@ -1,0 +1,5 @@
+Using ssh batch size of 1. Attempting to SSH into 1 nodes with a total of 1 workers.
+SSH: Attempting to connect to worker 2...
+E0729 20:12:54.766443  225663 hugepage_text.cc:344] RAW: File offset incorrectly aligned for file-backed THP: (600000 & ~ffffffffffe00000) = 0 != 1000 = (201000 & ~ffffffffffe00000)
+I0729 20:24:10.779204  227623 google_auth_provider.cc:181] Running on GCE, using service account 655343590563-compute@developer.gserviceaccount.com
+terminal action=activation-ladder-evaluate-bundle controller=2 process=1 status=0

@@ -1,0 +1,9 @@
+working_directory: /ABS/PATH/TO/moe-sae
+remote_project_root: /REMOTE/PATH/TO/moe-sae
+resources:
+  sae:
+    resource_id: REPLACE_SAE_PROFILE_RESOURCE
+    accelerator_type: v5litepod-16
+  transcoder:
+    resource_id: REPLACE_TRANSCODER_PROFILE_RESOURCE
+    accelerator_type: v5litepod-16

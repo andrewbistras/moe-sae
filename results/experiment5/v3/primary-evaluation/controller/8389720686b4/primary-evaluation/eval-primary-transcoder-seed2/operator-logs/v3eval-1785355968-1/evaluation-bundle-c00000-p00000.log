@@ -1,0 +1,571 @@
+Using ssh batch size of 1. Attempting to SSH into 1 nodes with a total of 1 workers.
+SSH: Attempting to connect to worker 0...
+E0729 20:12:54.751162  245896 hugepage_text.cc:344] RAW: File offset incorrectly aligned for file-backed THP: (600000 & ~ffffffffffe00000) = 0 != 1000 = (201000 & ~ffffffffffe00000)
+{"action": "endpoint-centering-cache", "cache_key_sha256": "26155db09af2c8e43a88476c8418cd6dcb80c4ddf951bdcb0d64c22458caf23f", "status": "miss"}
+I0729 20:24:10.786108  248211 google_auth_provider.cc:181] Running on GCE, using service account 655343590563-compute@developer.gserviceaccount.com
+{
+  "capacity_contract": {
+    "evaluation_capacity": 1108,
+    "evaluation_capacity_receipt_sha256": "61da86e2cb6ab02884cdf0fbd360e94f6c35fc2b2ff5f7797eb382f96a893354",
+    "selected_capacity": 1114,
+    "training_capacity": 1114
+  },
+  "cell_id": "transcoder-A512ReLUInclusiveTopK-seed2-2m",
+  "centering_receipt_sha256": "0924060c2ba57179d758ee61f45937c84e2153b33f56dbc1487d6ed0d0f884a7",
+  "checkpoint_actual_tokens": 2015232,
+  "checkpoint_sha256": "8fdce794a519ae2f83538e099d429ee726d31ce942773d42e903ae66604d52c5",
+  "checkpoint_tokens": 2000000,
+  "condition": "A512ReLUInclusiveTopK",
+  "config_file_sha256": "052dcc73e6cac691ee01de0e3a2d49357bdd7a11d35b20ed70153fddf2dc2c78",
+  "config_sha256": "059d845bbb7b1140ac50f6866efc7727fd2ee88fcc4e788d147ddcfa86c9798f",
+  "dead_rate": 0.0242462158203125,
+  "dead_rate_scope": "heldout_all_features",
+  "endpoint_sst_sha256": {
+    "component": "afeec57dd96fdc38ce2d769cc4a9d0e43dc660b31bbc23460314c3a247e8c2ce",
+    "oracle_shared": "77a07a1fbb68c1ed204d4f0c871bfbdfb7d2d0fca4dd8e4511e2a8efd79d53c4",
+    "routed": "555ada3b4d98457a4b156bf84664deb821da358fc3d1f3de56bf166c8a057f58"
+  },
+  "endpoints": {
+    "component": {
+      "ev": 0.3580211821203684,
+      "nmse": 0.6419788178796316,
+      "sse": 995738.645280242,
+      "sst": 1551045.9497231245
+    },
+    "oracle_shared": {
+      "ev": 0.5137955027815042,
+      "nmse": 0.4862044972184958,
+      "sse": 261941731.1417671,
+      "sst": 538748063.0892909
+    },
+    "routed": {
+      "ev": -0.3479853936013353,
+      "nmse": 1.3479853936013353,
+      "sse": 22046533163.53367,
+      "sst": 16355172146.660439
+    }
+  },
+  "evaluation_input_receipt_sha256s": [
+    "7b489b7353771972681e4290b9d05f1946c126dc22420bc7cd212b0d40824dc6",
+    "72a8773a223da8935b4adc0f33eed2d3041668370d239dd9c01babf26bf354ba",
+    "76ab16305de17f5d7cdcec9dbce99ba22123b607e15dde3ebf230df018af2c1d",
+    "037be79f8525fd6590e0972bbc5edfd43cbb86c8e999a1cb4d48449ee9268ab5"
+  ],
+  "evaluation_wall_seconds": 149.11434078800085,
+  "h_config_file_sha256": null,
+  "h_config_sha256": null,
+  "learned_evaluation_input_receipt_sha256s": null,
+  "milestone_name": "2m",
+  "packed_sequences": 625,
+  "panel": "transcoder",
+  "parent_checkpoint_pointer_file_sha256": "86623110bbc89d412fd11ca1210dea6fdfa40d854ca6e4e7c5cc736c0ebbee98",
+  "parent_checkpoint_pointer_sha256": "8fdce794a519ae2f83538e099d429ee726d31ce942773d42e903ae66604d52c5",
+  "parent_run_contract_file_sha256": "bd56bb7903d3b15f48dde9f5881d3c148cb7f65793536f6a823be1cbfc189d8e",
+  "parent_run_contract_sha256": "39f9f4e7bf3b5cd35db89a4c89f575d8995da412526d09cc27b3ab9a8284c7df",
+  "parent_training_result_file_sha256": "18af0078dca63c109044d1d9eecaa3351f96edfcb3a2b232c3ece6645c62bf2f",
+  "parent_training_result_sha256": "93f931272f0df4d62b26b971f6b24c1d5b4e119a1cfe72f410ba5f8cf725286b",
+  "positive_l0": 31.84306,
+  "positive_l0_contract": "bounded_zero_to_selected_slots",
+  "positive_l0_sum": 7960765,
+  "process_count": 4,
+  "process_evidence_sha256s": [
+    "00af9c688a903b51b84361812dbaca52f3101a6596d59e298e3d00c27af357b1",
+    "ce1f35ca98970b157e269d0e5bdfae99bec98820509b765e9e0f65d86238ed2f",
+    "7f92636d4fb0e12e156861685533132269a411ce42a84a3b597fa87194ccb450",
+    "085f6e18d2c08ed8f7f06e12bae6e8b701f04e86dad2dec88c88686dbaa58fea"
+  ],
+  "protocol_id": "gemma4-experiment5-routed-activation-ladder-v3-20260729",
+  "recomposition_sidecar_sha256": "37c7b8c012f8fc0c1f63210986c0b3071a261261c88ee4bc1f502220ce3b8526",
+  "result_sha256": "304ea6c0b53511d507fbf1b503b5161d2919d93aee2f6b5379487d7ac49e3a90",
+  "schema_version": "gemma4-experiment5-routed-activation-policy-cell-evaluation-v1",
+  "score_artifact_sha256": "cbb48a43b5a43d1bbddf17ae67027126a4ef05eaf73ed05c72d32b03a0ad53bb",
+  "score_data_bytes": 14500664,
+  "score_data_object": "objects/cccff42f634a5515b34fdedebbdb7dad80cd30a26d0ff3d3e73ecaaecca8ecec.safetensors",
+  "score_data_sha256": "cccff42f634a5515b34fdedebbdb7dad80cd30a26d0ff3d3e73ecaaecca8ecec",
+  "score_schema_version": "gemma4-experiment5-routed-activation-ladder-token-scores-v2",
+  "seed": 2,
+  "selected_slot_count": 32,
+  "source_manifest_sha256": "f68e2fe6e4cf568e694925697dd5d65fe10160a52d357c641892de85ee5c3da7",
+  "source_revision": "8389720686b4f449395ac230cad58383d0867872",
+  "status": "cell_evaluated",
+  "target_manifest_sha256": "31454e5ce8693521c41a2a95f2ef88d40c5d26c726a0efac5c26d882ed341f5e",
+  "token_identity_sha256": "c0e240e998ffd046baeee9c8644d9b81244bfb1fb44e9e5ac7e9cd53a8553bc2",
+  "tokens": 250000,
+  "total_features": 65536,
+  "training_contract_sha256": "39f9f4e7bf3b5cd35db89a4c89f575d8995da412526d09cc27b3ab9a8284c7df",
+  "training_result_sha256": "93f931272f0df4d62b26b971f6b24c1d5b4e119a1cfe72f410ba5f8cf725286b",
+  "training_source_revision": "8dcfadee4a517029b3c1c0c7f2bb830e9d35f12f",
+  "zero_selected_slot_fraction": 0.004904374999999961
+}
+{
+  "capacity_contract": {
+    "evaluation_capacity": 1108,
+    "evaluation_capacity_receipt_sha256": "61da86e2cb6ab02884cdf0fbd360e94f6c35fc2b2ff5f7797eb382f96a893354",
+    "selected_capacity": 1114,
+    "training_capacity": 1114
+  },
+  "cell_id": "transcoder-A512ReLUInclusiveTopK-seed2-5m",
+  "centering_receipt_sha256": "0924060c2ba57179d758ee61f45937c84e2153b33f56dbc1487d6ed0d0f884a7",
+  "checkpoint_actual_tokens": 5013504,
+  "checkpoint_sha256": "da6c5d13ab5f191946afefb9cf6cd845d7eac9cb32a19eabddbe6d7d7a262d4f",
+  "checkpoint_tokens": 5000000,
+  "condition": "A512ReLUInclusiveTopK",
+  "config_file_sha256": "052dcc73e6cac691ee01de0e3a2d49357bdd7a11d35b20ed70153fddf2dc2c78",
+  "config_sha256": "059d845bbb7b1140ac50f6866efc7727fd2ee88fcc4e788d147ddcfa86c9798f",
+  "dead_rate": 0.0260467529296875,
+  "dead_rate_scope": "heldout_all_features",
+  "endpoint_sst_sha256": {
+    "component": "afeec57dd96fdc38ce2d769cc4a9d0e43dc660b31bbc23460314c3a247e8c2ce",
+    "oracle_shared": "77a07a1fbb68c1ed204d4f0c871bfbdfb7d2d0fca4dd8e4511e2a8efd79d53c4",
+    "routed": "555ada3b4d98457a4b156bf84664deb821da358fc3d1f3de56bf166c8a057f58"
+  },
+  "endpoints": {
+    "component": {
+      "ev": 0.42198728359163407,
+      "nmse": 0.5780127164083659,
+      "sse": 896524.2826736569,
+      "sst": 1551045.9497231245
+    },
+    "oracle_shared": {
+      "ev": 0.5502576192325559,
+      "nmse": 0.44974238076744416,
+      "sse": 242297836.52762687,
+      "sst": 538748063.0892909
+    },
+    "routed": {
+      "ev": -0.1449172669567469,
+      "nmse": 1.144917266956747,
+      "sse": 18725318994.76158,
+      "sst": 16355172146.660439
+    }
+  },
+  "evaluation_input_receipt_sha256s": [
+    "7b489b7353771972681e4290b9d05f1946c126dc22420bc7cd212b0d40824dc6",
+    "72a8773a223da8935b4adc0f33eed2d3041668370d239dd9c01babf26bf354ba",
+    "76ab16305de17f5d7cdcec9dbce99ba22123b607e15dde3ebf230df018af2c1d",
+    "037be79f8525fd6590e0972bbc5edfd43cbb86c8e999a1cb4d48449ee9268ab5"
+  ],
+  "evaluation_wall_seconds": 136.20872875100758,
+  "h_config_file_sha256": null,
+  "h_config_sha256": null,
+  "learned_evaluation_input_receipt_sha256s": null,
+  "milestone_name": "5m",
+  "packed_sequences": 625,
+  "panel": "transcoder",
+  "parent_checkpoint_pointer_file_sha256": "0bab5a73715809b1cbb9f80591e1e62e0cf4af0683876636e5732dfa2565b229",
+  "parent_checkpoint_pointer_sha256": "da6c5d13ab5f191946afefb9cf6cd845d7eac9cb32a19eabddbe6d7d7a262d4f",
+  "parent_run_contract_file_sha256": "bd56bb7903d3b15f48dde9f5881d3c148cb7f65793536f6a823be1cbfc189d8e",
+  "parent_run_contract_sha256": "39f9f4e7bf3b5cd35db89a4c89f575d8995da412526d09cc27b3ab9a8284c7df",
+  "parent_training_result_file_sha256": "18af0078dca63c109044d1d9eecaa3351f96edfcb3a2b232c3ece6645c62bf2f",
+  "parent_training_result_sha256": "93f931272f0df4d62b26b971f6b24c1d5b4e119a1cfe72f410ba5f8cf725286b",
+  "positive_l0": 31.532732,
+  "positive_l0_contract": "bounded_zero_to_selected_slots",
+  "positive_l0_sum": 7883183,
+  "process_count": 4,
+  "process_evidence_sha256s": [
+    "bd9f07f1a00ac3295eb6cae72db6a78a278d37052c42a3a4445d00e2832f47a0",
+    "86f4782407bd1f005e865b2e83e17a05e6274b7dcc8228d936555f74ad99de39",
+    "091c52eff338c6daf5889a545e3d0de72cca9afab661fc1f9d8cbbcf3ecb59b7",
+    "900f7904e1fd8bd28415101005861cccdcaca756dbe637e87d526f5968cb5b48"
+  ],
+  "protocol_id": "gemma4-experiment5-routed-activation-ladder-v3-20260729",
+  "recomposition_sidecar_sha256": "37c7b8c012f8fc0c1f63210986c0b3071a261261c88ee4bc1f502220ce3b8526",
+  "result_sha256": "75ca12d0d37e5a47a3bc47cb40d0e4b8b5709ec0b9285d54770270e2d39b647b",
+  "schema_version": "gemma4-experiment5-routed-activation-policy-cell-evaluation-v1",
+  "score_artifact_sha256": "54979e255bd454a86594e29b40bf4e06511eb906856336a30fad68d78fe7a9e8",
+  "score_data_bytes": 14500664,
+  "score_data_object": "objects/7fd9bbc69ff469fc4df65ccba7e6305df5d9c5010e04a2668e901735c7d982fe.safetensors",
+  "score_data_sha256": "7fd9bbc69ff469fc4df65ccba7e6305df5d9c5010e04a2668e901735c7d982fe",
+  "score_schema_version": "gemma4-experiment5-routed-activation-ladder-token-scores-v2",
+  "seed": 2,
+  "selected_slot_count": 32,
+  "source_manifest_sha256": "f68e2fe6e4cf568e694925697dd5d65fe10160a52d357c641892de85ee5c3da7",
+  "source_revision": "8389720686b4f449395ac230cad58383d0867872",
+  "status": "cell_evaluated",
+  "target_manifest_sha256": "31454e5ce8693521c41a2a95f2ef88d40c5d26c726a0efac5c26d882ed341f5e",
+  "token_identity_sha256": "c0e240e998ffd046baeee9c8644d9b81244bfb1fb44e9e5ac7e9cd53a8553bc2",
+  "tokens": 250000,
+  "total_features": 65536,
+  "training_contract_sha256": "39f9f4e7bf3b5cd35db89a4c89f575d8995da412526d09cc27b3ab9a8284c7df",
+  "training_result_sha256": "93f931272f0df4d62b26b971f6b24c1d5b4e119a1cfe72f410ba5f8cf725286b",
+  "training_source_revision": "8dcfadee4a517029b3c1c0c7f2bb830e9d35f12f",
+  "zero_selected_slot_fraction": 0.014602125000000021
+}
+{
+  "capacity_contract": {
+    "evaluation_capacity": 1108,
+    "evaluation_capacity_receipt_sha256": "61da86e2cb6ab02884cdf0fbd360e94f6c35fc2b2ff5f7797eb382f96a893354",
+    "selected_capacity": 1114,
+    "training_capacity": 1114
+  },
+  "cell_id": "transcoder-A512ReLUInclusiveTopK-seed2-10m",
+  "centering_receipt_sha256": "0924060c2ba57179d758ee61f45937c84e2153b33f56dbc1487d6ed0d0f884a7",
+  "checkpoint_actual_tokens": 10000000,
+  "checkpoint_sha256": "9954dbccd5ac7df5da6a6c3e64bc694eb09f0877fc36df1c23d372d2e80fde99",
+  "checkpoint_tokens": 10000000,
+  "condition": "A512ReLUInclusiveTopK",
+  "config_file_sha256": "052dcc73e6cac691ee01de0e3a2d49357bdd7a11d35b20ed70153fddf2dc2c78",
+  "config_sha256": "059d845bbb7b1140ac50f6866efc7727fd2ee88fcc4e788d147ddcfa86c9798f",
+  "dead_rate": 0.0251312255859375,
+  "dead_rate_scope": "heldout_all_features",
+  "endpoint_sst_sha256": {
+    "component": "afeec57dd96fdc38ce2d769cc4a9d0e43dc660b31bbc23460314c3a247e8c2ce",
+    "oracle_shared": "77a07a1fbb68c1ed204d4f0c871bfbdfb7d2d0fca4dd8e4511e2a8efd79d53c4",
+    "routed": "555ada3b4d98457a4b156bf84664deb821da358fc3d1f3de56bf166c8a057f58"
+  },
+  "endpoints": {
+    "component": {
+      "ev": 0.43193724805778577,
+      "nmse": 0.5680627519422142,
+      "sse": 881091.4305885434,
+      "sst": 1551045.9497231245
+    },
+    "oracle_shared": {
+      "ev": 0.5572457715132431,
+      "nmse": 0.4427542284867569,
+      "sse": 238532983.0218336,
+      "sst": 538748063.0892909
+    },
+    "routed": {
+      "ev": -0.12020299676869661,
+      "nmse": 1.1202029967686966,
+      "sse": 18321112851.35694,
+      "sst": 16355172146.660439
+    }
+  },
+  "evaluation_input_receipt_sha256s": [
+    "7b489b7353771972681e4290b9d05f1946c126dc22420bc7cd212b0d40824dc6",
+    "72a8773a223da8935b4adc0f33eed2d3041668370d239dd9c01babf26bf354ba",
+    "76ab16305de17f5d7cdcec9dbce99ba22123b607e15dde3ebf230df018af2c1d",
+    "037be79f8525fd6590e0972bbc5edfd43cbb86c8e999a1cb4d48449ee9268ab5"
+  ],
+  "evaluation_wall_seconds": 135.34976334500243,
+  "h_config_file_sha256": null,
+  "h_config_sha256": null,
+  "learned_evaluation_input_receipt_sha256s": null,
+  "milestone_name": "10m",
+  "packed_sequences": 625,
+  "panel": "transcoder",
+  "parent_checkpoint_pointer_file_sha256": "7ff48accfa3a17c799c888de05b1163ecc9ec656e07e975639322a09253944af",
+  "parent_checkpoint_pointer_sha256": "9954dbccd5ac7df5da6a6c3e64bc694eb09f0877fc36df1c23d372d2e80fde99",
+  "parent_run_contract_file_sha256": "bd56bb7903d3b15f48dde9f5881d3c148cb7f65793536f6a823be1cbfc189d8e",
+  "parent_run_contract_sha256": "39f9f4e7bf3b5cd35db89a4c89f575d8995da412526d09cc27b3ab9a8284c7df",
+  "parent_training_result_file_sha256": "18af0078dca63c109044d1d9eecaa3351f96edfcb3a2b232c3ece6645c62bf2f",
+  "parent_training_result_sha256": "93f931272f0df4d62b26b971f6b24c1d5b4e119a1cfe72f410ba5f8cf725286b",
+  "positive_l0": 31.470744,
+  "positive_l0_contract": "bounded_zero_to_selected_slots",
+  "positive_l0_sum": 7867686,
+  "process_count": 4,
+  "process_evidence_sha256s": [
+    "0300c588ccd8023516c1ed01cedd00e6888935a2841d665e8acb5442cded9996",
+    "bd00438ea4b914073851f4a38b855ab0bd8e0e382722c5bee8e6967449cc10ff",
+    "f43976a246c80105277257aac34edbdf7957ec1646693f60e3ff98587a24bc43",
+    "cef3648017bbcddf67709480c2d76aed72a306cab6407aba222be75b3994082d"
+  ],
+  "protocol_id": "gemma4-experiment5-routed-activation-ladder-v3-20260729",
+  "recomposition_sidecar_sha256": "37c7b8c012f8fc0c1f63210986c0b3071a261261c88ee4bc1f502220ce3b8526",
+  "result_sha256": "21485a6860e396dc7603374c125ad4de1c92c45d5542ba1f4fd9b634c00bdc94",
+  "schema_version": "gemma4-experiment5-routed-activation-policy-cell-evaluation-v1",
+  "score_artifact_sha256": "3dfe95bd2a2bfb64952eae1060e22a41fe0e3130e970dd97117ba1f732b6539c",
+  "score_data_bytes": 14500664,
+  "score_data_object": "objects/dedb3efac0727f58c3aeb81ee54ff5dbd239ddd2c0be4db2fb26c26c10f3283b.safetensors",
+  "score_data_sha256": "dedb3efac0727f58c3aeb81ee54ff5dbd239ddd2c0be4db2fb26c26c10f3283b",
+  "score_schema_version": "gemma4-experiment5-routed-activation-ladder-token-scores-v2",
+  "seed": 2,
+  "selected_slot_count": 32,
+  "source_manifest_sha256": "f68e2fe6e4cf568e694925697dd5d65fe10160a52d357c641892de85ee5c3da7",
+  "source_revision": "8389720686b4f449395ac230cad58383d0867872",
+  "status": "cell_evaluated",
+  "target_manifest_sha256": "31454e5ce8693521c41a2a95f2ef88d40c5d26c726a0efac5c26d882ed341f5e",
+  "token_identity_sha256": "c0e240e998ffd046baeee9c8644d9b81244bfb1fb44e9e5ac7e9cd53a8553bc2",
+  "tokens": 250000,
+  "total_features": 65536,
+  "training_contract_sha256": "39f9f4e7bf3b5cd35db89a4c89f575d8995da412526d09cc27b3ab9a8284c7df",
+  "training_result_sha256": "93f931272f0df4d62b26b971f6b24c1d5b4e119a1cfe72f410ba5f8cf725286b",
+  "training_source_revision": "8dcfadee4a517029b3c1c0c7f2bb830e9d35f12f",
+  "zero_selected_slot_fraction": 0.016539250000000005
+}
+{
+  "capacity_contract": {
+    "evaluation_capacity": 1108,
+    "evaluation_capacity_receipt_sha256": "61da86e2cb6ab02884cdf0fbd360e94f6c35fc2b2ff5f7797eb382f96a893354",
+    "selected_capacity": 1114,
+    "training_capacity": 1114
+  },
+  "cell_id": "transcoder-A512Softplus-seed2-2m",
+  "centering_receipt_sha256": "0924060c2ba57179d758ee61f45937c84e2153b33f56dbc1487d6ed0d0f884a7",
+  "checkpoint_actual_tokens": 2015232,
+  "checkpoint_sha256": "dbb792f5620f5b8507dc5764b5e03eeee62f3fe28927ce9221de5a107726d6c1",
+  "checkpoint_tokens": 2000000,
+  "condition": "A512Softplus",
+  "config_file_sha256": "052dcc73e6cac691ee01de0e3a2d49357bdd7a11d35b20ed70153fddf2dc2c78",
+  "config_sha256": "059d845bbb7b1140ac50f6866efc7727fd2ee88fcc4e788d147ddcfa86c9798f",
+  "dead_rate": 0.0235443115234375,
+  "dead_rate_scope": "heldout_all_features",
+  "endpoint_sst_sha256": {
+    "component": "afeec57dd96fdc38ce2d769cc4a9d0e43dc660b31bbc23460314c3a247e8c2ce",
+    "oracle_shared": "77a07a1fbb68c1ed204d4f0c871bfbdfb7d2d0fca4dd8e4511e2a8efd79d53c4",
+    "routed": "555ada3b4d98457a4b156bf84664deb821da358fc3d1f3de56bf166c8a057f58"
+  },
+  "endpoints": {
+    "component": {
+      "ev": 0.3129414206175152,
+      "nmse": 0.6870585793824848,
+      "sse": 1065659.426773727,
+      "sst": 1551045.9497231245
+    },
+    "oracle_shared": {
+      "ev": 0.4724095631453904,
+      "nmse": 0.5275904368546096,
+      "sse": 284238325.9598537,
+      "sst": 538748063.0892909
+    },
+    "routed": {
+      "ev": -0.25582540059249115,
+      "nmse": 1.2558254005924911,
+      "sse": 20539240612.838997,
+      "sst": 16355172146.660439
+    }
+  },
+  "evaluation_input_receipt_sha256s": [
+    "7b489b7353771972681e4290b9d05f1946c126dc22420bc7cd212b0d40824dc6",
+    "72a8773a223da8935b4adc0f33eed2d3041668370d239dd9c01babf26bf354ba",
+    "76ab16305de17f5d7cdcec9dbce99ba22123b607e15dde3ebf230df018af2c1d",
+    "037be79f8525fd6590e0972bbc5edfd43cbb86c8e999a1cb4d48449ee9268ab5"
+  ],
+  "evaluation_wall_seconds": 145.30566243499925,
+  "h_config_file_sha256": null,
+  "h_config_sha256": null,
+  "learned_evaluation_input_receipt_sha256s": null,
+  "milestone_name": "2m",
+  "packed_sequences": 625,
+  "panel": "transcoder",
+  "parent_checkpoint_pointer_file_sha256": "6bc3d324bef51e615097b591378c2c3c90c223aabb852c8aad85c2d3a9bc7942",
+  "parent_checkpoint_pointer_sha256": "dbb792f5620f5b8507dc5764b5e03eeee62f3fe28927ce9221de5a107726d6c1",
+  "parent_run_contract_file_sha256": "8e967567991f9896258c1127cc556dc4e31ff1a16e166c13cd3b8a3377842934",
+  "parent_run_contract_sha256": "a06aa1d79e9c755a4ce9755f0ecaf00e306af7555fb6e7aad3f6a37a0996c439",
+  "parent_training_result_file_sha256": "ca8a73506d7e3a17eb057afe5d206cfcef0336e3eb374951a563a37261b799bf",
+  "parent_training_result_sha256": "3f29a40cc66b0d1c23b43995d34f023aa26b2e86a02c9100fdb32774871a4aef",
+  "positive_l0": 32.0,
+  "positive_l0_contract": "exact_selected_slots",
+  "positive_l0_sum": 8000000,
+  "process_count": 4,
+  "process_evidence_sha256s": [
+    "deb3e8eaa53ce194478c9f2e08ca6db5429b744e0be140c8b7e15750e54bac8e",
+    "ebcfd75b226be6b9c06b7032b6d0f76d2e38880e42d1c32d4848a3006cbcc2b3",
+    "970e8d54665f9edac656d52c3b69a65b8243daf8499daadc03fee387da3e0210",
+    "779c7a5352a7c6a50d907981a17c677c8db20fdf9e4f37535b68500a7eaa9623"
+  ],
+  "protocol_id": "gemma4-experiment5-routed-activation-ladder-v3-20260729",
+  "recomposition_sidecar_sha256": "37c7b8c012f8fc0c1f63210986c0b3071a261261c88ee4bc1f502220ce3b8526",
+  "result_sha256": "201249f1b0ada257494d45fb5183e65f8dd37ba0b0a87ba63b17e201eb89c386",
+  "schema_version": "gemma4-experiment5-routed-activation-policy-cell-evaluation-v1",
+  "score_artifact_sha256": "076c00c453202b6785403e4b81a256f74c56840c1eeb551e5ea8d6d73271989c",
+  "score_data_bytes": 14500664,
+  "score_data_object": "objects/97cb4dbdb50f8895b83b21dd14078cedefa3b7a888efb358398bdac12fe57bf6.safetensors",
+  "score_data_sha256": "97cb4dbdb50f8895b83b21dd14078cedefa3b7a888efb358398bdac12fe57bf6",
+  "score_schema_version": "gemma4-experiment5-routed-activation-ladder-token-scores-v2",
+  "seed": 2,
+  "selected_slot_count": 32,
+  "source_manifest_sha256": "f68e2fe6e4cf568e694925697dd5d65fe10160a52d357c641892de85ee5c3da7",
+  "source_revision": "8389720686b4f449395ac230cad58383d0867872",
+  "status": "cell_evaluated",
+  "target_manifest_sha256": "31454e5ce8693521c41a2a95f2ef88d40c5d26c726a0efac5c26d882ed341f5e",
+  "token_identity_sha256": "c0e240e998ffd046baeee9c8644d9b81244bfb1fb44e9e5ac7e9cd53a8553bc2",
+  "tokens": 250000,
+  "total_features": 65536,
+  "training_contract_sha256": "a06aa1d79e9c755a4ce9755f0ecaf00e306af7555fb6e7aad3f6a37a0996c439",
+  "training_result_sha256": "3f29a40cc66b0d1c23b43995d34f023aa26b2e86a02c9100fdb32774871a4aef",
+  "training_source_revision": "a1c04eb790508367a96224ecd19c356ba7b6db26",
+  "zero_selected_slot_fraction": 0.0
+}
+{
+  "capacity_contract": {
+    "evaluation_capacity": 1108,
+    "evaluation_capacity_receipt_sha256": "61da86e2cb6ab02884cdf0fbd360e94f6c35fc2b2ff5f7797eb382f96a893354",
+    "selected_capacity": 1114,
+    "training_capacity": 1114
+  },
+  "cell_id": "transcoder-A512Softplus-seed2-5m",
+  "centering_receipt_sha256": "0924060c2ba57179d758ee61f45937c84e2153b33f56dbc1487d6ed0d0f884a7",
+  "checkpoint_actual_tokens": 5013504,
+  "checkpoint_sha256": "14b66069c1466e9368e299ea5ca2a71052df9441318085a061690ed1682ddb1f",
+  "checkpoint_tokens": 5000000,
+  "condition": "A512Softplus",
+  "config_file_sha256": "052dcc73e6cac691ee01de0e3a2d49357bdd7a11d35b20ed70153fddf2dc2c78",
+  "config_sha256": "059d845bbb7b1140ac50f6866efc7727fd2ee88fcc4e788d147ddcfa86c9798f",
+  "dead_rate": 0.0249786376953125,
+  "dead_rate_scope": "heldout_all_features",
+  "endpoint_sst_sha256": {
+    "component": "afeec57dd96fdc38ce2d769cc4a9d0e43dc660b31bbc23460314c3a247e8c2ce",
+    "oracle_shared": "77a07a1fbb68c1ed204d4f0c871bfbdfb7d2d0fca4dd8e4511e2a8efd79d53c4",
+    "routed": "555ada3b4d98457a4b156bf84664deb821da358fc3d1f3de56bf166c8a057f58"
+  },
+  "endpoints": {
+    "component": {
+      "ev": 0.3869023855889775,
+      "nmse": 0.6130976144110225,
+      "sse": 950942.5716171265,
+      "sst": 1551045.9497231245
+    },
+    "oracle_shared": {
+      "ev": 0.5189071975765958,
+      "nmse": 0.4810928024234042,
+      "sse": 259187815.4718079,
+      "sst": 538748063.0892909
+    },
+    "routed": {
+      "ev": -0.15643087039136772,
+      "nmse": 1.1564308703913677,
+      "sse": 18913625960.963184,
+      "sst": 16355172146.660439
+    }
+  },
+  "evaluation_input_receipt_sha256s": [
+    "7b489b7353771972681e4290b9d05f1946c126dc22420bc7cd212b0d40824dc6",
+    "72a8773a223da8935b4adc0f33eed2d3041668370d239dd9c01babf26bf354ba",
+    "76ab16305de17f5d7cdcec9dbce99ba22123b607e15dde3ebf230df018af2c1d",
+    "037be79f8525fd6590e0972bbc5edfd43cbb86c8e999a1cb4d48449ee9268ab5"
+  ],
+  "evaluation_wall_seconds": 134.34123183001066,
+  "h_config_file_sha256": null,
+  "h_config_sha256": null,
+  "learned_evaluation_input_receipt_sha256s": null,
+  "milestone_name": "5m",
+  "packed_sequences": 625,
+  "panel": "transcoder",
+  "parent_checkpoint_pointer_file_sha256": "ff33de2266ee7216168ba4f29c867da276854c2d2634dd387a664f51b983b9a5",
+  "parent_checkpoint_pointer_sha256": "14b66069c1466e9368e299ea5ca2a71052df9441318085a061690ed1682ddb1f",
+  "parent_run_contract_file_sha256": "8e967567991f9896258c1127cc556dc4e31ff1a16e166c13cd3b8a3377842934",
+  "parent_run_contract_sha256": "a06aa1d79e9c755a4ce9755f0ecaf00e306af7555fb6e7aad3f6a37a0996c439",
+  "parent_training_result_file_sha256": "ca8a73506d7e3a17eb057afe5d206cfcef0336e3eb374951a563a37261b799bf",
+  "parent_training_result_sha256": "3f29a40cc66b0d1c23b43995d34f023aa26b2e86a02c9100fdb32774871a4aef",
+  "positive_l0": 32.0,
+  "positive_l0_contract": "exact_selected_slots",
+  "positive_l0_sum": 8000000,
+  "process_count": 4,
+  "process_evidence_sha256s": [
+    "49510af46525ccb84ea7bb5333d6f3516d366f63ea535acf3ee1eb94575b9ee0",
+    "f8e048e2f861747f6a25f83f504bd4a96d391239264a967c4c8cc818dc3b3a46",
+    "1f750a84e91509d5eb3c6dc3b6169e4ee88b37d515e51eaecf3240fc25a75016",
+    "2a2705341931e3a5f387ccb35ad9d4f164bcc7ff01165c1a89e825bc74037efd"
+  ],
+  "protocol_id": "gemma4-experiment5-routed-activation-ladder-v3-20260729",
+  "recomposition_sidecar_sha256": "37c7b8c012f8fc0c1f63210986c0b3071a261261c88ee4bc1f502220ce3b8526",
+  "result_sha256": "9bc9991e67fbd11505e94d67e159612fee382f8b2eaff2d144897556c87aa236",
+  "schema_version": "gemma4-experiment5-routed-activation-policy-cell-evaluation-v1",
+  "score_artifact_sha256": "c89b217c0f050172e277be4e42e205a1420f1c56c0d94cc91bfb7437b14e72a7",
+  "score_data_bytes": 14500664,
+  "score_data_object": "objects/2a726f8804d2ebb1c7d4fd9164ebf2c71ea03e3612020bfee9e254d5a92c0fd9.safetensors",
+  "score_data_sha256": "2a726f8804d2ebb1c7d4fd9164ebf2c71ea03e3612020bfee9e254d5a92c0fd9",
+  "score_schema_version": "gemma4-experiment5-routed-activation-ladder-token-scores-v2",
+  "seed": 2,
+  "selected_slot_count": 32,
+  "source_manifest_sha256": "f68e2fe6e4cf568e694925697dd5d65fe10160a52d357c641892de85ee5c3da7",
+  "source_revision": "8389720686b4f449395ac230cad58383d0867872",
+  "status": "cell_evaluated",
+  "target_manifest_sha256": "31454e5ce8693521c41a2a95f2ef88d40c5d26c726a0efac5c26d882ed341f5e",
+  "token_identity_sha256": "c0e240e998ffd046baeee9c8644d9b81244bfb1fb44e9e5ac7e9cd53a8553bc2",
+  "tokens": 250000,
+  "total_features": 65536,
+  "training_contract_sha256": "a06aa1d79e9c755a4ce9755f0ecaf00e306af7555fb6e7aad3f6a37a0996c439",
+  "training_result_sha256": "3f29a40cc66b0d1c23b43995d34f023aa26b2e86a02c9100fdb32774871a4aef",
+  "training_source_revision": "a1c04eb790508367a96224ecd19c356ba7b6db26",
+  "zero_selected_slot_fraction": 0.0
+}
+{
+  "capacity_contract": {
+    "evaluation_capacity": 1108,
+    "evaluation_capacity_receipt_sha256": "61da86e2cb6ab02884cdf0fbd360e94f6c35fc2b2ff5f7797eb382f96a893354",
+    "selected_capacity": 1114,
+    "training_capacity": 1114
+  },
+  "cell_id": "transcoder-A512Softplus-seed2-10m",
+  "centering_receipt_sha256": "0924060c2ba57179d758ee61f45937c84e2153b33f56dbc1487d6ed0d0f884a7",
+  "checkpoint_actual_tokens": 10000000,
+  "checkpoint_sha256": "b32ad29b0981116800f955042c4446e2ac48ca5fb87662de8ac4079a787b9ec7",
+  "checkpoint_tokens": 10000000,
+  "condition": "A512Softplus",
+  "config_file_sha256": "052dcc73e6cac691ee01de0e3a2d49357bdd7a11d35b20ed70153fddf2dc2c78",
+  "config_sha256": "059d845bbb7b1140ac50f6866efc7727fd2ee88fcc4e788d147ddcfa86c9798f",
+  "dead_rate": 0.0238494873046875,
+  "dead_rate_scope": "heldout_all_features",
+  "endpoint_sst_sha256": {
+    "component": "afeec57dd96fdc38ce2d769cc4a9d0e43dc660b31bbc23460314c3a247e8c2ce",
+    "oracle_shared": "77a07a1fbb68c1ed204d4f0c871bfbdfb7d2d0fca4dd8e4511e2a8efd79d53c4",
+    "routed": "555ada3b4d98457a4b156bf84664deb821da358fc3d1f3de56bf166c8a057f58"
+  },
+  "endpoints": {
+    "component": {
+      "ev": 0.4006643664117221,
+      "nmse": 0.5993356335882779,
+      "sse": 929597.1070018411,
+      "sst": 1551045.9497231245
+    },
+    "oracle_shared": {
+      "ev": 0.5283182136693079,
+      "nmse": 0.4716817863306921,
+      "sse": 254117648.78015712,
+      "sst": 538748063.0892909
+    },
+    "routed": {
+      "ev": -0.1423963219346409,
+      "nmse": 1.142396321934641,
+      "sse": 18684088504.95277,
+      "sst": 16355172146.660439
+    }
+  },
+  "evaluation_input_receipt_sha256s": [
+    "7b489b7353771972681e4290b9d05f1946c126dc22420bc7cd212b0d40824dc6",
+    "72a8773a223da8935b4adc0f33eed2d3041668370d239dd9c01babf26bf354ba",
+    "76ab16305de17f5d7cdcec9dbce99ba22123b607e15dde3ebf230df018af2c1d",
+    "037be79f8525fd6590e0972bbc5edfd43cbb86c8e999a1cb4d48449ee9268ab5"
+  ],
+  "evaluation_wall_seconds": 133.6558388419944,
+  "h_config_file_sha256": null,
+  "h_config_sha256": null,
+  "learned_evaluation_input_receipt_sha256s": null,
+  "milestone_name": "10m",
+  "packed_sequences": 625,
+  "panel": "transcoder",
+  "parent_checkpoint_pointer_file_sha256": "452787ec21b9e2658b46065057bce2b758225d7313882154d1cbea836f1b757c",
+  "parent_checkpoint_pointer_sha256": "b32ad29b0981116800f955042c4446e2ac48ca5fb87662de8ac4079a787b9ec7",
+  "parent_run_contract_file_sha256": "8e967567991f9896258c1127cc556dc4e31ff1a16e166c13cd3b8a3377842934",
+  "parent_run_contract_sha256": "a06aa1d79e9c755a4ce9755f0ecaf00e306af7555fb6e7aad3f6a37a0996c439",
+  "parent_training_result_file_sha256": "ca8a73506d7e3a17eb057afe5d206cfcef0336e3eb374951a563a37261b799bf",
+  "parent_training_result_sha256": "3f29a40cc66b0d1c23b43995d34f023aa26b2e86a02c9100fdb32774871a4aef",
+  "positive_l0": 32.0,
+  "positive_l0_contract": "exact_selected_slots",
+  "positive_l0_sum": 8000000,
+  "process_count": 4,
+  "process_evidence_sha256s": [
+    "5fd3d469defaa3fb8ab7ea9af696ab101b70fefbf9b75b2527e683250f2fb2a9",
+    "8da2e20f6c282408ca7ec4a145376445059ae832bd9757a65d368a916485c5cd",
+    "de00c37ab931b3c2936fc7e0f64d70a4adc87dbf64cdaf8fc7f63e8893a0c4a0",
+    "2fc4030716421a06d8d9f67ad1ce791442561ff53e256c6481ac64173e573ab4"
+  ],
+  "protocol_id": "gemma4-experiment5-routed-activation-ladder-v3-20260729",
+  "recomposition_sidecar_sha256": "37c7b8c012f8fc0c1f63210986c0b3071a261261c88ee4bc1f502220ce3b8526",
+  "result_sha256": "81a2c9770f9760800f1acf0a24e35ea20cbaf5f5d07674453b455b837919e9c4",
+  "schema_version": "gemma4-experiment5-routed-activation-policy-cell-evaluation-v1",
+  "score_artifact_sha256": "a0f1bdb0504d8b3b4a2426a9879609a8b86895a4edc9a144548ce3a6384f3764",
+  "score_data_bytes": 14500664,
+  "score_data_object": "objects/75288721358edc1455d553127781c0cbe5d884cac6eb40b98046b9d5755889b0.safetensors",
+  "score_data_sha256": "75288721358edc1455d553127781c0cbe5d884cac6eb40b98046b9d5755889b0",
+  "score_schema_version": "gemma4-experiment5-routed-activation-ladder-token-scores-v2",
+  "seed": 2,
+  "selected_slot_count": 32,
+  "source_manifest_sha256": "f68e2fe6e4cf568e694925697dd5d65fe10160a52d357c641892de85ee5c3da7",
+  "source_revision": "8389720686b4f449395ac230cad58383d0867872",
+  "status": "cell_evaluated",
+  "target_manifest_sha256": "31454e5ce8693521c41a2a95f2ef88d40c5d26c726a0efac5c26d882ed341f5e",
+  "token_identity_sha256": "c0e240e998ffd046baeee9c8644d9b81244bfb1fb44e9e5ac7e9cd53a8553bc2",
+  "tokens": 250000,
+  "total_features": 65536,
+  "training_contract_sha256": "a06aa1d79e9c755a4ce9755f0ecaf00e306af7555fb6e7aad3f6a37a0996c439",
+  "training_result_sha256": "3f29a40cc66b0d1c23b43995d34f023aa26b2e86a02c9100fdb32774871a4aef",
+  "training_source_revision": "a1c04eb790508367a96224ecd19c356ba7b6db26",
+  "zero_selected_slot_fraction": 0.0
+}
+{"bundle_spec_sha256": "31b216e176e6fd45cbfbcc56a1548d27e29a0603def5f0ffb4cbb314b9294ed2", "cell_results": [{"checkpoint_tokens": 2000000, "condition": "A512ReLUInclusiveTopK", "parent_checkpoint_pointer_file_sha256": "86623110bbc89d412fd11ca1210dea6fdfa40d854ca6e4e7c5cc736c0ebbee98", "parent_checkpoint_pointer_sha256": "8fdce794a519ae2f83538e099d429ee726d31ce942773d42e903ae66604d52c5", "parent_run_contract_file_sha256": "bd56bb7903d3b15f48dde9f5881d3c148cb7f65793536f6a823be1cbfc189d8e", "parent_run_contract_sha256": "39f9f4e7bf3b5cd35db89a4c89f575d8995da412526d09cc27b3ab9a8284c7df", "parent_training_result_file_sha256": "18af0078dca63c109044d1d9eecaa3351f96edfcb3a2b232c3ece6645c62bf2f", "parent_training_result_sha256": "93f931272f0df4d62b26b971f6b24c1d5b4e119a1cfe72f410ba5f8cf725286b", "result_file_sha256": "8a8bb19bb91825dc142585e375964c73b77b02524eb902771beb30c5d9112294", "result_root": "/home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/extensions/routed-activation-ladder-v3/8389720686b4/evaluation/transcoder/seed2/A512ReLUInclusiveTopK/2000000", "result_sha256": "304ea6c0b53511d507fbf1b503b5161d2919d93aee2f6b5379487d7ac49e3a90", "score_artifact_sha256": "cbb48a43b5a43d1bbddf17ae67027126a4ef05eaf73ed05c72d32b03a0ad53bb", "score_data_bytes": 14500664, "score_data_sha256": "cccff42f634a5515b34fdedebbdb7dad80cd30a26d0ff3d3e73ecaaecca8ecec", "training_source_revision": "8dcfadee4a517029b3c1c0c7f2bb830e9d35f12f"}, {"checkpoint_tokens": 5000000, "condition": "A512ReLUInclusiveTopK", "parent_checkpoint_pointer_file_sha256": "0bab5a73715809b1cbb9f80591e1e62e0cf4af0683876636e5732dfa2565b229", "parent_checkpoint_pointer_sha256": "da6c5d13ab5f191946afefb9cf6cd845d7eac9cb32a19eabddbe6d7d7a262d4f", "parent_run_contract_file_sha256": "bd56bb7903d3b15f48dde9f5881d3c148cb7f65793536f6a823be1cbfc189d8e", "parent_run_contract_sha256": "39f9f4e7bf3b5cd35db89a4c89f575d8995da412526d09cc27b3ab9a8284c7df", "parent_training_result_file_sha256": "18af0078dca63c109044d1d9eecaa3351f96edfcb3a2b232c3ece6645c62bf2f", "parent_training_result_sha256": "93f931272f0df4d62b26b971f6b24c1d5b4e119a1cfe72f410ba5f8cf725286b", "result_file_sha256": "4cbcf1c209b3451abb142b4f789d1297a077ed9b19c8698791ce6f40a6a4c1a0", "result_root": "/home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/extensions/routed-activation-ladder-v3/8389720686b4/evaluation/transcoder/seed2/A512ReLUInclusiveTopK/5000000", "result_sha256": "75ca12d0d37e5a47a3bc47cb40d0e4b8b5709ec0b9285d54770270e2d39b647b", "score_artifact_sha256": "54979e255bd454a86594e29b40bf4e06511eb906856336a30fad68d78fe7a9e8", "score_data_bytes": 14500664, "score_data_sha256": "7fd9bbc69ff469fc4df65ccba7e6305df5d9c5010e04a2668e901735c7d982fe", "training_source_revision": "8dcfadee4a517029b3c1c0c7f2bb830e9d35f12f"}, {"checkpoint_tokens": 10000000, "condition": "A512ReLUInclusiveTopK", "parent_checkpoint_pointer_file_sha256": "7ff48accfa3a17c799c888de05b1163ecc9ec656e07e975639322a09253944af", "parent_checkpoint_pointer_sha256": "9954dbccd5ac7df5da6a6c3e64bc694eb09f0877fc36df1c23d372d2e80fde99", "parent_run_contract_file_sha256": "bd56bb7903d3b15f48dde9f5881d3c148cb7f65793536f6a823be1cbfc189d8e", "parent_run_contract_sha256": "39f9f4e7bf3b5cd35db89a4c89f575d8995da412526d09cc27b3ab9a8284c7df", "parent_training_result_file_sha256": "18af0078dca63c109044d1d9eecaa3351f96edfcb3a2b232c3ece6645c62bf2f", "parent_training_result_sha256": "93f931272f0df4d62b26b971f6b24c1d5b4e119a1cfe72f410ba5f8cf725286b", "result_file_sha256": "e0f4380b8e2b2e995d41eef9661ba7327b3ffe56383dc5013a62e63c459cf0f5", "result_root": "/home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/extensions/routed-activation-ladder-v3/8389720686b4/evaluation/transcoder/seed2/A512ReLUInclusiveTopK/10000000", "result_sha256": "21485a6860e396dc7603374c125ad4de1c92c45d5542ba1f4fd9b634c00bdc94", "score_artifact_sha256": "3dfe95bd2a2bfb64952eae1060e22a41fe0e3130e970dd97117ba1f732b6539c", "score_data_bytes": 14500664, "score_data_sha256": "dedb3efac0727f58c3aeb81ee54ff5dbd239ddd2c0be4db2fb26c26c10f3283b", "training_source_revision": "8dcfadee4a517029b3c1c0c7f2bb830e9d35f12f"}, {"checkpoint_tokens": 2000000, "condition": "A512Softplus", "parent_checkpoint_pointer_file_sha256": "6bc3d324bef51e615097b591378c2c3c90c223aabb852c8aad85c2d3a9bc7942", "parent_checkpoint_pointer_sha256": "dbb792f5620f5b8507dc5764b5e03eeee62f3fe28927ce9221de5a107726d6c1", "parent_run_contract_file_sha256": "8e967567991f9896258c1127cc556dc4e31ff1a16e166c13cd3b8a3377842934", "parent_run_contract_sha256": "a06aa1d79e9c755a4ce9755f0ecaf00e306af7555fb6e7aad3f6a37a0996c439", "parent_training_result_file_sha256": "ca8a73506d7e3a17eb057afe5d206cfcef0336e3eb374951a563a37261b799bf", "parent_training_result_sha256": "3f29a40cc66b0d1c23b43995d34f023aa26b2e86a02c9100fdb32774871a4aef", "result_file_sha256": "4cab7ce5c1fd4734733a5557bf2bf331b3f0fffa499737d069a1a246b017e074", "result_root": "/home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/extensions/routed-activation-ladder-v3/8389720686b4/evaluation/transcoder/seed2/A512Softplus/2000000", "result_sha256": "201249f1b0ada257494d45fb5183e65f8dd37ba0b0a87ba63b17e201eb89c386", "score_artifact_sha256": "076c00c453202b6785403e4b81a256f74c56840c1eeb551e5ea8d6d73271989c", "score_data_bytes": 14500664, "score_data_sha256": "97cb4dbdb50f8895b83b21dd14078cedefa3b7a888efb358398bdac12fe57bf6", "training_source_revision": "a1c04eb790508367a96224ecd19c356ba7b6db26"}, {"checkpoint_tokens": 5000000, "condition": "A512Softplus", "parent_checkpoint_pointer_file_sha256": "ff33de2266ee7216168ba4f29c867da276854c2d2634dd387a664f51b983b9a5", "parent_checkpoint_pointer_sha256": "14b66069c1466e9368e299ea5ca2a71052df9441318085a061690ed1682ddb1f", "parent_run_contract_file_sha256": "8e967567991f9896258c1127cc556dc4e31ff1a16e166c13cd3b8a3377842934", "parent_run_contract_sha256": "a06aa1d79e9c755a4ce9755f0ecaf00e306af7555fb6e7aad3f6a37a0996c439", "parent_training_result_file_sha256": "ca8a73506d7e3a17eb057afe5d206cfcef0336e3eb374951a563a37261b799bf", "parent_training_result_sha256": "3f29a40cc66b0d1c23b43995d34f023aa26b2e86a02c9100fdb32774871a4aef", "result_file_sha256": "9488f9bd9b3166a5e18ad932342c1e0617a2efbbd13357f012a836d241981222", "result_root": "/home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/extensions/routed-activation-ladder-v3/8389720686b4/evaluation/transcoder/seed2/A512Softplus/5000000", "result_sha256": "9bc9991e67fbd11505e94d67e159612fee382f8b2eaff2d144897556c87aa236", "score_artifact_sha256": "c89b217c0f050172e277be4e42e205a1420f1c56c0d94cc91bfb7437b14e72a7", "score_data_bytes": 14500664, "score_data_sha256": "2a726f8804d2ebb1c7d4fd9164ebf2c71ea03e3612020bfee9e254d5a92c0fd9", "training_source_revision": "a1c04eb790508367a96224ecd19c356ba7b6db26"}, {"checkpoint_tokens": 10000000, "condition": "A512Softplus", "parent_checkpoint_pointer_file_sha256": "452787ec21b9e2658b46065057bce2b758225d7313882154d1cbea836f1b757c", "parent_checkpoint_pointer_sha256": "b32ad29b0981116800f955042c4446e2ac48ca5fb87662de8ac4079a787b9ec7", "parent_run_contract_file_sha256": "8e967567991f9896258c1127cc556dc4e31ff1a16e166c13cd3b8a3377842934", "parent_run_contract_sha256": "a06aa1d79e9c755a4ce9755f0ecaf00e306af7555fb6e7aad3f6a37a0996c439", "parent_training_result_file_sha256": "ca8a73506d7e3a17eb057afe5d206cfcef0336e3eb374951a563a37261b799bf", "parent_training_result_sha256": "3f29a40cc66b0d1c23b43995d34f023aa26b2e86a02c9100fdb32774871a4aef", "result_file_sha256": "5377991ac86d5af086adc2a6312d4ef474be7f037f831e0b42be5d30ad5a6331", "result_root": "/home/abistras/moe-sae/artifacts/gemma4_v1/production/experiment5/extensions/routed-activation-ladder-v3/8389720686b4/evaluation/transcoder/seed2/A512Softplus/10000000", "result_sha256": "81a2c9770f9760800f1acf0a24e35ea20cbaf5f5d07674453b455b837919e9c4", "score_artifact_sha256": "a0f1bdb0504d8b3b4a2426a9879609a8b86895a4edc9a144548ce3a6384f3764", "score_data_bytes": 14500664, "score_data_sha256": "75288721358edc1455d553127781c0cbe5d884cac6eb40b98046b9d5755889b0", "training_source_revision": "a1c04eb790508367a96224ecd19c356ba7b6db26"}], "operator_manifest_sha256": "db11aa989fae9590816cd43610313cf53f5e873108ed980b293292709b8a4f71", "panel": "transcoder", "protocol_id": "gemma4-experiment5-routed-activation-ladder-v3-20260729", "result_sha256": "d183dc7063fbf48d721f1a91f2cdedfd70d57c75c0edfab654ab25f3e9005d4d", "schema_version": "gemma4-experiment5-routed-activation-policy-resident-bundle-result-v1", "seed": 2, "source_revision": "8389720686b4f449395ac230cad58383d0867872", "status": "bundle_evaluated", "timing": {"accelerator_type": "v4-32", "chip_count": 16, "successful_attempt_chip_seconds": 25276.008980208077, "successful_attempt_wall_seconds": 1579.7505612630048, "timing_scope": "successful_resident_worker_after_cli_parse_through_cell_completion"}}
+terminal action=activation-ladder-evaluate-bundle controller=0 process=0 status=0

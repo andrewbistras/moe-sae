@@ -455,7 +455,7 @@ class _ResidentRuntime:
         default_factory=dict
     )
     capacities: dict[
-        tuple[str, float],
+        tuple[Any, ...],
         tuple[Any, tuple[Any, ...]],
     ] = dataclasses.field(default_factory=dict)
 
@@ -3439,31 +3439,37 @@ def run(
             process_count=int(jax.process_count()),
             process_index=int(jax.process_index()),
         )
-    capacity_key = (
-        source.receipt.receipt_sha256,
-        float(config.runtime.capacity_margin_fraction),
-    )
-    cached_capacity = (
-        resident_runtime.capacities.get(capacity_key)
-        if resident_runtime is not None
-        else None
-    )
-    if cached_capacity is None:
-        local_capacity = source.scan_local_capacity(
-            margin_fraction=config.runtime.capacity_margin_fraction
+    evaluation_capacity: Any | None = None
+    capacity_receipts: tuple[Any, ...] = ()
+    if layout.condition in {"A", "R"}:
+        capacity_key = (
+            layout.condition,
+            source.receipt.receipt_sha256,
+            float(config.runtime.capacity_margin_fraction),
         )
-        capacity_receipts = tuple(
-            CapacityReceipt(**row)
-            for row in _collective_records(dataclasses.asdict(local_capacity))
+        cached_capacity = (
+            resident_runtime.capacities.get(capacity_key)
+            if resident_runtime is not None
+            else None
         )
-        evaluation_capacity = merge_capacity_receipts(capacity_receipts)
-        if resident_runtime is not None:
-            resident_runtime.capacities[capacity_key] = (
-                evaluation_capacity,
-                capacity_receipts,
+        if cached_capacity is None:
+            local_capacity = source.scan_local_capacity(
+                margin_fraction=config.runtime.capacity_margin_fraction
             )
-    else:
-        evaluation_capacity, capacity_receipts = cached_capacity
+            capacity_receipts = tuple(
+                CapacityReceipt(**row)
+                for row in _collective_records(
+                    dataclasses.asdict(local_capacity)
+                )
+            )
+            evaluation_capacity = merge_capacity_receipts(capacity_receipts)
+            if resident_runtime is not None:
+                resident_runtime.capacities[capacity_key] = (
+                    evaluation_capacity,
+                    capacity_receipts,
+                )
+        else:
+            evaluation_capacity, capacity_receipts = cached_capacity
     if args.condition == "H":
         if h_context is None:
             raise RoutedLadderEvaluationError(
@@ -3482,9 +3488,13 @@ def run(
         training_capacity = _checkpoint_a_capacity(pointer)
     try:
         capacity_roles = _evaluation_capacity_roles(
-            "A",
+            layout.condition,
             training_capacity=training_capacity,
-            evaluation_capacity=int(evaluation_capacity.capacity),
+            evaluation_capacity=(
+                int(evaluation_capacity.capacity)
+                if evaluation_capacity is not None
+                else None
+            ),
         )
     except ValueError as error:
         raise RoutedLadderEvaluationError(
@@ -3542,7 +3552,7 @@ def run(
             _training_config(
                 plan,
                 optimizer_sae_config(layout, optimizer),
-                bank_capacity=int(capacity_roles.checkpoint),
+                bank_capacity=capacity_roles.checkpoint,
             ),
             checkpoint_payload_root=args.checkpoint_payload_root,
             checkpoint_identity=result["run_identity"],
@@ -3568,7 +3578,7 @@ def run(
             _training_config(
                 plan,
                 optimizer_sae_config(layout, optimizer),
-                bank_capacity=int(capacity_roles.checkpoint),
+                bank_capacity=capacity_roles.checkpoint,
             ),
             checkpoint_payload_root=args.checkpoint_payload_root,
             checkpoint_identity=result["run_identity"],
@@ -3591,10 +3601,11 @@ def run(
     )
     evaluator_key = (
         config.panel,
+        layout.condition,
         layout.bank_width,
         layout.k_per_contribution,
         layout.randomization_key,
-        int(capacity_roles.execution),
+        capacity_roles.execution,
         encoder_activation,
         topk_requires_strictly_positive,
     )
@@ -3609,7 +3620,7 @@ def run(
                 mesh,
                 layout,
                 distributed,
-                bank_capacity=int(capacity_roles.execution),
+                bank_capacity=capacity_roles.execution,
                 encoder_activation=encoder_activation,
                 topk_requires_strictly_positive=(
                     topk_requires_strictly_positive
@@ -3620,7 +3631,7 @@ def run(
                 mesh,
                 layout,
                 distributed,
-                bank_capacity=int(capacity_roles.execution),
+                bank_capacity=capacity_roles.execution,
                 encoder_activation=encoder_activation,
                 topk_requires_strictly_positive=(
                     topk_requires_strictly_positive
@@ -4022,14 +4033,25 @@ def run(
                 else layout.total_features
             ),
             **sparsity_summary,
-            "capacity_contract": {
-                "training_capacity": int(capacity_roles.checkpoint),
-                "evaluation_capacity": int(evaluation_capacity.capacity),
-                "selected_capacity": int(capacity_roles.execution),
-                "evaluation_capacity_receipt_sha256": (
-                    evaluation_capacity.receipt_sha256
-                ),
-            },
+            "capacity_contract": (
+                {
+                    "applicability": "required_for_routed_banks",
+                    "training_capacity": int(capacity_roles.checkpoint),
+                    "evaluation_capacity": int(evaluation_capacity.capacity),
+                    "selected_capacity": int(capacity_roles.execution),
+                    "evaluation_capacity_receipt_sha256": (
+                        evaluation_capacity.receipt_sha256
+                    ),
+                }
+                if layout.condition in {"A", "R"}
+                else {
+                    "applicability": "not_applicable_for_rank_banks",
+                    "training_capacity": None,
+                    "evaluation_capacity": None,
+                    "selected_capacity": None,
+                    "evaluation_capacity_receipt_sha256": None,
+                }
+            ),
         }
         final = seal_merged_result(
             output,
