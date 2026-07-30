@@ -410,6 +410,70 @@ def test_evaluation_validator_panel_qualifies_shared_result_bases(
     )
 
 
+def _reseal_evaluation_plan(plan: dict) -> None:
+    for bundle in plan["bundles"]:
+        body = {
+            key: value
+            for key, value in bundle.items()
+            if key != "bundle_sha256"
+        }
+        bundle["bundle_sha256"] = canonical_sha256(body)
+    body = {
+        key: value for key, value in plan.items() if key != "plan_sha256"
+    }
+    plan["plan_sha256"] = canonical_sha256(body)
+
+
+def test_evaluation_validator_accepts_exact_prequalified_result_bases(
+    tmp_path: Path,
+) -> None:
+    plan = _shared_result_base_evaluation_plan(tmp_path)
+    for bundle in plan["bundles"]:
+        panel = bundle["panel"]
+        runtime = bundle["runtime"]
+        runtime["result_root_remote"] += f"/{panel}"
+        runtime["result_root_controller"] += f"/{panel}"
+    _reseal_evaluation_plan(plan)
+
+    checked = validate_evaluation_plan(plan)
+
+    assert checked == plan
+    assert all(
+        f"/{bundle['panel']}/seed{bundle['seed']}/" in cell["result_root"]
+        and f"/{bundle['panel']}/{bundle['panel']}/" not in cell["result_root"]
+        for bundle in checked["bundles"]
+        for cell in bundle["cells"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("remote_suffix", "controller_suffix"),
+    (
+        ("/sae", ""),
+        ("", "/sae"),
+        ("/transcoder", "/transcoder"),
+        ("/sae/sae", "/sae/sae"),
+        ("/transcoder/sae", "/transcoder/sae"),
+    ),
+)
+def test_evaluation_validator_rejects_invalid_panel_qualified_result_bases(
+    tmp_path: Path,
+    remote_suffix: str,
+    controller_suffix: str,
+) -> None:
+    plan = _shared_result_base_evaluation_plan(tmp_path)
+    bundle = plan["bundles"][0]
+    bundle["runtime"]["result_root_remote"] += remote_suffix
+    bundle["runtime"]["result_root_controller"] += controller_suffix
+    _reseal_evaluation_plan(plan)
+
+    with pytest.raises(
+        ComponentClosureEvaluationError,
+        match="panel qualif",
+    ):
+        validate_evaluation_plan(plan)
+
+
 def test_evaluation_validator_rejects_rehashed_duplicate_result_roots(
     tmp_path: Path,
 ) -> None:

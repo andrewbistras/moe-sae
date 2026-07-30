@@ -184,14 +184,40 @@ def _canonical_cell_result_roots(
 ) -> tuple[str, str]:
     """Return the panel-qualified remote and controller roots for one cell."""
 
-    suffix = (panel, f"seed{seed}", condition.lower(), str(checkpoint))
-    remote = PurePosixPath(str(runtime["result_root_remote"])).joinpath(*suffix)
-    controller = (
-        Path(str(runtime["result_root_controller"]))
-        .expanduser()
-        .resolve()
-        .joinpath(*suffix)
+    remote_base = PurePosixPath(str(runtime["result_root_remote"]))
+    controller_base = (
+        Path(str(runtime["result_root_controller"])).expanduser().resolve()
     )
+    known_panels = set(PANELS)
+    remote_tail = remote_base.name
+    controller_tail = controller_base.name
+    if (
+        remote_tail in known_panels
+        and remote_tail != panel
+        or controller_tail in known_panels
+        and controller_tail != panel
+    ):
+        raise ComponentClosureEvaluationError(
+            "evaluation result base has the wrong panel qualifier"
+        )
+    remote_qualified = remote_tail == panel
+    controller_qualified = controller_tail == panel
+    if remote_qualified != controller_qualified:
+        raise ComponentClosureEvaluationError(
+            "evaluation result bases have inconsistent panel qualification"
+        )
+    if remote_qualified and (
+        remote_base.parent.name in known_panels
+        or controller_base.parent.name in known_panels
+    ):
+        raise ComponentClosureEvaluationError(
+            "evaluation result base has duplicate panel qualification"
+        )
+    suffix = (f"seed{seed}", condition.lower(), str(checkpoint))
+    if not remote_qualified:
+        suffix = (panel, *suffix)
+    remote = remote_base.joinpath(*suffix)
+    controller = controller_base.joinpath(*suffix)
     return str(remote), str(controller)
 
 
