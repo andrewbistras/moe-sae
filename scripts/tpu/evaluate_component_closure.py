@@ -16,7 +16,7 @@ import time
 import uuid
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from typing import Sequence
+from typing import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 
 import yaml
@@ -339,14 +339,43 @@ def _validated_remote_cell(
     return value, relative
 
 
+def _validated_centering_receipt(
+    result: Mapping[str, object],
+    payload: bytes,
+) -> dict:
+    try:
+        value = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ComponentClosureEvaluationOperatorError(
+            "remote centering receipt is not JSON"
+        ) from error
+    if not isinstance(value, dict):
+        raise ComponentClosureEvaluationOperatorError(
+            "remote centering receipt is not an object"
+        )
+    claimed = value.get("receipt_sha256")
+    unsigned = {key: item for key, item in value.items() if key != "receipt_sha256"}
+    if (
+        not isinstance(claimed, str)
+        or canonical_sha256(unsigned) != claimed
+        or claimed != result.get("centering_receipt_sha256")
+    ):
+        raise ComponentClosureEvaluationOperatorError(
+            "remote centering receipt identity changed"
+        )
+    return value
+
+
 def _publish_cell(
     cell: dict,
     *,
     result_payload: bytes,
     relative: str,
     score_payload: bytes,
+    centering_payload: bytes,
 ) -> None:
     result = json.loads(result_payload)
+    _validated_centering_receipt(result, centering_payload)
     if hashlib.sha256(score_payload).hexdigest() != result.get(
         "score_data_sha256"
     ) or len(score_payload) != result.get("score_data_bytes"):
@@ -356,14 +385,17 @@ def _publish_cell(
     destination = Path(cell["result_root_controller"])
     result_path = destination / "evaluation-result.json"
     score_path = destination / relative
+    centering_path = destination / "centering-receipt.json"
     if destination.exists():
         if (
             destination.is_dir()
             and not destination.is_symlink()
             and result_path.is_file()
             and score_path.is_file()
+            and centering_path.is_file()
             and result_path.read_bytes() == result_payload
             and score_path.read_bytes() == score_payload
+            and centering_path.read_bytes() == centering_payload
         ):
             return
         raise ComponentClosureEvaluationOperatorError(
@@ -375,6 +407,7 @@ def _publish_cell(
         (staging / Path(relative).parent).mkdir(parents=True, mode=0o700)
         (staging / "evaluation-result.json").write_bytes(result_payload)
         (staging / relative).write_bytes(score_payload)
+        (staging / "centering-receipt.json").write_bytes(centering_payload)
         os.rename(staging, destination)
     finally:
         if staging.exists():
@@ -443,6 +476,9 @@ def _existing_operator_completion(
             ) from error
         relative = result.get("score_data_object")
         score_path = Path(cell["result_root_controller"]) / str(relative)
+        centering_path = (
+            Path(cell["result_root_controller"]) / "centering-receipt.json"
+        )
         if (
             result.get("result_sha256") != row.get("result_sha256")
             or not isinstance(relative, str)
@@ -454,6 +490,11 @@ def _existing_operator_completion(
             raise ComponentClosureEvaluationOperatorError(
                 "bundle controller score completion changed"
             )
+        if not centering_path.is_file() or centering_path.is_symlink():
+            raise ComponentClosureEvaluationOperatorError(
+                "bundle controller centering receipt is absent"
+            )
+        _validated_centering_receipt(result, centering_path.read_bytes())
     return value
 
 
@@ -611,11 +652,19 @@ def _run_bundle_operator(
             controller=process_zero,
             remote_path=f"{cell['result_root']}/{relative}",
         )
+        centering_payload = routed_operator._remote_bytes(
+            settings,
+            controller=process_zero,
+            remote_path=(
+                f"{cell['result_root']}/centering-receipt.json"
+            ),
+        )
         _publish_cell(
             cell,
             result_payload=result_payload,
             relative=relative,
             score_payload=score_payload,
+            centering_payload=centering_payload,
         )
         published.append(
             {

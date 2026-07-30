@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import copy
+import json
 from pathlib import Path
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from moe_sae.component_closure_campaign import (
@@ -31,6 +34,7 @@ from moe_sae.component_closure_evaluation import (
     BUNDLE_SCHEMA_VERSION,
     PLAN_SCHEMA_VERSION as EVAL_PLAN_SCHEMA_VERSION,
     ComponentClosureEvaluationError,
+    _score_cell_target_identity,
     build_evaluation_plan,
     validate_evaluation_plan,
 )
@@ -39,7 +43,10 @@ from moe_sae.component_closure_references import (
     SCHEMA_VERSION as A_SCHEMA_VERSION,
     validate_a_reference_manifest,
 )
-from moe_sae.contribution_artifacts import canonical_sha256
+from moe_sae.contribution_artifacts import (
+    canonical_sha256,
+    token_identity_sha256,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 SHA = "a" * 64
@@ -529,6 +536,187 @@ def test_evaluation_bundles_follow_resource_specific_v5_v4_planes(
         for bundle in plan["bundles"]
         for cell in bundle["cells"]
     )
+
+
+def _target_identity_case(tmp_path: Path) -> tuple[Path, dict, SimpleNamespace]:
+    sequence = np.asarray([10, 10, 11, 11], dtype=np.int64)
+    position = np.asarray([0, 1, 0, 1], dtype=np.uint16)
+    receipt_body = {
+        "schema_version": "centering-v1",
+        "protocol_id": PROTOCOL_ID,
+        "panel": "sae",
+        "config_sha256": "1" * 64,
+        "target_manifest_sha256": "a" * 64,
+        "source_manifest_sha256": None,
+        "recomposition_sidecar_sha256": "3" * 64,
+        "target_mean_sha256": "4" * 64,
+        "source_mean_sha256": None,
+        "routed_mean_sha256": "5" * 64,
+        "oracle_shared_mean_sha256": "6" * 64,
+        "endpoint_receipt_sha256": "7" * 64,
+        "endpoint_cache_key_sha256": "8" * 64,
+    }
+    receipt = {
+        **receipt_body,
+        "receipt_sha256": canonical_sha256(receipt_body),
+    }
+    result_path = tmp_path / "evaluation-result.json"
+    (tmp_path / "centering-receipt.json").write_text(
+        json.dumps(receipt, sort_keys=True),
+        encoding="ascii",
+    )
+    token_sha256 = token_identity_sha256(sequence, position)
+    result = {
+        "protocol_id": PROTOCOL_ID,
+        "panel": "sae",
+        "token_identity_sha256": token_sha256,
+        "target_manifest_sha256": "2" * 64,
+        "source_manifest_sha256": None,
+        "recomposition_sidecar_sha256": "3" * 64,
+        "centering_receipt_sha256": receipt["receipt_sha256"],
+        "tokens": 4,
+        "packed_sequences": 2,
+    }
+    scores = SimpleNamespace(
+        sequence_id=sequence,
+        position=position,
+        token_identity_sha256=token_sha256,
+        capture_manifest_sha256="2" * 64,
+        recomposition_sidecar_sha256="3" * 64,
+        tokens=4,
+        packed_sequences=2,
+    )
+    return result_path, result, scores
+
+
+def test_score_cell_target_identity_cross_checks_result_scores_and_centering(
+    tmp_path: Path,
+) -> None:
+    result_path, result, scores = _target_identity_case(tmp_path)
+    identity = _score_cell_target_identity(
+        result_path,
+        result=result,
+        scores=scores,
+    )
+    assert identity == {
+        "evaluation_token_identity_sha256": scores.token_identity_sha256,
+        "evaluation_target_manifest_sha256": "2" * 64,
+        "evaluation_token_count": 4,
+        "evaluation_packed_sequences": 2,
+        "evaluation_source_manifest_sha256": None,
+        "centering_receipt_sha256": result["centering_receipt_sha256"],
+        "centering_target_manifest_sha256": "a" * 64,
+        "target_mean_sha256": "4" * 64,
+        "endpoint_receipt_sha256": "7" * 64,
+        "endpoint_cache_key_sha256": "8" * 64,
+        "routed_mean_sha256": "5" * 64,
+        "oracle_shared_mean_sha256": "6" * 64,
+        "recomposition_sidecar_sha256": "3" * 64,
+        "source_manifest_sha256": None,
+        "source_mean_sha256": None,
+    }
+
+
+def test_score_cell_target_identity_preserves_distinct_eval_and_train_sources(
+    tmp_path: Path,
+) -> None:
+    result_path, result, scores = _target_identity_case(tmp_path)
+    receipt_path = tmp_path / "centering-receipt.json"
+    receipt = json.loads(receipt_path.read_text(encoding="ascii"))
+    receipt.update(
+        {
+            "panel": "transcoder",
+            "source_manifest_sha256": "c" * 64,
+            "source_mean_sha256": "d" * 64,
+        }
+    )
+    body = {key: value for key, value in receipt.items() if key != "receipt_sha256"}
+    receipt["receipt_sha256"] = canonical_sha256(body)
+    receipt_path.write_text(json.dumps(receipt, sort_keys=True), encoding="ascii")
+    result.update(
+        {
+            "panel": "transcoder",
+            "source_manifest_sha256": "e" * 64,
+            "centering_receipt_sha256": receipt["receipt_sha256"],
+        }
+    )
+
+    identity = _score_cell_target_identity(
+        result_path,
+        result=result,
+        scores=scores,
+    )
+    assert identity["evaluation_target_manifest_sha256"] == "2" * 64
+    assert identity["centering_target_manifest_sha256"] == "a" * 64
+    assert identity["evaluation_source_manifest_sha256"] == "e" * 64
+    assert identity["source_manifest_sha256"] == "c" * 64
+    assert identity["source_mean_sha256"] == "d" * 64
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("token_identity_sha256", "e" * 64),
+        ("target_manifest_sha256", "e" * 64),
+        ("recomposition_sidecar_sha256", "e" * 64),
+    ],
+)
+def test_score_cell_target_identity_rejects_result_score_disagreement(
+    tmp_path: Path,
+    field: str,
+    value: str,
+) -> None:
+    result_path, result, scores = _target_identity_case(tmp_path)
+    result[field] = value
+    with pytest.raises(
+        ComponentClosureEvaluationError,
+        match="result and loaded scores target identity differ",
+    ):
+        _score_cell_target_identity(
+            result_path,
+            result=result,
+            scores=scores,
+        )
+
+
+def test_score_cell_target_identity_rejects_changed_centering_receipt(
+    tmp_path: Path,
+) -> None:
+    result_path, result, scores = _target_identity_case(tmp_path)
+    receipt_path = tmp_path / "centering-receipt.json"
+    receipt = json.loads(receipt_path.read_text(encoding="ascii"))
+    receipt["target_mean_sha256"] = "e" * 64
+    receipt_path.write_text(json.dumps(receipt, sort_keys=True), encoding="ascii")
+
+    with pytest.raises(ComponentClosureEvaluationError, match="self-hash changed"):
+        _score_cell_target_identity(
+            result_path,
+            result=result,
+            scores=scores,
+        )
+
+
+def test_score_cell_target_identity_rejects_centering_recomposition_drift(
+    tmp_path: Path,
+) -> None:
+    result_path, result, scores = _target_identity_case(tmp_path)
+    receipt_path = tmp_path / "centering-receipt.json"
+    receipt = json.loads(receipt_path.read_text(encoding="ascii"))
+    receipt["recomposition_sidecar_sha256"] = "e" * 64
+    body = {key: value for key, value in receipt.items() if key != "receipt_sha256"}
+    receipt["receipt_sha256"] = canonical_sha256(body)
+    receipt_path.write_text(json.dumps(receipt, sort_keys=True), encoding="ascii")
+    result["centering_receipt_sha256"] = receipt["receipt_sha256"]
+
+    with pytest.raises(
+        ComponentClosureEvaluationError,
+        match="centering receipt and evaluation target identity differ",
+    ):
+        _score_cell_target_identity(
+            result_path,
+            result=result,
+            scores=scores,
+        )
 
 
 def test_training_scheduler_binds_command_environment_and_planes(

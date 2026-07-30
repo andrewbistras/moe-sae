@@ -29,13 +29,14 @@ from moe_sae.component_closure_config import (
     load_component_closure_config,
 )
 from moe_sae.component_closure_references import validate_a_reference_manifest
-from moe_sae.contribution_artifacts import canonical_sha256
+from moe_sae.contribution_artifacts import canonical_sha256, token_identity_sha256
 
 PLAN_SCHEMA_VERSION = "gemma4-a512-component-closure-evaluation-plan-v1"
 BUNDLE_SCHEMA_VERSION = "gemma4-a512-component-closure-resident-bundle-v1"
 CELL_COUNT = 72
 BUNDLE_COUNT = 6
 _GIT_RE = re.compile(r"^[0-9a-f]{40}$")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _RUNTIME_FIELDS = {
     "resource_id",
     "a_config_remote",
@@ -207,6 +208,177 @@ def _read_self_hashed(path: Path, field: str) -> tuple[dict[str, Any], str]:
     if not isinstance(claimed, str) or canonical_sha256(body) != claimed:
         raise ComponentClosureEvaluationError(f"parent {path} self-hash changed")
     return value, hashlib.sha256(payload).hexdigest()
+
+
+def _required_sha256(value: Any, *, name: str) -> str:
+    if not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None:
+        raise ComponentClosureEvaluationError(f"{name} is not a SHA-256")
+    return value
+
+
+def _nullable_sha256(value: Any, *, name: str) -> str | None:
+    if value is None:
+        return None
+    return _required_sha256(value, name=name)
+
+
+def _score_cell_target_identity(
+    result_path: Path,
+    *,
+    result: Mapping[str, Any],
+    scores: Any,
+    packed_sequence_count: int | None = None,
+) -> dict[str, Any]:
+    """Bind one score row to its ordered held-out tokens and target basis."""
+
+    result_token_identity = _required_sha256(
+        result.get("token_identity_sha256"),
+        name="evaluation result token identity",
+    )
+    result_target_manifest = _required_sha256(
+        result.get("target_manifest_sha256"),
+        name="evaluation result target manifest",
+    )
+    result_recomposition = _required_sha256(
+        result.get("recomposition_sidecar_sha256"),
+        name="evaluation result recomposition sidecar",
+    )
+    result_centering = _required_sha256(
+        result.get("centering_receipt_sha256"),
+        name="evaluation result centering receipt",
+    )
+    result_source_manifest = _nullable_sha256(
+        result.get("source_manifest_sha256"),
+        name="evaluation result source manifest",
+    )
+    tokens = result.get("tokens")
+    packed_sequences = result.get("packed_sequences")
+    if (
+        isinstance(tokens, bool)
+        or not isinstance(tokens, int)
+        or tokens <= 0
+        or isinstance(packed_sequences, bool)
+        or not isinstance(packed_sequences, int)
+        or packed_sequences <= 0
+        or packed_sequences > tokens
+    ):
+        raise ComponentClosureEvaluationError(
+            "evaluation result token counts are invalid"
+        )
+    canonical_token_identity = token_identity_sha256(
+        scores.sequence_id,
+        scores.position,
+    )
+    observed_packed_sequences = (
+        scores.packed_sequences
+        if packed_sequence_count is None
+        else packed_sequence_count
+    )
+    if (
+        result_token_identity != scores.token_identity_sha256
+        or result_token_identity != canonical_token_identity
+        or result_target_manifest != scores.capture_manifest_sha256
+        or result_recomposition != scores.recomposition_sidecar_sha256
+        or tokens != scores.tokens
+        or packed_sequences != observed_packed_sequences
+    ):
+        raise ComponentClosureEvaluationError(
+            "evaluation result and loaded scores target identity differ"
+        )
+    receipt_path = result_path.parent / "centering-receipt.json"
+    receipt, _receipt_file_sha256 = _read_self_hashed(
+        receipt_path,
+        "receipt_sha256",
+    )
+    expected_receipt_fields = {
+        "schema_version",
+        "protocol_id",
+        "panel",
+        "config_sha256",
+        "target_manifest_sha256",
+        "source_manifest_sha256",
+        "recomposition_sidecar_sha256",
+        "target_mean_sha256",
+        "source_mean_sha256",
+        "routed_mean_sha256",
+        "oracle_shared_mean_sha256",
+        "endpoint_receipt_sha256",
+        "endpoint_cache_key_sha256",
+        "receipt_sha256",
+    }
+    if set(receipt) != expected_receipt_fields:
+        raise ComponentClosureEvaluationError(
+            "centering receipt fields changed"
+        )
+    receipt_sha256 = _required_sha256(
+        receipt.get("receipt_sha256"),
+        name="centering receipt identity",
+    )
+    centering_target_manifest = _required_sha256(
+        receipt.get("target_manifest_sha256"),
+        name="centering target manifest",
+    )
+    centering_recomposition = _required_sha256(
+        receipt.get("recomposition_sidecar_sha256"),
+        name="centering recomposition sidecar",
+    )
+    source_manifest = _nullable_sha256(
+        receipt.get("source_manifest_sha256"),
+        name="centering source manifest",
+    )
+    source_mean = _nullable_sha256(
+        receipt.get("source_mean_sha256"),
+        name="centering source mean",
+    )
+    required_centering = {
+        "target_mean_sha256": _required_sha256(
+            receipt.get("target_mean_sha256"),
+            name="centering target mean",
+        ),
+        "endpoint_receipt_sha256": _required_sha256(
+            receipt.get("endpoint_receipt_sha256"),
+            name="centering endpoint receipt",
+        ),
+        "endpoint_cache_key_sha256": _required_sha256(
+            receipt.get("endpoint_cache_key_sha256"),
+            name="centering endpoint cache key",
+        ),
+        "routed_mean_sha256": _required_sha256(
+            receipt.get("routed_mean_sha256"),
+            name="centering routed mean",
+        ),
+        "oracle_shared_mean_sha256": _required_sha256(
+            receipt.get("oracle_shared_mean_sha256"),
+            name="centering oracle shared mean",
+        ),
+    }
+    _required_sha256(
+        receipt.get("config_sha256"),
+        name="centering config",
+    )
+    if (
+        receipt_sha256 != result_centering
+        or receipt.get("protocol_id") != result.get("protocol_id")
+        or receipt.get("panel") != result.get("panel")
+        or centering_recomposition != result_recomposition
+        or (source_manifest is None) is not (source_mean is None)
+    ):
+        raise ComponentClosureEvaluationError(
+            "centering receipt and evaluation target identity differ"
+        )
+    return {
+        "evaluation_token_identity_sha256": result_token_identity,
+        "evaluation_target_manifest_sha256": result_target_manifest,
+        "evaluation_token_count": tokens,
+        "evaluation_packed_sequences": packed_sequences,
+        "evaluation_source_manifest_sha256": result_source_manifest,
+        "centering_receipt_sha256": receipt_sha256,
+        "centering_target_manifest_sha256": centering_target_manifest,
+        **required_centering,
+        "recomposition_sidecar_sha256": centering_recomposition,
+        "source_manifest_sha256": source_manifest,
+        "source_mean_sha256": source_mean,
+    }
 
 
 def _fresh_cells(training: Mapping[str, Any]) -> dict[tuple[str, int, str, int], Any]:
@@ -996,6 +1168,12 @@ def collect_score_grid(
                     result_path,
                     "result_sha256",
                 )
+                target_identity = _score_cell_target_identity(
+                    result_path,
+                    result=result,
+                    scores=scores,
+                    packed_sequence_count=int(sequence.size),
+                )
                 cells.append(
                     {
                         "panel": bundle["panel"],
@@ -1006,6 +1184,7 @@ def collect_score_grid(
                         "component_sse": sse.tolist(),
                         "component_sst": sst.tolist(),
                         "evaluation_result_sha256": result["result_sha256"],
+                        **target_identity,
                     }
                 )
     finally:

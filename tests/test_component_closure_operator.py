@@ -127,6 +127,31 @@ def test_remote_bundle_command_fans_out_process_identity() -> None:
     assert "controller=%s process=%s" in joined
 
 
+def test_centering_receipt_is_self_hashed_and_result_bound() -> None:
+    module = _operator_module()
+    body = {"schema_version": "centering-v1"}
+    receipt = {
+        **body,
+        "receipt_sha256": module.canonical_sha256(body),
+    }
+    payload = json.dumps(receipt).encode("ascii")
+    assert (
+        module._validated_centering_receipt(
+            {"centering_receipt_sha256": receipt["receipt_sha256"]},
+            payload,
+        )
+        == receipt
+    )
+    with pytest.raises(
+        module.ComponentClosureEvaluationOperatorError,
+        match="centering receipt identity changed",
+    ):
+        module._validated_centering_receipt(
+            {"centering_receipt_sha256": "e" * 64},
+            payload,
+        )
+
+
 def _operator_case(
     module,
     tmp_path: Path,
@@ -195,6 +220,8 @@ def _operator_case(
             assert controller == 0
             if remote_path.endswith("/evaluation-result.json"):
                 return result_payload
+            if remote_path.endswith("/centering-receipt.json"):
+                return centering_payload
             assert remote_path.endswith("/objects/score.bin")
             return score_payload
 
@@ -223,6 +250,18 @@ def _operator_case(
 
     monkeypatch.setattr(module, "_run_remote", run_remote)
     score_payload = b"component-closure-score"
+    centering_body = {
+        "schema_version": "centering-v1",
+        "protocol_id": cell["source_protocol_id"],
+    }
+    centering_payload = json.dumps(
+        {
+            **centering_body,
+            "receipt_sha256": module.canonical_sha256(centering_body),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
     result_body = {
         "protocol_id": cell["source_protocol_id"],
         "status": "cell_evaluated",
@@ -240,6 +279,7 @@ def _operator_case(
         "score_data_object": "objects/score.bin",
         "score_data_sha256": hashlib.sha256(score_payload).hexdigest(),
         "score_data_bytes": len(score_payload),
+        "centering_receipt_sha256": module.canonical_sha256(centering_body),
     }
     result_payload = json.dumps(
         {
@@ -287,6 +327,20 @@ def test_nonzero_transports_with_four_exact_success_markers_publish(
         == 0
     )
     assert (tmp_path / "published/evaluation-result.json").is_file()
+    published_result = json.loads(
+        (tmp_path / "published/evaluation-result.json").read_text(
+            encoding="ascii"
+        )
+    )
+    published_centering = json.loads(
+        (tmp_path / "published/centering-receipt.json").read_text(
+            encoding="ascii"
+        )
+    )
+    assert (
+        published_centering["receipt_sha256"]
+        == published_result["centering_receipt_sha256"]
+    )
     completion = json.loads(
         (
             tmp_path / "state/bundles/sae-seed0/completion.json"
