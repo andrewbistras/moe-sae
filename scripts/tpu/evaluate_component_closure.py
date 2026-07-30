@@ -573,12 +573,23 @@ def _run_bundle_operator(
         )
         for controller, process in mapping.items()
     }
-    if any(status != 0 for status in statuses.values()) or any(
-        status != 0 for status in transports.values()
-    ):
+    if any(status != 0 for status in statuses.values()):
         raise ComponentClosureEvaluationOperatorError(
             f"bundle workers failed: transports={transports}, "
             f"statuses={statuses}, logs={log_root}"
+        )
+    transport_anomalies = {
+        controller: status
+        for controller, status in transports.items()
+        if status != 0
+    }
+    if transport_anomalies:
+        print(
+            "bundle worker transports exited nonzero after exact remote "
+            f"success markers: transports={transports}, statuses={statuses}, "
+            f"logs={log_root}",
+            file=sys.stderr,
+            flush=True,
         )
     process_zero = next(
         controller for controller, process in mapping.items() if process == 0
