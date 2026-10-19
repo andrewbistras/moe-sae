@@ -1,5 +1,11 @@
 # moe-sae
 
+**The Router Already Knows** (Bistras and Johnson, 2026). The configurations,
+aggregate results, figures and animated routing schematic released with the
+paper are in [`release/`](release/).
+
+![A token enters the frozen router, which selects experts 76 and 79; their dictionary banks open and each selects four features.](release/figures/routing-schematic.gif)
+
 This repository studies whether a model's native MoE routing structure can
 make sparse representation learning more effective than an unstructured
 global dictionary at the same candidate or parameter budget.
