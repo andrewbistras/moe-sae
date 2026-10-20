@@ -1,0 +1,141 @@
+schema_version: gemma4-pilot-learning-horizon-run-config-v1
+protocol_id: gemma4-pilot-learning-horizon-v1-20260728
+scientific_model: transcoder
+parent_protocol_id: gemma4-contribution-transcoder-v2-20260727
+
+provenance:
+  model_id: google/gemma-4-26B-A4B
+  model_revision: 24548b62aa021d562695c04aaf7758a1ea47990b
+  maxtext_base_commit: 48c7da3e28e8f57fe36ddf09d00eec53072a2ea0
+  maxtext_fork_commit: 73bafe53569eb17dc18542f2568dd591a8db9e28
+  dataset_name: allenai/c4
+  dataset_config: en
+  dataset_revision: 1588ec454efa1a09f29cd18ddd04fe05fc8653a2
+  train_split: train
+  eval_split: validation
+
+model:
+  target_layer_one_indexed: 15
+  hidden_size: 2816
+  num_routed_experts: 128
+  experts_per_token: 8
+
+artifacts:
+  target_schema_version: gemma4-expert-contribution-v2
+  source_overlay_schema_version: gemma4-routed-input-overlay-v1
+  train_target_manifest_sha256: PENDING_SEALED_10M_TARGET_MANIFEST
+  eval_target_manifest_sha256: 31454e5ce8693521c41a2a95f2ef88d40c5d26c726a0efac5c26d882ed341f5e
+  train_source_overlay_manifest_sha256: PENDING_SEALED_10M_SOURCE_OVERLAY_MANIFEST
+  eval_source_overlay_manifest_sha256: f68e2fe6e4cf568e694925697dd5d65fe10160a52d357c641892de85ee5c3da7
+  # Canonical projection hash of the target-bound overlay capture contract;
+  # this is deliberately not a recursively embedded self-hash.
+  source_overlay_capture_contract_sha256: PENDING_SEALED_10M_SOURCE_OVERLAY_CAPTURE_CONTRACT
+  train_tokens: 10000000
+  eval_tokens: 250000
+  recomposition_sidecar_schema_version: gemma4-contribution-recomposition-v1
+
+training:
+  phase_name: learning_horizon_10m
+  layout_set: pilot
+  seed: 0
+  initialization: from_scratch
+  encoder_activation: softplus
+  train_tokens: 10000000
+  eval_tokens: 250000
+  effective_batch_tokens: 16384
+  microbatch_tokens: 4096
+  planned_updates: 611
+  warmup_updates: 61
+  tail_mask_tokens: 10624
+  source_centering: one_global_routed_input_mean
+  target_centering: one_pooled_raw_expert_output_mean
+  output_bias: none
+  contribution_loss: normalized_router_weighted_sse
+  router_weight_math_dtype: float32
+  topk_requires_strictly_positive: true
+  topk_tie_break: global_latent_id_ascending
+  capacity_margin_fraction: 0.10
+  capacity_overflow_policy: hard_error
+
+execution:
+  accelerator_min_useful_mfu: 0.10
+  accelerator_qualification_max_seconds: 600
+  # One invocation normally finishes all 611 updates. The deadline remains a
+  # crash boundary; rolling checkpoints make Spot preemption resumable.
+  direct_runtime_max_seconds: 43200
+  restart_checkpoint_tokens:
+    - 1000000
+    - 2000000
+    - 3000000
+    - 4000000
+    - 5000000
+    - 6000000
+    - 7000000
+    - 8000000
+    - 9000000
+    - 10000000
+
+optimizer:
+  parameter_dtype: bfloat16
+  matmul_dtype: bfloat16
+  moment_dtype: float32
+  reduction_dtype: float32
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1.0e-8
+  weight_decay: 0.0
+  global_gradient_clip: 1.0
+  peak_learning_rate: 0.0003
+  minimum_learning_rate: 0.00003
+  schedule: linear_warmup_cosine_decay
+  decoder_init: unit_norm_columns
+  encoder_init: decoder_transpose
+  encoder_bias_init: zeros
+  tangent_decoder_gradient_projection: true
+  decoder_column_renormalization: true
+
+layouts:
+  - condition: A
+    target: raw_selected_expert_output
+    bank_identity: true_expert_id
+    bank_count: 128
+    bank_width: 256
+    components_per_token: 8
+    topk_per_component: 2
+  - condition: R
+    target: raw_selected_expert_output
+    bank_identity: per_sequence_randomized_expert_id
+    bank_count: 128
+    bank_width: 256
+    components_per_token: 8
+    topk_per_component: 2
+  - condition: B
+    target: raw_selected_expert_output
+    bank_identity: router_rank
+    bank_count: 8
+    bank_width: 256
+    components_per_token: 8
+    topk_per_component: 2
+  - condition: F
+    target: raw_selected_expert_output
+    bank_identity: router_rank
+    bank_count: 8
+    bank_width: 4096
+    components_per_token: 8
+    topk_per_component: 2
+
+evaluation:
+  checkpoint_tokens:
+    - 2000000
+    - 5000000
+    - 10000000
+  relative_quality_gates: []
+  common_target_sst: true
+  bootstrap_unit: packed_sequence
+  bootstrap_replicates: 20000
+  paired_confidence_level: 0.95
+  primary_contrasts:
+    - A-R
+    - A-B
+    - A-F
+    - F-B

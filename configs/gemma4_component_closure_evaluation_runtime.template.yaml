@@ -1,0 +1,116 @@
+# Each resident bundle is pinned to one admitted training resource. SAE seeds
+# stay on the two central1/v5 planes; transcoder seed0 stays on v5, seed1 on
+# the on-demand v4, and seed2 on the spot v4.
+assignments:
+  sae.seed0: sae-v5-seed0
+  sae.seed1: sae-v5-seed1
+  sae.seed2: sae-v5-seed0
+  transcoder.seed0: transcoder-v5-seed0
+  transcoder.seed1: transcoder-v4-od-seed1
+  transcoder.seed2: transcoder-v4-spot-seed2
+
+resources:
+  sae-v5-seed0:
+    resource_id: sae-v5-seed0
+    a_config_remote: /REMOTE/moe-sae/configs/gemma4_experiment5_routed_ladder_sae_v3.yaml
+    result_root_remote: /REMOTE/PLANES/sae-v5-shared/component-closure/evaluation
+    result_root_controller: /ABS/PLANES/sae-v5-shared/component-closure/evaluation
+    accelerator_type: v5litepod-16
+    peak_flops_per_second: 3152000000000000
+    train_target_root: /REMOTE/PLANES/sae-v5-seed0/captures/train-target
+    eval_target_root: /REMOTE/PLANES/sae-v5-seed0/captures/eval-target
+    train_target_object_prefix: gs://replace-bucket/sae-v5-seed0/train-target
+    eval_target_object_prefix: gs://replace-bucket/sae-v5-seed0/eval-target
+    train_source_root: null
+    eval_source_root: null
+    train_source_object_prefix: null
+    eval_source_object_prefix: null
+    cache_root: /dev/shm/moe-sae-local/horizon-10m/cache
+    cache_max_bytes: 171798691840
+    regional_mirror_seal: /REMOTE/PLANES/sae-v5-shared/evidence/regional-mirror.json
+    recomposition_sidecar: /REMOTE/PLANES/sae-v5-seed0/evidence/recomposition-sidecar.json
+    expected_token_identity_sha256: null
+
+  sae-v5-seed1:
+    resource_id: sae-v5-seed1
+    a_config_remote: /REMOTE/moe-sae/configs/gemma4_experiment5_routed_ladder_sae_v3.yaml
+    result_root_remote: /REMOTE/PLANES/sae-v5-shared/component-closure/evaluation
+    result_root_controller: /ABS/PLANES/sae-v5-shared/component-closure/evaluation
+    accelerator_type: v5litepod-16
+    peak_flops_per_second: 3152000000000000
+    train_target_root: /REMOTE/PLANES/sae-v5-seed1/captures/train-target
+    eval_target_root: /REMOTE/PLANES/sae-v5-seed1/captures/eval-target
+    train_target_object_prefix: gs://replace-bucket/sae-v5-seed1/train-target
+    eval_target_object_prefix: gs://replace-bucket/sae-v5-seed1/eval-target
+    train_source_root: null
+    eval_source_root: null
+    train_source_object_prefix: null
+    eval_source_object_prefix: null
+    cache_root: /dev/shm/moe-sae-local/horizon-10m/cache
+    cache_max_bytes: 171798691840
+    regional_mirror_seal: /REMOTE/PLANES/sae-v5-shared/evidence/regional-mirror.json
+    recomposition_sidecar: /REMOTE/PLANES/sae-v5-seed1/evidence/recomposition-sidecar.json
+    expected_token_identity_sha256: null
+
+  transcoder-v5-seed0:
+    resource_id: transcoder-v5-seed0
+    a_config_remote: /REMOTE/moe-sae/configs/gemma4_experiment5_routed_ladder_transcoder_v3.yaml
+    result_root_remote: /REMOTE/PLANES/transcoder-v5-seed0/component-closure/evaluation
+    result_root_controller: /ABS/PLANES/transcoder-v5-seed0/component-closure/evaluation
+    accelerator_type: v5litepod-16
+    peak_flops_per_second: 3152000000000000
+    train_target_root: /REMOTE/PLANES/transcoder-v5-seed0/captures/train-target
+    eval_target_root: /REMOTE/PLANES/transcoder-v5-seed0/captures/eval-target
+    train_target_object_prefix: gs://replace-bucket/transcoder-v5-seed0/train-target
+    eval_target_object_prefix: gs://replace-bucket/transcoder-v5-seed0/eval-target
+    train_source_root: /REMOTE/PLANES/transcoder-v5-seed0/captures/train-source-overlay
+    eval_source_root: /REMOTE/PLANES/transcoder-v5-seed0/captures/eval-source-overlay
+    train_source_object_prefix: gs://replace-bucket/transcoder-v5-seed0/train-source-overlay
+    eval_source_object_prefix: gs://replace-bucket/transcoder-v5-seed0/eval-source-overlay
+    cache_root: /dev/shm/moe-sae-local/horizon-10m/cache
+    cache_max_bytes: 171798691840
+    regional_mirror_seal: /REMOTE/PLANES/transcoder-v5-seed0/evidence/regional-mirror.json
+    recomposition_sidecar: /REMOTE/PLANES/transcoder-v5-seed0/evidence/recomposition-sidecar.json
+    expected_token_identity_sha256: null
+
+  transcoder-v4-od-seed1:
+    resource_id: transcoder-v4-od-seed1
+    a_config_remote: /REMOTE/moe-sae/configs/gemma4_experiment5_routed_ladder_transcoder_v3.yaml
+    result_root_remote: /REMOTE/PLANES/transcoder-v4-od-seed1/component-closure/evaluation
+    result_root_controller: /ABS/PLANES/transcoder-v4-od-seed1/component-closure/evaluation
+    accelerator_type: v4-32
+    peak_flops_per_second: 4400000000000000
+    train_target_root: /REMOTE/PLANES/transcoder-v4-od-seed1/captures/train-target
+    eval_target_root: /REMOTE/PLANES/transcoder-v4-od-seed1/captures/eval-target
+    train_target_object_prefix: gs://replace-bucket/transcoder-v4-od-seed1/train-target
+    eval_target_object_prefix: gs://replace-bucket/transcoder-v4-od-seed1/eval-target
+    train_source_root: /REMOTE/PLANES/transcoder-v4-od-seed1/captures/train-source-overlay
+    eval_source_root: /REMOTE/PLANES/transcoder-v4-od-seed1/captures/eval-source-overlay
+    train_source_object_prefix: gs://replace-bucket/transcoder-v4-od-seed1/train-source-overlay
+    eval_source_object_prefix: gs://replace-bucket/transcoder-v4-od-seed1/eval-source-overlay
+    cache_root: /dev/shm/moe-sae-local/horizon-10m/cache
+    cache_max_bytes: 171798691840
+    regional_mirror_seal: null
+    recomposition_sidecar: /REMOTE/PLANES/transcoder-v4-od-seed1/evidence/recomposition-sidecar.json
+    expected_token_identity_sha256: null
+
+  transcoder-v4-spot-seed2:
+    resource_id: transcoder-v4-spot-seed2
+    a_config_remote: /REMOTE/moe-sae/configs/gemma4_experiment5_routed_ladder_transcoder_v3.yaml
+    result_root_remote: /REMOTE/PLANES/transcoder-v4-spot-seed2/component-closure/evaluation
+    result_root_controller: /ABS/PLANES/transcoder-v4-spot-seed2/component-closure/evaluation
+    accelerator_type: v4-32
+    peak_flops_per_second: 4400000000000000
+    train_target_root: /REMOTE/PLANES/transcoder-v4-spot-seed2/captures/train-target
+    eval_target_root: /REMOTE/PLANES/transcoder-v4-spot-seed2/captures/eval-target
+    train_target_object_prefix: gs://replace-bucket/transcoder-v4-spot-seed2/train-target
+    eval_target_object_prefix: gs://replace-bucket/transcoder-v4-spot-seed2/eval-target
+    train_source_root: /REMOTE/PLANES/transcoder-v4-spot-seed2/captures/train-source-overlay
+    eval_source_root: /REMOTE/PLANES/transcoder-v4-spot-seed2/captures/eval-source-overlay
+    train_source_object_prefix: gs://replace-bucket/transcoder-v4-spot-seed2/train-source-overlay
+    eval_source_object_prefix: gs://replace-bucket/transcoder-v4-spot-seed2/eval-source-overlay
+    cache_root: /dev/shm/moe-sae-local/horizon-10m/cache
+    cache_max_bytes: 171798691840
+    regional_mirror_seal: null
+    recomposition_sidecar: /REMOTE/PLANES/transcoder-v4-spot-seed2/evidence/recomposition-sidecar.json
+    expected_token_identity_sha256: null

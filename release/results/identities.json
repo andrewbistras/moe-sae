@@ -1,0 +1,20 @@
+{
+  "report_sha256": "fc1d6d4112dbd2f5cea075e1c257424c7fc6e917d66b9e6c5d42814a0940f460",
+  "evidence_sha256": "4b8bf760befc6b8dbca2efe209e5de9c1ed47ce67f46e3a1cd9e0dbc9370329f",
+  "report_schema_version": "gemma4-a512-component-closure-report-v2",
+  "evidence_schema_version": "gemma4-a512-component-closure-score-grid-v2",
+  "protocol_id": "gemma4-a512-component-closure-v1-20260729",
+  "bootstrap": {
+    "algorithm": "hierarchical-paired-seed-packed-sequence-percentile-bootstrap-v1",
+    "replicates": 20000,
+    "confidence_level": 0.95
+  },
+  "evaluation_tokens": 250000,
+  "evaluation_packed_sequences": 625,
+  "evaluation_target_manifest_sha256": "31454e5ce8693521c41a2a95f2ef88d40c5d26c726a0efac5c26d882ed341f5e",
+  "training_source_revisions": [
+    "301e0dc829bbd8a70a6e0fe8cd3198fc79532610",
+    "8dcfadee4a517029b3c1c0c7f2bb830e9d35f12f"
+  ],
+  "note": "Canonical identities: SHA-256 of canonical JSON, embedded in each file. Not raw-file digests."
+}

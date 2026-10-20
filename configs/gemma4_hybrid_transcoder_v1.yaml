@@ -1,0 +1,226 @@
+schema_version: gemma4-routed-shared-hybrid-run-config-v1
+protocol_id: gemma4-routed-shared-hybrid-v1-20260728
+panel: transcoder
+parent_protocol_id: gemma4-pilot-learning-horizon-v1-20260728
+
+provenance:
+  model_id: google/gemma-4-26B-A4B
+  model_revision: 24548b62aa021d562695c04aaf7758a1ea47990b
+  maxtext_base_commit: 48c7da3e28e8f57fe36ddf09d00eec53072a2ea0
+  maxtext_fork_commit: 73bafe53569eb17dc18542f2568dd591a8db9e28
+  dataset_name: allenai/c4
+  dataset_config: en
+  dataset_revision: 1588ec454efa1a09f29cd18ddd04fe05fc8653a2
+  train_split: train
+  eval_split: validation
+
+model:
+  target_layer_one_indexed: 15
+  hidden_size: 2816
+  num_routed_experts: 128
+  experts_per_token: 8
+  shared_experts: 1
+
+# This document directly binds the existing sealed Experiment-4 captures and
+# recomposition sidecar.
+artifacts:
+  new_harvest_allowed: false
+  target_schema_version: gemma4-expert-contribution-v2
+  source_overlay_schema_version: gemma4-routed-input-overlay-v1
+  train_target_manifest_sha256: f29aaf45d9ff93be08cc3d175cdcea9fa4aecc37fc0e256d09720e88e1ae838c
+  eval_target_manifest_sha256: 31454e5ce8693521c41a2a95f2ef88d40c5d26c726a0efac5c26d882ed341f5e
+  train_source_overlay_manifest_sha256: 8f27dcf9c1dc0c7f3ffa2e2941daec13d8a72c7204077f09420e15aacb02ffe0
+  eval_source_overlay_manifest_sha256: f68e2fe6e4cf568e694925697dd5d65fe10160a52d357c641892de85ee5c3da7
+  source_overlay_capture_contract_sha256: fe0b004ca6e48c9eb8163237a5ea20f45b33acdbd9a3a267a9fb4e670ed2c954
+  recomposition_sidecar_content_sha256: 37c7b8c012f8fc0c1f63210986c0b3071a261261c88ee4bc1f502220ce3b8526
+  recomposition_sidecar_file_sha256: 6486288677e81665b21815879729c424c6acb8c7d0e45be264b961a9d652fe3d
+  train_tokens: 10000000
+  eval_tokens: 250000
+
+training:
+  phase_name: routed_shared_hybrid_10m
+  seeds:
+    - 0
+    - 1
+    - 2
+  initialization: from_scratch
+  encoder_activation: softplus
+  softplus_positive_floor: smallest_normal_float32
+  train_tokens: 10000000
+  eval_tokens: 250000
+  effective_batch_tokens: 16384
+  microbatch_tokens: 4096
+  planned_updates: 611
+  warmup_updates: 61
+  tail_mask_tokens: 10624
+  common_source: block15_post_attention_routed_input
+  objective_target: exact_full_ffn_output_before_residual
+  objective: normalized_full_ffn_sse
+  target_sst_policy: one_common_target_only_sst
+  router_weight_math_dtype: float32
+  recomposition_math_dtype: float32
+  topk_requires_strictly_positive: true
+  topk_tie_break: global_latent_id_ascending
+  capacity_margin_fraction: 0.10
+  capacity_overflow_policy: hard_error
+  token_drop_policy: hard_error
+
+centering:
+  common_source: one_global_routed_input_mean
+  routed_target: one_pooled_raw_expert_output_mean
+  shared_target: one_global_normalized_shared_mean
+  global_target: one_global_full_ffn_output_mean
+  per_expert_means_allowed: false
+
+optimizer:
+  parameter_dtype: bfloat16
+  matmul_dtype: bfloat16
+  moment_dtype: float32
+  reduction_dtype: float32
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1.0e-8
+  weight_decay: 0.0
+  global_gradient_clip: 1.0
+  peak_learning_rate: 0.0003
+  minimum_learning_rate: 0.00003
+  schedule: linear_warmup_cosine_decay
+  decoder_init: unit_norm_columns
+  encoder_init: decoder_transpose
+  encoder_bias_init: zeros
+  tangent_decoder_gradient_projection: true
+  decoder_column_renormalization: true
+
+layouts:
+  - condition: H
+    architecture: routed_shared_hybrid
+    routed_bank_identity: true_expert_id
+    routed_source: block15_post_attention_routed_input
+    routed_target: raw_selected_expert_output
+    routed_bank_count: 128
+    routed_bank_width: 512
+    routed_visible_banks_per_token: 8
+    routed_topk_per_component: 4
+    shared_source: block15_post_attention_routed_input
+    shared_target: normalized_shared_branch
+    shared_bank_count: 1
+    shared_bank_width: 4096
+    shared_topk_per_token: 32
+    total_features: 69632
+    candidates_per_token: 8192
+    exact_total_l0: 64
+    trainable_parameters: 392237056
+  - condition: R
+    architecture: routed_shared_hybrid
+    routed_bank_identity: per_sequence_randomized_expert_id
+    routed_source: block15_post_attention_routed_input
+    routed_target: raw_selected_expert_output
+    routed_bank_count: 128
+    routed_bank_width: 512
+    routed_visible_banks_per_token: 8
+    routed_topk_per_component: 4
+    shared_source: block15_post_attention_routed_input
+    shared_target: normalized_shared_branch
+    shared_bank_count: 1
+    shared_bank_width: 4096
+    shared_topk_per_token: 32
+    total_features: 69632
+    candidates_per_token: 8192
+    exact_total_l0: 64
+    trainable_parameters: 392237056
+  - condition: B
+    architecture: global
+    source: block15_post_attention_routed_input
+    target: exact_full_ffn_output_before_residual
+    bank_count: 1
+    bank_width: 8192
+    topk_per_token: 64
+    total_features: 8192
+    candidates_per_token: 8192
+    exact_total_l0: 64
+    trainable_parameters: 46145536
+  - condition: F
+    architecture: global
+    source: block15_post_attention_routed_input
+    target: exact_full_ffn_output_before_residual
+    bank_count: 1
+    bank_width: 69632
+    topk_per_token: 64
+    total_features: 69632
+    candidates_per_token: 69632
+    exact_total_l0: 64
+    trainable_parameters: 392237056
+
+randomized_control:
+  condition: R
+  unit: packed_sequence
+  mapping: keyed_bijection_over_128_expert_ids
+  key_fields:
+    - protocol_id
+    - seed
+    - sequence_id
+  training_evaluation_mapping_identical: true
+
+execution:
+  accelerator_mfu_gate_enforced: false
+  accelerator_min_useful_mfu: 0.10
+  accelerator_qualification_max_seconds: 600
+  direct_runtime_max_seconds: 43200
+  restart_checkpoint_tokens:
+    - 1000000
+    - 2000000
+    - 3000000
+    - 4000000
+    - 5000000
+    - 6000000
+    - 7000000
+    - 8000000
+    - 9000000
+    - 10000000
+  new_bulk_capture_allowed: false
+  cross_region_bulk_copy_allowed: false
+  require_region_local_artifact_access: true
+  h_f_same_accelerator_generation: true
+
+budget:
+  currency: USD
+  incremental_cash_hard_limit: 50.0
+  maximum_launch_reservation: 45.0
+  contingency: 5.0
+  trc_tpu_time_is_quota_funded: true
+  stop_before_projected_exceedance: true
+  protocol_reduction_on_budget_pressure_allowed: false
+
+evaluation:
+  checkpoint_tokens:
+    - 2000000
+    - 5000000
+    - 10000000
+  primary_endpoint: full_ffn
+  common_target_sst: true
+  bootstrap_unit: packed_sequence
+  bootstrap_replicates: 20000
+  hierarchical_seed_bootstrap: true
+  paired_confidence_level: 0.95
+  primary_contrasts:
+    - H-R
+    - H-B
+    - H-F
+    - F-B
+  gain_recovery_denominator: F-B
+  gain_recovery_undefined_if_nonpositive_denominator: true
+  fixed_quality_reference:
+    condition: F
+    checkpoint_tokens: 10000000
+    candidate_condition: H
+    interpolation_allowed: false
+  branch_diagnostics:
+    - routed
+    - shared
+    - oracle_shared_full_ffn
+    - oracle_routed_full_ffn
+    - error_cancellation
+  coverage_metrics:
+    - cumulative_training_firing_coverage
+    - heldout_nonfiring_rate
+    - routed_bank_exposure

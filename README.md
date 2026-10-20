@@ -1,14 +1,54 @@
 # moe-sae
 
-This repository runs one focused Gemma 4 experiment:
+**The Router Already Knows** (Bistras and Johnson, 2026). The configurations,
+aggregate results, figures and animated routing schematic released with the
+paper are in [`release/`](release/).
 
-> Router-conditioned A recovers **G%** of the full-dictionary reconstruction
-> gain at **C%** of its measured marginal SAE training cost.
+![A token enters the frozen router, which selects experts 76 and 79; their dictionary banks open and each selects four features.](release/figures/routing-schematic.gif)
 
-The active model is `google/gemma-4-26B-A4B`, text only. Activations are the
-aggregate routed-MoE branch at one-indexed block 15, immediately after
-`post_feedforward_layernorm_2`. Conditions A, B, and F reconstruct exactly the
-same globally centered target with exact per-token TopK-64.
+This repository studies whether a model's native MoE routing structure can
+make sparse representation learning more effective than an unstructured
+global dictionary at the same candidate or parameter budget.
+
+The active model is `google/gemma-4-26B-A4B`, text only, at one-indexed block
+15. The project now contains three linked experiments and a post-launch
+diagnostic extension:
+
+1. aggregate routed-branch sparse autoencoders;
+2. per-expert contribution sparse autoencoders; and
+3. source-only contribution transcoders.
+
+Experiment 5 tests a routed/shared hybrid on the exact full FFN output. Its
+activation-policy v3 compares full-sized `A512ReLUInclusiveTopK` and
+`A512Softplus` at matched geometry and maximum selected slots, while retaining
+panel-native `A256Native` and hybrid `H` as read-only context. V2 remains
+immutable terminal evidence for the infeasible strict-positive ReLU policy.
+
+## Current result
+
+Experiment 5 v3 is complete. At 10M training tokens, inclusive-zero ReLU beat
+exact-positive Softplus by 0.03970 component EV in the SAE panel and 0.03181
+component EV in the transcoder panel. All six paired seed differences favored
+ReLU, both crossed 95% intervals excluded zero, and marginal training cost was
+approximately unchanged. See
+[`docs/EXPERIMENT_5_RESULTS.md`](docs/EXPERIMENT_5_RESULTS.md) for the sealed
+verdict, learning curves, cost comparison, and immutable evidence locations.
+
+Experiment 3 shows that expert alignment transfers from reconstruction to
+prediction. On 250,000 held-out tokens, the true-expert transcoder A reached
+component EV 0.18743, versus -0.04715 for randomized identity R, 0.15532 for
+candidate-matched router-rank B, and 0.13408 for parameter-matched full-width
+F. Paired A-minus-R, A-minus-B, and A-minus-F intervals all exclude zero.
+
+The preregistered cost-efficiency result was not established. F was worse than
+B at the component endpoint, so the F-over-B gain-recovery denominator and G3
+are undefined. A also consumed 103.37% of F's measured marginal training
+chip-seconds. This is therefore a strong positive architecture and
+fixed-budget sample-efficiency result, not a lower-cost headline.
+
+See [`EXPERIMENT_3.md`](EXPERIMENT_3.md) for the protocol and execution record,
+and [`results/experiment3/REPORT.md`](results/experiment3/REPORT.md) for the
+sealed result and immutable evidence locations.
 
 The previous DeepSeek-VL2/spec-era implementation is intentionally absent from
 the active tree. It is preserved at Git tag
@@ -17,8 +57,30 @@ the active tree. It is preserved at Git tag
 
 ## Active surface
 
-- [`configs/gemma4_26b_a4b.yaml`](configs/gemma4_26b_a4b.yaml) — the single
-  production configuration.
+- [`configs/gemma4_26b_a4b.yaml`](configs/gemma4_26b_a4b.yaml) — base Gemma
+  capture and aggregate-SAE configuration.
+- [`configs/gemma4_contribution_v1.yaml`](configs/gemma4_contribution_v1.yaml)
+  — per-expert contribution SAE configuration.
+- [`configs/gemma4_transcoder_v2.yaml`](configs/gemma4_transcoder_v2.yaml) —
+  exact-positive source-only transcoder configuration.
+- [`configs/gemma4_experiment5_routed_ladder_sae_v2.yaml`](configs/gemma4_experiment5_routed_ladder_sae_v2.yaml)
+  and
+  [`configs/gemma4_experiment5_routed_ladder_transcoder_v2.yaml`](configs/gemma4_experiment5_routed_ladder_transcoder_v2.yaml)
+  — immutable strict-positive ReLU feasibility-attempt contracts.
+- [`configs/gemma4_experiment5_routed_ladder_sae_v3.yaml`](configs/gemma4_experiment5_routed_ladder_sae_v3.yaml)
+  and
+  [`configs/gemma4_experiment5_routed_ladder_transcoder_v3.yaml`](configs/gemma4_experiment5_routed_ladder_transcoder_v3.yaml)
+  — active ReLU-inclusive/Softplus activation-policy contracts.
+- [`EXPERIMENT_2.md`](EXPERIMENT_2.md) and
+  [`EXPERIMENT_3.md`](EXPERIMENT_3.md) — frozen scientific contracts and
+  execution records.
+- [`docs/EXPERIMENT_5.md`](docs/EXPERIMENT_5.md) — frozen H/R/B/F contract;
+  [`docs/EXPERIMENT_5_LADDER_V2.md`](docs/EXPERIMENT_5_LADDER_V2.md) — the
+  immutable strict-positive feasibility attempt; and
+  [`docs/EXPERIMENT_5_LADDER_V3.md`](docs/EXPERIMENT_5_LADDER_V3.md) — the
+  completed panel-native activation-policy reset, with
+  [`docs/EXPERIMENT_5_RESULTS.md`](docs/EXPERIMENT_5_RESULTS.md) as its sealed
+  result summary.
 - `moe-sae` — the single CLI, with `stage-c4`, `qualify-storage`,
   `qualify-sae-storage`, `preflight`,
   `convert-checkpoint`, `benchmark-harvest`, `harvest`, `activation-farm`,

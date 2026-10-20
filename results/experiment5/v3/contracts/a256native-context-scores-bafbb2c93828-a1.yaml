@@ -1,0 +1,351 @@
+schema_version: gemma4-experiment5-routed-activation-ladder-v3-a256native-context-score-manifest-v1
+manifest_id: gemma4-experiment5-v3-a256native-context-scores-20260729
+source_protocol_id: gemma4-pilot-learning-horizon-v1-20260728
+target_protocol_id: gemma4-experiment5-routed-activation-ladder-v3-20260729
+source_plan_sha256: 0af508a3244ff394850c1a80dc85b8d0872f0417f14a0f298255a3803912b12d
+provenance_addendum:
+  addendum_id: gemma4-experiment5-v3-a256native-provenance-correction-20260729
+  controller_path: /mnt/moe-sae-control/experiment5/extensions/routed-activation-ladder-v3/contracts/a256native-provenance-addendum-bafbb2c93828-a1.yaml
+  file_sha256: 4632d2995c155eae906e17624a4d9af1659580e658f6631a2dda427195f22e5c
+  manifest_sha256: d9d2dde064f36c332ac1cde9499198810a99ca4da4741e673e116db374abc6fe
+scientific_scope:
+  condition: A256Native
+  evidentiary_role: panel_native_descriptive_score_context_only
+  included_in_primary_a512_inference: false
+  included_in_primary_a512_estimand: false
+  cross_panel_pooling_allowed: false
+  across_seed_inference_allowed: false
+  cross_panel_activation_contrast_allowed: false
+  allowed_use: within_panel_historical_learning_curve_context
+  prohibited_uses:
+  - matched_a512_activation_policy_contrast
+  - cross_panel_activation_policy_contrast
+  - three_seed_inference
+  - pooled_a256_estimate
+  - replacement_for_any_a512_cell
+shared_held_out_identity:
+  evaluation_tokens: 250000
+  target_capture_manifest_sha256: 31454e5ce8693521c41a2a95f2ef88d40c5d26c726a0efac5c26d882ed341f5e
+  component_sst: 1551045.9514335394
+  routed_sst: 16355172147.999086
+  panel_representations:
+    sae:
+      ordered_token_identity_sha256: a1e3997f37589aa3b00ab2647f91a5f77307d5670a74f8a6a0823625bceb3d2b
+      component_sst_content_sha256: 786da87f17bd09f7b964b68a06929e8874a0fae1f0f2bb302b5590c7a9a177c9
+      routed_sst_content_sha256: 345578a4c3ca72471104f2510f0291dedc265773f1c864f2bfbe23304f5d943d
+    transcoder:
+      ordered_token_identity_sha256: c0e240e998ffd046baeee9c8644d9b81244bfb1fb44e9e5ac7e9cd53a8553bc2
+      component_sst_content_sha256: de2b85df11d4d3a2727656e3c54ab651d968c7aceadab1c4f3535e97cdfb6b71
+      routed_sst_content_sha256: f2bdf533631ac902c7367208c74966d0673051467c754699df9ee66148150303
+  token_identity_policy: The target capture SHA-256 and retained token count are common
+    across both panels. Ordered token and SST-content hashes are panel-local representations
+    because the historical evaluators serialized and aggregated the same capture in
+    different row orders; no cross-panel byte-hash equality or pooling is asserted.
+cells:
+- panel: sae
+  condition: A256Native
+  source_condition: A
+  source_label: A256ReLU
+  seed: 0
+  checkpoint_tokens: 2000000
+  checkpoint_actual_tokens: 2015232
+  encoder_activation: relu
+  selection_policy: strict_positive_topk
+  source_config_semantic_sha256: 035e1afc91f7351fda3128582ac52e2051fcb0741f6f71913f5141aaa1c7ab59
+  source_config_file_sha256: 1bc8b252a26fdf1ac92aa182a41b34e6a40e719074de28465fd16b77a2e84f98
+  source_result:
+    controller_path: /mnt/moe-sae-usc1/horizon-10m/evaluation/sae/2000000/scientific-result.json
+    remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/evaluation/sae/2000000/scientific-result.json
+    file_sha256: 1a8cd3b18a5b612b6042d88903a39cbf865986b72be69eed8215b0c1f24bcfec
+    result_sha256: 46d7ee167c1174d3e291a06031b6bfd0745e462a5f918ffca298d56941d352a2
+  parent_hashes:
+    target_capture_manifest_sha256: 31454e5ce8693521c41a2a95f2ef88d40c5d26c726a0efac5c26d882ed341f5e
+    source_capture_manifest_sha256: null
+    training_target_manifest_sha256: f29aaf45d9ff93be08cc3d175cdcea9fa4aecc37fc0e256d09720e88e1ae838c
+    training_source_manifest_sha256: null
+    recomposition_sidecar_sha256: null
+    run_contract_sha256: aa45e048b489c64cd618261c257959dac0b06084d06c0de4c0f4c1e6cc4de462
+    run_contract_file_sha256: e2694dccf3b731c15ce8cd3a126f411d77e60ec3bae8702481f12778e6796725
+    training_result_sha256: 1c193f1baf148acf48dcaafbcf91417866681456de14b418fc9926eddfed366d
+    training_result_file_sha256: 8404a4375ed84b51022a54d2c9d56d1f3738a1e27fa6a0d0271d491c4721728c
+    checkpoint_pointer_sha256: 4129681dc02f541d38cd87245ecaecec509ef86d680e40649ab11d10aa9869dd
+    checkpoint_pointer_file_sha256: 322e6cc2c760f9b3868d100c6edf898c71e819f23dce0fe4db8e110d3054b88a
+    evaluation_receipt_sha256: 53ec0d77cbeedeb218f423f5db644d54d2ce8b440f0b7d95e6e7ba68c7548ae8
+    common_sst_receipt_sha256: d6b8c1498a321ebf4002695cae0f8a298cc501462e118cf34f6cc139bbe86bef
+    common_sst_receipt_file_sha256: null
+    score_artifact_sha256: ce5c2cedfd2e6b294dbbb490a0421053c8a22c386f121d24cf4408e26caf7a27
+    ordered_token_identity_sha256: a1e3997f37589aa3b00ab2647f91a5f77307d5670a74f8a6a0823625bceb3d2b
+    component_sst_content_sha256: 786da87f17bd09f7b964b68a06929e8874a0fae1f0f2bb302b5590c7a9a177c9
+    routed_sst_content_sha256: 345578a4c3ca72471104f2510f0291dedc265773f1c864f2bfbe23304f5d943d
+  endpoints:
+    component:
+      sse: 914733.108124435
+      sst: 1551045.9514335394
+      nmse: 0.5897524230529738
+      ev: 0.4102475769470262
+    routed:
+      sse: 18407641814.41917
+      sst: 16355172147.999086
+      nmse: 1.1254936143653607
+      ev: -0.12549361436536066
+  sparsity:
+    l0_per_contribution: 2
+    total_l0: 16
+    dead_rate: 0.217437744140625
+    fired_feature_fraction: 0.782562255859375
+- panel: sae
+  condition: A256Native
+  source_condition: A
+  source_label: A256ReLU
+  seed: 0
+  checkpoint_tokens: 5000000
+  checkpoint_actual_tokens: 5013504
+  encoder_activation: relu
+  selection_policy: strict_positive_topk
+  source_config_semantic_sha256: 035e1afc91f7351fda3128582ac52e2051fcb0741f6f71913f5141aaa1c7ab59
+  source_config_file_sha256: 1bc8b252a26fdf1ac92aa182a41b34e6a40e719074de28465fd16b77a2e84f98
+  source_result:
+    controller_path: /mnt/moe-sae-usc1/horizon-10m/evaluation/sae/5000000/scientific-result.json
+    remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/evaluation/sae/5000000/scientific-result.json
+    file_sha256: 952168366d98f60e453613e417a721cce946ab9ca7c61dfe8c5426d023b0308a
+    result_sha256: 085f69af4f2cbdaa591ce9fdeae0fb8461fd9258a3c78f5921a416e0fbcc9058
+  parent_hashes:
+    target_capture_manifest_sha256: 31454e5ce8693521c41a2a95f2ef88d40c5d26c726a0efac5c26d882ed341f5e
+    source_capture_manifest_sha256: null
+    training_target_manifest_sha256: f29aaf45d9ff93be08cc3d175cdcea9fa4aecc37fc0e256d09720e88e1ae838c
+    training_source_manifest_sha256: null
+    recomposition_sidecar_sha256: null
+    run_contract_sha256: aa45e048b489c64cd618261c257959dac0b06084d06c0de4c0f4c1e6cc4de462
+    run_contract_file_sha256: e2694dccf3b731c15ce8cd3a126f411d77e60ec3bae8702481f12778e6796725
+    training_result_sha256: 1c193f1baf148acf48dcaafbcf91417866681456de14b418fc9926eddfed366d
+    training_result_file_sha256: 8404a4375ed84b51022a54d2c9d56d1f3738a1e27fa6a0d0271d491c4721728c
+    checkpoint_pointer_sha256: f62d077078257c8d2f2f2f6873c1b010e496ebae4450d48c4ec116180c9839bf
+    checkpoint_pointer_file_sha256: dd32b4b9cd00fa99de537b5706d184ec709e7b12eae6b5296c1325db581f5197
+    evaluation_receipt_sha256: db5d0638e6cbeeb20874ac3d5e1f28f5e1702f6d0fb9b55558f18fd5bb32435f
+    common_sst_receipt_sha256: 4cd00bc550caade17bd0c1ed0dfd59b9ab9b95eb30a7f1bd442b92c10a7ae14f
+    common_sst_receipt_file_sha256: null
+    score_artifact_sha256: ad841d4f91f130d51751de2cb4337aa28fa8464fd1ae4f0526052efc578831fd
+    ordered_token_identity_sha256: a1e3997f37589aa3b00ab2647f91a5f77307d5670a74f8a6a0823625bceb3d2b
+    component_sst_content_sha256: 786da87f17bd09f7b964b68a06929e8874a0fae1f0f2bb302b5590c7a9a177c9
+    routed_sst_content_sha256: 345578a4c3ca72471104f2510f0291dedc265773f1c864f2bfbe23304f5d943d
+  endpoints:
+    component:
+      sse: 822021.3842474818
+      sst: 1551045.9514335394
+      nmse: 0.5299787433684582
+      ev: 0.4700212566315418
+    routed:
+      sse: 15767568613.420143
+      sst: 16355172147.999086
+      nmse: 0.9640723112382017
+      ev: 0.035927688761798304
+  sparsity:
+    l0_per_contribution: 2
+    total_l0: 16
+    dead_rate: 0.527008056640625
+    fired_feature_fraction: 0.472991943359375
+- panel: sae
+  condition: A256Native
+  source_condition: A
+  source_label: A256ReLU
+  seed: 0
+  checkpoint_tokens: 10000000
+  checkpoint_actual_tokens: 10000000
+  encoder_activation: relu
+  selection_policy: strict_positive_topk
+  source_config_semantic_sha256: 035e1afc91f7351fda3128582ac52e2051fcb0741f6f71913f5141aaa1c7ab59
+  source_config_file_sha256: 1bc8b252a26fdf1ac92aa182a41b34e6a40e719074de28465fd16b77a2e84f98
+  source_result:
+    controller_path: /mnt/moe-sae-usc1/horizon-10m/evaluation/sae/10000000/scientific-result.json
+    remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/evaluation/sae/10000000/scientific-result.json
+    file_sha256: 25713c2d8068f13c871f2e69a7c5529b45021307723515e18e659e2211d72b75
+    result_sha256: f9864abebb2abb48a930c03b766f3b13336327d5cb6ccfdbb334e80a79defeaa
+  parent_hashes:
+    target_capture_manifest_sha256: 31454e5ce8693521c41a2a95f2ef88d40c5d26c726a0efac5c26d882ed341f5e
+    source_capture_manifest_sha256: null
+    training_target_manifest_sha256: f29aaf45d9ff93be08cc3d175cdcea9fa4aecc37fc0e256d09720e88e1ae838c
+    training_source_manifest_sha256: null
+    recomposition_sidecar_sha256: null
+    run_contract_sha256: aa45e048b489c64cd618261c257959dac0b06084d06c0de4c0f4c1e6cc4de462
+    run_contract_file_sha256: e2694dccf3b731c15ce8cd3a126f411d77e60ec3bae8702481f12778e6796725
+    training_result_sha256: 1c193f1baf148acf48dcaafbcf91417866681456de14b418fc9926eddfed366d
+    training_result_file_sha256: 8404a4375ed84b51022a54d2c9d56d1f3738a1e27fa6a0d0271d491c4721728c
+    checkpoint_pointer_sha256: 0b0d1f65fabb0cbe9e49e90f2916773492eb34a22670f46eec7db829fce91a27
+    checkpoint_pointer_file_sha256: ed333f7b494f284cb733243ed57c955373f579d2aa703f17ec3adced3bb1ecba
+    evaluation_receipt_sha256: 73b3fb0091c52a9cc61388d416f099b00cc2c45837d4fbae302412b6883fa372
+    common_sst_receipt_sha256: 7eda067ca6f65e24880e620fe304a471e49893cf60c95c0a36416ac1f5254beb
+    common_sst_receipt_file_sha256: null
+    score_artifact_sha256: 2d423e9ca6cdee3b725640cc36bd8a2952cfdbf77905ae69f38c38b5e619618f
+    ordered_token_identity_sha256: a1e3997f37589aa3b00ab2647f91a5f77307d5670a74f8a6a0823625bceb3d2b
+    component_sst_content_sha256: 786da87f17bd09f7b964b68a06929e8874a0fae1f0f2bb302b5590c7a9a177c9
+    routed_sst_content_sha256: 345578a4c3ca72471104f2510f0291dedc265773f1c864f2bfbe23304f5d943d
+  endpoints:
+    component:
+      sse: 809122.4909607172
+      sst: 1551045.9514335394
+      nmse: 0.521662488601897
+      ev: 0.478337511398103
+    routed:
+      sse: 15563674511.550135
+      sst: 16355172147.999086
+      nmse: 0.9516056676575071
+      ev: 0.04839433234249291
+  sparsity:
+    l0_per_contribution: 2
+    total_l0: 16
+    dead_rate: 0.57073974609375
+    fired_feature_fraction: 0.42926025390625
+- panel: transcoder
+  condition: A256Native
+  source_condition: A
+  source_label: A256Softplus
+  seed: 0
+  checkpoint_tokens: 2000000
+  checkpoint_actual_tokens: 2015232
+  encoder_activation: softplus
+  selection_policy: exact_positive_topk
+  source_config_semantic_sha256: 8e9937ea16e43addc7f7274a144f029f5f4c3731a98e653a2ce32fb27922c64d
+  source_config_file_sha256: 660ea3bfa89270c24e728bd6725a913576425b96d6ddd65d31e246d5bf06dd6a
+  source_result:
+    controller_path: /mnt/moe-sae-ew4/horizon-10m/evaluation/transcoder/2000000/scientific-result.json
+    remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/evaluation/transcoder/2000000/scientific-result.json
+    file_sha256: 83109e04aa2f944349b6a5d7445581ffdf244bfe119d18fc8e411f021c3afb3a
+    result_sha256: 02754a6dbf5ffb3321de7e6aa1ba70db2d06612381bde36150bdc1cab4202d6c
+  parent_hashes:
+    target_capture_manifest_sha256: 31454e5ce8693521c41a2a95f2ef88d40c5d26c726a0efac5c26d882ed341f5e
+    source_capture_manifest_sha256: f68e2fe6e4cf568e694925697dd5d65fe10160a52d357c641892de85ee5c3da7
+    training_target_manifest_sha256: f29aaf45d9ff93be08cc3d175cdcea9fa4aecc37fc0e256d09720e88e1ae838c
+    training_source_manifest_sha256: 8f27dcf9c1dc0c7f3ffa2e2941daec13d8a72c7204077f09420e15aacb02ffe0
+    recomposition_sidecar_sha256: 37c7b8c012f8fc0c1f63210986c0b3071a261261c88ee4bc1f502220ce3b8526
+    run_contract_sha256: d8798b92e2bbc4f4e9a1a8b5452936de635a6e8394ee4bc0ac7cccb089a70997
+    run_contract_file_sha256: c4f3d261f84384ebb2c9e393d8c7bac3b672b79c7641e8a6d8289694e0905517
+    training_result_sha256: a45f18b5573af8b8cdd524dd7ce970dddd8c9e120e8d8348508d93dc03a4a364
+    training_result_file_sha256: 25cf0042cdcc15fd97f92fe1f17d17d8d86801b0871ae90d175519cd0e628b78
+    checkpoint_pointer_sha256: 7af3b20b52cc5f0a8098edd380deec5148ff5d5d14a59a5c3ddf6feadca1c33e
+    checkpoint_pointer_file_sha256: 04cc722abc26fe5304aa4fe435d77459a6b2abf5ec8d78e306386c7dfd531f2c
+    evaluation_receipt_sha256: 38c00cd9b37e08b4664be831ac038757b909fd8ec78ad4310182464556eca1dc
+    common_sst_receipt_sha256: f9d82fc27e5e5c4a19d82e8d68aebe54bec4df35fd5b5b8efda00da1370a7861
+    common_sst_receipt_file_sha256: b755c3fef82afc6b76f31bc63c82bcdc8e7512e0d006ae52ef9c101366da5413
+    score_artifact_sha256: 70e2cc864a375ac5768ef00ffa0c899e8f860a970df8fe9eea696700c5d4fa22
+    ordered_token_identity_sha256: c0e240e998ffd046baeee9c8644d9b81244bfb1fb44e9e5ac7e9cd53a8553bc2
+    component_sst_content_sha256: de2b85df11d4d3a2727656e3c54ab651d968c7aceadab1c4f3535e97cdfb6b71
+    routed_sst_content_sha256: f2bdf533631ac902c7367208c74966d0673051467c754699df9ee66148150303
+  endpoints:
+    component:
+      sse: 1081146.4973511696
+      sst: 1551045.9514335394
+      nmse: 0.697043499163858
+      ev: 0.302956500836142
+    routed:
+      sse: 22322345153.07737
+      sst: 16355172147.999086
+      nmse: 1.3648492936106646
+      ev: -0.36484929361066465
+  sparsity:
+    l0_per_contribution: 2
+    total_l0: 16
+    dead_rate: 0.023193359375
+    fired_feature_fraction: 0.976806640625
+- panel: transcoder
+  condition: A256Native
+  source_condition: A
+  source_label: A256Softplus
+  seed: 0
+  checkpoint_tokens: 5000000
+  checkpoint_actual_tokens: 5013504
+  encoder_activation: softplus
+  selection_policy: exact_positive_topk
+  source_config_semantic_sha256: 8e9937ea16e43addc7f7274a144f029f5f4c3731a98e653a2ce32fb27922c64d
+  source_config_file_sha256: 660ea3bfa89270c24e728bd6725a913576425b96d6ddd65d31e246d5bf06dd6a
+  source_result:
+    controller_path: /mnt/moe-sae-ew4/horizon-10m/evaluation/transcoder/5000000/scientific-result.json
+    remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/evaluation/transcoder/5000000/scientific-result.json
+    file_sha256: 857a51cd8cc94e28ade819e61ca36e7bda42cbc8602c35ee143e677805bb620e
+    result_sha256: 891df4e8e5346fbbe8a4198344c82a577c35b6fb2c4cdf963d241f439a832ef7
+  parent_hashes:
+    target_capture_manifest_sha256: 31454e5ce8693521c41a2a95f2ef88d40c5d26c726a0efac5c26d882ed341f5e
+    source_capture_manifest_sha256: f68e2fe6e4cf568e694925697dd5d65fe10160a52d357c641892de85ee5c3da7
+    training_target_manifest_sha256: f29aaf45d9ff93be08cc3d175cdcea9fa4aecc37fc0e256d09720e88e1ae838c
+    training_source_manifest_sha256: 8f27dcf9c1dc0c7f3ffa2e2941daec13d8a72c7204077f09420e15aacb02ffe0
+    recomposition_sidecar_sha256: 37c7b8c012f8fc0c1f63210986c0b3071a261261c88ee4bc1f502220ce3b8526
+    run_contract_sha256: d8798b92e2bbc4f4e9a1a8b5452936de635a6e8394ee4bc0ac7cccb089a70997
+    run_contract_file_sha256: c4f3d261f84384ebb2c9e393d8c7bac3b672b79c7641e8a6d8289694e0905517
+    training_result_sha256: a45f18b5573af8b8cdd524dd7ce970dddd8c9e120e8d8348508d93dc03a4a364
+    training_result_file_sha256: 25cf0042cdcc15fd97f92fe1f17d17d8d86801b0871ae90d175519cd0e628b78
+    checkpoint_pointer_sha256: f6c7e28c4944d7ed5b01538a0a26697fdf090787c41f456dbcdcbdad64d82393
+    checkpoint_pointer_file_sha256: a4ea33305fc16ffd323e95551becfa89327bbc7099e022db30e30f85ac016f94
+    evaluation_receipt_sha256: 7bebfafdec39bb34e62e109f8f2d6ca75ff98c60e9a96f62f1a07e8e84bba93f
+    common_sst_receipt_sha256: 936da36e1573f2a6b8bf9e2476daa7d5fc5ab28110a5e74113f992978cf86a52
+    common_sst_receipt_file_sha256: 095cb6d50be46ac6f1d5d854ae0e65bf9c7c261dce081f2f29934a381148b2ac
+    score_artifact_sha256: 2a4d53c00ed49d625332015a2fed344a2f0b4a9ef6857d9587b355630f0d95a0
+    ordered_token_identity_sha256: c0e240e998ffd046baeee9c8644d9b81244bfb1fb44e9e5ac7e9cd53a8553bc2
+    component_sst_content_sha256: de2b85df11d4d3a2727656e3c54ab651d968c7aceadab1c4f3535e97cdfb6b71
+    routed_sst_content_sha256: f2bdf533631ac902c7367208c74966d0673051467c754699df9ee66148150303
+  endpoints:
+    component:
+      sse: 945225.3765185475
+      sst: 1551045.9514335394
+      nmse: 0.6094115881253757
+      ev: 0.39058841187462434
+    routed:
+      sse: 19497026615.401154
+      sst: 16355172147.999086
+      nmse: 1.1921015834606452
+      ev: -0.1921015834606452
+  sparsity:
+    l0_per_contribution: 2
+    total_l0: 16
+    dead_rate: 0.026275634765625
+    fired_feature_fraction: 0.973724365234375
+- panel: transcoder
+  condition: A256Native
+  source_condition: A
+  source_label: A256Softplus
+  seed: 0
+  checkpoint_tokens: 10000000
+  checkpoint_actual_tokens: 10000000
+  encoder_activation: softplus
+  selection_policy: exact_positive_topk
+  source_config_semantic_sha256: 8e9937ea16e43addc7f7274a144f029f5f4c3731a98e653a2ce32fb27922c64d
+  source_config_file_sha256: 660ea3bfa89270c24e728bd6725a913576425b96d6ddd65d31e246d5bf06dd6a
+  source_result:
+    controller_path: /mnt/moe-sae-ew4/horizon-10m/evaluation/transcoder/10000000/scientific-result.json
+    remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/evaluation/transcoder/10000000/scientific-result.json
+    file_sha256: db343d66587c625667f84fed0bc499fb371cf1ad5e4ad6604185868156b1ff9f
+    result_sha256: c501c20f9e2f5d97a2a76dc58d856078d26db677a8cc96d3beaf38676072e300
+  parent_hashes:
+    target_capture_manifest_sha256: 31454e5ce8693521c41a2a95f2ef88d40c5d26c726a0efac5c26d882ed341f5e
+    source_capture_manifest_sha256: f68e2fe6e4cf568e694925697dd5d65fe10160a52d357c641892de85ee5c3da7
+    training_target_manifest_sha256: f29aaf45d9ff93be08cc3d175cdcea9fa4aecc37fc0e256d09720e88e1ae838c
+    training_source_manifest_sha256: 8f27dcf9c1dc0c7f3ffa2e2941daec13d8a72c7204077f09420e15aacb02ffe0
+    recomposition_sidecar_sha256: 37c7b8c012f8fc0c1f63210986c0b3071a261261c88ee4bc1f502220ce3b8526
+    run_contract_sha256: d8798b92e2bbc4f4e9a1a8b5452936de635a6e8394ee4bc0ac7cccb089a70997
+    run_contract_file_sha256: c4f3d261f84384ebb2c9e393d8c7bac3b672b79c7641e8a6d8289694e0905517
+    training_result_sha256: a45f18b5573af8b8cdd524dd7ce970dddd8c9e120e8d8348508d93dc03a4a364
+    training_result_file_sha256: 25cf0042cdcc15fd97f92fe1f17d17d8d86801b0871ae90d175519cd0e628b78
+    checkpoint_pointer_sha256: fd2207b096f33ac45ed5d3d0c7929ec8a5be985e641adb537aea44774f74726c
+    checkpoint_pointer_file_sha256: d78895e78d748583d46a23aaf70e28ddcd2ceb0fc9e9fd9b029d20d96f4cf763
+    evaluation_receipt_sha256: cc6034c87d597f8db9fc6dd693341215d55c0cb827cbffe5462f39f674820e1d
+    common_sst_receipt_sha256: 6d38774ab2775e5c3f5877f986792efe6ae006399ba2a70624cbbad54a9e61a6
+    common_sst_receipt_file_sha256: e48c84834d384d0ee635b7aca6fb4a0aef92f7477a8ed56b068dca68483de8d7
+    score_artifact_sha256: fd13223d1be746d4f10c6b31d39231d86c9b89e1fd0ebe641d47bcedf80bfa85
+    ordered_token_identity_sha256: c0e240e998ffd046baeee9c8644d9b81244bfb1fb44e9e5ac7e9cd53a8553bc2
+    component_sst_content_sha256: de2b85df11d4d3a2727656e3c54ab651d968c7aceadab1c4f3535e97cdfb6b71
+    routed_sst_content_sha256: f2bdf533631ac902c7367208c74966d0673051467c754699df9ee66148150303
+  endpoints:
+    component:
+      sse: 931486.3460680842
+      sst: 1551045.9514335394
+      nmse: 0.60055367489736
+      ev: 0.39944632510264
+    routed:
+      sse: 19149394101.852486
+      sst: 16355172147.999086
+      nmse: 1.1708463798832742
+      ev: -0.17084637988327422
+  sparsity:
+    l0_per_contribution: 2
+    total_l0: 16
+    dead_rate: 0.025665283203125
+    fired_feature_fraction: 0.974334716796875
+manifest_sha256: 567392932d08797d414765f43d0b1c8579b0132ba4deb4999108a230d9c6282f

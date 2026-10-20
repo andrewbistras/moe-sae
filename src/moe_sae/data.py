@@ -12,18 +12,18 @@ does not initialize Hugging Face, Grain, or JAX.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from dataclasses import dataclass
 import gzip
 import hashlib
 import itertools
 import json
 import os
-from pathlib import Path
 import re
 import shutil
 import struct
 import subprocess
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -34,7 +34,6 @@ from moe_sae.model import (
     expected_hf_repository_inventory_sha256,
 )
 
-
 PACKED_DATASET_SCHEMA = "gemma4-c4-packed-arrayrecord-v2"
 PACKED_RECORD_FORMAT = "moe-sae-packed-sequence-v1"
 PACKED_RECORD_MAGIC = b"MSAEPK01"
@@ -43,7 +42,13 @@ ALLENAI_C4_REPO_ID = C4_REPOSITORY
 ALLENAI_C4_REVISION = C4_REVISION
 DEFAULT_SEQUENCE_LENGTH = 1_024
 DEFAULT_PROCESS_COUNT = 4
-DEFAULT_PER_DEVICE_SEQUENCE_BATCHES = (1, 2, 4)
+# This tuple is part of the already-sealed packed-dataset schema. It records
+# the batch candidates for which the original files were tail-aligned and must
+# not grow when a later runtime candidate is qualified.
+STAGED_PER_DEVICE_SEQUENCE_BATCHES = (1, 2, 4)
+# Retain the public name used by the v1 staging API. Runtime qualification is
+# owned independently by ``moe_sae.runtime.PER_DEVICE_SEQUENCE_BATCHES``.
+DEFAULT_PER_DEVICE_SEQUENCE_BATCHES = STAGED_PER_DEVICE_SEQUENCE_BATCHES
 DEFAULT_LOCAL_CHIPS = 4
 PAD_ID = 0
 EOS_ID = 1
@@ -470,7 +475,9 @@ def _manifest_identity(
         "consumer": {
             "process_count": process_count,
             "host_sharding": "record_index_mod_process_count",
-            "per_device_sequence_batches": list(DEFAULT_PER_DEVICE_SEQUENCE_BATCHES),
+            "per_device_sequence_batches": list(
+                STAGED_PER_DEVICE_SEQUENCE_BATCHES
+            ),
         },
     }
 
@@ -647,7 +654,7 @@ def _validate_aggregate_state(
         record_multiple = (
             process_count
             * DEFAULT_LOCAL_CHIPS
-            * max(DEFAULT_PER_DEVICE_SEQUENCE_BATCHES)
+            * max(STAGED_PER_DEVICE_SEQUENCE_BATCHES)
         )
         if record_index % record_multiple:
             raise StagingError("sealed staging record count is not batch-aligned")
@@ -1063,7 +1070,9 @@ def stage_c4_split(
     for _ in itertools.islice(iterator, source_examples):
         pass
 
-    max_local_batch = DEFAULT_LOCAL_CHIPS * max(DEFAULT_PER_DEVICE_SEQUENCE_BATCHES)
+    max_local_batch = (
+        DEFAULT_LOCAL_CHIPS * max(STAGED_PER_DEVICE_SEQUENCE_BATCHES)
+    )
     record_multiple = process_count * max_local_batch
     packer = OrderedPacker(sequence_length)
     writer: Any | None = None
@@ -1262,7 +1271,21 @@ def verify_packed_source(
 
 
 class PackedBatchIterable:
-    """Yield host-local batches from immutable packed records in strided order."""
+    """Yield static host-local batches from immutable records in strided order.
+
+    The sealed files are aligned for the original staging candidates 1/2/4.
+    A later exact qualifier may authorize a larger runtime batch. Such a
+    caller must name that batch explicitly; if the final immutable lane is
+    short, this reader fills the remainder with all-zero padding records so no
+    scientific source record is dropped and the accelerator shape stays
+    static.
+
+    ``replay_lane_prefix_records`` exists only to reproduce an already sealed
+    scientific inventory whose producer replayed a compile batch. It inserts
+    the named prefix before the complete immutable lane, then rebatches that
+    exact record stream at the requested static shape. The source-key validator
+    remains authoritative; this option must never be used to relax identity.
+    """
 
     def __init__(
         self,
@@ -1272,6 +1295,8 @@ class PackedBatchIterable:
         process_index: int,
         process_count: int,
         sequence_length: int = DEFAULT_SEQUENCE_LENGTH,
+        qualified_per_device_sequence_batch: int | None = None,
+        replay_lane_prefix_records: int = 0,
     ):
         if not files:
             raise ValueError("packed ArrayRecord file inventory cannot be empty")
@@ -1281,19 +1306,40 @@ class PackedBatchIterable:
             raise ValueError("process_index is outside process_count")
         if global_batch_size <= 0 or global_batch_size % process_count:
             raise ValueError("global batch size must divide evenly across controllers")
+        if qualified_per_device_sequence_batch is None:
+            per_device_batches = STAGED_PER_DEVICE_SEQUENCE_BATCHES
+        else:
+            if (
+                isinstance(qualified_per_device_sequence_batch, bool)
+                or not isinstance(qualified_per_device_sequence_batch, int)
+                or qualified_per_device_sequence_batch <= 0
+            ):
+                raise ValueError(
+                    "qualified per-device sequence batch must be a positive integer"
+                )
+            per_device_batches = (qualified_per_device_sequence_batch,)
         supported = {
             process_count * DEFAULT_LOCAL_CHIPS * per_device
-            for per_device in DEFAULT_PER_DEVICE_SEQUENCE_BATCHES
+            for per_device in per_device_batches
         }
         if global_batch_size not in supported:
             raise ValueError(
                 "global batch size must match a qualified per-device sequence batch"
+            )
+        if (
+            isinstance(replay_lane_prefix_records, bool)
+            or not isinstance(replay_lane_prefix_records, int)
+            or replay_lane_prefix_records < 0
+        ):
+            raise ValueError(
+                "replayed lane-prefix records must be a nonnegative integer"
             )
         self.files = tuple(files)
         self.global_batch_size = global_batch_size
         self.process_index = process_index
         self.process_count = process_count
         self.sequence_length = sequence_length
+        self.replay_lane_prefix_records = replay_lane_prefix_records
 
     def __iter__(self) -> Iterator[dict[str, np.ndarray]]:
         source = _array_record_source(self.files)
@@ -1301,12 +1347,27 @@ class PackedBatchIterable:
         lane_records = (
             len(source) - self.process_index + self.process_count - 1
         ) // self.process_count
-        full_steps = lane_records // local_batch
-        for step in range(full_steps):
+        replay = self.replay_lane_prefix_records
+        if replay > lane_records:
+            raise StagingError(
+                "replayed lane prefix is longer than the immutable source lane"
+            )
+        consumer_records = lane_records + replay
+        steps = (consumer_records + local_batch - 1) // local_batch
+        padding_i32 = np.zeros(self.sequence_length, dtype=np.int32)
+        padding_u16 = np.zeros(self.sequence_length, dtype=np.uint16)
+        for step in range(steps):
             records = []
             lane_start = step * local_batch
-            for offset in range(local_batch):
-                index = self.process_index + (lane_start + offset) * self.process_count
+            records_in_step = min(local_batch, consumer_records - lane_start)
+            for offset in range(records_in_step):
+                consumer_index = lane_start + offset
+                lane_index = (
+                    consumer_index
+                    if consumer_index < replay
+                    else consumer_index - replay
+                )
+                index = self.process_index + lane_index * self.process_count
                 records.append(
                     decode_packed_record(
                         bytes(source[index]),
@@ -1314,13 +1375,19 @@ class PackedBatchIterable:
                         expected_sequence_length=self.sequence_length,
                     )
                 )
+            missing = local_batch - records_in_step
             yield {
-                "inputs": np.stack([record.token_ids for record in records]),
-                "inputs_position": np.stack([record.positions for record in records]).astype(
-                    np.int32
+                "inputs": np.stack(
+                    [record.token_ids for record in records]
+                    + [padding_i32] * missing
                 ),
+                "inputs_position": np.stack(
+                    [record.positions for record in records]
+                    + [padding_u16] * missing
+                ).astype(np.int32),
                 "inputs_segmentation": np.stack(
                     [record.segment_ids for record in records]
+                    + [padding_u16] * missing
                 ).astype(np.int32),
             }
 
@@ -1331,12 +1398,16 @@ def build_maxtext_packed_iterator(
     config: Any,
     mesh: Any,
     global_batch_size: int | None = None,
+    qualified_per_device_sequence_batch: int | None = None,
+    replay_lane_prefix_records: int = 0,
 ) -> Any:
     """Wrap the offline reader in MaxText's native global-array adapter."""
 
     try:
         import jax
-        from maxtext.input_pipeline.multihost_dataloading import MultiHostDataLoadIterator
+        from maxtext.input_pipeline.multihost_dataloading import (
+            MultiHostDataLoadIterator,
+        )
     except ImportError as error:
         raise StagingError("packed TPU input requires the pinned MaxText runtime") from error
     local = PackedBatchIterable(
@@ -1345,6 +1416,10 @@ def build_maxtext_packed_iterator(
         process_index=int(jax.process_index()),
         process_count=int(jax.process_count()),
         sequence_length=int(config.max_target_length),
+        qualified_per_device_sequence_batch=(
+            qualified_per_device_sequence_batch
+        ),
+        replay_lane_prefix_records=replay_lane_prefix_records,
     )
     return MultiHostDataLoadIterator(local, mesh, generate_padding_batch=False)
 
@@ -1426,19 +1501,20 @@ __all__ = [
     "PACKED_DATASET_SCHEMA",
     "PACKED_RECORD_FORMAT",
     "PAD_ID",
+    "STAGED_PER_DEVICE_SEQUENCE_BATCHES",
     "PackedBatchIterable",
     "PackedRecord",
     "SourceFile",
     "StagingError",
     "StagingResult",
-    "build_maxtext_packed_iterator",
     "allenai_c4_stream",
+    "build_maxtext_packed_iterator",
     "decode_packed_record",
     "encode_packed_record",
     "gemma_tokenizer",
     "lane_for_record",
-    "publish_staged_dataset",
     "materialize_gemma_tokenizer",
+    "publish_staged_dataset",
     "stage_c4_split",
     "verify_packed_source",
 ]

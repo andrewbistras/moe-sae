@@ -1,0 +1,18 @@
+[Unit]
+Description=Experiment 5 sealed-core activation handoff 4472ff228b43
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=3600
+StartLimitBurst=3
+
+[Service]
+Type=exec
+WorkingDirectory=/home/tpuops
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/tpuops/src/moe-sae-activation-4472ff228b43/.venv/bin/python /home/tpuops/.local/libexec/handoff_experiment5_activation_ladder.py run
+Restart=on-failure
+RestartSec=30s
+TimeoutStopSec=120s
+
+[Install]
+WantedBy=default.target

@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 import subprocess
+from pathlib import Path
 
 import pytest
-
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_ROOT = REPO_ROOT / "scripts" / "tpu"
@@ -60,6 +59,33 @@ def test_bootstrap_contains_no_disk_mutation_or_secret_inputs() -> None:
     assert "source \"$config_file\"" not in bootstrap
     assert "TOKEN" not in deploy
     assert "PASSWORD" not in deploy
+
+
+def test_deploy_requires_explicit_internal_ip_for_regional_slices() -> None:
+    deploy = (SCRIPT_ROOT / "deploy_workers.sh").read_text()
+    assert "TPU_USE_INTERNAL_IP=${TPU_USE_INTERNAL_IP:-0}" in deploy
+    assert '"$TPU_ACCELERATOR_TYPE" == "v6e-16"' in deploy
+    assert '"$TPU_ACCELERATOR_TYPE" == "v5litepod-16"' in deploy
+    assert (
+        "$TPU_ACCELERATOR_TYPE deployment requires explicit "
+        "TPU_USE_INTERNAL_IP=1"
+    ) in deploy
+    assert "gcloud_common+=(--internal-ip)" in deploy
+    assert "ssh_command+=(--internal-ip)" in deploy
+    inspect = (SCRIPT_ROOT / "inspect_workers.sh").read_text()
+    assert "TPU_USE_INTERNAL_IP=${TPU_USE_INTERNAL_IP:-0}" in inspect
+    assert "command+=(--internal-ip)" in inspect
+
+
+def test_worker_operators_use_one_validated_explicit_remote_username() -> None:
+    deploy = (SCRIPT_ROOT / "deploy_workers.sh").read_text()
+    inspect = (SCRIPT_ROOT / "inspect_workers.sh").read_text()
+    for source in (deploy, inspect):
+        assert "TPU_SSH_USER=${TPU_SSH_USER:-}" in source
+        assert "TPU_SSH_USER must be a safe lowercase Linux username" in source
+        assert 'TPU_SSH_TARGET="$TPU_SSH_USER@$TPU_NAME"' in source
+        assert 'tpu-vm ssh "$TPU_SSH_TARGET"' in source
+    assert '"$TPU_SSH_TARGET:~/.cache/moe-sae-deploy/$deployment_id/"' in deploy
 
 
 def test_bootstrap_gates_activation_capacity_before_and_after_dependencies() -> None:

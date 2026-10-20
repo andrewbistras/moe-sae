@@ -1,0 +1,737 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://moe-sae.invalid/schemas/gemma4_hybrid_result_v1.schema.json",
+  "title": "Gemma 4 routed/shared hybrid scientific curve point",
+  "description": "One Experiment-5 panel, seed, and 2M/5M/10M checkpoint evaluated jointly across H/R/B/F.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "protocol_id",
+    "status",
+    "panel",
+    "seed",
+    "checkpoint_target_tokens",
+    "checkpoint_actual_tokens",
+    "evaluation_tokens",
+    "source_revision",
+    "completed_at",
+    "config_sha256",
+    "parents",
+    "common_full_ffn_sst",
+    "conditions",
+    "paired_effects",
+    "predictions_artifact_sha256",
+    "result_sha256"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "gemma4-routed-shared-hybrid-scientific-result-v1"
+    },
+    "protocol_id": {
+      "const": "gemma4-routed-shared-hybrid-v1-20260728"
+    },
+    "status": {
+      "const": "curve_point_measured"
+    },
+    "panel": {
+      "enum": [
+        "sae",
+        "transcoder"
+      ]
+    },
+    "seed": {
+      "enum": [
+        0,
+        1,
+        2
+      ]
+    },
+    "checkpoint_target_tokens": {
+      "enum": [
+        2000000,
+        5000000,
+        10000000
+      ]
+    },
+    "checkpoint_actual_tokens": {
+      "$ref": "#/$defs/conditionPositiveIntegers"
+    },
+    "evaluation_tokens": {
+      "const": 250000
+    },
+    "source_revision": {
+      "$ref": "#/$defs/gitSha"
+    },
+    "completed_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "config_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "parents": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "train_target_manifest_sha256",
+        "eval_target_manifest_sha256",
+        "train_source_overlay_manifest_sha256",
+        "eval_source_overlay_manifest_sha256",
+        "source_overlay_capture_contract_sha256",
+        "recomposition_sidecar_content_sha256",
+        "recomposition_sidecar_file_sha256"
+      ],
+      "properties": {
+        "train_target_manifest_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "eval_target_manifest_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "train_source_overlay_manifest_sha256": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/sha256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "eval_source_overlay_manifest_sha256": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/sha256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_overlay_capture_contract_sha256": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/sha256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "recomposition_sidecar_content_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "recomposition_sidecar_file_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "common_full_ffn_sst": {
+      "type": "number",
+      "exclusiveMinimum": 0
+    },
+    "conditions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "H",
+        "R",
+        "B",
+        "F"
+      ],
+      "properties": {
+        "H": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/conditionResult"
+            },
+            {
+              "properties": {
+                "condition": {
+                  "const": "H"
+                }
+              }
+            }
+          ]
+        },
+        "R": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/conditionResult"
+            },
+            {
+              "properties": {
+                "condition": {
+                  "const": "R"
+                }
+              }
+            }
+          ]
+        },
+        "B": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/conditionResult"
+            },
+            {
+              "properties": {
+                "condition": {
+                  "const": "B"
+                }
+              }
+            }
+          ]
+        },
+        "F": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/conditionResult"
+            },
+            {
+              "properties": {
+                "condition": {
+                  "const": "F"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "paired_effects": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "H-R",
+        "H-B",
+        "H-F",
+        "F-B"
+      ],
+      "properties": {
+        "H-R": {
+          "$ref": "#/$defs/pairedEffect"
+        },
+        "H-B": {
+          "$ref": "#/$defs/pairedEffect"
+        },
+        "H-F": {
+          "$ref": "#/$defs/pairedEffect"
+        },
+        "F-B": {
+          "$ref": "#/$defs/pairedEffect"
+        }
+      }
+    },
+    "predictions_artifact_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "result_sha256": {
+      "$ref": "#/$defs/sha256"
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "gitSha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "score": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sse",
+        "sst",
+        "nmse",
+        "ev"
+      ],
+      "properties": {
+        "sse": {
+          "type": "number",
+          "minimum": 0
+        },
+        "sst": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "nmse": {
+          "type": "number",
+          "minimum": 0
+        },
+        "ev": {
+          "type": "number"
+        }
+      }
+    },
+    "nullableScore": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/score"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "coverageCount": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fired_features",
+        "total_features",
+        "firing_fraction"
+      ],
+      "properties": {
+        "fired_features": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "total_features": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "firing_fraction": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        }
+      }
+    },
+    "heldoutNonfiring": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fired_features",
+        "total_features",
+        "nonfiring_fraction"
+      ],
+      "properties": {
+        "fired_features": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "total_features": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "nonfiring_fraction": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        }
+      }
+    },
+    "bankExposure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "bank_id",
+        "routed_training_components",
+        "routed_evaluation_components",
+        "cumulative_training_fired_features",
+        "heldout_fired_features",
+        "bank_features"
+      ],
+      "properties": {
+        "bank_id": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 127
+        },
+        "routed_training_components": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "routed_evaluation_components": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cumulative_training_fired_features": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "heldout_fired_features": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "bank_features": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "trainingCost": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "marginal_chip_seconds",
+        "wall_seconds",
+        "tokens_per_second",
+        "accelerator_type",
+        "accelerator_generation",
+        "chip_count",
+        "useful_mfu",
+        "training_receipt_sha256",
+        "checkpoint_firing_mask_sha256"
+      ],
+      "properties": {
+        "marginal_chip_seconds": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "wall_seconds": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "tokens_per_second": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "accelerator_type": {
+          "type": "string",
+          "minLength": 1
+        },
+        "accelerator_generation": {
+          "enum": [
+            "v4",
+            "v5e",
+            "v6e"
+          ]
+        },
+        "chip_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "useful_mfu": {
+          "oneOf": [
+            {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "training_receipt_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "checkpoint_firing_mask_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "conditionResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "condition",
+        "total_features",
+        "candidates_per_token",
+        "nominal_exposure_fraction",
+        "exact_l0",
+        "finite",
+        "full_ffn",
+        "routed",
+        "shared",
+        "oracle_shared_full_ffn",
+        "oracle_routed_full_ffn",
+        "error_cancellation_sse_delta",
+        "cumulative_training_coverage",
+        "heldout_nonfiring",
+        "routed_bank_exposure",
+        "training"
+      ],
+      "properties": {
+        "condition": {
+          "enum": [
+            "H",
+            "R",
+            "B",
+            "F"
+          ]
+        },
+        "total_features": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "candidates_per_token": {
+          "type": "integer",
+          "minimum": 64
+        },
+        "nominal_exposure_fraction": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 1
+        },
+        "exact_l0": {
+          "const": 64
+        },
+        "finite": {
+          "const": true
+        },
+        "full_ffn": {
+          "$ref": "#/$defs/score"
+        },
+        "routed": {
+          "$ref": "#/$defs/nullableScore"
+        },
+        "shared": {
+          "$ref": "#/$defs/nullableScore"
+        },
+        "oracle_shared_full_ffn": {
+          "$ref": "#/$defs/nullableScore"
+        },
+        "oracle_routed_full_ffn": {
+          "$ref": "#/$defs/nullableScore"
+        },
+        "error_cancellation_sse_delta": {
+          "oneOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cumulative_training_coverage": {
+          "$ref": "#/$defs/coverageCount"
+        },
+        "heldout_nonfiring": {
+          "$ref": "#/$defs/heldoutNonfiring"
+        },
+        "routed_bank_exposure": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/bankExposure"
+          },
+          "maxItems": 128
+        },
+        "training": {
+          "$ref": "#/$defs/trainingCost"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "condition": {
+                "enum": [
+                  "H",
+                  "R"
+                ]
+              }
+            },
+            "required": [
+              "condition"
+            ]
+          },
+          "then": {
+            "properties": {
+              "total_features": {
+                "const": 69632
+              },
+              "candidates_per_token": {
+                "const": 8192
+              },
+              "nominal_exposure_fraction": {
+                "const": 0.11764705882352941
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "condition": {
+                "const": "B"
+              }
+            },
+            "required": [
+              "condition"
+            ]
+          },
+          "then": {
+            "properties": {
+              "total_features": {
+                "const": 8192
+              },
+              "candidates_per_token": {
+                "const": 8192
+              },
+              "nominal_exposure_fraction": {
+                "const": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "condition": {
+                "const": "F"
+              }
+            },
+            "required": [
+              "condition"
+            ]
+          },
+          "then": {
+            "properties": {
+              "total_features": {
+                "const": 69632
+              },
+              "candidates_per_token": {
+                "const": 69632
+              },
+              "nominal_exposure_fraction": {
+                "const": 1
+              }
+            }
+          }
+        }
+      ]
+    },
+    "pairedEffect": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "endpoint",
+        "estimate",
+        "lower",
+        "upper",
+        "confidence_level",
+        "bootstrap_unit",
+        "bootstrap_replicates"
+      ],
+      "properties": {
+        "endpoint": {
+          "const": "full_ffn"
+        },
+        "estimate": {
+          "type": "number"
+        },
+        "lower": {
+          "type": "number"
+        },
+        "upper": {
+          "type": "number"
+        },
+        "confidence_level": {
+          "const": 0.95
+        },
+        "bootstrap_unit": {
+          "const": "packed_sequence"
+        },
+        "bootstrap_replicates": {
+          "const": 20000
+        }
+      }
+    },
+    "conditionPositiveIntegers": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "H",
+        "R",
+        "B",
+        "F"
+      ],
+      "properties": {
+        "H": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "R": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "B": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "F": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "panel": {
+            "const": "sae"
+          }
+        },
+        "required": [
+          "panel"
+        ]
+      },
+      "then": {
+        "properties": {
+          "parents": {
+            "properties": {
+              "train_target_manifest_sha256": {
+                "const": "f29aaf45d9ff93be08cc3d175cdcea9fa4aecc37fc0e256d09720e88e1ae838c"
+              },
+              "eval_target_manifest_sha256": {
+                "const": "31454e5ce8693521c41a2a95f2ef88d40c5d26c726a0efac5c26d882ed341f5e"
+              },
+              "train_source_overlay_manifest_sha256": {
+                "type": "null"
+              },
+              "eval_source_overlay_manifest_sha256": {
+                "type": "null"
+              },
+              "source_overlay_capture_contract_sha256": {
+                "type": "null"
+              },
+              "recomposition_sidecar_content_sha256": {
+                "const": "37c7b8c012f8fc0c1f63210986c0b3071a261261c88ee4bc1f502220ce3b8526"
+              },
+              "recomposition_sidecar_file_sha256": {
+                "const": "6486288677e81665b21815879729c424c6acb8c7d0e45be264b961a9d652fe3d"
+              }
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "parents": {
+            "properties": {
+              "train_target_manifest_sha256": {
+                "const": "f29aaf45d9ff93be08cc3d175cdcea9fa4aecc37fc0e256d09720e88e1ae838c"
+              },
+              "eval_target_manifest_sha256": {
+                "const": "31454e5ce8693521c41a2a95f2ef88d40c5d26c726a0efac5c26d882ed341f5e"
+              },
+              "train_source_overlay_manifest_sha256": {
+                "const": "8f27dcf9c1dc0c7f3ffa2e2941daec13d8a72c7204077f09420e15aacb02ffe0"
+              },
+              "eval_source_overlay_manifest_sha256": {
+                "const": "f68e2fe6e4cf568e694925697dd5d65fe10160a52d357c641892de85ee5c3da7"
+              },
+              "source_overlay_capture_contract_sha256": {
+                "const": "fe0b004ca6e48c9eb8163237a5ea20f45b33acdbd9a3a267a9fb4e670ed2c954"
+              },
+              "recomposition_sidecar_content_sha256": {
+                "const": "37c7b8c012f8fc0c1f63210986c0b3071a261261c88ee4bc1f502220ce3b8526"
+              },
+              "recomposition_sidecar_file_sha256": {
+                "const": "6486288677e81665b21815879729c424c6acb8c7d0e45be264b961a9d652fe3d"
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

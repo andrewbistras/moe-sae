@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://moe-sae.invalid/schemas/gemma4_hybrid_budget_ledger_v1.schema.json",
+  "title": "Gemma 4 routed/shared hybrid incremental cash ledger",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "protocol_id",
+    "currency",
+    "hard_limit",
+    "incremental_cash_spent",
+    "quota_funded_tpu_chip_seconds",
+    "line_items",
+    "ledger_sha256"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "gemma4-routed-shared-hybrid-budget-ledger-v1"
+    },
+    "protocol_id": {
+      "const": "gemma4-routed-shared-hybrid-v1-20260728"
+    },
+    "currency": {
+      "const": "USD"
+    },
+    "hard_limit": {
+      "const": 50
+    },
+    "incremental_cash_spent": {
+      "type": "number",
+      "minimum": 0
+    },
+    "quota_funded_tpu_chip_seconds": {
+      "type": "number",
+      "minimum": 0
+    },
+    "line_items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "category",
+          "amount_usd"
+        ],
+        "properties": {
+          "category": {
+            "type": "string",
+            "minLength": 1
+          },
+          "amount_usd": {
+            "type": "number",
+            "minimum": 0
+          }
+        }
+      }
+    },
+    "ledger_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  }
+}

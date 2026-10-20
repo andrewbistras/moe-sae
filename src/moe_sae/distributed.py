@@ -33,6 +33,7 @@ from moe_sae.checkpointing import (
     checkpoint_payload_uri,
     final_pointer_from_latest,
     make_pointer,
+    milestone_pointer_path,
     new_attempt_id,
     normalize_payload_root,
     pointer_path,
@@ -260,6 +261,29 @@ def batch_shardings(mesh: Mesh, config: DistributedConfig) -> DistributedBatch:
     )
 
 
+def replicate_process_local_array(value: Any, mesh: Mesh) -> jax.Array:
+    """Assemble an identical process-local value as a global replicated array.
+
+    A multi-controller :class:`NamedSharding` names devices that are not
+    addressable by any one process.  Consequently, ``jax.device_put(value,
+    NamedSharding(mesh, P()))`` cannot construct a replicated global array
+    from a host-local value on such a mesh.  JAX's process-local assembly API
+    creates only the addressable replica buffers on each controller while
+    preserving the global ``P()`` sharding.
+
+    Callers are responsible for supplying the same deterministic value on
+    every process.  Initialization keys come from the shared run seed and
+    centering means come from the sealed capture manifest.
+    """
+
+    local_value = np.asarray(jax.device_get(value))
+    return jax.make_array_from_process_local_data(
+        NamedSharding(mesh, P()),
+        local_value,
+        global_shape=local_value.shape,
+    )
+
+
 def shard_train_state(
     state: TrainState,
     mesh: Mesh,
@@ -285,12 +309,24 @@ def init_distributed_state(
     distributed = distributed or DistributedConfig()
     _validate_mesh_model(mesh, sae_config, distributed)
     output_shardings = state_shardings(mesh, distributed)
+    typed_key = jax.dtypes.issubdtype(key.dtype, jax.dtypes.prng_key)
+    key_impl = jax.random.key_impl(key) if typed_key else None
+    key_data = np.asarray(jax.device_get(jax.random.key_data(key)))
+
+    def initialize_from_key_data(rng_data: jax.Array) -> TrainState:
+        rng = (
+            jax.random.wrap_key_data(rng_data, impl=key_impl)
+            if typed_key
+            else rng_data
+        )
+        return init_train_state(rng, sae_config)
+
     initialize = jax.jit(
-        lambda rng: init_train_state(rng, sae_config),
+        initialize_from_key_data,
         in_shardings=NamedSharding(mesh, P()),
         out_shardings=output_shardings,
     )
-    return initialize(jax.device_put(key, NamedSharding(mesh, P())))
+    return initialize(replicate_process_local_array(key_data, mesh))
 
 
 def _validate_mesh_model(
@@ -752,8 +788,8 @@ class DistributedTrainer:
             if process_local
             else shard_batch(batch, self.mesh, self.distributed)
         )
-        mean_array = jax.device_put(
-            jnp.asarray(mean, jnp.float32), NamedSharding(self.mesh, P())
+        mean_array = replicate_process_local_array(
+            jnp.asarray(mean, jnp.float32), self.mesh
         )
         return batch, mean_array
 
@@ -1040,6 +1076,39 @@ def _collective_load_pointer(
         prepare_error = error
     _checkpoint_phase_decision("pointer load preparation", prepare_error)
     assert path is not None
+    raw = _coordinator_read_checkpoint_json_if_exists(
+        path, operation=f"{kind} pointer"
+    )
+    if raw is None:
+        return None
+
+    pointer: dict[str, Any] | None = None
+    validation_error: Exception | None = None
+    try:
+        if not isinstance(raw, Mapping):
+            raise RuntimeError("checkpoint pointer must be a JSON object")
+        pointer = validate_pointer(
+            raw,
+            expected_kind=kind,  # type: ignore[arg-type]
+            payload_root=payload_root,
+            run_identity=run_identity,
+        )
+    except Exception as error:
+        validation_error = error
+    _checkpoint_phase_decision("pointer validation", validation_error)
+    assert pointer is not None
+    return pointer
+
+
+def _collective_load_exact_pointer(
+    path: Path,
+    *,
+    kind: str,
+    payload_root: str | Path,
+    run_identity: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Collectively load and validate one caller-selected pointer pathname."""
+
     raw = _coordinator_read_checkpoint_json_if_exists(
         path, operation=f"{kind} pointer"
     )
@@ -2092,8 +2161,8 @@ def distributed_evaluate(
             if process_local_inputs
             else shard_batch(stacked, mesh, distributed)
         )
-        mean_array = jax.device_put(
-            jnp.asarray(mean, jnp.float32), NamedSharding(mesh, P())
+        mean_array = replicate_process_local_array(
+            jnp.asarray(mean, jnp.float32), mesh
         )
         _, aux = compiled(
             params,
@@ -2253,27 +2322,84 @@ def restore_distributed_checkpoint(
     *,
     checkpoint_payload_root: str | Path | None = None,
     checkpoint_identity: Mapping[str, Any] | None = None,
+    checkpoint_metadata_identity: Mapping[str, Any] | None = None,
 ) -> tuple[TrainState, dict[str, Any]]:
-    """Restore only through a validated ``latest.json`` or ``final.json`` pointer."""
+    """Restore through a validated mutable or immutable control pointer.
+
+    ``checkpoint_identity`` always binds the complete control pointer and its
+    payload namespace.  Payload metadata defaults to that same identity.
+    Callers whose immutable payload stores a canonical identity digest instead
+    may supply that nonempty exact subset via ``checkpoint_metadata_identity``.
+    """
 
     if "://" in str(path):
         raise ValueError("checkpoint control pointer must be a POSIX path")
     pointer_file = Path(path)
-    if pointer_file.name not in {"latest.json", "final.json"}:
-        raise ValueError(
-            "distributed checkpoint restore requires latest.json or final.json"
+    milestone = False
+    if pointer_file.name in {"latest.json", "final.json"}:
+        kind = "latest" if pointer_file.name == "latest.json" else "final"
+        checkpoint_dir = pointer_file.parent
+    else:
+        name = pointer_file.name
+        prefix = "target-tokens-"
+        suffix = ".json"
+        token_field = (
+            name[len(prefix) : -len(suffix)]
+            if name.startswith(prefix) and name.endswith(suffix)
+            else ""
         )
-    kind = "latest" if pointer_file.name == "latest.json" else "final"
+        if (
+            pointer_file.parent.name != "milestones"
+            or len(token_field) != 12
+            or any(character not in "0123456789" for character in token_field)
+        ):
+            raise ValueError(
+                "distributed checkpoint restore requires latest.json or final.json, "
+                "or milestones/target-tokens-XXXXXXXXXXXX.json"
+            )
+        checkpoint_dir = pointer_file.parent.parent
+        expected_path = milestone_pointer_path(checkpoint_dir, int(token_field))
+        if pointer_file != expected_path:
+            raise ValueError("checkpoint milestone pointer path is not canonical")
+        kind = "latest"
+        milestone = True
     identity = dict(checkpoint_identity or {})
+    if checkpoint_metadata_identity is None:
+        metadata_identity = identity
+    else:
+        metadata_identity = dict(checkpoint_metadata_identity)
+        if not metadata_identity:
+            raise ValueError(
+                "explicit checkpoint metadata identity must be nonempty"
+            )
+        invalid_metadata_identity = {
+            name: (expected, identity.get(name))
+            for name, expected in metadata_identity.items()
+            if name not in identity or identity[name] != expected
+        }
+        if invalid_metadata_identity:
+            raise ValueError(
+                "explicit checkpoint metadata identity must be an exact "
+                "subset of checkpoint identity: "
+                + ", ".join(sorted(invalid_metadata_identity))
+            )
     payload_root = _effective_checkpoint_payload_root(
-        pointer_file.parent, checkpoint_payload_root
+        checkpoint_dir, checkpoint_payload_root
     )
-    pointer = _collective_load_pointer(
-        pointer_file.parent,
-        kind=kind,
-        payload_root=payload_root,
-        run_identity=identity,
-    )
+    if milestone:
+        pointer = _collective_load_exact_pointer(
+            pointer_file,
+            kind="latest",
+            payload_root=payload_root,
+            run_identity=identity,
+        )
+    else:
+        pointer = _collective_load_pointer(
+            checkpoint_dir,
+            kind=kind,
+            payload_root=payload_root,
+            run_identity=identity,
+        )
     if pointer is None:
         raise RuntimeError(f"checkpoint pointer is missing: {pointer_file}")
     _collectively_require_finalized_checkpoint(str(pointer["payload_uri"]))
@@ -2303,7 +2429,7 @@ def restore_distributed_checkpoint(
             )
         mismatches = {
             name: (metadata.get(name), expected)
-            for name, expected in identity.items()
+            for name, expected in metadata_identity.items()
             if metadata.get(name) != expected
         }
         if mismatches:
@@ -2740,6 +2866,7 @@ __all__ = [
     "evaluate_distributed",
     "init_distributed_state",
     "precompute_distributed_a_capacity",
+    "replicate_process_local_array",
     "restore_distributed_checkpoint",
     "run_distributed_training",
     "save_distributed_checkpoint",

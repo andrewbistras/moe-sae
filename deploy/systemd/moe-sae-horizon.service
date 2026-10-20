@@ -1,0 +1,21 @@
+[Unit]
+Description=Gemma 10M learning-horizon supervisor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tpuops
+Group=tpuops
+Environment=TPU_SSH_USER=abistras
+EnvironmentFile=/etc/moe-sae/horizon.env
+ExecStart=/usr/bin/bash -lc 'cd "$HORIZON_REPO" && exec "$HORIZON_PYTHON" scripts/tpu/run_horizon.py run --plan "$HORIZON_PLAN"'
+Restart=on-failure
+RestartSec=30
+KillMode=control-group
+TimeoutStopSec=120
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,70 @@
+schema_version: gemma4-experiment5-resource-evidence-overrides-v2
+execution_profile: ready-three-v1
+project_commit: 674cecbb19ba9130a81a4e27249c9862de08ad17
+resources:
+  slice-sae-a:
+    tpu_name: gemma4-horizon-v5e-usc-a
+    tpu_description:
+      controller_path: /mnt/moe-sae-usc1/horizon-10m/topology/gemma4-horizon-v5e-usc-a/assignments/experiment5-ready-three-v1-674cecbb19ba-a1-slice-sae-a/tpu-description.json
+      remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/topology/gemma4-horizon-v5e-usc-a/assignments/experiment5-ready-three-v1-674cecbb19ba-a1-slice-sae-a/tpu-description.json
+      sha256: b40db0b4debd52de9570de2cc40c788919a743f230c1268f8c6505d153d2b803
+    accelerator_contract:
+      controller_path: /mnt/moe-sae-usc1/horizon-10m/topology/gemma4-horizon-v5e-usc-a/assignments/experiment5-ready-three-v1-674cecbb19ba-a1-slice-sae-a/accelerator-contract.json
+      remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/topology/gemma4-horizon-v5e-usc-a/assignments/experiment5-ready-three-v1-674cecbb19ba-a1-slice-sae-a/accelerator-contract.json
+      sha256: 21698ddb841d4aa515a2a75a1d9b2a13ab258026b5034b3036c78c20d0b6c1ec
+    spot_attestation:
+      controller_path: /mnt/moe-sae-usc1/horizon-10m/topology/gemma4-horizon-v5e-usc-a/assignments/experiment5-ready-three-v1-674cecbb19ba-a1-slice-sae-a/spot-attestation.json
+      remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/topology/gemma4-horizon-v5e-usc-a/assignments/experiment5-ready-three-v1-674cecbb19ba-a1-slice-sae-a/spot-attestation.json
+      sha256: 61bc1170a78011fbedc880b55850dacfcf028bf07ecdb5a2b4a5e59ed125e3a6
+    controller_mapping:
+      controller_path: /mnt/moe-sae-usc1/horizon-10m/topology/gemma4-horizon-v5e-usc-a/assignments/experiment5-ready-three-v1-674cecbb19ba-a1-slice-sae-a/probes/probe-experiment5-ready-three-v1-674cecbb19ba-a1-slice-sae-a/controller-mapping.json
+      remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/topology/gemma4-horizon-v5e-usc-a/assignments/experiment5-ready-three-v1-674cecbb19ba-a1-slice-sae-a/probes/probe-experiment5-ready-three-v1-674cecbb19ba-a1-slice-sae-a/controller-mapping.json
+      sha256: ae7f07f2841ddc5ecadb4ecbc97a763c82bde089fe929c3191503a20b0af00dd
+    cache_inventory:
+      controller_path: /mnt/moe-sae-usc1/horizon-10m/topology/gemma4-horizon-v5e-usc-a/assignments/experiment5-ready-three-v1-674cecbb19ba-a1-slice-sae-a/probes/probe-experiment5-ready-three-v1-674cecbb19ba-a1-slice-sae-a/cache-inventory.json
+      remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/topology/gemma4-horizon-v5e-usc-a/assignments/experiment5-ready-three-v1-674cecbb19ba-a1-slice-sae-a/probes/probe-experiment5-ready-three-v1-674cecbb19ba-a1-slice-sae-a/cache-inventory.json
+      sha256: 1916ff2bf261070f3fda783d1af8d251ef96f64ec8fdeff55cab16370c57c0a6
+  slice-sae-b:
+    tpu_name: gemma4-horizon-harvest-0728
+    tpu_description:
+      controller_path: /mnt/moe-sae-control/horizon-10m/topology/gemma4-horizon-harvest-0728/assignments/experiment5-ready-three-v1-674cecbb19ba-a1-slice-sae-b/tpu-description.json
+      remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/topology/gemma4-horizon-harvest-0728/assignments/experiment5-ready-three-v1-674cecbb19ba-a1-slice-sae-b/tpu-description.json
+      sha256: 1bc28a5a6d7daea971cc37261b005f82b60bad3a070b0feb8f47ca5f8391ffca
+    accelerator_contract:
+      controller_path: /mnt/moe-sae-control/horizon-10m/topology/gemma4-horizon-harvest-0728/assignments/experiment5-ready-three-v1-674cecbb19ba-a1-slice-sae-b/accelerator-contract.json
+      remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/topology/gemma4-horizon-harvest-0728/assignments/experiment5-ready-three-v1-674cecbb19ba-a1-slice-sae-b/accelerator-contract.json
+      sha256: 92fa20b62b74e6da00a1ab025606fe0453bbdfac7ed047a2668450617c02fe11
+    spot_attestation:
+      controller_path: /mnt/moe-sae-control/horizon-10m/topology/gemma4-horizon-harvest-0728/assignments/experiment5-ready-three-v1-674cecbb19ba-a1-slice-sae-b/spot-attestation.json
+      remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/topology/gemma4-horizon-harvest-0728/assignments/experiment5-ready-three-v1-674cecbb19ba-a1-slice-sae-b/spot-attestation.json
+      sha256: 8303c997cbf8b447636d22a85b638a45b96224aaafedbb3267f3406c60e5fd9a
+    controller_mapping:
+      controller_path: /mnt/moe-sae-control/horizon-10m/topology/gemma4-horizon-harvest-0728/assignments/experiment5-ready-three-v1-674cecbb19ba-a1-slice-sae-b/probes/probe-experiment5-ready-three-v1-674cecbb19ba-a1-slice-sae-b/controller-mapping.json
+      remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/topology/gemma4-horizon-harvest-0728/assignments/experiment5-ready-three-v1-674cecbb19ba-a1-slice-sae-b/probes/probe-experiment5-ready-three-v1-674cecbb19ba-a1-slice-sae-b/controller-mapping.json
+      sha256: 8daa9801e02a9ec2df2b8247d1972a506aee2b3a8daaac6c5e31765ca91eb955
+    cache_inventory:
+      controller_path: /mnt/moe-sae-control/horizon-10m/topology/gemma4-horizon-harvest-0728/assignments/experiment5-ready-three-v1-674cecbb19ba-a1-slice-sae-b/probes/probe-experiment5-ready-three-v1-674cecbb19ba-a1-slice-sae-b/cache-inventory.json
+      remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/topology/gemma4-horizon-harvest-0728/assignments/experiment5-ready-three-v1-674cecbb19ba-a1-slice-sae-b/probes/probe-experiment5-ready-three-v1-674cecbb19ba-a1-slice-sae-b/cache-inventory.json
+      sha256: 1d7f591e5380d23b27d682b388fe3aec633b6b0d1b44db9e8d0a4d000155bd23
+  slice-transcoder-b:
+    tpu_name: gemma4-horizon-v4-spot-trans-b
+    tpu_description:
+      controller_path: /mnt/moe-sae-control/horizon-10m/topology/gemma4-horizon-v4-spot-trans-b/assignments/experiment5-ready-three-v1-674cecbb19ba-a1-slice-transcoder-b/tpu-description.json
+      remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/topology/gemma4-horizon-v4-spot-trans-b/assignments/experiment5-ready-three-v1-674cecbb19ba-a1-slice-transcoder-b/tpu-description.json
+      sha256: c5315d8d7bfe434d48244f35a43d70d0711f45e321197a41737a970618017ca4
+    accelerator_contract:
+      controller_path: /mnt/moe-sae-control/horizon-10m/topology/gemma4-horizon-v4-spot-trans-b/assignments/experiment5-ready-three-v1-674cecbb19ba-a1-slice-transcoder-b/accelerator-contract.json
+      remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/topology/gemma4-horizon-v4-spot-trans-b/assignments/experiment5-ready-three-v1-674cecbb19ba-a1-slice-transcoder-b/accelerator-contract.json
+      sha256: 5819968cd4ac3c36dae334a82f4585f4874ecdbfa5706a58159e6f460690d800
+    spot_attestation:
+      controller_path: /mnt/moe-sae-control/horizon-10m/topology/gemma4-horizon-v4-spot-trans-b/assignments/experiment5-ready-three-v1-674cecbb19ba-a1-slice-transcoder-b/spot-attestation.json
+      remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/topology/gemma4-horizon-v4-spot-trans-b/assignments/experiment5-ready-three-v1-674cecbb19ba-a1-slice-transcoder-b/spot-attestation.json
+      sha256: 94a35e064d5eeb960d0d1a60edda0b8e13dce18e2b42320b19ea5aaa28395bd1
+    controller_mapping:
+      controller_path: /mnt/moe-sae-control/horizon-10m/topology/gemma4-horizon-v4-spot-trans-b/assignments/experiment5-ready-three-v1-674cecbb19ba-a1-slice-transcoder-b/probes/probe-experiment5-ready-three-v1-674cecbb19ba-a1-slice-transcoder-b/controller-mapping.json
+      remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/topology/gemma4-horizon-v4-spot-trans-b/assignments/experiment5-ready-three-v1-674cecbb19ba-a1-slice-transcoder-b/probes/probe-experiment5-ready-three-v1-674cecbb19ba-a1-slice-transcoder-b/controller-mapping.json
+      sha256: 21204cea562096b50eddd37ffb96a39326742bee499699ba7728783a845a88e3
+    cache_inventory:
+      controller_path: /mnt/moe-sae-control/horizon-10m/topology/gemma4-horizon-v4-spot-trans-b/assignments/experiment5-ready-three-v1-674cecbb19ba-a1-slice-transcoder-b/probes/probe-experiment5-ready-three-v1-674cecbb19ba-a1-slice-transcoder-b/cache-inventory.json
+      remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/topology/gemma4-horizon-v4-spot-trans-b/assignments/experiment5-ready-three-v1-674cecbb19ba-a1-slice-transcoder-b/probes/probe-experiment5-ready-three-v1-674cecbb19ba-a1-slice-transcoder-b/cache-inventory.json
+      sha256: c60cc6e2ccd7d0d73df449a1159801b42b941379a06b22f2b6aa95ae0b48d2e0

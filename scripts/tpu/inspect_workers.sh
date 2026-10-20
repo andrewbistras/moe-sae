@@ -16,6 +16,9 @@ Required environment variables:
 
 Optional environment variable:
   SSH_KEY_FILE  gcloud SSH key (default: ~/.ssh/google_compute_engine)
+  TPU_SSH_USER  explicit remote Linux username (default: gcloud
+                account-derived username)
+  TPU_USE_INTERNAL_IP  1 to use private TPU VM addresses (default: 0)
 
 This command is read-only. Use its lsblk/df/findmnt output to choose an
 existing host-local filesystem and set an explicit LOCAL_BUFFER_ROOT beneath
@@ -39,13 +42,20 @@ require_env() {
 
 ensure_gcloud_ssh_key() {
   local key_file=$1
-  gcloud compute tpus tpu-vm ssh "$TPU_NAME" \
-    --project="$GCP_PROJECT" \
-    --zone="$TPU_ZONE" \
-    --worker=0 \
-    --ssh-key-file="$key_file" \
-    --command=true \
-    --quiet >/dev/null
+  local -a command
+  command=(
+    gcloud compute tpus tpu-vm ssh "$TPU_SSH_TARGET"
+    --project="$GCP_PROJECT"
+    --zone="$TPU_ZONE"
+    --worker=0
+    --ssh-key-file="$key_file"
+    --command=true
+    --quiet
+  )
+  if [[ "$TPU_USE_INTERNAL_IP" == "1" ]]; then
+    command+=(--internal-ip)
+  fi
+  "${command[@]}" >/dev/null
   [[ -f "$key_file" ]] || die "gcloud did not create the expected SSH key: $key_file"
   ssh-add "$key_file" >/dev/null 2>&1 || die \
     "could not add $key_file to an SSH agent; run 'eval \"\$(ssh-agent -s)\"' and retry"
@@ -61,12 +71,23 @@ main() {
   require_env TPU_NAME
   require_env TPU_ZONE
   SSH_KEY_FILE=${SSH_KEY_FILE:-$HOME/.ssh/google_compute_engine}
+  TPU_USE_INTERNAL_IP=${TPU_USE_INTERNAL_IP:-0}
+  TPU_SSH_USER=${TPU_SSH_USER:-}
 
   command -v gcloud >/dev/null 2>&1 || die "gcloud is unavailable"
   command -v ssh-add >/dev/null 2>&1 || die "ssh-add is unavailable"
   [[ "$GCP_PROJECT" =~ ^[a-z][a-z0-9-]{4,61}[a-z0-9]$ ]] || die "invalid GCP_PROJECT"
   [[ "$TPU_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9-]*$ ]] || die "invalid TPU_NAME"
   [[ "$TPU_ZONE" =~ ^[a-z0-9-]+$ ]] || die "invalid TPU_ZONE"
+  [[ "$TPU_USE_INTERNAL_IP" == "0" || "$TPU_USE_INTERNAL_IP" == "1" ]] || \
+    die "TPU_USE_INTERNAL_IP must be exactly 0 or 1"
+  if [[ -n "$TPU_SSH_USER" ]]; then
+    [[ "$TPU_SSH_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || \
+      die "TPU_SSH_USER must be a safe lowercase Linux username"
+    TPU_SSH_TARGET="$TPU_SSH_USER@$TPU_NAME"
+  else
+    TPU_SSH_TARGET="$TPU_NAME"
+  fi
 
   local remote_command
   remote_command=$(cat <<'REMOTE_BASH'
@@ -96,13 +117,20 @@ REMOTE_BASH
 )
 
   ensure_gcloud_ssh_key "$SSH_KEY_FILE"
-  gcloud compute tpus tpu-vm ssh "$TPU_NAME" \
-    --project="$GCP_PROJECT" \
-    --zone="$TPU_ZONE" \
-    --worker=all \
-    --ssh-key-file="$SSH_KEY_FILE" \
-    --command="bash -c $(printf '%q' "$remote_command")" \
+  local -a command
+  command=(
+    gcloud compute tpus tpu-vm ssh "$TPU_SSH_TARGET"
+    --project="$GCP_PROJECT"
+    --zone="$TPU_ZONE"
+    --worker=all
+    --ssh-key-file="$SSH_KEY_FILE"
+    --command="bash -c $(printf '%q' "$remote_command")"
     --quiet
+  )
+  if [[ "$TPU_USE_INTERNAL_IP" == "1" ]]; then
+    command+=(--internal-ip)
+  fi
+  "${command[@]}"
 }
 
 main "$@"

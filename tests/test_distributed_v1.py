@@ -12,6 +12,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 
 import moe_sae.distributed as distributed_module
 from moe_sae.checkpointing import (
@@ -27,6 +29,7 @@ from moe_sae.distributed import (
     evaluate_distributed,
     init_distributed_state,
     precompute_distributed_a_capacity,
+    replicate_process_local_array,
     restore_distributed_checkpoint,
     run_distributed_training,
     save_distributed_checkpoint,
@@ -34,7 +37,7 @@ from moe_sae.distributed import (
 )
 from moe_sae.pipeline import ActivationBatch, TrainingConfig
 from moe_sae.metrics_journal import JournalIdentity, MetricsJournal
-from moe_sae.sae import SAEConfig
+from moe_sae.sae import SAEConfig, init_train_state
 
 
 def test_default_mesh_is_process_by_local_devices() -> None:
@@ -45,6 +48,127 @@ def test_default_mesh_is_process_by_local_devices() -> None:
         jax.process_count(),
         jax.local_device_count(),
     )
+
+
+def test_replicated_array_uses_process_local_global_assembly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mesh = create_mesh()
+    real_assemble = jax.make_array_from_process_local_data
+    calls: list[tuple[NamedSharding, tuple[int, ...], tuple[int, ...] | None]] = []
+
+    def record_assemble(sharding, local_data, global_shape=None):
+        assert isinstance(local_data, np.ndarray)
+        calls.append((sharding, tuple(local_data.shape), global_shape))
+        return real_assemble(
+            sharding,
+            local_data,
+            global_shape=global_shape,
+        )
+
+    monkeypatch.setattr(
+        jax,
+        "make_array_from_process_local_data",
+        record_assemble,
+    )
+    value = np.asarray([1.25, -0.5, 3.0], np.float32)
+    actual = replicate_process_local_array(value, mesh)
+
+    assert calls == [
+        (
+            NamedSharding(mesh, P()),
+            value.shape,
+            value.shape,
+        )
+    ]
+    assert actual.sharding == NamedSharding(mesh, P())
+    assert actual.is_fully_replicated
+    np.testing.assert_array_equal(np.asarray(actual), value)
+
+
+@pytest.mark.parametrize("typed_key", [False, True])
+def test_distributed_initialization_assembles_a_replicated_process_local_key(
+    monkeypatch: pytest.MonkeyPatch,
+    typed_key: bool,
+) -> None:
+    mesh = create_mesh()
+    config = SAEConfig(
+        "B",
+        hidden_dim=3,
+        num_experts=2,
+        top_routed=1,
+        bank_width=2,
+        k=1,
+        parameter_dtype="float32",
+        warmup_steps=0,
+        total_steps=1,
+    )
+    key = jax.random.key(7) if typed_key else jax.random.PRNGKey(7)
+    observed: list[np.ndarray] = []
+    real_replicate = distributed_module.replicate_process_local_array
+
+    def record_replicate(value, selected_mesh):
+        observed.append(value)
+        return real_replicate(value, selected_mesh)
+
+    monkeypatch.setattr(
+        distributed_module,
+        "replicate_process_local_array",
+        record_replicate,
+    )
+    actual = init_distributed_state(key, mesh, config)
+    repeated = init_distributed_state(key, mesh, config)
+    expected = init_train_state(key, config)
+
+    assert len(observed) == 2
+    np.testing.assert_array_equal(observed[0], jax.random.key_data(key))
+    np.testing.assert_array_equal(observed[1], jax.random.key_data(key))
+    assert observed[0].dtype == np.uint32
+    assert observed[1].dtype == np.uint32
+    for actual_leaf, repeated_leaf, expected_leaf in zip(
+        jax.tree_util.tree_leaves(actual),
+        jax.tree_util.tree_leaves(repeated),
+        jax.tree_util.tree_leaves(expected),
+        strict=True,
+    ):
+        np.testing.assert_array_equal(
+            np.asarray(actual_leaf),
+            np.asarray(repeated_leaf),
+        )
+        np.testing.assert_allclose(
+            np.asarray(actual_leaf),
+            np.asarray(expected_leaf),
+            rtol=2e-7,
+            atol=1e-7,
+            equal_nan=True,
+        )
+
+
+def test_legacy_and_typed_keys_have_identical_distributed_initialization() -> None:
+    mesh = create_mesh()
+    config = SAEConfig(
+        "B",
+        hidden_dim=3,
+        num_experts=2,
+        top_routed=1,
+        bank_width=2,
+        k=1,
+        parameter_dtype="float32",
+        warmup_steps=0,
+        total_steps=1,
+    )
+    legacy = init_distributed_state(jax.random.PRNGKey(11), mesh, config)
+    typed = init_distributed_state(jax.random.key(11), mesh, config)
+
+    for legacy_leaf, typed_leaf in zip(
+        jax.tree_util.tree_leaves(legacy),
+        jax.tree_util.tree_leaves(typed),
+        strict=True,
+    ):
+        np.testing.assert_array_equal(
+            np.asarray(legacy_leaf),
+            np.asarray(typed_leaf),
+        )
 
 
 def test_capacity_scan_uses_static_local_microbatches_and_margin() -> None:
@@ -350,6 +474,322 @@ def test_checkpoint_timing_resume_uses_coordinator_value_without_exists_branch(
         restored_tokens=8,
     ) == payload
     assert reads == [tmp_path / "checkpoint_timing.json"]
+
+
+def _stub_distributed_checkpoint_restore(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    metadata: dict[str, object],
+) -> tuple[SimpleNamespace, list[dict[str, object]]]:
+    payload_uri = "gs://bucket/checkpoints/payload"
+    state = SimpleNamespace(
+        tokens_seen=jnp.asarray(8),
+        step=jnp.asarray(2),
+    )
+    pointer_identities: list[dict[str, object]] = []
+
+    def load_pointer(
+        _root,
+        *,
+        kind,
+        payload_root,
+        run_identity,
+    ):
+        assert kind == "latest"
+        assert payload_root == "gs://bucket/checkpoints"
+        pointer_identities.append(dict(run_identity))
+        return {
+            "payload_uri": payload_uri,
+            "tokens_seen": 8,
+            "step": 2,
+        }
+
+    def decide(_operation: str, error: Exception | None) -> None:
+        if error is not None:
+            raise error
+
+    monkeypatch.setattr(
+        distributed_module,
+        "_collective_load_pointer",
+        load_pointer,
+    )
+    monkeypatch.setattr(
+        distributed_module,
+        "_collectively_require_finalized_checkpoint",
+        lambda _uri: None,
+    )
+    monkeypatch.setattr(
+        distributed_module,
+        "_restore_distributed_payload",
+        lambda *_args: (state, dict(metadata)),
+    )
+    monkeypatch.setattr(
+        distributed_module,
+        "_checkpoint_phase_decision",
+        decide,
+    )
+    return state, pointer_identities
+
+
+def test_restore_uses_full_pointer_identity_and_explicit_payload_subset(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    run_identity = {
+        "condition": "A",
+        "seed": 0,
+        "run_identity_sha256": "a" * 64,
+    }
+    metadata_identity = {"run_identity_sha256": "a" * 64}
+    expected, pointer_identities = _stub_distributed_checkpoint_restore(
+        monkeypatch,
+        metadata={
+            **metadata_identity,
+            "checkpoint_payload_uri": "gs://bucket/checkpoints/payload",
+            "tokens_seen": 8,
+            "steps": 2,
+        },
+    )
+
+    restored, _ = restore_distributed_checkpoint(
+        tmp_path / "latest.json",
+        object(),  # type: ignore[arg-type]
+        object(),  # type: ignore[arg-type]
+        object(),  # type: ignore[arg-type]
+        checkpoint_payload_root="gs://bucket/checkpoints",
+        checkpoint_identity=run_identity,
+        checkpoint_metadata_identity=metadata_identity,
+    )
+
+    assert restored is expected
+    assert pointer_identities == [run_identity]
+
+
+def test_restore_loads_exact_immutable_milestone_pointer_collectively(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    payload_root = "gs://bucket/checkpoints"
+    run_identity = {
+        "condition": "A",
+        "run_identity_sha256": "a" * 64,
+    }
+    payload_uri = checkpoint_payload_uri(
+        payload_root,
+        run_identity,
+        step=2,
+        tokens_seen=8,
+        attempt_id="b" * 32,
+    )
+    pointer = make_pointer(
+        kind="latest",
+        payload_uri=payload_uri,
+        step=2,
+        tokens_seen=8,
+        attempt_id="b" * 32,
+        run_identity=run_identity,
+    )
+    milestone = (
+        tmp_path
+        / "checkpoints"
+        / "milestones"
+        / "target-tokens-000000000007.json"
+    )
+    reads: list[tuple[Path, str]] = []
+    state = SimpleNamespace(tokens_seen=jnp.asarray(8), step=jnp.asarray(2))
+
+    def read(path: Path, *, operation: str):
+        reads.append((path, operation))
+        return pointer
+
+    def decide(_operation: str, error: Exception | None) -> None:
+        if error is not None:
+            raise error
+
+    monkeypatch.setattr(
+        distributed_module,
+        "_coordinator_read_checkpoint_json_if_exists",
+        read,
+    )
+    monkeypatch.setattr(
+        distributed_module,
+        "_collectively_require_finalized_checkpoint",
+        lambda uri: uri == payload_uri or pytest.fail("wrong payload URI"),
+    )
+    monkeypatch.setattr(
+        distributed_module,
+        "_restore_distributed_payload",
+        lambda *_args: (
+            state,
+            {
+                **run_identity,
+                "checkpoint_payload_uri": payload_uri,
+                "tokens_seen": 8,
+                "steps": 2,
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        distributed_module,
+        "_checkpoint_phase_decision",
+        decide,
+    )
+
+    restored, _ = restore_distributed_checkpoint(
+        milestone,
+        object(),  # type: ignore[arg-type]
+        object(),  # type: ignore[arg-type]
+        object(),  # type: ignore[arg-type]
+        checkpoint_payload_root=payload_root,
+        checkpoint_identity=run_identity,
+    )
+
+    assert restored is state
+    assert reads == [(milestone, "latest pointer")]
+
+
+def test_restore_rejects_final_pointer_body_at_milestone_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    payload_root = "gs://bucket/checkpoints"
+    run_identity = {"run_identity_sha256": "a" * 64}
+    latest = make_pointer(
+        kind="latest",
+        payload_uri=checkpoint_payload_uri(
+            payload_root,
+            run_identity,
+            step=2,
+            tokens_seen=8,
+            attempt_id="c" * 32,
+        ),
+        step=2,
+        tokens_seen=8,
+        attempt_id="c" * 32,
+        run_identity=run_identity,
+    )
+
+    monkeypatch.setattr(
+        distributed_module,
+        "_coordinator_read_checkpoint_json_if_exists",
+        lambda *_args, **_kwargs: final_pointer_from_latest(latest),
+    )
+    monkeypatch.setattr(
+        distributed_module,
+        "_checkpoint_phase_decision",
+        lambda _operation, error: (_ for _ in ()).throw(error)
+        if error is not None
+        else None,
+    )
+
+    with pytest.raises(RuntimeError, match="kind mismatch"):
+        restore_distributed_checkpoint(
+            tmp_path
+            / "checkpoints"
+            / "milestones"
+            / "target-tokens-000000000007.json",
+            object(),  # type: ignore[arg-type]
+            object(),  # type: ignore[arg-type]
+            object(),  # type: ignore[arg-type]
+            checkpoint_payload_root=payload_root,
+            checkpoint_identity=run_identity,
+        )
+
+
+def test_restore_rejects_wrong_payload_identity_hash(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    run_identity = {
+        "condition": "A",
+        "run_identity_sha256": "a" * 64,
+    }
+    _stub_distributed_checkpoint_restore(
+        monkeypatch,
+        metadata={
+            "run_identity_sha256": "b" * 64,
+            "checkpoint_payload_uri": "gs://bucket/checkpoints/payload",
+            "tokens_seen": 8,
+            "steps": 2,
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="different run"):
+        restore_distributed_checkpoint(
+            tmp_path / "latest.json",
+            object(),  # type: ignore[arg-type]
+            object(),  # type: ignore[arg-type]
+            object(),  # type: ignore[arg-type]
+            checkpoint_payload_root="gs://bucket/checkpoints",
+            checkpoint_identity=run_identity,
+            checkpoint_metadata_identity={"run_identity_sha256": "a" * 64},
+        )
+
+
+def test_restore_defaults_payload_validation_to_full_pointer_identity(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    run_identity = {
+        "condition": "A",
+        "run_identity_sha256": "a" * 64,
+    }
+    _stub_distributed_checkpoint_restore(
+        monkeypatch,
+        metadata={
+            **run_identity,
+            "checkpoint_payload_uri": "gs://bucket/checkpoints/payload",
+            "tokens_seen": 8,
+            "steps": 2,
+        },
+    )
+
+    restore_distributed_checkpoint(
+        tmp_path / "latest.json",
+        object(),  # type: ignore[arg-type]
+        object(),  # type: ignore[arg-type]
+        object(),  # type: ignore[arg-type]
+        checkpoint_payload_root="gs://bucket/checkpoints",
+        checkpoint_identity=run_identity,
+    )
+
+    _stub_distributed_checkpoint_restore(
+        monkeypatch,
+        metadata={
+            "run_identity_sha256": "a" * 64,
+            "checkpoint_payload_uri": "gs://bucket/checkpoints/payload",
+            "tokens_seen": 8,
+            "steps": 2,
+        },
+    )
+    with pytest.raises(RuntimeError, match="different run"):
+        restore_distributed_checkpoint(
+            tmp_path / "latest.json",
+            object(),  # type: ignore[arg-type]
+            object(),  # type: ignore[arg-type]
+            object(),  # type: ignore[arg-type]
+            checkpoint_payload_root="gs://bucket/checkpoints",
+            checkpoint_identity=run_identity,
+        )
+
+
+@pytest.mark.parametrize(
+    "metadata_identity",
+    [
+        {},
+        {"missing": "value"},
+        {"run_identity_sha256": "b" * 64},
+    ],
+)
+def test_restore_rejects_invalid_explicit_payload_identity_subset(
+    metadata_identity: dict[str, object],
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="metadata identity"):
+        restore_distributed_checkpoint(
+            tmp_path / "latest.json",
+            object(),  # type: ignore[arg-type]
+            object(),  # type: ignore[arg-type]
+            object(),  # type: ignore[arg-type]
+            checkpoint_payload_root="gs://bucket/checkpoints",
+            checkpoint_identity={"run_identity_sha256": "a" * 64},
+            checkpoint_metadata_identity=metadata_identity,
+        )
 
 
 def test_evaluation_restores_training_capacity_then_uses_eval_capacity(

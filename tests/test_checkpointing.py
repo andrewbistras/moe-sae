@@ -8,9 +8,12 @@ import pytest
 from moe_sae.checkpointing import (
     checkpoint_payload_uri,
     final_pointer_from_latest,
+    load_milestone_pointer,
     load_pointer,
     make_pointer,
+    milestone_pointer_path,
     normalize_payload_root,
+    publish_milestone_pointer,
     publish_pointer,
     validate_pointer,
 )
@@ -100,6 +103,34 @@ def test_final_pointer_reuses_latest_payload_but_has_its_own_hash(
         payload_root=tmp_path / "payloads",
         run_identity=identity,
     )
+
+
+def test_milestone_pointer_is_create_only_and_identity_bound(
+    tmp_path: Path,
+) -> None:
+    identity = {"condition": "A", "seed": 0}
+    latest = _latest(tmp_path, identity)
+
+    path = publish_milestone_pointer(tmp_path / "control", latest)
+    assert path == milestone_pointer_path(
+        tmp_path / "control",
+        int(latest["tokens_seen"]),
+    )
+    assert (
+        load_milestone_pointer(
+            tmp_path / "control",
+            checkpoint_target_tokens=int(latest["tokens_seen"]),
+            payload_root=tmp_path / "payloads",
+            run_identity=identity,
+            expected_tokens_seen=int(latest["tokens_seen"]),
+        )
+        == latest
+    )
+    assert publish_milestone_pointer(tmp_path / "control", latest) == path
+
+    different = _latest(tmp_path, {**identity, "seed": 1})
+    with pytest.raises(RuntimeError, match="different content"):
+        publish_milestone_pointer(tmp_path / "control", different)
 
 
 def test_gcs_payload_root_is_canonical_and_rejects_dot_segments() -> None:

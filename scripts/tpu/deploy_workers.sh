@@ -28,6 +28,11 @@ Required environment variables (none are secrets):
 Optional environment variables:
   UV_VERSION                  pinned uv version (default: 0.11.14)
   SSH_KEY_FILE                gcloud SSH key (default: ~/.ssh/google_compute_engine)
+  TPU_SSH_USER                explicit remote Linux username (default: gcloud
+                              account-derived username)
+  TPU_ACCELERATOR_TYPE        exact expected type (default: v4-32)
+  TPU_USE_INTERNAL_IP         1 to use private TPU VM addresses (default: 0);
+                              required for v6e-16 and v5litepod-16
 
 Before setting LOCAL_BUFFER_ROOT, run scripts/tpu/inspect_workers.sh. This
 script never creates a TPU, chooses a device, partitions a disk, or formats a
@@ -92,13 +97,24 @@ validate_inputs() {
   [[ "$NFS_EXPORT" =~ ^/[A-Za-z0-9._/-]+$ ]] || die "invalid NFS_EXPORT"
   [[ "$NFS_EXPORT" != */ ]] || die "NFS_EXPORT must not end with '/'"
   [[ "$UV_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "invalid UV_VERSION"
+  [[ "$TPU_ACCELERATOR_TYPE" == "v4-32" || \
+     "$TPU_ACCELERATOR_TYPE" == "v6e-16" || \
+     "$TPU_ACCELERATOR_TYPE" == "v5litepod-16" ]] || \
+    die "TPU_ACCELERATOR_TYPE must be exactly v4-32, v6e-16, or v5litepod-16"
+  [[ "$TPU_USE_INTERNAL_IP" == "0" || "$TPU_USE_INTERNAL_IP" == "1" ]] || \
+    die "TPU_USE_INTERNAL_IP must be exactly 0 or 1"
+  if [[ "$TPU_ACCELERATOR_TYPE" == "v6e-16" || \
+        "$TPU_ACCELERATOR_TYPE" == "v5litepod-16" ]]; then
+    [[ "$TPU_USE_INTERNAL_IP" == "1" ]] || \
+      die "$TPU_ACCELERATOR_TYPE deployment requires explicit TPU_USE_INTERNAL_IP=1"
+  fi
 }
 
 ensure_gcloud_ssh_key() {
   local key_file=$1
   local -a ssh_command
   ssh_command=(
-    gcloud compute tpus tpu-vm ssh "$TPU_NAME"
+    gcloud compute tpus tpu-vm ssh "$TPU_SSH_TARGET"
     --project="$GCP_PROJECT"
     --zone="$TPU_ZONE"
     --worker=0
@@ -106,6 +122,9 @@ ensure_gcloud_ssh_key() {
     --command=true
     --quiet
   )
+  if [[ "$TPU_USE_INTERNAL_IP" == "1" ]]; then
+    ssh_command+=(--internal-ip)
+  fi
 
   log "opening worker 0 once so gcloud can create/install its SSH key"
   "${ssh_command[@]}" >/dev/null
@@ -152,6 +171,16 @@ main() {
   done
   UV_VERSION=${UV_VERSION:-$DEFAULT_UV_VERSION}
   SSH_KEY_FILE=${SSH_KEY_FILE:-$HOME/.ssh/google_compute_engine}
+  TPU_ACCELERATOR_TYPE=${TPU_ACCELERATOR_TYPE:-v4-32}
+  TPU_USE_INTERNAL_IP=${TPU_USE_INTERNAL_IP:-0}
+  TPU_SSH_USER=${TPU_SSH_USER:-}
+  if [[ -n "$TPU_SSH_USER" ]]; then
+    [[ "$TPU_SSH_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || \
+      die "TPU_SSH_USER must be a safe lowercase Linux username"
+    TPU_SSH_TARGET="$TPU_SSH_USER@$TPU_NAME"
+  else
+    TPU_SSH_TARGET="$TPU_NAME"
+  fi
   validate_inputs
 
   require_command git
@@ -193,11 +222,11 @@ main() {
     die "local checkout is dirty; commit intentional changes before production deployment"
 
   maxtext_commit=$(
-    awk '$1 == "maxtext_commit:" {print $2}' \
-      "$repo_root/configs/gemma4_26b_a4b.yaml"
+    awk '$1 == "maxtext_fork_commit:" {print $2}' \
+      "$repo_root/configs/gemma4_contribution_v1.yaml"
   )
   [[ "$maxtext_commit" =~ ^[0-9a-f]{40}$ ]] || \
-    die "could not read the pinned MaxText commit from the production config"
+    die "could not read the pinned Experiment-2 MaxText fork commit"
 
   temp_dir=$(mktemp -d "${TMPDIR:-/tmp}/moe-sae-deploy.XXXXXX")
   DEPLOY_TEMP_DIR=$temp_dir
@@ -229,9 +258,9 @@ main() {
   IFS=',' read -r tpu_state accelerator_type <<< "$tpu_description"
   [[ "$tpu_state" == "READY" ]] || \
     die "TPU VM state is '$tpu_state'; wait for READY before deployment"
-  [[ "$accelerator_type" == "v4-32" ]] || \
-    die "TPU accelerator type is '$accelerator_type'; this pipeline requires v4-32"
-  log "target TPU is READY with accelerator type v4-32"
+  [[ "$accelerator_type" == "$TPU_ACCELERATOR_TYPE" ]] || \
+    die "TPU accelerator type is '$accelerator_type', not '$TPU_ACCELERATOR_TYPE'"
+  log "target TPU is READY with accelerator type $TPU_ACCELERATOR_TYPE"
   ensure_gcloud_ssh_key "$SSH_KEY_FILE"
 
   gcloud_common=(
@@ -240,8 +269,11 @@ main() {
     --ssh-key-file="$SSH_KEY_FILE"
     --quiet
   )
+  if [[ "$TPU_USE_INTERNAL_IP" == "1" ]]; then
+    gcloud_common+=(--internal-ip)
+  fi
   log "creating deployment directory on every worker"
-  gcloud compute tpus tpu-vm ssh "$TPU_NAME" \
+  gcloud compute tpus tpu-vm ssh "$TPU_SSH_TARGET" \
     "${gcloud_common[@]}" \
     --worker=all \
     --command="install -d -m 0700 $remote_dir"
@@ -249,19 +281,19 @@ main() {
   log "copying bundle, config, and bootstrap helper to every worker"
   gcloud compute tpus tpu-vm scp \
     "$bundle_file" "$bootstrap_file" "$config_file" \
-    "$TPU_NAME:~/.cache/moe-sae-deploy/$deployment_id/" \
+    "$TPU_SSH_TARGET:~/.cache/moe-sae-deploy/$deployment_id/" \
     "${gcloud_common[@]}" \
     --worker=all
 
   remote_command="bash $remote_dir/bootstrap_worker.sh --config $remote_dir/worker.conf --bundle $remote_dir/repository.bundle"
   log "bootstrapping every worker concurrently; any worker failure fails this deployment"
-  gcloud compute tpus tpu-vm ssh "$TPU_NAME" \
+  gcloud compute tpus tpu-vm ssh "$TPU_SSH_TARGET" \
     "${gcloud_common[@]}" \
     --worker=all \
     --command="$remote_command"
 
   log "all workers are bootstrapped at exact commit $PROJECT_COMMIT"
-  log "next gate: launch the repository's collective qualify-storage command on all workers"
+  log "next gate: run the bounded Experiment-2 contribution qualifier"
 }
 
 main "$@"

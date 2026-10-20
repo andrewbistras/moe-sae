@@ -1,0 +1,327 @@
+# Structurally complete example only. Every ``replace-*`` value, zero hash,
+# controller path, remote path, and GCS prefix must be replaced from sealed
+# deployment evidence before `run`. This file contains no live TPU identity.
+schema_version: gemma4-horizon-direct-campaign-plan-v1
+campaign_id: replace-gemma4-horizon-10m
+state_root: /mnt/replace-controller/horizon-10m/direct-controller
+working_directory: /home/replace-controller/moe-sae
+python_executable: /home/replace-controller/moe-sae/.venv/bin/python
+remote_project_root: /home/replace-worker/moe-sae
+remote_uv: /home/replace-worker/.local/bin/uv
+project_commit: "0000000000000000000000000000000000000000"
+max_parallel_train: 8
+max_parallel_eval: 2
+retry_policy:
+  max_transient_attempts: 8
+  initial_backoff_seconds: 30
+  maximum_backoff_seconds: 600
+
+# These are non-secret operator inputs shared by every task. Resource identity,
+# fresh evidence, control/checkpoint roots, and local log roots are injected by
+# the driver and may not appear here.
+environment:
+  ARTIFACT_ROOT: /home/replace-worker/moe-sae/artifacts/gemma4_v1/production
+  BULK_GCS_ROOT: gs://replace-regional-bucket/horizon-10m
+  CONTRIBUTION_TRAIN_CAPTURE_ROOT: /home/replace-worker/moe-sae/artifacts/gemma4_v1/production/experiment2/contributions/train
+  CONTRIBUTION_EVAL_CAPTURE_ROOT: /home/replace-worker/moe-sae/artifacts/gemma4_v1/production/experiment2/contributions/eval
+  CONTRIBUTION_OBJECT_PREFIX: gs://replace-source-bucket/experiment2/contributions/train
+  CONTRIBUTION_EVAL_OBJECT_PREFIX: gs://replace-source-bucket/experiment2/contributions/eval
+  CONTRIBUTION_SOURCE_OVERLAY_ROOT: /home/replace-worker/moe-sae/artifacts/gemma4_v1/production/horizon-10m/captures/transcoder-overlay/train
+  CONTRIBUTION_EVAL_SOURCE_OVERLAY_ROOT: /home/replace-worker/moe-sae/artifacts/gemma4_v1/production/experiment3/routed-input-overlay/eval
+  CONTRIBUTION_SOURCE_OVERLAY_PREFIX: gs://replace-source-bucket/horizon-10m/transcoder-overlay/train
+  CONTRIBUTION_EVAL_SOURCE_OVERLAY_PREFIX: gs://replace-source-bucket/experiment3/routed-input-overlay/eval
+  CONTRIBUTION_RECOMPOSITION_SIDECAR: /home/replace-worker/moe-sae/artifacts/gemma4_v1/production/experiment2/qualification/recomposition-sidecar.json
+  CONTRIBUTION_SAE_CACHE_ROOT: /dev/shm/moe-sae-local/horizon-10m/cache
+  CONTRIBUTION_SAE_CACHE_MAX_BYTES: "171798691840"
+  TRAINING_PROJECT_COMMIT: "0000000000000000000000000000000000000000"
+  TRANSCODER_PEAK_FLOPS_PER_SECOND: "14688000000000000"
+  TRANSCODER_HARVEST_CHIP_SECONDS: "0"
+
+# One distinct resource is owned by exactly one trajectory. The three evidence
+# records are controller-readable immutable files plus their exact TPU-side
+# paths. Mirror seals may be shared within a region; mappings and cache
+# inventories must be fresh and unique per slice.
+resources:
+  - id: slice-sae-a
+    project: replace-project
+    tpu_name: replace-sae-a
+    zone: example-region-a
+    region: example-region
+    accelerator_type: v6e-16
+    internal_ip: true
+    ssh_user: replace-user
+    evidence:
+      controller_mapping:
+        controller_path: /mnt/replace-controller/topology/replace-sae-a/controller-mapping.json
+        remote_path: /home/replace-worker/moe-sae/artifacts/gemma4_v1/production/topology/replace-sae-a/controller-mapping.json
+        sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+      cache_inventory:
+        controller_path: /mnt/replace-controller/topology/replace-sae-a/cache-inventory.json
+        remote_path: /home/replace-worker/moe-sae/artifacts/gemma4_v1/production/topology/replace-sae-a/cache-inventory.json
+        sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+      mirror_seal: &mirror_seal
+        controller_path: /mnt/replace-controller/regional/mirror-seal.json
+        remote_path: /home/replace-worker/moe-sae/artifacts/gemma4_v1/production/regional/mirror-seal.json
+        sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+    environment: {}
+  - id: slice-sae-r
+    project: replace-project
+    tpu_name: replace-sae-r
+    zone: example-region-a
+    region: example-region
+    accelerator_type: v6e-16
+    internal_ip: true
+    ssh_user: replace-user
+    evidence:
+      controller_mapping:
+        controller_path: /mnt/replace-controller/topology/replace-sae-r/controller-mapping.json
+        remote_path: /home/replace-worker/moe-sae/artifacts/gemma4_v1/production/topology/replace-sae-r/controller-mapping.json
+        sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+      cache_inventory:
+        controller_path: /mnt/replace-controller/topology/replace-sae-r/cache-inventory.json
+        remote_path: /home/replace-worker/moe-sae/artifacts/gemma4_v1/production/topology/replace-sae-r/cache-inventory.json
+        sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+      mirror_seal: *mirror_seal
+    environment: {}
+  - id: slice-sae-b
+    project: replace-project
+    tpu_name: replace-sae-b
+    zone: example-region-a
+    region: example-region
+    accelerator_type: v6e-16
+    internal_ip: true
+    ssh_user: replace-user
+    evidence:
+      controller_mapping:
+        controller_path: /mnt/replace-controller/topology/replace-sae-b/controller-mapping.json
+        remote_path: /home/replace-worker/moe-sae/artifacts/gemma4_v1/production/topology/replace-sae-b/controller-mapping.json
+        sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+      cache_inventory:
+        controller_path: /mnt/replace-controller/topology/replace-sae-b/cache-inventory.json
+        remote_path: /home/replace-worker/moe-sae/artifacts/gemma4_v1/production/topology/replace-sae-b/cache-inventory.json
+        sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+      mirror_seal: *mirror_seal
+    environment: {}
+  - id: slice-sae-f
+    project: replace-project
+    tpu_name: replace-sae-f
+    zone: example-region-a
+    region: example-region
+    accelerator_type: v6e-16
+    internal_ip: true
+    ssh_user: replace-user
+    evidence:
+      controller_mapping:
+        controller_path: /mnt/replace-controller/topology/replace-sae-f/controller-mapping.json
+        remote_path: /home/replace-worker/moe-sae/artifacts/gemma4_v1/production/topology/replace-sae-f/controller-mapping.json
+        sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+      cache_inventory:
+        controller_path: /mnt/replace-controller/topology/replace-sae-f/cache-inventory.json
+        remote_path: /home/replace-worker/moe-sae/artifacts/gemma4_v1/production/topology/replace-sae-f/cache-inventory.json
+        sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+      mirror_seal: *mirror_seal
+    environment: {}
+  - id: slice-transcoder-a
+    project: replace-project
+    tpu_name: replace-transcoder-a
+    zone: example-region-a
+    region: example-region
+    accelerator_type: v6e-16
+    internal_ip: true
+    ssh_user: replace-user
+    evidence:
+      controller_mapping:
+        controller_path: /mnt/replace-controller/topology/replace-transcoder-a/controller-mapping.json
+        remote_path: /home/replace-worker/moe-sae/artifacts/gemma4_v1/production/topology/replace-transcoder-a/controller-mapping.json
+        sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+      cache_inventory:
+        controller_path: /mnt/replace-controller/topology/replace-transcoder-a/cache-inventory.json
+        remote_path: /home/replace-worker/moe-sae/artifacts/gemma4_v1/production/topology/replace-transcoder-a/cache-inventory.json
+        sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+      mirror_seal: *mirror_seal
+    environment: {}
+  - id: slice-transcoder-r
+    project: replace-project
+    tpu_name: replace-transcoder-r
+    zone: example-region-a
+    region: example-region
+    accelerator_type: v6e-16
+    internal_ip: true
+    ssh_user: replace-user
+    evidence:
+      controller_mapping:
+        controller_path: /mnt/replace-controller/topology/replace-transcoder-r/controller-mapping.json
+        remote_path: /home/replace-worker/moe-sae/artifacts/gemma4_v1/production/topology/replace-transcoder-r/controller-mapping.json
+        sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+      cache_inventory:
+        controller_path: /mnt/replace-controller/topology/replace-transcoder-r/cache-inventory.json
+        remote_path: /home/replace-worker/moe-sae/artifacts/gemma4_v1/production/topology/replace-transcoder-r/cache-inventory.json
+        sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+      mirror_seal: *mirror_seal
+    environment: {}
+  - id: slice-transcoder-b
+    project: replace-project
+    tpu_name: replace-transcoder-b
+    zone: example-region-a
+    region: example-region
+    accelerator_type: v6e-16
+    internal_ip: true
+    ssh_user: replace-user
+    evidence:
+      controller_mapping:
+        controller_path: /mnt/replace-controller/topology/replace-transcoder-b/controller-mapping.json
+        remote_path: /home/replace-worker/moe-sae/artifacts/gemma4_v1/production/topology/replace-transcoder-b/controller-mapping.json
+        sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+      cache_inventory:
+        controller_path: /mnt/replace-controller/topology/replace-transcoder-b/cache-inventory.json
+        remote_path: /home/replace-worker/moe-sae/artifacts/gemma4_v1/production/topology/replace-transcoder-b/cache-inventory.json
+        sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+      mirror_seal: *mirror_seal
+    environment: {}
+  - id: slice-transcoder-f
+    project: replace-project
+    tpu_name: replace-transcoder-f
+    zone: example-region-a
+    region: example-region
+    accelerator_type: v6e-16
+    internal_ip: true
+    ssh_user: replace-user
+    evidence:
+      controller_mapping:
+        controller_path: /mnt/replace-controller/topology/replace-transcoder-f/controller-mapping.json
+        remote_path: /home/replace-worker/moe-sae/artifacts/gemma4_v1/production/topology/replace-transcoder-f/controller-mapping.json
+        sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+      cache_inventory:
+        controller_path: /mnt/replace-controller/topology/replace-transcoder-f/cache-inventory.json
+        remote_path: /home/replace-worker/moe-sae/artifacts/gemma4_v1/production/topology/replace-transcoder-f/cache-inventory.json
+        sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+      mirror_seal: *mirror_seal
+    environment: {}
+
+trajectories:
+  - &sae_a
+    id: train-sae-a
+    scientific_model: sae
+    condition: A
+    seed: 0
+    resource_id: slice-sae-a
+    run_id: horizon10m-sae-a-seed0
+    config_remote: /home/replace-worker/moe-sae/artifacts/gemma4_v1/production/horizon-10m/contracts/sae.yaml
+    phase: learning_horizon_10m
+    control_root_remote: /home/replace-worker/moe-sae/artifacts/gemma4_v1/production/horizon-10m/runs/sae
+    checkpoint_root_gcs: gs://replace-regional-bucket/horizon-10m/checkpoints/sae
+    completion_path_controller: /mnt/replace-controller/horizon-10m/runs/sae/runs/horizon10m-sae-a-seed0/training-result.json
+    environment: {}
+  - <<: *sae_a
+    id: train-sae-r
+    condition: R
+    resource_id: slice-sae-r
+    run_id: horizon10m-sae-r-seed0
+    completion_path_controller: /mnt/replace-controller/horizon-10m/runs/sae/runs/horizon10m-sae-r-seed0/training-result.json
+  - <<: *sae_a
+    id: train-sae-b
+    condition: B
+    resource_id: slice-sae-b
+    run_id: horizon10m-sae-b-seed0
+    completion_path_controller: /mnt/replace-controller/horizon-10m/runs/sae/runs/horizon10m-sae-b-seed0/training-result.json
+  - <<: *sae_a
+    id: train-sae-f
+    condition: F
+    resource_id: slice-sae-f
+    run_id: horizon10m-sae-f-seed0
+    completion_path_controller: /mnt/replace-controller/horizon-10m/runs/sae/runs/horizon10m-sae-f-seed0/training-result.json
+  - &transcoder_a
+    id: train-transcoder-a
+    scientific_model: transcoder
+    condition: A
+    seed: 0
+    resource_id: slice-transcoder-a
+    run_id: horizon10m-transcoder-a-seed0
+    config_remote: /home/replace-worker/moe-sae/artifacts/gemma4_v1/production/horizon-10m/contracts/transcoder.yaml
+    phase: learning_horizon_10m
+    control_root_remote: /home/replace-worker/moe-sae/artifacts/gemma4_v1/production/horizon-10m/runs/transcoder
+    checkpoint_root_gcs: gs://replace-regional-bucket/horizon-10m/checkpoints/transcoder
+    completion_path_controller: /mnt/replace-controller/horizon-10m/runs/transcoder/runs/horizon10m-transcoder-a-seed0/training-result.json
+    environment: {}
+  - <<: *transcoder_a
+    id: train-transcoder-r
+    condition: R
+    resource_id: slice-transcoder-r
+    run_id: horizon10m-transcoder-r-seed0
+    completion_path_controller: /mnt/replace-controller/horizon-10m/runs/transcoder/runs/horizon10m-transcoder-r-seed0/training-result.json
+  - <<: *transcoder_a
+    id: train-transcoder-b
+    condition: B
+    resource_id: slice-transcoder-b
+    run_id: horizon10m-transcoder-b-seed0
+    completion_path_controller: /mnt/replace-controller/horizon-10m/runs/transcoder/runs/horizon10m-transcoder-b-seed0/training-result.json
+  - <<: *transcoder_a
+    id: train-transcoder-f
+    condition: F
+    resource_id: slice-transcoder-f
+    run_id: horizon10m-transcoder-f-seed0
+    completion_path_controller: /mnt/replace-controller/horizon-10m/runs/transcoder/runs/horizon10m-transcoder-f-seed0/training-result.json
+
+# Each entry invokes one evaluator that jointly reads A/R/B/F. These are six
+# physical tasks total, never one task per condition.
+evaluations:
+  - &sae_eval
+    id: eval-sae-2000000
+    scientific_model: sae
+    milestone_tokens: 2000000
+    seed: 0
+    resource_id: slice-sae-a
+    config_remote: /home/replace-worker/moe-sae/artifacts/gemma4_v1/production/horizon-10m/contracts/sae.yaml
+    phase: learning_horizon_10m
+    control_root_remote: /home/replace-worker/moe-sae/artifacts/gemma4_v1/production/horizon-10m/runs/sae
+    checkpoint_root_gcs: gs://replace-regional-bucket/horizon-10m/checkpoints/sae
+    result_root_remote: /home/replace-worker/moe-sae/artifacts/gemma4_v1/production/horizon-10m/evaluation/sae/2000000
+    completion_path_controller: /mnt/replace-controller/horizon-10m/evaluation/sae/2000000/scientific-result.json
+    run_roots_remote: &sae_runs
+      A: /home/replace-worker/moe-sae/artifacts/gemma4_v1/production/horizon-10m/runs/sae/runs/horizon10m-sae-a-seed0
+      R: /home/replace-worker/moe-sae/artifacts/gemma4_v1/production/horizon-10m/runs/sae/runs/horizon10m-sae-r-seed0
+      B: /home/replace-worker/moe-sae/artifacts/gemma4_v1/production/horizon-10m/runs/sae/runs/horizon10m-sae-b-seed0
+      F: /home/replace-worker/moe-sae/artifacts/gemma4_v1/production/horizon-10m/runs/sae/runs/horizon10m-sae-f-seed0
+    environment: {}
+  - <<: *sae_eval
+    id: eval-sae-5000000
+    milestone_tokens: 5000000
+    result_root_remote: /home/replace-worker/moe-sae/artifacts/gemma4_v1/production/horizon-10m/evaluation/sae/5000000
+    completion_path_controller: /mnt/replace-controller/horizon-10m/evaluation/sae/5000000/scientific-result.json
+    run_roots_remote: *sae_runs
+  - <<: *sae_eval
+    id: eval-sae-10000000
+    milestone_tokens: 10000000
+    result_root_remote: /home/replace-worker/moe-sae/artifacts/gemma4_v1/production/horizon-10m/evaluation/sae/10000000
+    completion_path_controller: /mnt/replace-controller/horizon-10m/evaluation/sae/10000000/scientific-result.json
+    run_roots_remote: *sae_runs
+  - &transcoder_eval
+    id: eval-transcoder-2000000
+    scientific_model: transcoder
+    milestone_tokens: 2000000
+    seed: 0
+    resource_id: slice-transcoder-a
+    config_remote: /home/replace-worker/moe-sae/artifacts/gemma4_v1/production/horizon-10m/contracts/transcoder.yaml
+    phase: learning_horizon_10m
+    control_root_remote: /home/replace-worker/moe-sae/artifacts/gemma4_v1/production/horizon-10m/runs/transcoder
+    checkpoint_root_gcs: gs://replace-regional-bucket/horizon-10m/checkpoints/transcoder
+    result_root_remote: /home/replace-worker/moe-sae/artifacts/gemma4_v1/production/horizon-10m/evaluation/transcoder/2000000
+    completion_path_controller: /mnt/replace-controller/horizon-10m/evaluation/transcoder/2000000/scientific-result.json
+    run_roots_remote: &transcoder_runs
+      A: /home/replace-worker/moe-sae/artifacts/gemma4_v1/production/horizon-10m/runs/transcoder/runs/horizon10m-transcoder-a-seed0
+      R: /home/replace-worker/moe-sae/artifacts/gemma4_v1/production/horizon-10m/runs/transcoder/runs/horizon10m-transcoder-r-seed0
+      B: /home/replace-worker/moe-sae/artifacts/gemma4_v1/production/horizon-10m/runs/transcoder/runs/horizon10m-transcoder-b-seed0
+      F: /home/replace-worker/moe-sae/artifacts/gemma4_v1/production/horizon-10m/runs/transcoder/runs/horizon10m-transcoder-f-seed0
+    environment: {}
+  - <<: *transcoder_eval
+    id: eval-transcoder-5000000
+    milestone_tokens: 5000000
+    result_root_remote: /home/replace-worker/moe-sae/artifacts/gemma4_v1/production/horizon-10m/evaluation/transcoder/5000000
+    completion_path_controller: /mnt/replace-controller/horizon-10m/evaluation/transcoder/5000000/scientific-result.json
+    run_roots_remote: *transcoder_runs
+  - <<: *transcoder_eval
+    id: eval-transcoder-10000000
+    milestone_tokens: 10000000
+    result_root_remote: /home/replace-worker/moe-sae/artifacts/gemma4_v1/production/horizon-10m/evaluation/transcoder/10000000
+    completion_path_controller: /mnt/replace-controller/horizon-10m/evaluation/transcoder/10000000/scientific-result.json
+    run_roots_remote: *transcoder_runs

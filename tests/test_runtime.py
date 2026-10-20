@@ -1,20 +1,28 @@
+import sys
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
 
 import numpy as np
 import pytest
 
+import moe_sae.data as data_module
 from moe_sae.runtime import (
-    BenchmarkObservation,
     HARVEST_MESHES,
+    BenchmarkObservation,
+    RuntimeDependencyError,
     _staged_path_accessible,
+    accelerator_peak_flops_per_second,
+    accelerator_runtime_status,
     build_maxtext_argv,
     choose_harvest_benchmark,
     compact_capture,
+    create_maxtext_runtime,
     environment_fingerprint,
     estimate_useful_prefix_flops,
     immutable_range_id,
-    scientific_token_mask,
+    require_accelerator_runtime,
     scan_token_shaped_secrets,
+    scientific_token_mask,
     token_quota,
     updates_for_tokens,
 )
@@ -44,6 +52,110 @@ def test_benchmark_selection_requires_gate_and_maximizes_persisted_goodput():
     assert choose_harvest_benchmark([too_low, slower, faster]) == faster
     with pytest.raises(RuntimeError, match="no harvester benchmark"):
         choose_harvest_benchmark([too_low])
+
+
+def test_v6e_16_runtime_requires_exact_four_by_four_topology(
+    monkeypatch,
+) -> None:
+    devices = [
+        SimpleNamespace(
+            platform="tpu",
+            device_kind="TPU v6 lite",
+            process_index=index // 4,
+            id=index,
+        )
+        for index in range(16)
+    ]
+    jax = ModuleType("jax")
+    jax.devices = lambda: devices
+    jax.process_count = lambda: 4
+    jax.local_device_count = lambda: 4
+    jax.distributed = SimpleNamespace(
+        is_initialized=lambda: True,
+        initialize=lambda: None,
+    )
+    monkeypatch.setitem(sys.modules, "jax", jax)
+
+    passed, detail = accelerator_runtime_status("v6e-16")
+    assert passed is True
+    assert "process_count=4" in detail
+    require_accelerator_runtime(
+        "v6e-16",
+        peak_flops_per_second=14_688_000_000_000_000,
+    )
+
+    jax.process_count = lambda: 2
+    passed, _ = accelerator_runtime_status("v6e-16")
+    assert passed is False
+
+
+def test_v6e_runtime_rejects_v4_peak_before_authoritative_work(
+    monkeypatch,
+) -> None:
+    jax = ModuleType("jax")
+    jax.distributed = SimpleNamespace(
+        is_initialized=lambda: True,
+        initialize=lambda: None,
+    )
+    monkeypatch.setitem(sys.modules, "jax", jax)
+
+    with pytest.raises(RuntimeDependencyError, match="14688000000000000"):
+        require_accelerator_runtime(
+            "v6e-16",
+            peak_flops_per_second=4_400_000_000_000_000,
+        )
+
+
+def test_v5litepod_runtime_requires_exact_observed_kind_and_peak(
+    monkeypatch,
+) -> None:
+    observed_kind = "TPU v5 lite observed by probe"
+    devices = [
+        SimpleNamespace(
+            platform="tpu",
+            device_kind=observed_kind,
+            process_index=index // 4,
+            id=index,
+        )
+        for index in range(16)
+    ]
+    jax = ModuleType("jax")
+    jax.devices = lambda: devices
+    jax.process_count = lambda: 4
+    jax.local_device_count = lambda: 4
+    jax.distributed = SimpleNamespace(
+        is_initialized=lambda: True,
+        initialize=lambda: None,
+    )
+    monkeypatch.setitem(sys.modules, "jax", jax)
+
+    passed, detail = accelerator_runtime_status(
+        "v5litepod-16",
+        environment={"MOE_SAE_V5LITEPOD_DEVICE_KIND": observed_kind},
+    )
+    assert passed is True
+    assert "local_device_count=4" in detail
+    monkeypatch.setenv("MOE_SAE_V5LITEPOD_DEVICE_KIND", observed_kind)
+    require_accelerator_runtime(
+        "v5litepod-16",
+        peak_flops_per_second=3_152_000_000_000_000,
+    )
+    assert (
+        accelerator_peak_flops_per_second("v5litepod-16")
+        == 3_152_000_000_000_000
+    )
+
+    passed, detail = accelerator_runtime_status(
+        "v5litepod-16",
+        environment={},
+    )
+    assert passed is False
+    assert "fresh controller identity probe" in detail
+    passed, _ = accelerator_runtime_status(
+        "v5litepod-16",
+        environment={"MOE_SAE_V5LITEPOD_DEVICE_KIND": "guessed kind"},
+    )
+    assert passed is False
 
 
 def test_benchmark_uses_device_time_for_mfu_and_total_time_for_persistence():
@@ -89,7 +201,75 @@ def test_maxtext_argv_locks_scientific_capture_settings():
     assert "use_multimodal=false" in joined
     assert "load_balance_loss_weight=0" in joined
     assert "use_ragged_sort=true" in joined
+    assert "eval_per_device_batch_size=2" in joined
     assert "ici_expert_parallelism=16" in joined
+
+
+def test_packed_runtime_forwards_exact_qualified_b128_contract(
+    monkeypatch,
+) -> None:
+    config = SimpleNamespace(
+        mesh_axes=("expert", "fsdp", "tensor"),
+        per_device_batch_size=8,
+        eval_per_device_batch_size=8,
+        global_batch_size_to_load=128,
+        global_batch_size_to_load_eval=128,
+    )
+    mesh = object()
+    model = object()
+
+    jax = ModuleType("jax")
+    jax.sharding = SimpleNamespace(Mesh=lambda _devices, _axes: mesh)
+    common_types = ModuleType("maxtext.common.common_types")
+    common_types.MODEL_MODE_TRAIN = "train"
+    pyconfig = SimpleNamespace(initialize=lambda _argv: config)
+    configs = ModuleType("maxtext.configs")
+    configs.pyconfig = pyconfig
+    input_interface = SimpleNamespace(
+        create_data_iterator=lambda _config, _mesh: (None, None)
+    )
+    input_pipeline = ModuleType("maxtext.input_pipeline")
+    input_pipeline.input_pipeline_interface = input_interface
+    maxtext_utils = SimpleNamespace(create_device_mesh=lambda _config: object())
+    model_creation_utils = SimpleNamespace(
+        from_pretrained=lambda _config, **_kwargs: model
+    )
+    utils = ModuleType("maxtext.utils")
+    utils.maxtext_utils = maxtext_utils
+    utils.model_creation_utils = model_creation_utils
+    packages = {
+        "jax": jax,
+        "maxtext": ModuleType("maxtext"),
+        "maxtext.common": ModuleType("maxtext.common"),
+        "maxtext.common.common_types": common_types,
+        "maxtext.configs": configs,
+        "maxtext.input_pipeline": input_pipeline,
+        "maxtext.utils": utils,
+    }
+    for name, value in packages.items():
+        monkeypatch.setitem(sys.modules, name, value)
+
+    calls = []
+
+    def build(files, **kwargs):
+        calls.append((tuple(files), kwargs))
+        return object()
+
+    monkeypatch.setattr(data_module, "build_maxtext_packed_iterator", build)
+    runtime = create_maxtext_runtime(
+        ("base.yml",),
+        packed_train_files=("train-0",),
+        packed_eval_files=("eval-0",),
+        packed_lane_prefix_replay_records=4,
+    )
+
+    assert runtime.model is model
+    assert [call[0] for call in calls] == [("train-0",), ("eval-0",)]
+    assert [call[1]["global_batch_size"] for call in calls] == [128, 128]
+    assert [
+        call[1]["qualified_per_device_sequence_batch"] for call in calls
+    ] == [8, 8]
+    assert [call[1]["replay_lane_prefix_records"] for call in calls] == [4, 4]
 
 
 def test_exact_host_quota_and_immutable_ids():

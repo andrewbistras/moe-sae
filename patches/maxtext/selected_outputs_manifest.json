@@ -1,0 +1,34 @@
+{
+  "schema_version": "maxtext-selected-outputs-patch-v1",
+  "base_commit": "48c7da3e28e8f57fe36ddf09d00eec53072a2ea0",
+  "fork_repository": "https://github.com/andrewbistras/maxtext.git",
+  "fork_branch": "gemma4-contribution-v1",
+  "fork_commit": "73bafe53569eb17dc18542f2568dd591a8db9e28",
+  "patch": "0001-gemma4-return-selected-outputs.patch",
+  "patch_sha256": "9da1ec2a0792a569123093c8840c20d9ee09891854f2665a972d3d7340d8c42d",
+  "files": {
+    "src/maxtext/layers/moe.py": {
+      "base_git_blob_sha1": "afa2799f9b542d21e1f84de3aca96a697c3161ed",
+      "base_sha256": "8850cfe6dcf65fa1a8059ce0a4ab3036057cf8757f4526d97cd8267d5e24269a",
+      "patched_git_blob_sha1": "1b9c6ed087ab9efa7df84ac1122c922153199a24",
+      "patched_sha256": "e731a50cf30f6bd4295f7891e97c8fdcb104092abf63268bc39aa5e6c8bdc531"
+    }
+  },
+  "qualified_path": {
+    "decoder_block": "gemma4",
+    "sparse_matmul": true,
+    "use_ring_of_experts": false,
+    "ragged_buffer_factor_max": 0.0,
+    "tensor_parallelism": 1,
+    "hash_routing": false,
+    "serve_quantization": false,
+    "fused_vllm": false
+  },
+  "default_return_arity": 3,
+  "auxiliary_return_arity": 4,
+  "auxiliary_shape": "[batch, sequence, top_k, hidden]",
+  "performance_optimizations": [
+    "linear_sender_to_expert_ragged_permutation",
+    "linear_inverse_permutation"
+  ]
+}

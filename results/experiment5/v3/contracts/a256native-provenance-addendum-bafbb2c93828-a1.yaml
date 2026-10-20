@@ -1,0 +1,144 @@
+schema_version: gemma4-experiment5-routed-activation-ladder-v3-a256native-provenance-addendum-v1
+addendum_id: gemma4-experiment5-v3-a256native-provenance-correction-20260729
+source_protocol_id: gemma4-pilot-learning-horizon-v1-20260728
+target_protocol_id: gemma4-experiment5-routed-activation-ladder-v3-20260729
+source_plan_sha256: 0af508a3244ff394850c1a80dc85b8d0872f0417f14a0f298255a3803912b12d
+scientific_scope:
+  condition: A256Native
+  evidentiary_role: panel_native_descriptive_context_only
+  included_in_primary_a512_inference: false
+  included_in_primary_a512_estimand: false
+  cross_panel_pooling_allowed: false
+  across_seed_inference_allowed: false
+  allowed_use: within_panel_historical_scale_context
+  prohibited_uses:
+  - matched_a512_activation_policy_contrast
+  - cross_panel_activation_policy_contrast
+  - three_seed_inference
+  - replacement_for_any_a512_cell
+panels:
+- panel: sae
+  target_condition: A256Native
+  source_condition: A
+  source_label: A256ReLU
+  seed: 0
+  encoder_activation: relu
+  selection_policy: strict_positive_topk
+  declared_source_config_semantic_sha256: 035e1afc91f7351fda3128582ac52e2051fcb0741f6f71913f5141aaa1c7ab59
+  observed_source_config_semantic_sha256: 035e1afc91f7351fda3128582ac52e2051fcb0741f6f71913f5141aaa1c7ab59
+  observed_source_config_file_sha256: 1bc8b252a26fdf1ac92aa182a41b34e6a40e719074de28465fd16b77a2e84f98
+  declaration_status: exact_match
+  disposition: contextual_reference_verified
+  training_source_revision: fa141831645e21b8adc5eb13d576bbc03a5ce1e0
+  source_config:
+    controller_path: /mnt/moe-sae-usc1/horizon-10m/contracts/sae.yaml
+    remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/contracts/sae.yaml
+    sha256: 1bc8b252a26fdf1ac92aa182a41b34e6a40e719074de28465fd16b77a2e84f98
+  run_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/runs/sae/runs/horizon10m-sae-a-seed0
+  checkpoint_payload_root_gcs: gs://moe-sae-horizon-usc1-neural-dragnet/horizon-10m/checkpoints/sae
+  run_contract:
+    controller_path: /mnt/moe-sae-usc1/horizon-10m/runs/sae/runs/horizon10m-sae-a-seed0/run-contract.json
+    remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/runs/sae/runs/horizon10m-sae-a-seed0/run-contract.json
+    sha256: e2694dccf3b731c15ce8cd3a126f411d77e60ec3bae8702481f12778e6796725
+  run_contract_sha256: aa45e048b489c64cd618261c257959dac0b06084d06c0de4c0f4c1e6cc4de462
+  training_result:
+    controller_path: /mnt/moe-sae-usc1/horizon-10m/runs/sae/runs/horizon10m-sae-a-seed0/training-result.json
+    remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/runs/sae/runs/horizon10m-sae-a-seed0/training-result.json
+    sha256: 8404a4375ed84b51022a54d2c9d56d1f3738a1e27fa6a0d0271d491c4721728c
+  training_result_sha256: 1c193f1baf148acf48dcaafbcf91417866681456de14b418fc9926eddfed366d
+  cost:
+    resource_id: slice-sae-a
+    accelerator_type: v5litepod-16
+    chip_count: 16
+    marginal_wall_seconds: 1090.7101320624352
+    chip_seconds: 17451.362112998962
+    chip_seconds_scope: fixed_capacity_scan_in_training_invocation_plus_synchronized_optimizer_loop_including_input_wait
+    chip_seconds_excludes:
+    - prefetch
+    - qualification
+    - lowering
+    - compilation
+    - checkpoint_serialization
+    - evaluation
+  checkpoints:
+  - checkpoint_tokens: 2000000
+    checkpoint_pointer:
+      controller_path: /mnt/moe-sae-usc1/horizon-10m/runs/sae/runs/horizon10m-sae-a-seed0/checkpoints/milestones/target-tokens-000002000000.json
+      remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/runs/sae/runs/horizon10m-sae-a-seed0/checkpoints/milestones/target-tokens-000002000000.json
+      sha256: 322e6cc2c760f9b3868d100c6edf898c71e819f23dce0fe4db8e110d3054b88a
+    checkpoint_pointer_sha256: 4129681dc02f541d38cd87245ecaecec509ef86d680e40649ab11d10aa9869dd
+  - checkpoint_tokens: 5000000
+    checkpoint_pointer:
+      controller_path: /mnt/moe-sae-usc1/horizon-10m/runs/sae/runs/horizon10m-sae-a-seed0/checkpoints/milestones/target-tokens-000005000000.json
+      remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/runs/sae/runs/horizon10m-sae-a-seed0/checkpoints/milestones/target-tokens-000005000000.json
+      sha256: dd32b4b9cd00fa99de537b5706d184ec709e7b12eae6b5296c1325db581f5197
+    checkpoint_pointer_sha256: f62d077078257c8d2f2f2f6873c1b010e496ebae4450d48c4ec116180c9839bf
+  - checkpoint_tokens: 10000000
+    checkpoint_pointer:
+      controller_path: /mnt/moe-sae-usc1/horizon-10m/runs/sae/runs/horizon10m-sae-a-seed0/checkpoints/milestones/target-tokens-000010000000.json
+      remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/runs/sae/runs/horizon10m-sae-a-seed0/checkpoints/milestones/target-tokens-000010000000.json
+      sha256: ed333f7b494f284cb733243ed57c955373f579d2aa703f17ec3adced3bb1ecba
+    checkpoint_pointer_sha256: 0b0d1f65fabb0cbe9e49e90f2916773492eb34a22670f46eec7db829fce91a27
+- panel: transcoder
+  target_condition: A256Native
+  source_condition: A
+  source_label: A256Softplus
+  seed: 0
+  encoder_activation: softplus
+  selection_policy: exact_positive_topk
+  declared_source_config_semantic_sha256: 1742ebc1b7993dffd0b35665695a074c3d10025f5d410021dd66ccb1bb221ec9
+  observed_source_config_semantic_sha256: 8e9937ea16e43addc7f7274a144f029f5f4c3731a98e653a2ce32fb27922c64d
+  observed_source_config_file_sha256: 660ea3bfa89270c24e728bd6725a913576425b96d6ddd65d31e246d5bf06dd6a
+  declaration_status: mismatch
+  disposition: contextual_reference_corrected_by_observed_lineage
+  training_source_revision: fa141831645e21b8adc5eb13d576bbc03a5ce1e0
+  source_config:
+    controller_path: /mnt/moe-sae-ew4/horizon-10m/contracts/transcoder.yaml
+    remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/contracts/transcoder.yaml
+    sha256: 660ea3bfa89270c24e728bd6725a913576425b96d6ddd65d31e246d5bf06dd6a
+  run_root_remote: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/runs/transcoder/runs/horizon10m-transcoder-a-seed0
+  checkpoint_payload_root_gcs: gs://moe-sae-horizon-ew4-neural-dragnet/horizon-10m/checkpoints/transcoder
+  run_contract:
+    controller_path: /mnt/moe-sae-ew4/horizon-10m/runs/transcoder/runs/horizon10m-transcoder-a-seed0/run-contract.json
+    remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/runs/transcoder/runs/horizon10m-transcoder-a-seed0/run-contract.json
+    sha256: c4f3d261f84384ebb2c9e393d8c7bac3b672b79c7641e8a6d8289694e0905517
+  run_contract_sha256: d8798b92e2bbc4f4e9a1a8b5452936de635a6e8394ee4bc0ac7cccb089a70997
+  training_result:
+    controller_path: /mnt/moe-sae-ew4/horizon-10m/runs/transcoder/runs/horizon10m-transcoder-a-seed0/training-result.json
+    remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/runs/transcoder/runs/horizon10m-transcoder-a-seed0/training-result.json
+    sha256: 25cf0042cdcc15fd97f92fe1f17d17d8d86801b0871ae90d175519cd0e628b78
+  training_result_sha256: a45f18b5573af8b8cdd524dd7ce970dddd8c9e120e8d8348508d93dc03a4a364
+  cost:
+    resource_id: slice-transcoder-a
+    accelerator_type: v5litepod-16
+    chip_count: 16
+    marginal_wall_seconds: 1140.887173295021
+    chip_seconds: 18254.194772720337
+    chip_seconds_scope: fixed_capacity_scan_in_training_invocation_plus_synchronized_optimizer_loop_including_input_wait
+    chip_seconds_excludes:
+    - prefetch
+    - qualification
+    - lowering
+    - compilation
+    - checkpoint_serialization
+    - evaluation
+  checkpoints:
+  - checkpoint_tokens: 2000000
+    checkpoint_pointer:
+      controller_path: /mnt/moe-sae-ew4/horizon-10m/runs/transcoder/runs/horizon10m-transcoder-a-seed0/checkpoints/milestones/target-tokens-000002000000.json
+      remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/runs/transcoder/runs/horizon10m-transcoder-a-seed0/checkpoints/milestones/target-tokens-000002000000.json
+      sha256: 04cc722abc26fe5304aa4fe435d77459a6b2abf5ec8d78e306386c7dfd531f2c
+    checkpoint_pointer_sha256: 7af3b20b52cc5f0a8098edd380deec5148ff5d5d14a59a5c3ddf6feadca1c33e
+  - checkpoint_tokens: 5000000
+    checkpoint_pointer:
+      controller_path: /mnt/moe-sae-ew4/horizon-10m/runs/transcoder/runs/horizon10m-transcoder-a-seed0/checkpoints/milestones/target-tokens-000005000000.json
+      remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/runs/transcoder/runs/horizon10m-transcoder-a-seed0/checkpoints/milestones/target-tokens-000005000000.json
+      sha256: a4ea33305fc16ffd323e95551becfa89327bbc7099e022db30e30f85ac016f94
+    checkpoint_pointer_sha256: f6c7e28c4944d7ed5b01538a0a26697fdf090787c41f456dbcdcbdad64d82393
+  - checkpoint_tokens: 10000000
+    checkpoint_pointer:
+      controller_path: /mnt/moe-sae-ew4/horizon-10m/runs/transcoder/runs/horizon10m-transcoder-a-seed0/checkpoints/milestones/target-tokens-000010000000.json
+      remote_path: /home/abistras/moe-sae/artifacts/gemma4_v1/production/horizon-10m/runs/transcoder/runs/horizon10m-transcoder-a-seed0/checkpoints/milestones/target-tokens-000010000000.json
+      sha256: d78895e78d748583d46a23aaf70e28ddcd2ceb0fc9e9fd9b029d20d96f4cf763
+    checkpoint_pointer_sha256: fd2207b096f33ac45ed5d3d0c7929ec8a5be985e641adb537aea44774f74726c
+manifest_sha256: d9d2dde064f36c332ac1cde9499198810a99ca4da4741e673e116db374abc6fe

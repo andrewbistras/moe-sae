@@ -79,6 +79,8 @@ def test_public_cli_import_is_jax_cold_and_exposes_expected_commands():
         "sae-status",
         "sae-abort",
         "sae-phase",
+        "gate1-audit",
+        "gate1-report",
         "train",
         "eval",
         "report",

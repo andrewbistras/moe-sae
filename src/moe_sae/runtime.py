@@ -7,22 +7,22 @@ the CPU test/training environment while leaving the production path explicit.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor
 import contextlib
-from dataclasses import asdict, dataclass
+import glob
 import hashlib
-from importlib import metadata, resources
 import json
 import math
 import os
-from pathlib import Path
 import platform
 import re
-import glob
 import subprocess
 import sys
 import time
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import asdict, dataclass
+from importlib import metadata, resources
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -31,6 +31,15 @@ from moe_sae.config import MAXTEXT_COMMIT, MODEL_ID
 
 V4_32_CHIPS = 16
 V4_32_BF16_PEAK_FLOPS = 4.4e15
+V6E_16_CHIPS = 16
+V6E_16_BF16_PEAK_FLOPS = 14.688e15
+V5LITEPOD_16_CHIPS = 16
+V5LITEPOD_16_BF16_PEAK_FLOPS = 3.152e15
+V5LITEPOD_DEVICE_KIND_ENV = "MOE_SAE_V5LITEPOD_DEVICE_KIND"
+SUPPORTED_TRAINING_ACCELERATOR_TYPES = frozenset(
+    {"v4-32", "v6e-16", "v5litepod-16"}
+)
+REGIONAL_ACCELERATOR_TYPES = frozenset({"v6e-16", "v5litepod-16"})
 TARGET_SEQUENCE_LENGTH = 1_024
 TARGET_LAYER_ONE_INDEXED = 15
 TARGET_TRAIN_TOKENS = 50_000_000
@@ -53,7 +62,7 @@ HARVEST_MESHES = (
     MeshCandidate("ep8-fsdp2-tp1", 8, 2, 1),
     MeshCandidate("ep8-fsdp1-tp2", 8, 1, 2),
 )
-PER_DEVICE_SEQUENCE_BATCHES = (1, 2, 4)
+PER_DEVICE_SEQUENCE_BATCHES = (1, 2, 4, 8)
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,6 +218,123 @@ def require_v4_32_runtime() -> None:
     if not passed:
         raise RuntimeDependencyError(
             f"authoritative execution requires a v4-32: {detail}"
+        )
+
+
+def accelerator_peak_flops_per_second(accelerator_type: str) -> int:
+    """Return the exact published aggregate BF16 peak for one slice."""
+
+    expected_peaks = {
+        "v4-32": int(V4_32_BF16_PEAK_FLOPS),
+        "v6e-16": int(V6E_16_BF16_PEAK_FLOPS),
+        "v5litepod-16": int(V5LITEPOD_16_BF16_PEAK_FLOPS),
+    }
+    try:
+        return expected_peaks[accelerator_type]
+    except KeyError as error:
+        raise RuntimeDependencyError(
+            f"unsupported accelerator type: {accelerator_type!r}"
+        ) from error
+
+
+def v5litepod_device_kind_from_environment(
+    environment: Mapping[str, str] | None = None,
+) -> str:
+    """Return the operator-supplied exact JAX v5litepod device kind."""
+
+    source = os.environ if environment is None else environment
+    expected_kind = source.get(V5LITEPOD_DEVICE_KIND_ENV, "")
+    if (
+        not expected_kind
+        or len(expected_kind) > 128
+        or any(ord(character) < 32 for character in expected_kind)
+    ):
+        raise RuntimeDependencyError(
+            f"{V5LITEPOD_DEVICE_KIND_ENV} must be set to the exact "
+            "device_kind observed by the fresh controller identity probe"
+        )
+    return expected_kind
+
+
+def accelerator_runtime_status(
+    accelerator_type: str,
+    *,
+    environment: Mapping[str, str] | None = None,
+) -> tuple[bool, str]:
+    """Return exact training topology status for supported 16-chip slices.
+
+    Historical v4 callers retain :func:`require_v4_32_runtime` unchanged.
+    New regional training/evaluation paths additionally require the observed
+    four-process by four-local-device topology used by regional 16-chip
+    ``v6e-16`` and ``v5litepod-16`` slices.
+    """
+
+    if accelerator_type == "v4-32":
+        return v4_32_runtime_status()
+    if accelerator_type not in REGIONAL_ACCELERATOR_TYPES:
+        return False, f"unsupported accelerator_type={accelerator_type!r}"
+    try:
+        import jax
+    except ImportError:
+        return False, "JAX unavailable"
+    devices = tuple(jax.devices())
+    platforms = sorted({str(device.platform) for device in devices})
+    kinds = sorted({str(device.device_kind) for device in devices})
+    if accelerator_type == "v6e-16":
+        kind_matches = all(
+            "v6e" in str(device.device_kind).lower()
+            or "v6 lite" in str(device.device_kind).lower()
+            for device in devices
+        )
+        expected_chips = V6E_16_CHIPS
+    else:
+        try:
+            expected_kind = v5litepod_device_kind_from_environment(environment)
+        except RuntimeDependencyError as error:
+            return False, str(error)
+        kind_matches = all(
+            str(device.device_kind) == expected_kind for device in devices
+        )
+        expected_chips = V5LITEPOD_16_CHIPS
+    correct = (
+        len(devices) == expected_chips
+        and int(jax.process_count()) == 4
+        and int(jax.local_device_count()) == 4
+        and all(device.platform == "tpu" for device in devices)
+        and kind_matches
+    )
+    return (
+        correct,
+        f"{len(devices)} devices; process_count={int(jax.process_count())}; "
+        f"local_device_count={int(jax.local_device_count())}; "
+        f"platforms={platforms}; kinds={kinds}",
+    )
+
+
+def require_accelerator_runtime(
+    accelerator_type: str,
+    *,
+    peak_flops_per_second: int | None = None,
+) -> None:
+    """Require one exact supported runtime and, when supplied, its peak."""
+
+    initialize_jax_distributed()
+    expected_peak = accelerator_peak_flops_per_second(accelerator_type)
+    if (
+        peak_flops_per_second is not None
+        and peak_flops_per_second != expected_peak
+    ):
+        raise RuntimeDependencyError(
+            f"{accelerator_type} BF16 peak must be exactly {expected_peak}"
+        )
+    if accelerator_type == "v4-32":
+        # Preserve the historical v4 acceptance surface byte-for-byte.
+        require_v4_32_runtime()
+        return
+    passed, detail = accelerator_runtime_status(accelerator_type)
+    if not passed:
+        raise RuntimeDependencyError(
+            f"authoritative execution requires a {accelerator_type}: {detail}"
         )
 
 
@@ -454,7 +580,7 @@ def build_maxtext_argv(
     if not checkpoint_path:
         raise ValueError("checkpoint_path is required")
     if per_device_sequence_batch not in PER_DEVICE_SEQUENCE_BATCHES:
-        raise ValueError("per-device sequence batch must be one of 1, 2, or 4")
+        raise ValueError("per-device sequence batch must be one of 1, 2, 4, or 8")
     if not synthetic and (not grain_train_files or not grain_eval_files):
         raise ValueError("pre-staged Grain train and eval files are required")
     argv = [base_config_path or maxtext_base_config_path()]
@@ -493,6 +619,7 @@ def build_maxtext_argv(
         "grain_file_type": "arrayrecord",
         "enable_data_shuffling": "false",
         "per_device_batch_size": per_device_sequence_batch,
+        "eval_per_device_batch_size": per_device_sequence_batch,
         "ici_expert_parallelism": mesh.expert_parallelism,
         "ici_fsdp_parallelism": mesh.fsdp_parallelism,
         "ici_tensor_parallelism": mesh.tensor_parallelism,
@@ -516,6 +643,7 @@ def create_maxtext_runtime(
     *,
     packed_train_files: Sequence[str] | None = None,
     packed_eval_files: Sequence[str] | None = None,
+    packed_lane_prefix_replay_records: int = 0,
 ) -> MaxTextRuntime:
     """Load the pinned MaxText model and iterators without importing Torch."""
 
@@ -546,11 +674,18 @@ def create_maxtext_runtime(
 
         if not packed_train_files or not packed_eval_files:
             raise ValueError("packed runtime requires exact train and eval file inventories")
+        per_device_sequence_batch = int(config.per_device_batch_size)
+        if per_device_sequence_batch not in PER_DEVICE_SEQUENCE_BATCHES:
+            raise ValueError(
+                "packed runtime per-device sequence batch was not qualified"
+            )
         train_iterator = build_maxtext_packed_iterator(
             packed_train_files,
             config=config,
             mesh=mesh,
             global_batch_size=int(config.global_batch_size_to_load),
+            qualified_per_device_sequence_batch=per_device_sequence_batch,
+            replay_lane_prefix_records=packed_lane_prefix_replay_records,
         )
         eval_batch = int(
             getattr(config, "global_batch_size_to_load_eval", 0)
@@ -561,6 +696,8 @@ def create_maxtext_runtime(
             config=config,
             mesh=mesh,
             global_batch_size=eval_batch,
+            qualified_per_device_sequence_batch=per_device_sequence_batch,
+            replay_lane_prefix_records=packed_lane_prefix_replay_records,
         )
     return MaxTextRuntime(config, mesh, model, train_iterator, eval_iterator)
 

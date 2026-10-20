@@ -1,0 +1,224 @@
+# Local-only inputs for the durable 18-task closure controller. Replace every
+# placeholder. The five TPU rows are already-deployed resources; this file does
+# not create, delete, or discover cloud resources.
+campaign_id: component-closure-REPLACE_COMMIT12
+working_directory: /ABS/PATH/TO/moe-sae
+python_executable: /ABS/PATH/TO/moe-sae/.venv/bin/python
+remote_project_root: /REMOTE/PATH/TO/moe-sae
+remote_uv: /REMOTE/PATH/TO/moe-sae/.venv/bin/uv
+state_root: /ABS/CONTROLLER/component-closure/controller-state
+max_parallel_train: 5
+
+retry_policy:
+  max_transient_attempts: 4
+  initial_backoff_seconds: 30.0
+  maximum_backoff_seconds: 300.0
+
+# The watchdog stops before the protected $36 launch limit and can never
+# reserve an attempt above the absolute $40 ceiling. The wall bound is frozen
+# by the plan builder at 43,200 seconds.
+cost_policy:
+  hard_limit_usd: 40.0
+  contingency_usd: 4.0
+  already_spent_usd: 0.0
+  fixed_cost_reserve_usd: 15.0
+  training_attempt_reserve_usd: 0.5
+  evaluation_attempt_reserve_usd: 0.0
+
+environment: {}
+
+# Resource rows intentionally use the mature controller's full immutable TPU
+# identity/evidence contract. Every evidence path must lie under that
+# resource's plane below. deployed_commit must equal --project-commit.
+resources:
+  - id: sae-v5-seed0
+    project: REPLACE_PROJECT
+    tpu_name: REPLACE_SAE_V5_SEED0_TPU
+    zone: us-central1-a
+    region: us-central1
+    accelerator_type: v5litepod-16
+    internal_ip: true
+    ssh_user: abistras
+    cache_profile: paired
+    deployed_commit: "0000000000000000000000000000000000000000"
+    evidence:
+      controller_mapping:
+        controller_path: /ABS/PLANES/sae-v5-shared/evidence/sae-v5-seed0-controller-mapping.json
+        remote_path: /REMOTE/PLANES/sae-v5-shared/evidence/sae-v5-seed0-controller-mapping.json
+        sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+      cache_inventory:
+        controller_path: /ABS/PLANES/sae-v5-shared/evidence/sae-v5-seed0-cache-inventory.json
+        remote_path: /REMOTE/PLANES/sae-v5-shared/evidence/sae-v5-seed0-cache-inventory.json
+        sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+      mirror_seal:
+        controller_path: /ABS/PLANES/sae-v5-shared/evidence/regional-mirror.json
+        remote_path: /REMOTE/PLANES/sae-v5-shared/evidence/regional-mirror.json
+        sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+    environment:
+      MOE_SAE_V5LITEPOD_DEVICE_KIND: REPLACE_OBSERVED_DEVICE_KIND
+      CONTRIBUTION_QUALIFICATION_BUNDLE: /REMOTE/PLANES/sae-v5-seed0/evidence/qualification.json
+      CONTRIBUTION_TRAIN_CAPTURE_ROOT: /REMOTE/PLANES/sae-v5-seed0/captures/train-target
+      CONTRIBUTION_OBJECT_PREFIX: gs://replace-bucket/sae-v5-seed0/train-target
+      CONTRIBUTION_RECOMPOSITION_SIDECAR: /REMOTE/PLANES/sae-v5-seed0/evidence/recomposition-sidecar.json
+      CONTRIBUTION_SAE_CACHE_ROOT: /dev/shm/moe-sae-local/horizon-10m/cache
+      CONTRIBUTION_SAE_CACHE_MAX_BYTES: "171798691840"
+
+  - id: sae-v5-seed1
+    project: REPLACE_PROJECT
+    tpu_name: REPLACE_SAE_V5_SEED1_TPU
+    zone: us-central1-a
+    region: us-central1
+    accelerator_type: v5litepod-16
+    internal_ip: true
+    ssh_user: abistras
+    cache_profile: paired
+    deployed_commit: "0000000000000000000000000000000000000000"
+    evidence:
+      controller_mapping:
+        controller_path: /ABS/PLANES/sae-v5-shared/evidence/sae-v5-seed1-controller-mapping.json
+        remote_path: /REMOTE/PLANES/sae-v5-shared/evidence/sae-v5-seed1-controller-mapping.json
+        sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+      cache_inventory:
+        controller_path: /ABS/PLANES/sae-v5-shared/evidence/sae-v5-seed1-cache-inventory.json
+        remote_path: /REMOTE/PLANES/sae-v5-shared/evidence/sae-v5-seed1-cache-inventory.json
+        sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+      mirror_seal:
+        controller_path: /ABS/PLANES/sae-v5-shared/evidence/regional-mirror.json
+        remote_path: /REMOTE/PLANES/sae-v5-shared/evidence/regional-mirror.json
+        sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+    environment:
+      MOE_SAE_V5LITEPOD_DEVICE_KIND: REPLACE_OBSERVED_DEVICE_KIND
+      CONTRIBUTION_QUALIFICATION_BUNDLE: /REMOTE/PLANES/sae-v5-seed1/evidence/qualification.json
+      CONTRIBUTION_TRAIN_CAPTURE_ROOT: /REMOTE/PLANES/sae-v5-seed1/captures/train-target
+      CONTRIBUTION_OBJECT_PREFIX: gs://replace-bucket/sae-v5-seed1/train-target
+      CONTRIBUTION_RECOMPOSITION_SIDECAR: /REMOTE/PLANES/sae-v5-seed1/evidence/recomposition-sidecar.json
+      CONTRIBUTION_SAE_CACHE_ROOT: /dev/shm/moe-sae-local/horizon-10m/cache
+      CONTRIBUTION_SAE_CACHE_MAX_BYTES: "171798691840"
+
+  - id: transcoder-v4-spot-seed2
+    project: REPLACE_PROJECT
+    tpu_name: REPLACE_TRANSCODER_V4_SPOT_SEED2_TPU
+    zone: us-central2-b
+    region: us-central2
+    accelerator_type: v4-32
+    internal_ip: true
+    ssh_user: abistras
+    cache_profile: paired
+    deployed_commit: "0000000000000000000000000000000000000000"
+    evidence:
+      controller_mapping:
+        controller_path: /ABS/PLANES/transcoder-v4-spot-seed2/evidence/controller-mapping.json
+        remote_path: /REMOTE/PLANES/transcoder-v4-spot-seed2/evidence/controller-mapping.json
+        sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+      cache_inventory:
+        controller_path: /ABS/PLANES/transcoder-v4-spot-seed2/evidence/cache-inventory.json
+        remote_path: /REMOTE/PLANES/transcoder-v4-spot-seed2/evidence/cache-inventory.json
+        sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+      mirror_seal: null
+    environment:
+      CONTRIBUTION_QUALIFICATION_BUNDLE: /REMOTE/PLANES/transcoder-v4-spot-seed2/evidence/qualification.json
+      CONTRIBUTION_TRAIN_CAPTURE_ROOT: /REMOTE/PLANES/transcoder-v4-spot-seed2/captures/train-target
+      CONTRIBUTION_OBJECT_PREFIX: gs://replace-bucket/transcoder-v4-spot-seed2/train-target
+      CONTRIBUTION_RECOMPOSITION_SIDECAR: /REMOTE/PLANES/transcoder-v4-spot-seed2/evidence/recomposition-sidecar.json
+      CONTRIBUTION_SAE_CACHE_ROOT: /dev/shm/moe-sae-local/horizon-10m/cache
+      CONTRIBUTION_SAE_CACHE_MAX_BYTES: "171798691840"
+
+  - id: transcoder-v5-seed0
+    project: REPLACE_PROJECT
+    tpu_name: REPLACE_TRANSCODER_V5_SEED0_TPU
+    zone: us-central1-a
+    region: us-central1
+    accelerator_type: v5litepod-16
+    internal_ip: true
+    ssh_user: abistras
+    cache_profile: paired
+    deployed_commit: "0000000000000000000000000000000000000000"
+    evidence:
+      controller_mapping:
+        controller_path: /ABS/PLANES/transcoder-v5-seed0/evidence/controller-mapping.json
+        remote_path: /REMOTE/PLANES/transcoder-v5-seed0/evidence/controller-mapping.json
+        sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+      cache_inventory:
+        controller_path: /ABS/PLANES/transcoder-v5-seed0/evidence/cache-inventory.json
+        remote_path: /REMOTE/PLANES/transcoder-v5-seed0/evidence/cache-inventory.json
+        sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+      mirror_seal:
+        controller_path: /ABS/PLANES/transcoder-v5-seed0/evidence/regional-mirror.json
+        remote_path: /REMOTE/PLANES/transcoder-v5-seed0/evidence/regional-mirror.json
+        sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+    environment:
+      MOE_SAE_V5LITEPOD_DEVICE_KIND: REPLACE_OBSERVED_DEVICE_KIND
+      CONTRIBUTION_QUALIFICATION_BUNDLE: /REMOTE/PLANES/transcoder-v5-seed0/evidence/qualification.json
+      CONTRIBUTION_TRAIN_CAPTURE_ROOT: /REMOTE/PLANES/transcoder-v5-seed0/captures/train-target
+      CONTRIBUTION_OBJECT_PREFIX: gs://replace-bucket/transcoder-v5-seed0/train-target
+      CONTRIBUTION_RECOMPOSITION_SIDECAR: /REMOTE/PLANES/transcoder-v5-seed0/evidence/recomposition-sidecar.json
+      CONTRIBUTION_SAE_CACHE_ROOT: /dev/shm/moe-sae-local/horizon-10m/cache
+      CONTRIBUTION_SAE_CACHE_MAX_BYTES: "171798691840"
+
+  - id: transcoder-v4-od-seed1
+    project: REPLACE_PROJECT
+    tpu_name: REPLACE_TRANSCODER_V4_OD_SEED1_TPU
+    zone: us-central2-b
+    region: us-central2
+    accelerator_type: v4-32
+    internal_ip: true
+    ssh_user: abistras
+    cache_profile: paired
+    deployed_commit: "0000000000000000000000000000000000000000"
+    evidence:
+      controller_mapping:
+        controller_path: /ABS/PLANES/transcoder-v4-od-seed1/evidence/controller-mapping.json
+        remote_path: /REMOTE/PLANES/transcoder-v4-od-seed1/evidence/controller-mapping.json
+        sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+      cache_inventory:
+        controller_path: /ABS/PLANES/transcoder-v4-od-seed1/evidence/cache-inventory.json
+        remote_path: /REMOTE/PLANES/transcoder-v4-od-seed1/evidence/cache-inventory.json
+        sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+      mirror_seal: null
+    environment:
+      CONTRIBUTION_QUALIFICATION_BUNDLE: /REMOTE/PLANES/transcoder-v4-od-seed1/evidence/qualification.json
+      CONTRIBUTION_TRAIN_CAPTURE_ROOT: /REMOTE/PLANES/transcoder-v4-od-seed1/captures/train-target
+      CONTRIBUTION_OBJECT_PREFIX: gs://replace-bucket/transcoder-v4-od-seed1/train-target
+      CONTRIBUTION_RECOMPOSITION_SIDECAR: /REMOTE/PLANES/transcoder-v4-od-seed1/evidence/recomposition-sidecar.json
+      CONTRIBUTION_SAE_CACHE_ROOT: /dev/shm/moe-sae-local/horizon-10m/cache
+      CONTRIBUTION_SAE_CACHE_MAX_BYTES: "171798691840"
+
+planes:
+  sae-v5-seed0:
+    controller_artifact_root: /ABS/PLANES/sae-v5-shared
+    remote_artifact_root: /REMOTE/PLANES/sae-v5-shared
+    bulk_gcs_root: gs://replace-bucket/sae-v5-shared
+    source_overlay_control_root_remote: null
+    source_overlay_object_prefix_gcs: null
+  sae-v5-seed1:
+    controller_artifact_root: /ABS/PLANES/sae-v5-shared
+    remote_artifact_root: /REMOTE/PLANES/sae-v5-shared
+    bulk_gcs_root: gs://replace-bucket/sae-v5-shared
+    source_overlay_control_root_remote: null
+    source_overlay_object_prefix_gcs: null
+  transcoder-v4-spot-seed2:
+    controller_artifact_root: /ABS/PLANES/transcoder-v4-spot-seed2
+    remote_artifact_root: /REMOTE/PLANES/transcoder-v4-spot-seed2
+    bulk_gcs_root: gs://replace-bucket/transcoder-v4-spot-seed2
+    source_overlay_control_root_remote: /REMOTE/PLANES/transcoder-v4-spot-seed2/captures/train-source-overlay
+    source_overlay_object_prefix_gcs: gs://replace-bucket/transcoder-v4-spot-seed2/train-source-overlay
+  transcoder-v5-seed0:
+    controller_artifact_root: /ABS/PLANES/transcoder-v5-seed0
+    remote_artifact_root: /REMOTE/PLANES/transcoder-v5-seed0
+    bulk_gcs_root: gs://replace-bucket/transcoder-v5-seed0
+    source_overlay_control_root_remote: /REMOTE/PLANES/transcoder-v5-seed0/captures/train-source-overlay
+    source_overlay_object_prefix_gcs: gs://replace-bucket/transcoder-v5-seed0/train-source-overlay
+  transcoder-v4-od-seed1:
+    controller_artifact_root: /ABS/PLANES/transcoder-v4-od-seed1
+    remote_artifact_root: /REMOTE/PLANES/transcoder-v4-od-seed1
+    bulk_gcs_root: gs://replace-bucket/transcoder-v4-od-seed1
+    source_overlay_control_root_remote: /REMOTE/PLANES/transcoder-v4-od-seed1/captures/train-source-overlay
+    source_overlay_object_prefix_gcs: gs://replace-bucket/transcoder-v4-od-seed1/train-source-overlay
+
+cohorts:
+  sae.seed0: [sae-v5-seed0, sae-v5-seed1]
+  sae.seed1: [sae-v5-seed0, sae-v5-seed1]
+  sae.seed2: [sae-v5-seed0, sae-v5-seed1]
+  transcoder.seed0: [transcoder-v5-seed0]
+  transcoder.seed1: [transcoder-v4-od-seed1]
+  transcoder.seed2: [transcoder-v4-spot-seed2]

@@ -1,0 +1,22 @@
+schema_version: gemma4-experiment5-report-recovery-plan-v1
+protocol_id: gemma4-routed-shared-hybrid-v1-20260728
+recovery_id: gemma4-experiment5-report-recovery-e0abd4a1af5b-a1
+report_root: /mnt/moe-sae-control/experiment5/report-recovery-v1/e0abd4a1af5b-a1/sealed
+working_directory: /home/tpuops/src/moe-sae
+reporting_source_revision: e0abd4a1af5ba352a5b1af84cbf591ecc6d3faec
+parent:
+  schema_version: gemma4-experiment5-report-recovery-parent-v1
+  evaluation_plan:
+    path: /mnt/moe-sae-control/experiment5/recovery/evaluation-v1/15a5f264245e-a2/contracts/evaluation-recovery.yaml
+    file_sha256: e81229aaa33af7101a563e3b092f4481b01133356d1856284f5f9f32499e25bd
+    plan_sha256: b5f560e58b00f2dc71912e8dfa68d7585415bc39eb12df781a07adaf76b92a5d
+  evaluation_source_revision: 15a5f264245e7e93815a97d21076156109bafc91
+  evaluation_barrier:
+    path: /mnt/moe-sae-control/experiment5/recovery/evaluation-v1/15a5f264245e-a2/state/evaluation-complete.json
+    file_sha256: 0b34dec011f0415743392321487be871cce6015c2e00e80b7d77a03672bc6c1d
+    record_sha256: 3aafe95e93ee1eee5b4ce3778d240349026f5bd6ce46d34b7a154f6f7f8f0680
+  budget_ledger:
+    path: /mnt/moe-sae-control/experiment5/recovery/evaluation-v1/15a5f264245e-a2/state/report/budget-ledger.json
+    file_sha256: 071f2a48d5db35d3fc2891b5c82c60be1a1e0d226e1acaff6d4d8d0509849e5a
+    ledger_sha256: de5bf5337a98adf1cbe965c208f53815796aaf742e3178cfecc38a47259c1a00
+plan_sha256: 5e4682c2e894f6af0a7b262d70e3af1117a1f4f74fc864846d041cd83b5f6f54
