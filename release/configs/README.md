@@ -1,9 +1,9 @@
 # Frozen configurations
 
 The paper's 24 training runs are defined by four configuration files in the
-repository's `configs/` directory. None has changed since the runs: the A
-configs were last modified in `8e2bfa2` and the R/B/F configs in `301e0dc`
-(both 2026-07-29).
+repository's `configs/` directory. The evidence records the commit each run
+trained from: `8dcfade` for the six A runs and `301e0dc` for the 18 R/B/F
+runs. At those commits all four files are byte-identical to the ones here.
 
 | Runs in the paper | Panel | Configuration | Layout name in the file |
 |---|---|---|---|
