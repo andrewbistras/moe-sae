@@ -66,5 +66,6 @@ The training and evaluation code is in `src/moe_sae/` and `scripts/tpu/`. The
 protocols are [`docs/EXPERIMENT_5_LADDER_V3.md`](../docs/EXPERIMENT_5_LADDER_V3.md),
 for the six aligned runs, and
 [`docs/A512_COMPONENT_CLOSURE_PROTOCOL.md`](../docs/A512_COMPONENT_CLOSURE_PROTOCOL.md),
-for the 18 controls and the final evaluation. Model weights and source data
-remain subject to their original licenses.
+for the 18 controls and the final evaluation. The code is released under the
+[MIT License](../LICENSE). Model weights and source data remain subject to
+their original licenses.
